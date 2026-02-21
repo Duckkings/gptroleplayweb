@@ -1,0 +1,156 @@
+﻿.app-shell {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.card {
+  width: min(980px, 100%);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: linear-gradient(160deg, #101725, var(--panel));
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+  padding: 20px;
+}
+
+h1 {
+  margin: 0 0 8px;
+}
+
+p {
+  color: var(--muted);
+}
+
+.actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+button,
+.file-button {
+  border: 1px solid var(--border);
+  background: #1a253a;
+  color: var(--text);
+  border-radius: 10px;
+  padding: 10px 14px;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+button:hover,
+.file-button:hover {
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.file-button {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.file-button input {
+  position: absolute;
+  opacity: 0;
+  inset: 0;
+  cursor: pointer;
+}
+
+.config-card textarea,
+.composer textarea {
+  width: 100%;
+  border: 1px solid var(--border);
+  background: #0a0f1b;
+  border-radius: 10px;
+  color: var(--text);
+  padding: 12px;
+  resize: vertical;
+}
+
+.config-card textarea {
+  min-height: 320px;
+  margin: 12px 0;
+}
+
+.chat-card {
+  display: grid;
+  gap: 12px;
+}
+
+.chat-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.messages {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #0a101a;
+  min-height: 360px;
+  max-height: 55vh;
+  overflow: auto;
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.msg {
+  border-radius: 10px;
+  padding: 10px;
+  border: 1px solid var(--border);
+}
+
+.msg.user {
+  background: #132138;
+}
+
+.msg.assistant {
+  background: #101f1d;
+  border-color: #22433c;
+}
+
+.msg strong {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--accent);
+}
+
+.msg p {
+  margin: 0;
+  color: var(--text);
+  white-space: pre-wrap;
+}
+
+.composer {
+  display: grid;
+  gap: 10px;
+}
+
+.composer textarea {
+  min-height: 100px;
+}
+
+.error {
+  color: var(--danger);
+  margin: 0;
+}
+
+.hint {
+  margin: 0;
+}
+
+@media (max-width: 768px) {
+  .chat-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}

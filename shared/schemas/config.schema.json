@@ -1,0 +1,49 @@
+﻿{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RoleplayWebConfig",
+  "type": "object",
+  "required": ["version", "openai_api_key", "model", "stream", "gm_prompt"],
+  "properties": {
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "openai_api_key": {
+      "type": "string",
+      "minLength": 1
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "stream": {
+      "type": "boolean"
+    },
+    "temperature": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 2,
+      "default": 0.8
+    },
+    "max_tokens": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 1200
+    },
+    "gm_prompt": {
+      "type": "string",
+      "minLength": 1
+    },
+    "ui": {
+      "type": "object",
+      "properties": {
+        "theme": {
+          "type": "string",
+          "default": "dark"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

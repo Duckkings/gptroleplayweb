@@ -1,0 +1,26 @@
+﻿:root {
+  color-scheme: dark;
+  --bg-1: #090b10;
+  --bg-2: #131926;
+  --panel: #0f1421;
+  --text: #e8edf7;
+  --muted: #9ba8c3;
+  --accent: #69d0b6;
+  --danger: #ff7a8c;
+  --border: #263146;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  color: var(--text);
+  font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  background: radial-gradient(circle at 20% 0%, #1a2638 0%, var(--bg-1) 45%), var(--bg-1);
+}
+
+#root {
+  min-height: 100vh;
+}
