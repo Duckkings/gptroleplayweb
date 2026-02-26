@@ -1,6 +1,6 @@
 ﻿# gptroleplayweb
 ## Docs
-- `docs/mvp-architecture.md`: MVP 架构、配置 schema、API 契约、开发顺序
+- `docs/technical/mvp-architecture.md`: MVP 架构、配置 schema、API 契约、开发顺序
 
 ## Current Features
 - 本地 JSON 配置导入（JSON 语法 + schema 校验）
@@ -33,6 +33,7 @@ npm run dev
 ```
 3. 在配置页或 `config.json` 中填写 `openai_api_key` 后进入聊天。
 
-完整说明见 `docs/mvp-architecture.md` 第 11 节。
+完整说明见 `docs/technical/mvp-architecture.md` 第 11 节。
+
 
 

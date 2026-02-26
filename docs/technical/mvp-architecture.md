@@ -1,5 +1,8 @@
 ﻿# Roleplay Web MVP 架构与接口契约
 
+## 设计来源
+- docs/design/gamedesign/gamedesign.md
+
 ## 1. 目标
 - 先做可用 MVP：本地配置、聊天、可选流式输出、基础错误恢复。
 - API Key 放入本地 `config.json`，由后端读取并转发请求。
@@ -32,7 +35,8 @@ gptroleplayweb/
     schemas/
       config.schema.json
   docs/
-    mvp-architecture.md
+    technical/
+      mvp-architecture.md
 ```
 
 ## 4. 配置文件契约
@@ -306,5 +310,7 @@ server: {
   - 或使用 Vite 代理转发 `/api`。
 - 端口占用：
   - 后端改 `--port 8001`，同时更新前端 API 基地址。
+
+
 
 
