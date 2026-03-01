@@ -12,6 +12,8 @@
   NpcChatResponse,
   NpcGreetResponse,
   NpcRoleCard,
+  RoleBuff,
+  InventoryItem,
   PathStatus,
   PlayerRuntimeData,
   PlayerStaticData,
@@ -384,6 +386,138 @@ export async function setPlayerStatic(sessionId: string, payload: PlayerStaticDa
   );
 }
 
+export async function equipPlayerItem(
+  sessionId: string,
+  payload: { item_id: string; slot: 'weapon' | 'armor' },
+  report?: DebugReporter,
+): Promise<PlayerStaticData> {
+  return requestJson(
+    `/player/equipment/equip?session_id=${encodeURIComponent(sessionId)}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) },
+    report,
+  );
+}
+
+export async function unequipPlayerItem(
+  sessionId: string,
+  payload: { slot: 'weapon' | 'armor' },
+  report?: DebugReporter,
+): Promise<PlayerStaticData> {
+  return requestJson(
+    `/player/equipment/unequip?session_id=${encodeURIComponent(sessionId)}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) },
+    report,
+  );
+}
+
+export async function addPlayerBuff(sessionId: string, buff: RoleBuff, report?: DebugReporter): Promise<PlayerStaticData> {
+  return requestJson(
+    `/player/buffs/add?session_id=${encodeURIComponent(sessionId)}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ buff }) },
+    report,
+  );
+}
+
+export async function removePlayerBuff(sessionId: string, buffId: string, report?: DebugReporter): Promise<PlayerStaticData> {
+  return requestJson(
+    `/player/buffs/remove?session_id=${encodeURIComponent(sessionId)}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ buff_id: buffId }) },
+    report,
+  );
+}
+
+export async function addPlayerItem(sessionId: string, item: InventoryItem, report?: DebugReporter): Promise<PlayerStaticData> {
+  return requestJson(
+    `/player/items/add?session_id=${encodeURIComponent(sessionId)}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ item }) },
+    report,
+  );
+}
+
+export async function removePlayerItem(
+  sessionId: string,
+  payload: { item_id: string; quantity?: number },
+  report?: DebugReporter,
+): Promise<PlayerStaticData> {
+  return requestJson(
+    `/player/items/remove?session_id=${encodeURIComponent(sessionId)}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) },
+    report,
+  );
+}
+
+export async function addPlayerSpell(sessionId: string, value: string, report?: DebugReporter): Promise<PlayerStaticData> {
+  return requestJson(
+    `/player/spells/add?session_id=${encodeURIComponent(sessionId)}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ value }) },
+    report,
+  );
+}
+
+export async function removePlayerSpell(sessionId: string, value: string, report?: DebugReporter): Promise<PlayerStaticData> {
+  return requestJson(
+    `/player/spells/remove?session_id=${encodeURIComponent(sessionId)}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ value }) },
+    report,
+  );
+}
+
+export async function addPlayerSkill(sessionId: string, value: string, report?: DebugReporter): Promise<PlayerStaticData> {
+  return requestJson(
+    `/player/skills/add?session_id=${encodeURIComponent(sessionId)}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ value }) },
+    report,
+  );
+}
+
+export async function removePlayerSkill(sessionId: string, value: string, report?: DebugReporter): Promise<PlayerStaticData> {
+  return requestJson(
+    `/player/skills/remove?session_id=${encodeURIComponent(sessionId)}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ value }) },
+    report,
+  );
+}
+
+export async function consumeSpellSlots(
+  sessionId: string,
+  payload: { level: number; amount?: number },
+  report?: DebugReporter,
+): Promise<PlayerStaticData> {
+  return requestJson(
+    `/player/resources/spell-slots/consume?session_id=${encodeURIComponent(sessionId)}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) },
+    report,
+  );
+}
+
+export async function recoverSpellSlots(
+  sessionId: string,
+  payload: { level: number; amount?: number },
+  report?: DebugReporter,
+): Promise<PlayerStaticData> {
+  return requestJson(
+    `/player/resources/spell-slots/recover?session_id=${encodeURIComponent(sessionId)}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) },
+    report,
+  );
+}
+
+export async function consumeStamina(sessionId: string, amount = 1, report?: DebugReporter): Promise<PlayerStaticData> {
+  return requestJson(
+    `/player/resources/stamina/consume?session_id=${encodeURIComponent(sessionId)}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ amount }) },
+    report,
+  );
+}
+
+export async function recoverStamina(sessionId: string, amount = 1, report?: DebugReporter): Promise<PlayerStaticData> {
+  return requestJson(
+    `/player/resources/stamina/recover?session_id=${encodeURIComponent(sessionId)}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ amount }) },
+    report,
+  );
+}
+
 export async function getPlayerRuntime(sessionId: string, report?: DebugReporter): Promise<PlayerRuntimeData> {
   return requestJson(`/player/runtime?session_id=${encodeURIComponent(sessionId)}`, { method: 'GET' }, report);
 }
@@ -427,6 +561,23 @@ export async function relatePlayerToRole(
 ): Promise<NpcRoleCard> {
   return requestJson(
     `/role-pool/${encodeURIComponent(roleId)}/relate-player?session_id=${encodeURIComponent(sessionId)}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function setRoleRelation(
+  sessionId: string,
+  roleId: string,
+  payload: { target_role_id: string; relation_tag: string; note?: string },
+  report?: DebugReporter,
+): Promise<NpcRoleCard> {
+  return requestJson(
+    `/role-pool/${encodeURIComponent(roleId)}/relations?session_id=${encodeURIComponent(sessionId)}`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

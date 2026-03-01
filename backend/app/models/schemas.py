@@ -209,32 +209,123 @@ class Dnd5eAbilityScores(BaseModel):
     charisma: int = Field(default=10, ge=1, le=30)
 
 
+class Dnd5eAbilityModifiers(BaseModel):
+    strength: int = Field(default=0, ge=-10, le=20)
+    dexterity: int = Field(default=0, ge=-10, le=20)
+    constitution: int = Field(default=0, ge=-10, le=20)
+    intelligence: int = Field(default=0, ge=-10, le=20)
+    wisdom: int = Field(default=0, ge=-10, le=20)
+    charisma: int = Field(default=0, ge=-10, le=20)
+
+
 class Dnd5eHitPoints(BaseModel):
     current: int = Field(default=10, ge=0)
     maximum: int = Field(default=10, ge=1)
     temporary: int = Field(default=0, ge=0)
 
 
+class Dnd5eSpellSlots(BaseModel):
+    level_1: int = Field(default=2, ge=0, le=9)
+    level_2: int = Field(default=0, ge=0, le=9)
+    level_3: int = Field(default=0, ge=0, le=9)
+    level_4: int = Field(default=0, ge=0, le=9)
+    level_5: int = Field(default=0, ge=0, le=9)
+    level_6: int = Field(default=0, ge=0, le=9)
+    level_7: int = Field(default=0, ge=0, le=9)
+    level_8: int = Field(default=0, ge=0, le=9)
+    level_9: int = Field(default=0, ge=0, le=9)
+
+
+class RoleBuffEffect(BaseModel):
+    strength_delta: int = 0
+    dexterity_delta: int = 0
+    constitution_delta: int = 0
+    intelligence_delta: int = 0
+    wisdom_delta: int = 0
+    charisma_delta: int = 0
+    ac_delta: int = 0
+    dc_delta: int = 0
+    speed_ft_delta: int = 0
+    move_speed_mph_delta: int = 0
+    hp_max_delta: int = 0
+    stamina_max_delta: int = 0
+
+
+class RoleBuff(BaseModel):
+    buff_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    description: str = Field(default="", min_length=0)
+    source: str = Field(default="", min_length=0)
+    duration_min: int = Field(default=10, ge=0)
+    remaining_min: int = Field(default=10, ge=0)
+    stackable: bool = False
+    effect: RoleBuffEffect = Field(default_factory=RoleBuffEffect)
+
+
+class InventoryItem(BaseModel):
+    item_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    item_type: str = Field(default="misc", min_length=1)
+    description: str = Field(default="", min_length=0)
+    weight: float = Field(default=0, ge=0)
+    rarity: str = Field(default="common", min_length=1)
+    value: int = Field(default=0, ge=0)
+    effect: str = Field(default="", min_length=0)
+    uses_max: int | None = Field(default=None, ge=0)
+    uses_left: int | None = Field(default=None, ge=0)
+    cooldown_min: int = Field(default=0, ge=0)
+    bound: bool = False
+    quantity: int = Field(default=1, ge=1)
+    slot_type: Literal["weapon", "armor", "misc"] = "misc"
+    attack_bonus: int = 0
+    armor_bonus: int = 0
+
+
+class InventoryData(BaseModel):
+    gold: int = Field(default=0, ge=0)
+    items: list[InventoryItem] = Field(default_factory=list)
+
+
+class EquipmentSlots(BaseModel):
+    weapon_item_id: str | None = None
+    armor_item_id: str | None = None
+
+
 class Dnd5eCharacterSheet(BaseModel):
     level: int = Field(default=1, ge=1, le=20)
+    experience_current: int = Field(default=0, ge=0)
+    experience_to_next_level: int = Field(default=300, ge=0)
     race: str = Field(default="", min_length=0)
     char_class: str = Field(default="", min_length=0)
     background: str = Field(default="", min_length=0)
     alignment: str = Field(default="", min_length=0)
     proficiency_bonus: int = Field(default=2)
     armor_class: int = Field(default=10, ge=0)
+    difficulty_class: int = Field(default=10, ge=0)
     speed_ft: int = Field(default=30, ge=0)
     initiative_bonus: int = Field(default=0)
+    stamina_current: int = Field(default=10, ge=0)
+    stamina_maximum: int = Field(default=10, ge=1)
+    is_dead: bool = False
+    status_flags: list[str] = Field(default_factory=list)
     hit_dice: str = Field(default="1d8", min_length=1)
     hit_points: Dnd5eHitPoints = Field(default_factory=Dnd5eHitPoints)
     ability_scores: Dnd5eAbilityScores = Field(default_factory=Dnd5eAbilityScores)
+    current_ability_scores: Dnd5eAbilityScores = Field(default_factory=Dnd5eAbilityScores)
+    ability_modifiers: Dnd5eAbilityModifiers = Field(default_factory=Dnd5eAbilityModifiers)
+    current_ability_modifiers: Dnd5eAbilityModifiers = Field(default_factory=Dnd5eAbilityModifiers)
     saving_throws_proficient: list[str] = Field(default_factory=list)
     skills_proficient: list[str] = Field(default_factory=list)
     languages: list[str] = Field(default_factory=list)
     tool_proficiencies: list[str] = Field(default_factory=list)
     equipment: list[str] = Field(default_factory=list)
+    equipment_slots: EquipmentSlots = Field(default_factory=EquipmentSlots)
+    backpack: InventoryData = Field(default_factory=InventoryData)
+    buffs: list[RoleBuff] = Field(default_factory=list)
     features_traits: list[str] = Field(default_factory=list)
     spells: list[str] = Field(default_factory=list)
+    spell_slots_max: Dnd5eSpellSlots = Field(default_factory=Dnd5eSpellSlots)
+    spell_slots_current: Dnd5eSpellSlots = Field(default_factory=Dnd5eSpellSlots)
     notes: str = Field(default="", min_length=0)
 
 
@@ -283,6 +374,8 @@ class NpcRoleCard(BaseModel):
     alignment: str = Field(default="", min_length=0)
     profile: PlayerStaticData = Field(default_factory=lambda: PlayerStaticData(role_type="npc"))
     relations: list[RoleRelation] = Field(default_factory=list)
+    cognition_changes: list[str] = Field(default_factory=list)
+    attitude_changes: list[str] = Field(default_factory=list)
     dialogue_logs: list[NpcDialogueEntry] = Field(default_factory=list)
     generated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
@@ -510,6 +603,12 @@ class RoleRelationUpsertRequest(BaseModel):
     note: str = Field(default="", min_length=0)
 
 
+class RoleRelationSetRequest(BaseModel):
+    target_role_id: str = Field(..., min_length=1)
+    relation_tag: str = Field(default="neutral", min_length=1)
+    note: str = Field(default="", min_length=0)
+
+
 class NpcGreetRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     npc_role_id: str = Field(..., min_length=1)
@@ -564,3 +663,46 @@ class ActionCheckResponse(BaseModel):
     narrative: str = Field(..., min_length=1)
     applied_effects: list[str] = Field(default_factory=list)
     relation_tag_suggestion: str | None = None
+
+
+class PlayerEquipRequest(BaseModel):
+    item_id: str = Field(..., min_length=1)
+    slot: Literal["weapon", "armor"]
+
+
+class PlayerUnequipRequest(BaseModel):
+    slot: Literal["weapon", "armor"]
+
+
+class PlayerBuffAddRequest(BaseModel):
+    buff: RoleBuff
+
+
+class PlayerBuffRemoveRequest(BaseModel):
+    buff_id: str = Field(..., min_length=1)
+
+
+class PlayerItemAddRequest(BaseModel):
+    item: InventoryItem
+
+
+class PlayerItemRemoveRequest(BaseModel):
+    item_id: str = Field(..., min_length=1)
+    quantity: int = Field(default=1, ge=1)
+
+
+class PlayerSpellSetRequest(BaseModel):
+    value: str = Field(..., min_length=1)
+
+
+class PlayerSkillSetRequest(BaseModel):
+    value: str = Field(..., min_length=1)
+
+
+class PlayerSpellSlotAdjustRequest(BaseModel):
+    level: int = Field(..., ge=1, le=9)
+    amount: int = Field(default=1, ge=1, le=9)
+
+
+class PlayerStaminaAdjustRequest(BaseModel):
+    amount: int = Field(default=1, ge=1)

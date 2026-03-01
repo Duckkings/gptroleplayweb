@@ -10,6 +10,7 @@ from openai import OpenAI
 
 from app.core.storage import read_save_payload, storage_state, write_save_payload
 from app.core.token_usage import token_usage_store
+from app.core.prompt_table import prompt_table
 from app.models.schemas import (
     ActionCheckRequest,
     ActionCheckResponse,
@@ -45,12 +46,26 @@ from app.models.schemas import (
     NpcGreetRequest,
     NpcGreetResponse,
     PlayerRuntimeData,
+    PlayerBuffAddRequest,
+    PlayerBuffRemoveRequest,
+    PlayerEquipRequest,
+    PlayerItemAddRequest,
+    PlayerItemRemoveRequest,
+    PlayerSkillSetRequest,
+    PlayerSpellSetRequest,
+    PlayerSpellSlotAdjustRequest,
+    PlayerStaminaAdjustRequest,
+    PlayerUnequipRequest,
+    RoleRelationSetRequest,
     PlayerStaticData,
     Position,
     RegionGenerateRequest,
     RegionGenerateResponse,
     RolePoolListResponse,
     RoleRelation,
+    RoleBuff,
+    Dnd5eAbilityScores,
+    Dnd5eAbilityModifiers,
     RenderMapRequest,
     RenderCircle,
     RenderMapResponse,
@@ -85,7 +100,9 @@ def _utc_now() -> str:
 
 
 def _default_static() -> PlayerStaticData:
-    return PlayerStaticData()
+    data = PlayerStaticData()
+    _recompute_player_derived(data)
+    return data
 
 
 def _default_runtime(session_id: str) -> PlayerRuntimeData:
@@ -128,6 +145,93 @@ def _ability_score_with_seed(seed: str, offset: int) -> int:
 
 def _ability_mod(score: int) -> int:
     return int((score - 10) // 2)
+
+
+def _spell_slot_field(level: int) -> str:
+    return f"level_{max(1, min(int(level), 9))}"
+
+
+def _sum_buff_delta(buffs: list[RoleBuff], key: str) -> int:
+    return sum(int(getattr(item.effect, key, 0) or 0) for item in buffs)
+
+
+def _sanitize_sheet_lists(profile: PlayerStaticData) -> None:
+    sheet = profile.dnd5e_sheet
+    sheet.skills_proficient = sorted({s.strip() for s in sheet.skills_proficient if s.strip()})
+    sheet.spells = sorted({s.strip() for s in sheet.spells if s.strip()})
+    sheet.status_flags = sorted({s.strip() for s in sheet.status_flags if s.strip()})
+    sheet.equipment = sorted({s.strip() for s in sheet.equipment if s.strip()})
+
+
+def _ensure_equipped_item_exists(profile: PlayerStaticData) -> None:
+    sheet = profile.dnd5e_sheet
+    item_ids = {item.item_id for item in sheet.backpack.items}
+    if sheet.equipment_slots.weapon_item_id and sheet.equipment_slots.weapon_item_id not in item_ids:
+        sheet.equipment_slots.weapon_item_id = None
+    if sheet.equipment_slots.armor_item_id and sheet.equipment_slots.armor_item_id not in item_ids:
+        sheet.equipment_slots.armor_item_id = None
+
+
+def _recompute_player_derived(profile: PlayerStaticData) -> None:
+    sheet = profile.dnd5e_sheet
+    _sanitize_sheet_lists(profile)
+    _ensure_equipped_item_exists(profile)
+
+    buffs = sheet.buffs
+    base = sheet.ability_scores
+    current = Dnd5eAbilityScores(
+        strength=max(1, min(30, base.strength + _sum_buff_delta(buffs, "strength_delta"))),
+        dexterity=max(1, min(30, base.dexterity + _sum_buff_delta(buffs, "dexterity_delta"))),
+        constitution=max(1, min(30, base.constitution + _sum_buff_delta(buffs, "constitution_delta"))),
+        intelligence=max(1, min(30, base.intelligence + _sum_buff_delta(buffs, "intelligence_delta"))),
+        wisdom=max(1, min(30, base.wisdom + _sum_buff_delta(buffs, "wisdom_delta"))),
+        charisma=max(1, min(30, base.charisma + _sum_buff_delta(buffs, "charisma_delta"))),
+    )
+    sheet.current_ability_scores = current
+
+    base_mod = Dnd5eAbilityModifiers(
+        strength=_ability_mod(base.strength),
+        dexterity=_ability_mod(base.dexterity),
+        constitution=_ability_mod(base.constitution),
+        intelligence=_ability_mod(base.intelligence),
+        wisdom=_ability_mod(base.wisdom),
+        charisma=_ability_mod(base.charisma),
+    )
+    current_mod = Dnd5eAbilityModifiers(
+        strength=_ability_mod(current.strength),
+        dexterity=_ability_mod(current.dexterity),
+        constitution=_ability_mod(current.constitution),
+        intelligence=_ability_mod(current.intelligence),
+        wisdom=_ability_mod(current.wisdom),
+        charisma=_ability_mod(current.charisma),
+    )
+    sheet.ability_modifiers = base_mod
+    sheet.current_ability_modifiers = current_mod
+
+    equipped_weapon = next((i for i in sheet.backpack.items if i.item_id == sheet.equipment_slots.weapon_item_id), None)
+    equipped_armor = next((i for i in sheet.backpack.items if i.item_id == sheet.equipment_slots.armor_item_id), None)
+    weapon_attack_bonus = int(equipped_weapon.attack_bonus if equipped_weapon is not None else 0)
+    armor_bonus = int(equipped_armor.armor_bonus if equipped_armor is not None else 0)
+    buff_ac = _sum_buff_delta(buffs, "ac_delta")
+    buff_dc = _sum_buff_delta(buffs, "dc_delta")
+    use_dex = bool(equipped_weapon and equipped_weapon.slot_type == "weapon" and "dex" in equipped_weapon.effect.lower())
+    attack_mod = current_mod.dexterity if use_dex else current_mod.strength
+    sheet.armor_class = max(0, 10 + armor_bonus + current_mod.dexterity + buff_ac)
+    sheet.difficulty_class = max(0, 8 + sheet.proficiency_bonus + attack_mod + weapon_attack_bonus + buff_dc)
+
+    sheet.initiative_bonus = current_mod.dexterity
+
+    hp = sheet.hit_points
+    hp.current = max(0, min(hp.current, hp.maximum))
+
+    sheet.stamina_current = max(0, min(sheet.stamina_current, sheet.stamina_maximum))
+    sheet.is_dead = hp.current <= 0
+
+    for level in range(1, 10):
+        key = _spell_slot_field(level)
+        max_val = max(0, int(getattr(sheet.spell_slots_max, key)))
+        cur_val = max(0, int(getattr(sheet.spell_slots_current, key)))
+        setattr(sheet.spell_slots_current, key, min(cur_val, max_val))
 
 
 def _pick(seed: str, options: list[str]) -> str:
@@ -193,7 +297,7 @@ def _build_npc_profile(npc_id: str, npc_name: str) -> PlayerStaticData:
     speed_ft = 30
     initiative_bonus = _ability_mod(dexterity)
 
-    return PlayerStaticData(
+    profile = PlayerStaticData(
         player_id=npc_id,
         name=npc_name,
         move_speed_mph=4200,
@@ -228,6 +332,8 @@ def _build_npc_profile(npc_id: str, npc_name: str) -> PlayerStaticData:
             "notes": "",
         },
     )
+    _recompute_player_derived(profile)
+    return profile
 
 
 def _ensure_role_pool_from_area(save: SaveFile) -> bool:
@@ -316,6 +422,9 @@ def get_current_save(default_session_id: str = "sess_default") -> SaveFile:
     save = SaveFile.model_validate(payload)
     if not save.player_runtime_data.session_id:
         save.player_runtime_data.session_id = save.session_id
+    _recompute_player_derived(save.player_static_data)
+    for role in save.role_pool:
+        _recompute_player_derived(role.profile)
     return save
 
 
@@ -338,6 +447,8 @@ def import_save(save: SaveFile) -> SaveFile:
 
 def get_player_static(session_id: str) -> PlayerStaticData:
     save = get_current_save(default_session_id=session_id)
+    _recompute_player_derived(save.player_static_data)
+    save_current(save)
     return save.player_static_data
 
 
@@ -345,6 +456,7 @@ def set_player_static(session_id: str, payload: PlayerStaticData) -> PlayerStati
     save = get_current_save(default_session_id=session_id)
     save.session_id = session_id
     save.player_static_data = payload
+    _recompute_player_derived(save.player_static_data)
     save_current(save)
     return save.player_static_data
 
@@ -365,6 +477,184 @@ def set_player_runtime(session_id: str, payload: PlayerRuntimeData) -> PlayerRun
     save.player_runtime_data = payload
     save_current(save)
     return save.player_runtime_data
+
+
+def _get_player_item(profile: PlayerStaticData, item_id: str):
+    return next((item for item in profile.dnd5e_sheet.backpack.items if item.item_id == item_id), None)
+
+
+def equip_player_item(session_id: str, payload: PlayerEquipRequest) -> PlayerStaticData:
+    save = get_current_save(default_session_id=session_id)
+    save.session_id = session_id
+    profile = save.player_static_data
+    item = _get_player_item(profile, payload.item_id)
+    if item is None:
+        raise KeyError("ITEM_NOT_FOUND")
+    if payload.slot == "weapon" and item.slot_type != "weapon":
+        raise ValueError("ITEM_SLOT_MISMATCH")
+    if payload.slot == "armor" and item.slot_type != "armor":
+        raise ValueError("ITEM_SLOT_MISMATCH")
+    if payload.slot == "weapon":
+        profile.dnd5e_sheet.equipment_slots.weapon_item_id = item.item_id
+    else:
+        profile.dnd5e_sheet.equipment_slots.armor_item_id = item.item_id
+    _recompute_player_derived(profile)
+    save_current(save)
+    return profile
+
+
+def unequip_player_item(session_id: str, payload: PlayerUnequipRequest) -> PlayerStaticData:
+    save = get_current_save(default_session_id=session_id)
+    save.session_id = session_id
+    if payload.slot == "weapon":
+        save.player_static_data.dnd5e_sheet.equipment_slots.weapon_item_id = None
+    else:
+        save.player_static_data.dnd5e_sheet.equipment_slots.armor_item_id = None
+    _recompute_player_derived(save.player_static_data)
+    save_current(save)
+    return save.player_static_data
+
+
+def add_player_buff(session_id: str, payload: PlayerBuffAddRequest) -> PlayerStaticData:
+    save = get_current_save(default_session_id=session_id)
+    save.session_id = session_id
+    buffs = [b for b in save.player_static_data.dnd5e_sheet.buffs if b.buff_id != payload.buff.buff_id]
+    buffs.append(payload.buff)
+    save.player_static_data.dnd5e_sheet.buffs = buffs
+    _recompute_player_derived(save.player_static_data)
+    save_current(save)
+    return save.player_static_data
+
+
+def remove_player_buff(session_id: str, payload: PlayerBuffRemoveRequest) -> PlayerStaticData:
+    save = get_current_save(default_session_id=session_id)
+    save.session_id = session_id
+    save.player_static_data.dnd5e_sheet.buffs = [
+        b for b in save.player_static_data.dnd5e_sheet.buffs if b.buff_id != payload.buff_id
+    ]
+    _recompute_player_derived(save.player_static_data)
+    save_current(save)
+    return save.player_static_data
+
+
+def add_player_item(session_id: str, payload: PlayerItemAddRequest) -> PlayerStaticData:
+    save = get_current_save(default_session_id=session_id)
+    save.session_id = session_id
+    items = save.player_static_data.dnd5e_sheet.backpack.items
+    existing = next((it for it in items if it.item_id == payload.item.item_id), None)
+    if existing is not None:
+        existing.quantity += payload.item.quantity
+    else:
+        items.append(payload.item)
+    _recompute_player_derived(save.player_static_data)
+    save_current(save)
+    return save.player_static_data
+
+
+def remove_player_item(session_id: str, payload: PlayerItemRemoveRequest) -> PlayerStaticData:
+    save = get_current_save(default_session_id=session_id)
+    save.session_id = session_id
+    items = save.player_static_data.dnd5e_sheet.backpack.items
+    found = next((it for it in items if it.item_id == payload.item_id), None)
+    if found is None:
+        raise KeyError("ITEM_NOT_FOUND")
+    found.quantity -= payload.quantity
+    if found.quantity <= 0:
+        save.player_static_data.dnd5e_sheet.backpack.items = [it for it in items if it.item_id != payload.item_id]
+    _recompute_player_derived(save.player_static_data)
+    save_current(save)
+    return save.player_static_data
+
+
+def add_player_spell(session_id: str, payload: PlayerSpellSetRequest) -> PlayerStaticData:
+    save = get_current_save(default_session_id=session_id)
+    save.session_id = session_id
+    save.player_static_data.dnd5e_sheet.spells.append(payload.value)
+    _recompute_player_derived(save.player_static_data)
+    save_current(save)
+    return save.player_static_data
+
+
+def remove_player_spell(session_id: str, payload: PlayerSpellSetRequest) -> PlayerStaticData:
+    save = get_current_save(default_session_id=session_id)
+    save.session_id = session_id
+    value = payload.value.strip().lower()
+    save.player_static_data.dnd5e_sheet.spells = [
+        s for s in save.player_static_data.dnd5e_sheet.spells if s.strip().lower() != value
+    ]
+    _recompute_player_derived(save.player_static_data)
+    save_current(save)
+    return save.player_static_data
+
+
+def add_player_skill(session_id: str, payload: PlayerSkillSetRequest) -> PlayerStaticData:
+    save = get_current_save(default_session_id=session_id)
+    save.session_id = session_id
+    save.player_static_data.dnd5e_sheet.skills_proficient.append(payload.value)
+    _recompute_player_derived(save.player_static_data)
+    save_current(save)
+    return save.player_static_data
+
+
+def remove_player_skill(session_id: str, payload: PlayerSkillSetRequest) -> PlayerStaticData:
+    save = get_current_save(default_session_id=session_id)
+    save.session_id = session_id
+    value = payload.value.strip().lower()
+    save.player_static_data.dnd5e_sheet.skills_proficient = [
+        s for s in save.player_static_data.dnd5e_sheet.skills_proficient if s.strip().lower() != value
+    ]
+    _recompute_player_derived(save.player_static_data)
+    save_current(save)
+    return save.player_static_data
+
+
+def consume_spell_slots(session_id: str, payload: PlayerSpellSlotAdjustRequest) -> PlayerStaticData:
+    save = get_current_save(default_session_id=session_id)
+    save.session_id = session_id
+    sheet = save.player_static_data.dnd5e_sheet
+    key = _spell_slot_field(payload.level)
+    cur = int(getattr(sheet.spell_slots_current, key))
+    if cur < payload.amount:
+        raise ValueError("SPELL_SLOT_NOT_ENOUGH")
+    setattr(sheet.spell_slots_current, key, cur - payload.amount)
+    _recompute_player_derived(save.player_static_data)
+    save_current(save)
+    return save.player_static_data
+
+
+def recover_spell_slots(session_id: str, payload: PlayerSpellSlotAdjustRequest) -> PlayerStaticData:
+    save = get_current_save(default_session_id=session_id)
+    save.session_id = session_id
+    sheet = save.player_static_data.dnd5e_sheet
+    key = _spell_slot_field(payload.level)
+    cur = int(getattr(sheet.spell_slots_current, key))
+    max_val = int(getattr(sheet.spell_slots_max, key))
+    setattr(sheet.spell_slots_current, key, min(max_val, cur + payload.amount))
+    _recompute_player_derived(save.player_static_data)
+    save_current(save)
+    return save.player_static_data
+
+
+def consume_stamina(session_id: str, payload: PlayerStaminaAdjustRequest) -> PlayerStaticData:
+    save = get_current_save(default_session_id=session_id)
+    save.session_id = session_id
+    sheet = save.player_static_data.dnd5e_sheet
+    if sheet.stamina_current < payload.amount:
+        raise ValueError("STAMINA_NOT_ENOUGH")
+    sheet.stamina_current -= payload.amount
+    _recompute_player_derived(save.player_static_data)
+    save_current(save)
+    return save.player_static_data
+
+
+def recover_stamina(session_id: str, payload: PlayerStaminaAdjustRequest) -> PlayerStaticData:
+    save = get_current_save(default_session_id=session_id)
+    save.session_id = session_id
+    sheet = save.player_static_data.dnd5e_sheet
+    sheet.stamina_current = min(sheet.stamina_maximum, sheet.stamina_current + payload.amount)
+    _recompute_player_derived(save.player_static_data)
+    save_current(save)
+    return save.player_static_data
 
 
 def add_game_log(req: GameLogAddRequest) -> GameLogEntry:
@@ -399,7 +689,7 @@ def set_game_log_settings(session_id: str, settings: GameLogSettings) -> GameLog
 
 
 def _build_region_prompt(center: Position, count: int, world_prompt: str) -> str:
-    return (
+    default_prompt = (
         "根据以下世界设定，生成可探索地图区块。"
         "必须返回严格 JSON，且只返回 JSON。"
         "结构如下："
@@ -412,7 +702,16 @@ def _build_region_prompt(center: Position, count: int, world_prompt: str) -> str
         "区块半径规则：small=60~180, medium=120~300, large=240~500。"
         "区块间不能重叠：任意两区块中心距离必须大于两者 radius_m 之和。"
         "sub_zones 的 offset_* 是相对区块中心坐标偏移（单位米）。"
-        f"世界设定提示：{world_prompt}"
+        "世界设定提示：$world_prompt"
+    )
+    return prompt_table.render(
+        "world.region.user",
+        default_prompt,
+        count=count,
+        center_x=center.x,
+        center_y=center.y,
+        center_z=center.z,
+        world_prompt=world_prompt,
     )
 
 
@@ -508,14 +807,21 @@ def _extract_json_content(content: str) -> dict:
 
 
 def _build_discover_prompt(sub_zone: AreaSubZone, intent: str) -> str:
-    return (
+    default_prompt = (
         "你是跑团场景设计器。"
         "请基于给定子区块和玩家意图，生成 1-3 个新的可交互对象。"
         "只能返回 JSON，不要输出任何额外文本。"
         "结构必须为："
         "{\"interactions\":[{\"name\":\"\",\"type\":\"item|scene|npc\",\"status\":\"ready|disabled|hidden\"}]}"
-        f"。子区块名称：{sub_zone.name}。子区块描述：{sub_zone.description}。玩家意图：{intent}。"
+        "。子区块名称：$sub_zone_name。子区块描述：$sub_zone_description。玩家意图：$intent。"
         "要求：名称具体、可操作，不要与“观察周边”这类通用词重复。"
+    )
+    return prompt_table.render(
+        "world.discover.user",
+        default_prompt,
+        sub_zone_name=sub_zone.name,
+        sub_zone_description=sub_zone.description,
+        intent=intent,
     )
 
 
@@ -567,7 +873,7 @@ def _ai_discover_interactions(config: ChatConfig, sub_zone: AreaSubZone, intent:
         temperature=min(max(config.temperature, 0), 2),
         response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": "你是可交互内容生成器，只输出 JSON。"},
+            {"role": "system", "content": prompt_table.get_text("world.discover.system", "你是可交互内容生成器，只输出 JSON。")},
             {"role": "user", "content": _build_discover_prompt(sub_zone, intent)},
         ],
     )
@@ -594,7 +900,7 @@ def _ai_generate_zones(session_id: str, center: Position, count: int, world_prom
             temperature=min(max(config.temperature, 0), 2),
             response_format={"type": "json_object"},
             messages=[
-                {"role": "system", "content": "你是地图设计器，只输出 JSON。"},
+                {"role": "system", "content": prompt_table.get_text("world.region.system", "你是地图设计器，只输出 JSON。")},
                 {"role": "user", "content": _build_region_prompt(center, count, world_prompt)},
             ],
         )
@@ -721,6 +1027,11 @@ def generate_regions(req: RegionGenerateRequest) -> RegionGenerateResponse:
     zones = _ai_generate_zones(req.session_id, req.player_position, count, req.world_prompt, req.config)
 
     save.session_id = req.session_id
+    if req.force_regenerate:
+        # Force regenerate must drop stale area/NPC data from previous map generations.
+        save.role_pool = []
+        save.area_snapshot = AreaSnapshot(clock=save.area_snapshot.clock)
+        save.map_snapshot.zones = []
     save.map_snapshot.player_position = req.player_position
     save.map_snapshot.zones = zones
     save.area_snapshot = _area_snapshot_from_map(save)
@@ -1226,6 +1537,17 @@ def _build_npc_context(role: NpcRoleCard, recent_count: int = 16) -> str:
     return "\n".join(lines)
 
 
+def _upsert_npc_player_relation(role: NpcRoleCard, player_id: str, relation_tag: str, note: str) -> None:
+    role.relations = [r for r in role.relations if r.target_role_id != player_id]
+    role.relations.append(
+        RoleRelation(
+            target_role_id=player_id,
+            relation_tag=(relation_tag.strip() or "neutral"),
+            note=(note or "").strip(),
+        )
+    )
+
+
 def apply_speech_time(session_id: str, text: str, config: ChatConfig | None) -> int:
     save = get_current_save(default_session_id=session_id)
     if save.session_id != session_id:
@@ -1267,14 +1589,26 @@ def npc_greet(req: NpcGreetRequest) -> NpcGreetResponse:
             try:
                 client = OpenAI(api_key=api_key)
                 world_time_text, _ = _world_time_payload(save.area_snapshot.clock)
-                prompt = (
+                default_prompt = (
                     "你是跑团NPC。场景是：玩家刚刚走到你面前，你注意到对方靠近并开口。"
                     "请生成第一反应式的自然招呼语。"
                     "要求：只输出1句口语化对话（最多35字），不要诗意描写，不要旁白，不要比喻，不要邀请长段剧情。"
                     "语气要像面对面打招呼，内容要贴合当前地点和时间。"
-                    f"姓名={role.name}, 性格={role.personality}, 说话方式={role.speaking_style}, "
-                    f"外观={role.appearance}, 背景={role.background}, 认知={role.cognition}, 阵营={role.alignment}, "
-                    f"当前世界时间={world_time_text}"
+                    "姓名=$name, 性格=$personality, 说话方式=$speaking_style, "
+                    "外观=$appearance, 背景=$background, 认知=$cognition, 阵营=$alignment, "
+                    "当前世界时间=$world_time_text"
+                )
+                prompt = prompt_table.render(
+                    "npc.greet.user",
+                    default_prompt,
+                    name=role.name,
+                    personality=role.personality,
+                    speaking_style=role.speaking_style,
+                    appearance=role.appearance,
+                    background=role.background,
+                    cognition=role.cognition,
+                    alignment=role.alignment,
+                    world_time_text=world_time_text,
                 )
                 resp = client.chat.completions.create(
                     model=model,
@@ -1349,15 +1683,29 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
                 client = OpenAI(api_key=api_key)
                 world_time_text, _ = _world_time_payload(save.area_snapshot.clock)
                 context = _build_npc_context(role)
-                prompt = (
+                default_prompt = (
                     "你要扮演一个NPC与玩家直接对话。"
                     "必须保持人设一致，结合历史对话与当前世界时间作答。"
                     "请返回1-3句自然口语化回复，不要输出编号，不要解释规则。"
-                    f"\nNPC信息: name={role.name}, personality={role.personality}, speaking_style={role.speaking_style}, "
-                    f"appearance={role.appearance}, background={role.background}, cognition={role.cognition}, alignment={role.alignment}"
-                    f"\n当前世界时间: {world_time_text}"
-                    f"\n历史对话(按时间顺序):\n{context}"
-                    f"\n玩家刚刚说: {player_text}"
+                    "\nNPC信息: name=$name, personality=$personality, speaking_style=$speaking_style, "
+                    "appearance=$appearance, background=$background, cognition=$cognition, alignment=$alignment"
+                    "\n当前世界时间: $world_time_text"
+                    "\n历史对话(按时间顺序):\n$context"
+                    "\n玩家刚刚说: $player_text"
+                )
+                prompt = prompt_table.render(
+                    "npc.chat.user",
+                    default_prompt,
+                    name=role.name,
+                    personality=role.personality,
+                    speaking_style=role.speaking_style,
+                    appearance=role.appearance,
+                    background=role.background,
+                    cognition=role.cognition,
+                    alignment=role.alignment,
+                    world_time_text=world_time_text,
+                    context=context,
+                    player_text=player_text,
                 )
                 resp = client.chat.completions.create(
                     model=model,
@@ -1388,6 +1736,19 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
         content=reply,
         clock=save.area_snapshot.clock,
     )
+    relation_tag = "met"
+    lower_text = player_text.lower()
+    if any(k in lower_text for k in ["谢谢", "thank", "help", "帮忙", "合作"]):
+        relation_tag = "friendly"
+    elif any(k in lower_text for k in ["威胁", "threat", "滚开", "attack", "抢"]):
+        relation_tag = "hostile"
+    _upsert_npc_player_relation(role, save.player_static_data.player_id, relation_tag, "对话自动更新关系")
+    role.attitude_changes.append(f"{_utc_now()} relation->{relation_tag}")
+    if len(role.attitude_changes) > 50:
+        role.attitude_changes = role.attitude_changes[-50:]
+    role.cognition_changes.append(f"{_utc_now()} 玩家发言: {player_text[:48]}")
+    if len(role.cognition_changes) > 50:
+        role.cognition_changes = role.cognition_changes[-50:]
     save.game_logs.append(
         _new_game_log(
             req.session_id,
@@ -1427,12 +1788,35 @@ def upsert_player_relation(session_id: str, role_id: str, relation_tag: str, not
     return role
 
 
+def set_role_relation(session_id: str, role_id: str, payload: RoleRelationSetRequest) -> NpcRoleCard:
+    save = get_current_save(default_session_id=session_id)
+    if save.session_id != session_id:
+        save.session_id = session_id
+    _ensure_area_snapshot(save)
+    role = next((r for r in save.role_pool if r.role_id == role_id), None)
+    if role is None:
+        raise KeyError("ROLE_NOT_FOUND")
+
+    role.relations = [r for r in role.relations if r.target_role_id != payload.target_role_id]
+    role.relations.append(
+        RoleRelation(
+            target_role_id=payload.target_role_id,
+            relation_tag=(payload.relation_tag.strip() or "neutral"),
+            note=(payload.note or "").strip(),
+        )
+    )
+    save_current(save)
+    return role
+
+
 def _get_actor_profile(save: SaveFile, actor_role_id: str | None) -> tuple[str, PlayerStaticData]:
     if not actor_role_id or actor_role_id == save.player_static_data.player_id:
+        _recompute_player_derived(save.player_static_data)
         return save.player_static_data.player_id, save.player_static_data
     role = next((r for r in save.role_pool if r.role_id == actor_role_id), None)
     if role is None:
         raise KeyError("ROLE_NOT_FOUND")
+    _recompute_player_derived(role.profile)
     return role.role_id, role.profile
 
 
@@ -1470,12 +1854,18 @@ def _ai_action_plan(req: ActionCheckRequest) -> dict[str, int | bool | str]:
         return _fallback_action_plan(req.action_type, req.action_prompt)
 
     try:
-        prompt = (
+        default_prompt = (
             "你是跑团行动判定助手。基于玩家行动，返回JSON。"
             "字段: ability_used(strength|dexterity|constitution|intelligence|wisdom|charisma),"
             "dc(5-30),time_spent_min(>=1),requires_check(boolean)。"
             "action_type=attack/check/item_use。"
-            f"action_type={req.action_type}, action_prompt={req.action_prompt}"
+            "action_type=$action_type, action_prompt=$action_prompt"
+        )
+        prompt = prompt_table.render(
+            "action.plan.user",
+            default_prompt,
+            action_type=req.action_type,
+            action_prompt=req.action_prompt,
         )
         client = OpenAI(api_key=api_key)
         resp = client.chat.completions.create(
@@ -1483,7 +1873,7 @@ def _ai_action_plan(req: ActionCheckRequest) -> dict[str, int | bool | str]:
             temperature=min(max(req.config.temperature, 0), 2),
             response_format={"type": "json_object"},
             messages=[
-                {"role": "system", "content": "你只输出JSON。"},
+                {"role": "system", "content": prompt_table.get_text("action.plan.system", "你只输出JSON。")},
                 {"role": "user", "content": prompt},
             ],
         )
@@ -1535,16 +1925,23 @@ def _suggest_relation_tag(req: ActionCheckRequest, success: bool, critical: str)
         if api_key and model:
             try:
                 client = OpenAI(api_key=api_key)
-                prompt = (
+                default_prompt = (
                     "基于互动行为和结果，输出JSON: {\"relation_tag\":\"ally|friendly|neutral|wary|hostile\"}。"
-                    f"action_prompt={req.action_prompt}; success={success}; critical={critical}"
+                    "action_prompt=$action_prompt; success=$success; critical=$critical"
+                )
+                prompt = prompt_table.render(
+                    "relation.tag.user",
+                    default_prompt,
+                    action_prompt=req.action_prompt,
+                    success=success,
+                    critical=critical,
                 )
                 resp = client.chat.completions.create(
                     model=model,
                     temperature=min(max(req.config.temperature, 0), 2),
                     response_format={"type": "json_object"},
                     messages=[
-                        {"role": "system", "content": "你只输出JSON。"},
+                        {"role": "system", "content": prompt_table.get_text("relation.tag.system", "你只输出JSON。")},
                         {"role": "user", "content": prompt},
                     ],
                 )
@@ -1628,6 +2025,19 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
         narrative = f"{profile.name} 掷出天然1，行动大失败。耗时 {time_spent_min} 分钟。"
 
     relation_tag = _suggest_relation_tag(req, success, critical)
+    if relation_tag is not None and "npc_id=" in req.action_prompt:
+        try:
+            npc_id = req.action_prompt.split("npc_id=", 1)[1].split(";", 1)[0].strip()
+            if npc_id:
+                role = next((r for r in save.role_pool if r.role_id == npc_id), None)
+                if role is not None:
+                    _upsert_npc_player_relation(role, save.player_static_data.player_id, relation_tag, "行动检定自动更新关系")
+                    role.attitude_changes.append(f"{_utc_now()} action->{relation_tag}")
+                    if len(role.attitude_changes) > 50:
+                        role.attitude_changes = role.attitude_changes[-50:]
+                    save_current(save)
+        except Exception:
+            pass
 
     return ActionCheckResponse(
         session_id=req.session_id,
@@ -1733,11 +2143,18 @@ def move_to_sub_zone(req: AreaMoveSubZoneRequest) -> AreaMoveResult:
             model = (req.config.model or "").strip()
             if api_key and model:
                 client = OpenAI(api_key=api_key)
-                prompt = (
+                default_prompt = (
                     "你是跑团GM。基于以下移动结果写一段50-120字叙事。"
                     "不要编号，不要选项。"
-                    f"from={from_point.sub_zone_id or from_point.zone_id}, to={to_sub.name}, "
-                    f"distance_m={round(distance_m, 2)}, duration_min={duration_min}"
+                    "from=$from_id, to=$to_name, distance_m=$distance_m, duration_min=$duration_min"
+                )
+                prompt = prompt_table.render(
+                    "move.subzone.user",
+                    default_prompt,
+                    from_id=(from_point.sub_zone_id or from_point.zone_id),
+                    to_name=to_sub.name,
+                    distance_m=round(distance_m, 2),
+                    duration_min=duration_min,
                 )
                 resp = client.chat.completions.create(
                     model=model,
@@ -1876,13 +2293,18 @@ def describe_behavior(session_id: str, movement_log: MovementLog, config: ChatCo
 
     try:
         client = OpenAI(api_key=api_key)
-        prompt = (
+        default_prompt = (
             "你是跑团GM。"
             "请根据移动日志生成一段简短但有氛围感的叙事反馈，100-180字。"
             "你是故事叙述者，默认不要给编号选项，除非玩家明确要求给出选项。"
             "必须优先使用区块名称，不要使用 zone_xxx 这类内部ID。"
             "日志JSON如下："
-            f"{json.dumps(movement_log.model_dump(mode='json'), ensure_ascii=False)}"
+            "$movement_log_json"
+        )
+        prompt = prompt_table.render(
+            "behavior.describe.user",
+            default_prompt,
+            movement_log_json=json.dumps(movement_log.model_dump(mode="json"), ensure_ascii=False),
         )
         resp = client.chat.completions.create(
             model=model,

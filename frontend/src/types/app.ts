@@ -274,32 +274,123 @@ export type Dnd5eAbilityScores = {
   charisma: number;
 };
 
+export type Dnd5eAbilityModifiers = {
+  strength: number;
+  dexterity: number;
+  constitution: number;
+  intelligence: number;
+  wisdom: number;
+  charisma: number;
+};
+
 export type Dnd5eHitPoints = {
   current: number;
   maximum: number;
   temporary: number;
 };
 
+export type Dnd5eSpellSlots = {
+  level_1: number;
+  level_2: number;
+  level_3: number;
+  level_4: number;
+  level_5: number;
+  level_6: number;
+  level_7: number;
+  level_8: number;
+  level_9: number;
+};
+
+export type RoleBuffEffect = {
+  strength_delta: number;
+  dexterity_delta: number;
+  constitution_delta: number;
+  intelligence_delta: number;
+  wisdom_delta: number;
+  charisma_delta: number;
+  ac_delta: number;
+  dc_delta: number;
+  speed_ft_delta: number;
+  move_speed_mph_delta: number;
+  hp_max_delta: number;
+  stamina_max_delta: number;
+};
+
+export type RoleBuff = {
+  buff_id: string;
+  name: string;
+  description: string;
+  source: string;
+  duration_min: number;
+  remaining_min: number;
+  stackable: boolean;
+  effect: RoleBuffEffect;
+};
+
+export type InventoryItem = {
+  item_id: string;
+  name: string;
+  item_type: string;
+  description: string;
+  weight: number;
+  rarity: string;
+  value: number;
+  effect: string;
+  uses_max: number | null;
+  uses_left: number | null;
+  cooldown_min: number;
+  bound: boolean;
+  quantity: number;
+  slot_type: 'weapon' | 'armor' | 'misc';
+  attack_bonus: number;
+  armor_bonus: number;
+};
+
+export type InventoryData = {
+  gold: number;
+  items: InventoryItem[];
+};
+
+export type EquipmentSlots = {
+  weapon_item_id: string | null;
+  armor_item_id: string | null;
+};
+
 export type Dnd5eCharacterSheet = {
   level: number;
+  experience_current: number;
+  experience_to_next_level: number;
   race: string;
   char_class: string;
   background: string;
   alignment: string;
   proficiency_bonus: number;
   armor_class: number;
+  difficulty_class: number;
   speed_ft: number;
   initiative_bonus: number;
+  stamina_current: number;
+  stamina_maximum: number;
+  is_dead: boolean;
+  status_flags: string[];
   hit_dice: string;
   hit_points: Dnd5eHitPoints;
   ability_scores: Dnd5eAbilityScores;
+  current_ability_scores: Dnd5eAbilityScores;
+  ability_modifiers: Dnd5eAbilityModifiers;
+  current_ability_modifiers: Dnd5eAbilityModifiers;
   saving_throws_proficient: string[];
   skills_proficient: string[];
   languages: string[];
   tool_proficiencies: string[];
   equipment: string[];
+  equipment_slots: EquipmentSlots;
+  backpack: InventoryData;
+  buffs: RoleBuff[];
   features_traits: string[];
   spells: string[];
+  spell_slots_max: Dnd5eSpellSlots;
+  spell_slots_current: Dnd5eSpellSlots;
   notes: string;
 };
 
@@ -334,6 +425,8 @@ export type NpcRoleCard = {
   alignment: string;
   profile: PlayerStaticData;
   relations: RoleRelation[];
+  cognition_changes: string[];
+  attitude_changes: string[];
   dialogue_logs: NpcDialogueEntry[];
   generated_at: string;
 };
@@ -380,14 +473,21 @@ export const defaultPlayerStaticData: PlayerStaticData = {
   role_type: 'player',
   dnd5e_sheet: {
     level: 1,
+    experience_current: 0,
+    experience_to_next_level: 300,
     race: '',
     char_class: '',
     background: '',
     alignment: '',
     proficiency_bonus: 2,
     armor_class: 10,
+    difficulty_class: 10,
     speed_ft: 30,
     initiative_bonus: 0,
+    stamina_current: 10,
+    stamina_maximum: 10,
+    is_dead: false,
+    status_flags: [],
     hit_dice: '1d8',
     hit_points: {
       current: 10,
@@ -402,13 +502,68 @@ export const defaultPlayerStaticData: PlayerStaticData = {
       wisdom: 10,
       charisma: 10,
     },
+    current_ability_scores: {
+      strength: 10,
+      dexterity: 10,
+      constitution: 10,
+      intelligence: 10,
+      wisdom: 10,
+      charisma: 10,
+    },
+    ability_modifiers: {
+      strength: 0,
+      dexterity: 0,
+      constitution: 0,
+      intelligence: 0,
+      wisdom: 0,
+      charisma: 0,
+    },
+    current_ability_modifiers: {
+      strength: 0,
+      dexterity: 0,
+      constitution: 0,
+      intelligence: 0,
+      wisdom: 0,
+      charisma: 0,
+    },
     saving_throws_proficient: [],
     skills_proficient: [],
     languages: [],
     tool_proficiencies: [],
     equipment: [],
+    equipment_slots: {
+      weapon_item_id: null,
+      armor_item_id: null,
+    },
+    backpack: {
+      gold: 0,
+      items: [],
+    },
+    buffs: [],
     features_traits: [],
     spells: [],
+    spell_slots_max: {
+      level_1: 2,
+      level_2: 0,
+      level_3: 0,
+      level_4: 0,
+      level_5: 0,
+      level_6: 0,
+      level_7: 0,
+      level_8: 0,
+      level_9: 0,
+    },
+    spell_slots_current: {
+      level_1: 2,
+      level_2: 0,
+      level_3: 0,
+      level_4: 0,
+      level_5: 0,
+      level_6: 0,
+      level_7: 0,
+      level_8: 0,
+      level_9: 0,
+    },
     notes: '',
   },
 };

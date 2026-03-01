@@ -39,11 +39,22 @@ from app.models.schemas import (
     NpcGreetResponse,
     PathConfig,
     PathStatusResponse,
+    PlayerBuffAddRequest,
+    PlayerBuffRemoveRequest,
+    PlayerEquipRequest,
+    PlayerItemAddRequest,
+    PlayerItemRemoveRequest,
     PlayerRuntimeData,
+    PlayerSkillSetRequest,
+    PlayerSpellSetRequest,
+    PlayerSpellSlotAdjustRequest,
     PlayerStaticData,
+    PlayerStaminaAdjustRequest,
+    PlayerUnequipRequest,
     RegionGenerateRequest,
     RegionGenerateResponse,
     RolePoolListResponse,
+    RoleRelationSetRequest,
     RoleRelationUpsertRequest,
     NpcRoleCard,
     RenderMapRequest,
@@ -69,6 +80,7 @@ from app.services.world_service import (
     apply_speech_time,
     discover_interactions,
     execute_interaction,
+    equip_player_item,
     generate_regions,
     get_area_current,
     get_game_log_settings,
@@ -78,6 +90,19 @@ from app.services.world_service import (
     get_player_static,
     get_role_card,
     get_role_pool,
+    add_player_buff,
+    add_player_item,
+    add_player_skill,
+    add_player_spell,
+    consume_spell_slots,
+    consume_stamina,
+    recover_spell_slots,
+    recover_stamina,
+    remove_player_buff,
+    remove_player_item,
+    remove_player_skill,
+    remove_player_spell,
+    set_role_relation,
     upsert_player_relation,
     import_save,
     move_to_zone,
@@ -88,6 +113,7 @@ from app.services.world_service import (
     set_game_log_settings,
     set_player_runtime,
     set_player_static,
+    unequip_player_item,
     init_world_clock,
     npc_greet,
 )
@@ -358,6 +384,90 @@ async def player_static_set(session_id: str, payload: PlayerStaticData) -> Playe
     return set_player_static(session_id, payload)
 
 
+@router.post("/player/equipment/equip", response_model=PlayerStaticData)
+async def player_equip_item(session_id: str, payload: PlayerEquipRequest) -> PlayerStaticData:
+    try:
+        return equip_player_item(session_id, payload)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="item not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/player/equipment/unequip", response_model=PlayerStaticData)
+async def player_unequip_item(session_id: str, payload: PlayerUnequipRequest) -> PlayerStaticData:
+    return unequip_player_item(session_id, payload)
+
+
+@router.post("/player/buffs/add", response_model=PlayerStaticData)
+async def player_buff_add(session_id: str, payload: PlayerBuffAddRequest) -> PlayerStaticData:
+    return add_player_buff(session_id, payload)
+
+
+@router.post("/player/buffs/remove", response_model=PlayerStaticData)
+async def player_buff_remove(session_id: str, payload: PlayerBuffRemoveRequest) -> PlayerStaticData:
+    return remove_player_buff(session_id, payload)
+
+
+@router.post("/player/items/add", response_model=PlayerStaticData)
+async def player_item_add(session_id: str, payload: PlayerItemAddRequest) -> PlayerStaticData:
+    return add_player_item(session_id, payload)
+
+
+@router.post("/player/items/remove", response_model=PlayerStaticData)
+async def player_item_remove(session_id: str, payload: PlayerItemRemoveRequest) -> PlayerStaticData:
+    try:
+        return remove_player_item(session_id, payload)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="item not found")
+
+
+@router.post("/player/spells/add", response_model=PlayerStaticData)
+async def player_spell_add(session_id: str, payload: PlayerSpellSetRequest) -> PlayerStaticData:
+    return add_player_spell(session_id, payload)
+
+
+@router.post("/player/spells/remove", response_model=PlayerStaticData)
+async def player_spell_remove(session_id: str, payload: PlayerSpellSetRequest) -> PlayerStaticData:
+    return remove_player_spell(session_id, payload)
+
+
+@router.post("/player/skills/add", response_model=PlayerStaticData)
+async def player_skill_add(session_id: str, payload: PlayerSkillSetRequest) -> PlayerStaticData:
+    return add_player_skill(session_id, payload)
+
+
+@router.post("/player/skills/remove", response_model=PlayerStaticData)
+async def player_skill_remove(session_id: str, payload: PlayerSkillSetRequest) -> PlayerStaticData:
+    return remove_player_skill(session_id, payload)
+
+
+@router.post("/player/resources/spell-slots/consume", response_model=PlayerStaticData)
+async def player_spell_slots_consume(session_id: str, payload: PlayerSpellSlotAdjustRequest) -> PlayerStaticData:
+    try:
+        return consume_spell_slots(session_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/player/resources/spell-slots/recover", response_model=PlayerStaticData)
+async def player_spell_slots_recover(session_id: str, payload: PlayerSpellSlotAdjustRequest) -> PlayerStaticData:
+    return recover_spell_slots(session_id, payload)
+
+
+@router.post("/player/resources/stamina/consume", response_model=PlayerStaticData)
+async def player_stamina_consume(session_id: str, payload: PlayerStaminaAdjustRequest) -> PlayerStaticData:
+    try:
+        return consume_stamina(session_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/player/resources/stamina/recover", response_model=PlayerStaticData)
+async def player_stamina_recover(session_id: str, payload: PlayerStaminaAdjustRequest) -> PlayerStaticData:
+    return recover_stamina(session_id, payload)
+
+
 @router.get("/player/runtime", response_model=PlayerRuntimeData)
 async def player_runtime_get(session_id: str) -> PlayerRuntimeData:
     return get_player_runtime(session_id)
@@ -385,6 +495,14 @@ async def role_pool_get(role_id: str, session_id: str) -> NpcRoleCard:
 async def role_pool_relate_player(role_id: str, session_id: str, payload: RoleRelationUpsertRequest) -> NpcRoleCard:
     try:
         return upsert_player_relation(session_id, role_id, payload.relation_tag, payload.note)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="role not found")
+
+
+@router.post("/role-pool/{role_id}/relations", response_model=NpcRoleCard)
+async def role_pool_set_relation(role_id: str, session_id: str, payload: RoleRelationSetRequest) -> NpcRoleCard:
+    try:
+        return set_role_relation(session_id, role_id, payload)
     except KeyError:
         raise HTTPException(status_code=404, detail="role not found")
 

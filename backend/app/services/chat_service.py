@@ -7,6 +7,7 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
+from app.core.prompt_table import prompt_table
 from app.models.schemas import (
     AreaDiscoverInteractionsRequest,
     AreaExecuteInteractionRequest,
@@ -14,16 +15,44 @@ from app.models.schemas import (
     ChatRequest,
     Message,
     MoveRequest,
+    InventoryItem,
+    PlayerBuffAddRequest,
+    PlayerBuffRemoveRequest,
+    PlayerEquipRequest,
+    PlayerItemAddRequest,
+    PlayerItemRemoveRequest,
+    PlayerSkillSetRequest,
+    PlayerSpellSetRequest,
+    PlayerSpellSlotAdjustRequest,
+    PlayerStaminaAdjustRequest,
+    PlayerUnequipRequest,
+    RoleBuff,
+    RoleRelationSetRequest,
     ToolEvent,
     Usage,
 )
 from app.services.world_service import (
+    add_player_buff,
+    add_player_item,
+    add_player_skill,
+    add_player_spell,
+    consume_spell_slots,
+    consume_stamina,
     discover_interactions,
+    equip_player_item,
     execute_interaction,
     generate_zones_for_chat,
     get_area_current,
     get_current_save,
     get_game_logs,
+    recover_spell_slots,
+    recover_stamina,
+    remove_player_buff,
+    remove_player_item,
+    remove_player_skill,
+    remove_player_spell,
+    set_role_relation,
+    unequip_player_item,
     move_to_sub_zone,
     move_to_zone,
 )
@@ -41,27 +70,30 @@ def _build_messages(payload: ChatRequest) -> list[dict[str, Any]]:
         {"role": "system", "content": payload.config.gm_prompt},
         {
             "role": "system",
-            "content": (
-                "Narration rule: act as a story narrator. "
-                "Do not output numbered action choices unless the player explicitly asks for options."
+            "content": prompt_table.get_text(
+                "chat.narration_rule",
+                "Narration rule: act as a story narrator. Do not output numbered action choices unless the player explicitly asks for options.",
             ),
         },
         {
             "role": "system",
-            "content": (
-                "Tool rule: when user asks to generate zones, move to zones, or confirm player state, "
-                "you must call the proper tool first, then narrate based on tool results."
+            "content": prompt_table.get_text(
+                "chat.tool_rule",
+                "Tool rule: when user asks to generate zones, move to zones, or confirm player state, you must call the proper tool first, then narrate based on tool results.",
             ),
         },
         {
             "role": "system",
-            "content": "Context rule: ignore prior chat history. Use tools to fetch state when needed.",
+            "content": prompt_table.get_text(
+                "chat.context_rule",
+                "Context rule: ignore prior chat history. Use tools to fetch state when needed.",
+            ),
         },
         {
             "role": "system",
-            "content": (
-                "Map awareness rule: if movement target is ambiguous or you need available destinations, "
-                "call get_map_index first to fetch current zone index."
+            "content": prompt_table.get_text(
+                "chat.map_awareness_rule",
+                "Map awareness rule: if movement target is ambiguous or you need available destinations, call get_map_index first to fetch current zone index.",
             ),
         },
     ]
@@ -209,6 +241,123 @@ def _tools_schema() -> list[dict[str, Any]]:
                         "interaction_id": {"type": "string"},
                     },
                     "required": ["interaction_id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "player_add_item",
+                "description": "Add an inventory item to player backpack.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "item_id": {"type": "string"},
+                        "name": {"type": "string"},
+                        "item_type": {"type": "string"},
+                        "quantity": {"type": "integer", "minimum": 1, "default": 1},
+                        "slot_type": {"type": "string", "enum": ["weapon", "armor", "misc"]},
+                        "attack_bonus": {"type": "integer"},
+                        "armor_bonus": {"type": "integer"},
+                    },
+                    "required": ["item_id", "name"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "player_equip_item",
+                "description": "Equip or unequip player weapon/armor slot.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "item_id": {"type": "string"},
+                        "slot": {"type": "string", "enum": ["weapon", "armor"]},
+                        "mode": {"type": "string", "enum": ["equip", "unequip"], "default": "equip"},
+                    },
+                    "required": ["slot"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "player_apply_buff",
+                "description": "Add or remove a temporary buff on player.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "mode": {"type": "string", "enum": ["add", "remove"], "default": "add"},
+                        "buff_id": {"type": "string"},
+                        "name": {"type": "string"},
+                        "duration_min": {"type": "integer", "minimum": 0, "default": 10},
+                        "strength_delta": {"type": "integer"},
+                        "dexterity_delta": {"type": "integer"},
+                        "constitution_delta": {"type": "integer"},
+                        "intelligence_delta": {"type": "integer"},
+                        "wisdom_delta": {"type": "integer"},
+                        "charisma_delta": {"type": "integer"},
+                        "ac_delta": {"type": "integer"},
+                        "dc_delta": {"type": "integer"},
+                    },
+                    "required": ["buff_id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "player_adjust_resource",
+                "description": "Consume/recover spell slots or stamina.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["spell_slot", "stamina"]},
+                        "mode": {"type": "string", "enum": ["consume", "recover"], "default": "consume"},
+                        "level": {"type": "integer", "minimum": 1, "maximum": 9},
+                        "amount": {"type": "integer", "minimum": 1, "default": 1},
+                    },
+                    "required": ["kind"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "role_set_relation",
+                "description": "Set one role relation to another role.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "role_id": {"type": "string"},
+                        "target_role_id": {"type": "string"},
+                        "relation_tag": {"type": "string"},
+                        "note": {"type": "string"},
+                    },
+                    "required": ["role_id", "target_role_id", "relation_tag"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "player_set_trait",
+                "description": "Add/remove player skill or spell.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["skill", "spell"]},
+                        "mode": {"type": "string", "enum": ["add", "remove"], "default": "add"},
+                        "value": {"type": "string"},
+                    },
+                    "required": ["kind", "value"],
                     "additionalProperties": False,
                 },
             },
@@ -570,6 +719,150 @@ async def _handle_tool_call(payload: ChatRequest, tool_call: Any) -> tuple[dict[
                 "tool_call_id": tool_call_id,
                 "content": json.dumps(result, ensure_ascii=False),
             },
+            event,
+        )
+
+    if tool_name == "player_add_item":
+        try:
+            args = json.loads(arg_text)
+            item = InventoryItem(
+                item_id=str(args.get("item_id") or "").strip(),
+                name=str(args.get("name") or "").strip(),
+                item_type=str(args.get("item_type") or "misc").strip() or "misc",
+                quantity=max(1, int(args.get("quantity") or 1)),
+                slot_type=str(args.get("slot_type") or "misc"),  # type: ignore[arg-type]
+                attack_bonus=int(args.get("attack_bonus") or 0),
+                armor_bonus=int(args.get("armor_bonus") or 0),
+            )
+            updated = add_player_item(payload.session_id, PlayerItemAddRequest(item=item))
+            result = {"ok": True, "player_static_data": updated.model_dump(mode="json")}
+            event = ToolEvent(tool_name="player_add_item", ok=True, summary="item added")
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="player_add_item", ok=False, summary=f"item add failed: {exc}")
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "player_equip_item":
+        try:
+            args = json.loads(arg_text)
+            slot = str(args.get("slot") or "").strip()
+            mode = str(args.get("mode") or "equip").strip().lower()
+            if mode == "unequip":
+                updated = unequip_player_item(payload.session_id, PlayerUnequipRequest(slot=slot))  # type: ignore[arg-type]
+            else:
+                updated = equip_player_item(
+                    payload.session_id,
+                    PlayerEquipRequest(item_id=str(args.get("item_id") or "").strip(), slot=slot),  # type: ignore[arg-type]
+                )
+            result = {"ok": True, "player_static_data": updated.model_dump(mode="json")}
+            event = ToolEvent(tool_name="player_equip_item", ok=True, summary=f"{mode} ok")
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="player_equip_item", ok=False, summary=f"equip failed: {exc}")
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "player_apply_buff":
+        try:
+            args = json.loads(arg_text)
+            mode = str(args.get("mode") or "add").strip().lower()
+            buff_id = str(args.get("buff_id") or "").strip()
+            if mode == "remove":
+                updated = remove_player_buff(payload.session_id, PlayerBuffRemoveRequest(buff_id=buff_id))
+            else:
+                buff = RoleBuff(
+                    buff_id=buff_id,
+                    name=str(args.get("name") or buff_id or "临时BUFF").strip(),
+                    duration_min=max(0, int(args.get("duration_min") or 10)),
+                    remaining_min=max(0, int(args.get("duration_min") or 10)),
+                    effect={
+                        "strength_delta": int(args.get("strength_delta") or 0),
+                        "dexterity_delta": int(args.get("dexterity_delta") or 0),
+                        "constitution_delta": int(args.get("constitution_delta") or 0),
+                        "intelligence_delta": int(args.get("intelligence_delta") or 0),
+                        "wisdom_delta": int(args.get("wisdom_delta") or 0),
+                        "charisma_delta": int(args.get("charisma_delta") or 0),
+                        "ac_delta": int(args.get("ac_delta") or 0),
+                        "dc_delta": int(args.get("dc_delta") or 0),
+                    },
+                )
+                updated = add_player_buff(payload.session_id, PlayerBuffAddRequest(buff=buff))
+            result = {"ok": True, "player_static_data": updated.model_dump(mode="json")}
+            event = ToolEvent(tool_name="player_apply_buff", ok=True, summary=f"buff {mode} ok")
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="player_apply_buff", ok=False, summary=f"buff failed: {exc}")
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "player_adjust_resource":
+        try:
+            args = json.loads(arg_text)
+            kind = str(args.get("kind") or "").strip().lower()
+            mode = str(args.get("mode") or "consume").strip().lower()
+            amount = max(1, int(args.get("amount") or 1))
+            if kind == "spell_slot":
+                req = PlayerSpellSlotAdjustRequest(level=max(1, int(args.get("level") or 1)), amount=amount)
+                updated = recover_spell_slots(payload.session_id, req) if mode == "recover" else consume_spell_slots(payload.session_id, req)
+            else:
+                req = PlayerStaminaAdjustRequest(amount=amount)
+                updated = recover_stamina(payload.session_id, req) if mode == "recover" else consume_stamina(payload.session_id, req)
+            result = {"ok": True, "player_static_data": updated.model_dump(mode="json")}
+            event = ToolEvent(tool_name="player_adjust_resource", ok=True, summary=f"{kind} {mode} ok")
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="player_adjust_resource", ok=False, summary=f"resource failed: {exc}")
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "role_set_relation":
+        try:
+            args = json.loads(arg_text)
+            updated_role = set_role_relation(
+                payload.session_id,
+                str(args.get("role_id") or "").strip(),
+                RoleRelationSetRequest(
+                    target_role_id=str(args.get("target_role_id") or "").strip(),
+                    relation_tag=str(args.get("relation_tag") or "neutral").strip(),
+                    note=str(args.get("note") or "").strip(),
+                ),
+            )
+            result = {"ok": True, "role": updated_role.model_dump(mode="json")}
+            event = ToolEvent(tool_name="role_set_relation", ok=True, summary="relation updated")
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="role_set_relation", ok=False, summary=f"relation failed: {exc}")
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "player_set_trait":
+        try:
+            args = json.loads(arg_text)
+            kind = str(args.get("kind") or "").strip().lower()
+            mode = str(args.get("mode") or "add").strip().lower()
+            value = str(args.get("value") or "").strip()
+            if kind == "spell":
+                updated = remove_player_spell(payload.session_id, PlayerSpellSetRequest(value=value)) if mode == "remove" else add_player_spell(payload.session_id, PlayerSpellSetRequest(value=value))
+            else:
+                updated = remove_player_skill(payload.session_id, PlayerSkillSetRequest(value=value)) if mode == "remove" else add_player_skill(payload.session_id, PlayerSkillSetRequest(value=value))
+            result = {"ok": True, "player_static_data": updated.model_dump(mode="json")}
+            event = ToolEvent(tool_name="player_set_trait", ok=True, summary=f"{kind} {mode} ok")
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="player_set_trait", ok=False, summary=f"trait failed: {exc}")
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
             event,
         )
 

@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from app.core.storage import storage_state
 from app.models.schemas import (
+    ChatConfig,
     AreaDiscoverInteractionsRequest,
     AreaExecuteInteractionRequest,
     AreaInteraction,
@@ -12,8 +13,14 @@ from app.models.schemas import (
     AreaSubZone,
     AreaZone,
     Coord3D,
+    NpcRoleCard,
+    PlayerStaticData,
+    Position,
+    RegionGenerateRequest,
     WorldClock,
     WorldClockInitRequest,
+    Zone,
+    ZoneSubZoneSeed,
 )
 from app.services.world_service import (
     AIRegionGenerationError,
@@ -23,6 +30,7 @@ from app.services.world_service import (
     execute_interaction,
     get_area_current,
     get_current_save,
+    generate_regions,
     init_world_clock,
     move_to_sub_zone,
 )
@@ -148,6 +156,95 @@ class AreaLogicTests(unittest.TestCase):
     def test_discover_schema_validation(self) -> None:
         with self.assertRaises(AIRegionGenerationError):
             _validate_discovered_interactions({'bad_key': []})
+
+    def test_force_regenerate_clears_stale_role_pool_and_area_data(self) -> None:
+        session_id = 'sess_force_regen'
+        save = clear_current_save(session_id)
+        save.session_id = session_id
+        save.map_snapshot.zones = [
+            Zone(
+                zone_id='zone_old',
+                name='旧区块',
+                x=0,
+                y=0,
+                z=0,
+                description='old',
+                tags=['old'],
+                sub_zones=[ZoneSubZoneSeed(name='旧子区', description='old')],
+            )
+        ]
+        save.area_snapshot = AreaSnapshot(
+            zones=[
+                AreaZone(
+                    zone_id='zone_old',
+                    name='旧区块',
+                    center=Coord3D(x=0, y=0, z=0),
+                    sub_zone_ids=['sub_zone_old_1'],
+                )
+            ],
+            sub_zones=[
+                AreaSubZone(
+                    sub_zone_id='sub_zone_old_1',
+                    zone_id='zone_old',
+                    name='旧子区',
+                    coord=Coord3D(x=0, y=0, z=0),
+                    description='old',
+                )
+            ],
+            current_zone_id='zone_old',
+            current_sub_zone_id='sub_zone_old_1',
+            clock=WorldClock(calendar='fantasy_default', year=1024, month=3, day=14, hour=9, minute=30),
+        )
+        save.role_pool = [
+            NpcRoleCard(
+                role_id='npc_old',
+                name='旧NPC',
+                zone_id='zone_old',
+                sub_zone_id='sub_zone_old_1',
+                profile=PlayerStaticData(role_type='npc'),
+            )
+        ]
+        from app.services.world_service import save_current
+
+        save_current(save)
+
+        new_zone = Zone(
+            zone_id='zone_new',
+            name='新区块',
+            x=100,
+            y=100,
+            z=0,
+            description='new',
+            tags=['new'],
+            sub_zones=[ZoneSubZoneSeed(name='新子区', description='new')],
+        )
+        with patch('app.services.world_service._ai_generate_zones', return_value=[new_zone]):
+            resp = generate_regions(
+                RegionGenerateRequest(
+                    session_id=session_id,
+                    config=ChatConfig(
+                        version='1.0.0',
+                        openai_api_key='sk-test',
+                        model='gpt-4.1-mini',
+                        stream=False,
+                        temperature=0.8,
+                        max_tokens=256,
+                        gm_prompt='test',
+                    ),
+                    player_position=Position(x=100, y=100, z=0, zone_id='zone_new'),
+                    desired_count=1,
+                    max_count=1,
+                    world_prompt='test',
+                    force_regenerate=True,
+                )
+            )
+        self.assertTrue(resp.generated)
+
+        updated = get_current_save(session_id)
+        self.assertEqual([z.zone_id for z in updated.map_snapshot.zones], ['zone_new'])
+        self.assertEqual(sorted({z.zone_id for z in updated.area_snapshot.zones}), ['zone_new'])
+        self.assertNotIn('npc_old', [r.role_id for r in updated.role_pool])
+        self.assertTrue(all((r.zone_id == 'zone_new') for r in updated.role_pool))
 
 
 if __name__ == '__main__':
