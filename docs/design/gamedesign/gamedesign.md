@@ -36,6 +36,9 @@
 - 核心玩法技术：`docs/technical/gameplay-core-technical.md`
 - 区块技术：`docs/technical/area-technical.md`
 - 角色技术：`docs/technical/role-technical.md`
+- 命运线技术：`docs/technical/fate-technical.md`
+- 任务技术：`docs/technical/quest-technical.md`
+- 遭遇技术：`docs/technical/encounter-technical.md`
 - 存档技术：`docs/technical/save-technical.md`
 - AI 工具协议：`docs/technical/ai-tool-protocol.md`
 - MVP 架构契约：`docs/technical/mvp-architecture.md`

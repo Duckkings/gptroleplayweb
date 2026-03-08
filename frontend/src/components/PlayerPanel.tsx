@@ -1,11 +1,15 @@
 import { useEffect, useState } from 'react';
-import type { InventoryItem, PlayerStaticData, RoleBuff } from '../types/app';
+import type { InventoryItem, PlayerStaticData, QuestState, RoleBuff } from '../types/app';
+import { QuestPanel } from './QuestPanel';
 
 type Props = {
   open: boolean;
   value: PlayerStaticData;
+  questState: QuestState;
   onClose: () => void;
   onSave: (next: PlayerStaticData) => void;
+  onTrackQuest: (questId: string) => void;
+  onEvaluateQuest: (questId: string) => void;
 };
 
 function parseLines(text: string): string[] {
@@ -15,7 +19,7 @@ function parseLines(text: string): string[] {
     .filter(Boolean);
 }
 
-export function PlayerPanel({ open, value, onClose, onSave }: Props) {
+export function PlayerPanel({ open, value, questState, onClose, onSave, onTrackQuest, onEvaluateQuest }: Props) {
   const [draft, setDraft] = useState<PlayerStaticData>(value);
   const [newItemName, setNewItemName] = useState('');
   const [newItemType, setNewItemType] = useState<'weapon' | 'armor' | 'misc'>('misc');
@@ -97,14 +101,14 @@ export function PlayerPanel({ open, value, onClose, onSave }: Props) {
       <header className="chat-header">
         <div>
           <h2>玩家数据面板</h2>
-          <p>完整角色核心数据编辑</p>
+          <p>完整编辑角色核心数据、背包和增益效果。</p>
         </div>
         <button onClick={onClose}>关闭</button>
       </header>
 
       <div className="player-form">
         <label>
-          玩家ID
+          玩家 ID
           <input type="text" value={draft.player_id} onChange={(e) => setDraft((p) => ({ ...p, player_id: e.target.value }))} />
         </label>
         <label>
@@ -211,24 +215,26 @@ export function PlayerPanel({ open, value, onClose, onSave }: Props) {
 
       <div className="player-form">
         <label>
-          新增BUFF
+          新增 BUFF
           <input type="text" value={newBuffName} onChange={(e) => setNewBuffName(e.target.value)} placeholder="BUFF 名称" />
         </label>
         <label>
-          AC加值
+          AC 加值
           <input type="number" value={newBuffAc} onChange={(e) => setNewBuffAc(Number(e.target.value) || 0)} />
         </label>
         <label>
-          DC加值
+          DC 加值
           <input type="number" value={newBuffDc} onChange={(e) => setNewBuffDc(Number(e.target.value) || 0)} />
         </label>
-        <button onClick={addBuff}>添加BUFF</button>
-        <p>当前BUFF：{sheet.buffs.map((b) => b.name).join(' / ') || '无'}</p>
+        <button onClick={addBuff}>添加 BUFF</button>
+        <p>当前 BUFF：{sheet.buffs.map((b) => b.name).join(' / ') || '无'}</p>
       </div>
 
       <div className="actions">
         <button onClick={() => onSave(draft)}>保存玩家数据</button>
       </div>
+
+      <QuestPanel state={questState} onTrackQuest={onTrackQuest} onEvaluateQuest={onEvaluateQuest} />
     </section>
   );
 }

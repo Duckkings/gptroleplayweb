@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class UIConfig(BaseModel):
@@ -55,11 +55,29 @@ class ToolEvent(BaseModel):
     payload: dict[str, str | int | float | bool] = Field(default_factory=dict)
 
 
+class SceneEvent(BaseModel):
+    event_id: str = Field(..., min_length=1)
+    kind: Literal[
+        "public_targeted_npc_reply",
+        "public_bystander_reaction",
+        "team_public_reaction",
+        "encounter_started",
+        "encounter_progress",
+        "encounter_background",
+    ]
+    actor_role_id: str = Field(default="", min_length=0)
+    actor_name: str = Field(default="", min_length=0)
+    content: str = Field(..., min_length=1)
+    metadata: dict[str, str | int | float | bool] = Field(default_factory=dict)
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
 class ChatResponse(BaseModel):
     session_id: str
     reply: Message
     usage: Usage
     tool_events: list[ToolEvent] = Field(default_factory=list)
+    scene_events: list[SceneEvent] = Field(default_factory=list)
     time_spent_min: int = 0
 
 
@@ -354,10 +372,21 @@ class NpcDialogueEntry(BaseModel):
     speaker: Literal["player", "npc"]
     speaker_role_id: str = Field(..., min_length=1)
     speaker_name: str = Field(..., min_length=1)
+    context_kind: Literal["private_chat", "public_targeted", "public_reaction", "team_chat", "encounter"] = "private_chat"
     content: str = Field(..., min_length=1)
     world_time_text: str = Field(..., min_length=1)
     world_time: dict[str, str | int] = Field(default_factory=dict)
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class NpcConversationState(BaseModel):
+    current_topic: str = Field(default="", min_length=0)
+    last_open_question: str = Field(default="", min_length=0)
+    last_npc_claim: str = Field(default="", min_length=0)
+    last_player_intent: str = Field(default="", min_length=0)
+    last_referenced_entity: str = Field(default="", min_length=0)
+    last_scene_mode: Literal["private_chat", "public_chat", "team_chat", "encounter", "unknown"] = "unknown"
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 class NpcRoleCard(BaseModel):
@@ -365,6 +394,9 @@ class NpcRoleCard(BaseModel):
     name: str = Field(..., min_length=1)
     zone_id: str | None = None
     sub_zone_id: str | None = None
+    source_world_revision: int = Field(default=1, ge=1)
+    source_map_revision: int = Field(default=1, ge=1)
+    knowledge_scope: str = Field(default="local", min_length=1)
     state: str = Field(default="idle", min_length=1)
     personality: str = Field(default="", min_length=0)
     speaking_style: str = Field(default="", min_length=0)
@@ -372,17 +404,156 @@ class NpcRoleCard(BaseModel):
     background: str = Field(default="", min_length=0)
     cognition: str = Field(default="", min_length=0)
     alignment: str = Field(default="", min_length=0)
+    secret: str = Field(default="", min_length=0)
+    likes: list[str] = Field(default_factory=list)
+    talkative_current: int = Field(default=100, ge=0, le=100)
+    talkative_maximum: int = Field(default=100, ge=1, le=100)
+    last_private_chat_at: str | None = None
     profile: PlayerStaticData = Field(default_factory=lambda: PlayerStaticData(role_type="npc"))
     relations: list[RoleRelation] = Field(default_factory=list)
     cognition_changes: list[str] = Field(default_factory=list)
     attitude_changes: list[str] = Field(default_factory=list)
+    conversation_state: NpcConversationState = Field(default_factory=NpcConversationState)
     dialogue_logs: list[NpcDialogueEntry] = Field(default_factory=list)
     generated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
-class SaveFile(BaseModel):
-    version: str = Field(default="1.1.0")
+class WorldState(BaseModel):
+    version: str = Field(default="0.1.0")
+    world_revision: int = Field(default=1, ge=1)
+    map_revision: int = Field(default=1, ge=1)
+    last_consistency_check_at: str | None = None
+    last_world_rebuild_at: str | None = None
+
+
+class EntityRef(BaseModel):
+    entity_type: Literal["zone", "sub_zone", "npc", "item", "quest", "encounter", "fate", "fate_phase"] = "zone"
+    entity_id: str = Field(..., min_length=1)
+    label: str = Field(default="", min_length=0)
+    required: bool = True
+    source: Literal["system", "ai", "fallback"] = "system"
+
+
+class ConsistencyIssue(BaseModel):
+    issue_id: str = Field(..., min_length=1)
+    severity: Literal["info", "warning", "error"] = "warning"
+    issue_type: str = Field(..., min_length=1)
+    entity_type: str = Field(..., min_length=1)
+    entity_id: str = Field(..., min_length=1)
+    message: str = Field(..., min_length=1)
+
+
+class StoryNpcSummary(BaseModel):
+    role_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    zone_id: str | None = None
+    sub_zone_id: str | None = None
+    relation_tag: str | None = None
+
+
+class StoryQuestSummary(BaseModel):
+    quest_id: str = Field(..., min_length=1)
+    title: str = Field(..., min_length=1)
+    status: str = Field(..., min_length=1)
+    source: str = Field(..., min_length=1)
+
+
+class StoryEncounterSummary(BaseModel):
+    encounter_id: str = Field(..., min_length=1)
+    title: str = Field(..., min_length=1)
+    status: str = Field(..., min_length=1)
+    type: str = Field(..., min_length=1)
+
+
+class PlayerStorySummary(BaseModel):
+    player_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    level: int = Field(default=1, ge=1)
+    hp_current: int = Field(default=0, ge=0)
+    hp_maximum: int = Field(default=0, ge=0)
+    inventory_item_names: list[str] = Field(default_factory=list)
+
+
+class GlobalStorySnapshot(BaseModel):
     session_id: str = Field(..., min_length=1)
+    world_revision: int = Field(default=1, ge=1)
+    map_revision: int = Field(default=1, ge=1)
+    current_zone_id: str | None = None
+    current_sub_zone_id: str | None = None
+    current_zone_name: str = Field(default="", min_length=0)
+    current_sub_zone_name: str = Field(default="", min_length=0)
+    clock: WorldClock | None = None
+    player_summary: PlayerStorySummary
+    visible_zone_ids: list[str] = Field(default_factory=list)
+    visible_sub_zone_ids: list[str] = Field(default_factory=list)
+    available_npc_ids: list[str] = Field(default_factory=list)
+    available_npcs: list[StoryNpcSummary] = Field(default_factory=list)
+    team_member_ids: list[str] = Field(default_factory=list)
+    active_quest_ids: list[str] = Field(default_factory=list)
+    active_quests: list[StoryQuestSummary] = Field(default_factory=list)
+    pending_quest_ids: list[str] = Field(default_factory=list)
+    current_fate_id: str | None = None
+    current_fate_phase_id: str | None = None
+    recent_encounter_ids: list[str] = Field(default_factory=list)
+    recent_game_log_refs: list[str] = Field(default_factory=list)
+
+
+class NpcKnowledgeSnapshot(BaseModel):
+    npc_role_id: str = Field(..., min_length=1)
+    npc_name: str = Field(..., min_length=1)
+    world_revision: int = Field(default=1, ge=1)
+    map_revision: int = Field(default=1, ge=1)
+    current_zone_id: str | None = None
+    current_sub_zone_id: str | None = None
+    self_profile_summary: str = Field(default="", min_length=0)
+    known_player_relation: str = Field(default="neutral", min_length=1)
+    known_local_npc_ids: list[str] = Field(default_factory=list)
+    known_local_zone_ids: list[str] = Field(default_factory=list)
+    known_active_quest_refs: list[EntityRef] = Field(default_factory=list)
+    recent_dialogue_summary: list[str] = Field(default_factory=list)
+    forbidden_entity_ids: list[str] = Field(default_factory=list)
+    response_rules: list[str] = Field(default_factory=list)
+
+
+class TeamMember(BaseModel):
+    role_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    origin_zone_id: str | None = None
+    origin_sub_zone_id: str | None = None
+    joined_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    affinity: int = Field(default=50, ge=0, le=100)
+    trust: int = Field(default=40, ge=0, le=100)
+    join_source: Literal["story", "debug"] = "story"
+    join_reason: str = Field(default="", min_length=0)
+    is_debug: bool = False
+    debug_prompt: str = Field(default="", min_length=0)
+    status: Literal["active", "left"] = "active"
+    last_reaction_at: str | None = None
+    last_reaction_preview: str = Field(default="", min_length=0)
+
+
+class TeamReaction(BaseModel):
+    reaction_id: str = Field(..., min_length=1)
+    member_role_id: str = Field(..., min_length=1)
+    member_name: str = Field(..., min_length=1)
+    trigger_kind: Literal["main_chat", "npc_chat", "zone_move", "sub_zone_move", "action_check", "team_chat", "public_chat", "encounter", "system"] = "system"
+    content: str = Field(..., min_length=1)
+    affinity_delta: int = 0
+    trust_delta: int = 0
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class TeamState(BaseModel):
+    version: str = Field(default="0.1.0")
+    members: list[TeamMember] = Field(default_factory=list)
+    reactions: list[TeamReaction] = Field(default_factory=list)
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class SaveFile(BaseModel):
+    version: str = Field(default="1.2.0")
+    session_id: str = Field(..., min_length=1)
+    world_state: WorldState = Field(default_factory=WorldState)
     map_snapshot: MapSnapshot = Field(default_factory=MapSnapshot)
     area_snapshot: AreaSnapshot = Field(default_factory=AreaSnapshot)
     game_logs: list[GameLogEntry] = Field(default_factory=list)
@@ -390,6 +561,10 @@ class SaveFile(BaseModel):
     player_static_data: PlayerStaticData = Field(default_factory=PlayerStaticData)
     player_runtime_data: PlayerRuntimeData = Field(default_factory=PlayerRuntimeData)
     role_pool: list[NpcRoleCard] = Field(default_factory=list)
+    team_state: TeamState = Field(default_factory=TeamState)
+    quest_state: QuestState = Field(default_factory=lambda: QuestState())
+    encounter_state: EncounterState = Field(default_factory=lambda: EncounterState())
+    fate_state: FateState = Field(default_factory=lambda: FateState())
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -505,6 +680,193 @@ class GameLogListResponse(BaseModel):
 class GameLogSettingsResponse(BaseModel):
     session_id: str
     settings: GameLogSettings
+
+
+class QuestObjective(BaseModel):
+    objective_id: str = Field(..., min_length=1)
+    kind: Literal["reach_zone", "talk_to_npc", "obtain_item", "resolve_encounter", "complete_quest", "manual_text"] = "manual_text"
+    title: str = Field(..., min_length=1)
+    description: str = Field(default="", min_length=0)
+    target_ref: dict[str, str | int | float | bool] = Field(default_factory=dict)
+    progress_current: int = Field(default=0, ge=0)
+    progress_target: int = Field(default=1, ge=1)
+    status: Literal["pending", "in_progress", "completed"] = "pending"
+    completed_at: str | None = None
+
+
+class QuestReward(BaseModel):
+    reward_id: str = Field(..., min_length=1)
+    kind: Literal["gold", "item", "relation", "flag", "none"] = "none"
+    label: str = Field(..., min_length=1)
+    payload: dict[str, str | int | float | bool] = Field(default_factory=dict)
+
+
+class QuestLogEntry(BaseModel):
+    id: str = Field(..., min_length=1)
+    kind: Literal["offer", "accept", "reject", "progress", "complete", "fail", "system"] = "system"
+    message: str = Field(..., min_length=1)
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class QuestEntry(BaseModel):
+    quest_id: str = Field(..., min_length=1)
+    source: Literal["normal", "fate"] = "normal"
+    offer_mode: Literal["accept_reject", "accept_only"] = "accept_reject"
+    title: str = Field(..., min_length=1)
+    description: str = Field(..., min_length=1)
+    issuer_role_id: str | None = None
+    zone_id: str | None = None
+    sub_zone_id: str | None = None
+    fate_id: str | None = None
+    fate_phase_id: str | None = None
+    source_world_revision: int = Field(default=1, ge=1)
+    source_map_revision: int = Field(default=1, ge=1)
+    entity_refs: list[EntityRef] = Field(default_factory=list)
+    invalidated_reason: str | None = None
+    status: Literal["pending_offer", "active", "rejected", "completed", "failed", "superseded", "invalidated"] = "pending_offer"
+    is_tracked: bool = False
+    objectives: list[QuestObjective] = Field(default_factory=list)
+    rewards: list[QuestReward] = Field(default_factory=list)
+    logs: list[QuestLogEntry] = Field(default_factory=list)
+    offered_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    accepted_at: str | None = None
+    rejected_at: str | None = None
+    completed_at: str | None = None
+    metadata: dict[str, str | int | float | bool] = Field(default_factory=dict)
+
+
+class QuestState(BaseModel):
+    version: str = Field(default="0.1.0")
+    tracked_quest_id: str | None = None
+    quests: list[QuestEntry] = Field(default_factory=list)
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class EncounterEntry(BaseModel):
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_status(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        status = str(data.get("status") or "").strip().lower()
+        if status == "presented":
+            data["status"] = "active"
+        elif status == "skipped":
+            data["status"] = "expired"
+        return data
+
+    encounter_id: str = Field(..., min_length=1)
+    type: Literal["npc", "event", "anomaly"] = "event"
+    source_world_revision: int = Field(default=1, ge=1)
+    source_map_revision: int = Field(default=1, ge=1)
+    entity_refs: list[EntityRef] = Field(default_factory=list)
+    invalidated_reason: str | None = None
+    status: Literal["queued", "active", "resolved", "escaped", "expired", "invalidated"] = "queued"
+    trigger_kind: Literal["random_move", "random_dialog", "scripted", "quest_rule", "fate_rule", "debug_forced"] = "random_move"
+    encounter_mode: Literal["standard", "npc_initiated_chat"] = "standard"
+    title: str = Field(..., min_length=1)
+    description: str = Field(..., min_length=1)
+    zone_id: str | None = None
+    sub_zone_id: str | None = None
+    npc_role_id: str | None = None
+    player_presence: Literal["engaged", "away"] = "engaged"
+    related_quest_ids: list[str] = Field(default_factory=list)
+    related_fate_phase_ids: list[str] = Field(default_factory=list)
+    generated_prompt_tags: list[str] = Field(default_factory=list)
+    allow_player_prompt: bool = True
+    termination_conditions: list["EncounterTerminationCondition"] = Field(default_factory=list)
+    steps: list["EncounterStepEntry"] = Field(default_factory=list)
+    scene_summary: str = Field(default="", min_length=0)
+    latest_outcome_summary: str = Field(default="", min_length=0)
+    background_tick_count: int = Field(default=0, ge=0)
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    presented_at: str | None = None
+    resolved_at: str | None = None
+    last_advanced_at: str | None = None
+
+
+class EncounterTerminationCondition(BaseModel):
+    condition_id: str = Field(..., min_length=1)
+    kind: Literal["npc_leaves", "player_escapes", "target_resolved", "time_elapsed", "manual_custom"] = "manual_custom"
+    description: str = Field(..., min_length=1)
+    satisfied: bool = False
+    satisfied_at: str | None = None
+
+
+class EncounterStepEntry(BaseModel):
+    step_id: str = Field(..., min_length=1)
+    kind: Literal["announcement", "player_action", "gm_update", "npc_reaction", "team_reaction", "escape_attempt", "background_tick", "resolution"] = "gm_update"
+    actor_type: Literal["player", "npc", "team", "system"] = "system"
+    actor_id: str = Field(default="", min_length=0)
+    actor_name: str = Field(default="", min_length=0)
+    content: str = Field(..., min_length=1)
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class EncounterResolution(BaseModel):
+    encounter_id: str = Field(..., min_length=1)
+    player_prompt: str = Field(..., min_length=1)
+    reply: str = Field(..., min_length=1)
+    time_spent_min: int = Field(default=1, ge=1)
+    quest_updates: list[str] = Field(default_factory=list)
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class EncounterState(BaseModel):
+    version: str = Field(default="0.1.0")
+    pending_ids: list[str] = Field(default_factory=list)
+    active_encounter_id: str | None = None
+    encounters: list[EncounterEntry] = Field(default_factory=list)
+    history: list[EncounterResolution] = Field(default_factory=list)
+    debug_force_trigger: bool = False
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class FateTriggerCondition(BaseModel):
+    condition_id: str = Field(..., min_length=1)
+    kind: Literal["manual", "days_elapsed", "met_npc", "obtained_item", "resolved_encounter", "completed_quest"] = "manual"
+    description: str = Field(..., min_length=1)
+    payload: dict[str, str | int | float | bool] = Field(default_factory=dict)
+    satisfied: bool = False
+    satisfied_at: str | None = None
+
+
+class FatePhase(BaseModel):
+    phase_id: str = Field(..., min_length=1)
+    index: int = Field(default=1, ge=1)
+    title: str = Field(..., min_length=1)
+    description: str = Field(..., min_length=1)
+    source_world_revision: int = Field(default=1, ge=1)
+    source_map_revision: int = Field(default=1, ge=1)
+    bound_entity_refs: list[EntityRef] = Field(default_factory=list)
+    invalidated_reason: str | None = None
+    status: Literal["locked", "ready", "quest_offered", "quest_active", "completed"] = "locked"
+    trigger_conditions: list[FateTriggerCondition] = Field(default_factory=list)
+    triggered_at: str | None = None
+    bound_quest_id: str | None = None
+    completed_at: str | None = None
+
+
+class FateLine(BaseModel):
+    fate_id: str = Field(..., min_length=1)
+    title: str = Field(..., min_length=1)
+    summary: str = Field(..., min_length=1)
+    source_world_revision: int = Field(default=1, ge=1)
+    source_map_revision: int = Field(default=1, ge=1)
+    bound_entity_refs: list[EntityRef] = Field(default_factory=list)
+    invalidated_reason: str | None = None
+    status: Literal["not_generated", "active", "completed", "superseded", "invalidated"] = "active"
+    current_phase_id: str | None = None
+    phases: list[FatePhase] = Field(default_factory=list)
+    generated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class FateState(BaseModel):
+    version: str = Field(default="0.1.0")
+    current_fate: FateLine | None = None
+    archive: list[FateLine] = Field(default_factory=list)
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 class TokenUsageBucket(BaseModel):
@@ -634,8 +996,13 @@ class NpcChatResponse(BaseModel):
     session_id: str
     npc_role_id: str
     reply: str = Field(..., min_length=1)
+    action_reaction: str = Field(default="", min_length=0)
+    speech_reply: str = Field(default="", min_length=0)
+    talkative_current: int = Field(default=0, ge=0, le=100)
+    talkative_maximum: int = Field(default=0, ge=0, le=100)
     time_spent_min: int = Field(ge=1)
     dialogue_logs: list[NpcDialogueEntry] = Field(default_factory=list)
+    scene_events: list[SceneEvent] = Field(default_factory=list)
 
 
 class ActionCheckRequest(BaseModel):
@@ -643,6 +1010,7 @@ class ActionCheckRequest(BaseModel):
     action_type: Literal["attack", "check", "item_use"] = "check"
     action_prompt: str = Field(..., min_length=1)
     actor_role_id: str | None = None
+    forced_dice_roll: int | None = Field(default=None, ge=1, le=20)
     config: ChatConfig | None = None
 
 
@@ -663,6 +1031,379 @@ class ActionCheckResponse(BaseModel):
     narrative: str = Field(..., min_length=1)
     applied_effects: list[str] = Field(default_factory=list)
     relation_tag_suggestion: str | None = None
+    scene_events: list[SceneEvent] = Field(default_factory=list)
+
+
+class QuestDraft(BaseModel):
+    source: Literal["normal", "fate"] = "normal"
+    offer_mode: Literal["accept_reject", "accept_only"] = "accept_reject"
+    title: str = Field(..., min_length=1)
+    description: str = Field(..., min_length=1)
+    issuer_role_id: str | None = None
+    zone_id: str | None = None
+    sub_zone_id: str | None = None
+    fate_id: str | None = None
+    fate_phase_id: str | None = None
+    entity_refs: list[EntityRef] = Field(default_factory=list)
+    objectives: list[QuestObjective] = Field(default_factory=list)
+    rewards: list[QuestReward] = Field(default_factory=list)
+    metadata: dict[str, str | int | float | bool] = Field(default_factory=dict)
+
+
+class QuestPublishRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    quest: QuestDraft | None = None
+    source: Literal["normal", "fate"] = "normal"
+    open_modal: bool = True
+    config: ChatConfig | None = None
+
+
+class QuestStateResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    quest_state: QuestState
+    pending_offers: list[QuestEntry] = Field(default_factory=list)
+    tracked_quest: QuestEntry | None = None
+
+
+class QuestMutationResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    quest_id: str
+    status: Literal["pending_offer", "active", "rejected", "completed", "failed", "superseded", "invalidated"]
+    chat_feedback: str = Field(default="", min_length=0)
+    quest: QuestEntry
+    quest_state: QuestState
+
+
+class QuestEvaluateRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    quest_id: str = Field(..., min_length=1)
+    config: ChatConfig | None = None
+
+
+class QuestActionRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    config: ChatConfig | None = None
+
+
+class QuestEvaluateAllRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    config: ChatConfig | None = None
+
+
+class EncounterCheckRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    trigger_kind: Literal["random_move", "random_dialog", "scripted", "quest_rule", "fate_rule", "debug_forced"] = "random_move"
+    config: ChatConfig | None = None
+
+
+class EncounterCheckResponse(BaseModel):
+    ok: bool = True
+    generated: bool = False
+    encounter_id: str | None = None
+    blocked_by_higher_priority_modal: bool = False
+    encounter: EncounterEntry | None = None
+
+
+class EncounterPendingResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    encounter_state: EncounterState
+    pending: list[EncounterEntry] = Field(default_factory=list)
+    active_encounter: EncounterEntry | None = None
+
+
+class EncounterHistoryResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    items: list[EncounterResolution] = Field(default_factory=list)
+
+
+class EncounterPresentRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+
+
+class EncounterPresentResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    encounter_id: str
+    status: Literal["queued", "active", "resolved", "escaped", "expired", "invalidated"]
+    encounter: EncounterEntry
+
+
+class EncounterActRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    player_prompt: str = Field(..., min_length=1)
+    config: ChatConfig | None = None
+
+
+class EncounterActResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    encounter_id: str
+    status: Literal["queued", "active", "resolved", "escaped", "expired", "invalidated"]
+    reply: str = Field(..., min_length=1)
+    time_spent_min: int = Field(default=1, ge=1)
+    encounter: EncounterEntry
+    resolution: EncounterResolution
+    encounter_state: EncounterState
+
+
+class EncounterForceToggleRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    enabled: bool | None = None
+
+
+class EncounterForceToggleResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    enabled: bool
+    encounter_state: EncounterState
+
+
+class EncounterEscapeRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    config: ChatConfig | None = None
+
+
+class EncounterEscapeResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    encounter_id: str
+    status: Literal["active", "escaped", "resolved", "expired", "invalidated"]
+    reply: str = Field(..., min_length=1)
+    time_spent_min: int = Field(default=1, ge=1)
+    escape_success: bool = False
+    encounter: EncounterEntry
+    encounter_state: EncounterState
+    action_check: ActionCheckResponse | None = None
+
+
+class EncounterRejoinRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    config: ChatConfig | None = None
+
+
+class EncounterRejoinResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    encounter_id: str
+    status: Literal["active", "escaped", "resolved", "expired", "invalidated"]
+    reply: str = Field(..., min_length=1)
+    encounter: EncounterEntry
+    encounter_state: EncounterState
+
+
+class EncounterDebugOverviewResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    active_encounter: EncounterEntry | None = None
+    queued_encounters: list[EncounterEntry] = Field(default_factory=list)
+    summary: str = Field(default="", min_length=0)
+
+
+class FateGenerateRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    config: ChatConfig | None = None
+
+
+class FateCurrentResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    fate_state: FateState
+
+
+class FateGenerateResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    fate_id: str | None = None
+    generated: bool = False
+    fate: FateLine | None = None
+
+
+class FateEvaluateRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    config: ChatConfig | None = None
+
+
+class FateEvaluateResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    fate_state: FateState
+    advanced: bool = False
+    generated_quest_id: str | None = None
+
+
+class StorySnapshotResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    snapshot: GlobalStorySnapshot
+
+
+class NpcKnowledgeResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    npc_role_id: str
+    snapshot: NpcKnowledgeSnapshot
+
+
+class TeamStateResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    team_state: TeamState
+    members: list[TeamMember] = Field(default_factory=list)
+
+
+class TeamInviteRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    npc_role_id: str = Field(..., min_length=1)
+    player_prompt: str = Field(default="", min_length=0)
+    config: ChatConfig | None = None
+
+
+class TeamLeaveRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    npc_role_id: str = Field(..., min_length=1)
+    reason: str = Field(default="", min_length=0)
+    config: ChatConfig | None = None
+
+
+class TeamDebugGenerateRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    prompt: str = Field(..., min_length=1)
+    config: ChatConfig | None = None
+
+
+class TeamMutationResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    team_state: TeamState
+    member: TeamMember | None = None
+    role: NpcRoleCard | None = None
+    accepted: bool = True
+    chat_feedback: str = Field(default="", min_length=0)
+
+
+class TeamChatRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    player_message: str = Field(..., min_length=1)
+    config: ChatConfig | None = None
+
+
+class TeamChatReply(BaseModel):
+    member_role_id: str = Field(..., min_length=1)
+    member_name: str = Field(..., min_length=1)
+    content: str = Field(..., min_length=1)
+    response_mode: Literal["speech", "action"] = "speech"
+    affinity_delta: int = 0
+    trust_delta: int = 0
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class TeamChatResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    player_message: str = Field(..., min_length=1)
+    replies: list[TeamChatReply] = Field(default_factory=list)
+    team_state: TeamState
+    time_spent_min: int = Field(default=1, ge=1)
+
+
+class EntityIndexResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    world_revision: int
+    map_revision: int
+    zone_ids: list[str] = Field(default_factory=list)
+    sub_zone_ids: list[str] = Field(default_factory=list)
+    npc_ids: list[str] = Field(default_factory=list)
+    quest_ids: list[str] = Field(default_factory=list)
+    encounter_ids: list[str] = Field(default_factory=list)
+    fate_phase_ids: list[str] = Field(default_factory=list)
+
+
+class ConsistencyRunRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+
+
+class ConsistencyStatusResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    world_state: WorldState
+    issue_count: int = 0
+    issues: list[ConsistencyIssue] = Field(default_factory=list)
+
+
+class ConsistencyRunResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    world_state: WorldState
+    issue_count: int = 0
+    issues: list[ConsistencyIssue] = Field(default_factory=list)
+    changed: bool = False
+
+
+class InventoryOwnerRef(BaseModel):
+    owner_type: Literal["player", "role"]
+    role_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_owner(self) -> "InventoryOwnerRef":
+        if self.owner_type == "player" and self.role_id:
+            raise ValueError("player owner must not include role_id")
+        if self.owner_type == "role" and not (self.role_id or "").strip():
+            raise ValueError("role owner requires role_id")
+        if self.owner_type == "player":
+            self.role_id = None
+        elif self.role_id is not None:
+            self.role_id = self.role_id.strip()
+        return self
+
+
+class InventoryEquipRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    owner: InventoryOwnerRef
+    item_id: str = Field(..., min_length=1)
+    slot: Literal["weapon", "armor"]
+
+
+class InventoryUnequipRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    owner: InventoryOwnerRef
+    slot: Literal["weapon", "armor"]
+
+
+class InventoryMutationResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    owner: InventoryOwnerRef
+    message: str = Field(default="", min_length=0)
+    player: PlayerStaticData | None = None
+    role: NpcRoleCard | None = None
+
+
+class InventoryInteractRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    owner: InventoryOwnerRef
+    item_id: str = Field(..., min_length=1)
+    mode: Literal["inspect", "use"] = "inspect"
+    prompt: str = Field(default="", min_length=0)
+    config: ChatConfig | None = None
+
+
+class InventoryInteractResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    owner: InventoryOwnerRef
+    item_id: str = Field(..., min_length=1)
+    mode: Literal["inspect", "use"]
+    reply: str = Field(..., min_length=1)
+    time_spent_min: int = Field(default=1, ge=1)
+    action_check: ActionCheckResponse | None = None
+    player: PlayerStaticData | None = None
+    role: NpcRoleCard | None = None
+    scene_events: list[SceneEvent] = Field(default_factory=list)
 
 
 class PlayerEquipRequest(BaseModel):
@@ -706,3 +1447,6 @@ class PlayerSpellSlotAdjustRequest(BaseModel):
 
 class PlayerStaminaAdjustRequest(BaseModel):
     amount: int = Field(default=1, ge=1)
+
+
+EncounterEntry.model_rebuild()

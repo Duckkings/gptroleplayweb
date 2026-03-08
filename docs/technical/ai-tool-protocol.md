@@ -1,167 +1,282 @@
-﻿# AI 工具协议（Tool Protocol）
-
+# AI 工具协议（Tool Protocol）
 ## 设计来源
-- docs/design/gamedesign/gamedesign.md
-- docs/design/gamedesign/areadesign.md
+- `docs/design/gamedesign/gamedesign.md`
+- `docs/design/gamedesign/roledesign.md`
+- `docs/design/gamedesign/teamdesign.md`
 
-本文档定义后端开放给 AI 的“工具调用协议”，用于在聊天流程中触发业务能力（如生成区块、移动玩家、读取玩家数据），并将结果回写到前端状态与存档。
+更新于 `2026-03-08`。
 
-## 目标
+## 1. 目标
+- 让模型通过结构化工具读取当前游戏事实，而不是依赖自由记忆。
+- 让所有写操作都经过后端校验、日志和存档。
+- 让一致性、角色、队伍、任务、遭遇等系统共享同一层工具协议。
 
-- 让玩家可以在聊天中用自然语言触发地图/日志等业务能力。
-- 保持 AI 不直接访问本地 API，由后端代理执行工具调用。
-- 保证工具调用参数可校验、可追踪、可回滚。
+## 2. 总体流程
+1. 前端调用 `/api/v1/chat` 或 `/api/v1/chat/stream`
+2. 后端把工具 schema 附给模型
+3. 模型返回 `tool_call`
+4. 后端执行：
+   - 参数解析
+   - schema 校验
+   - 业务逻辑
+   - 结果序列化
+5. 后端将 `tool` 消息回注给模型
+6. 模型输出最终自然语言结果
+7. 工具执行摘要进入 `tool_events`
 
-## 总体流程
+## 3. 工具分层
+### 3.1 只读工具
+- `get_player_state`
+- `get_story_snapshot`
+- `get_entity_index`
+- `get_consistency_status`
+- `get_npc_knowledge`
+- `get_team_state`
+- `get_role_inventory`
+- `get_map_index`
+- `get_game_logs`
+- `get_current_sub_zone`
 
-1. 前端发送聊天请求到后端（`/api/v1/chat`）。
-2. 后端调用模型，并附带工具定义（tools schema）。
-3. 模型返回 `tool_call`（函数名 + JSON 参数）。
-4. 后端校验参数并执行对应业务函数。
-5. 后端将工具结果作为 `tool` 消息回注给模型，获取最终自然语言回复。
-6. 后端返回：
-   - `reply`（GM 文本）
-   - `tool_events`（本次工具执行摘要）
-   - `state_patch`（前端应刷新的状态片段，可选）
+### 3.2 写入工具
+- `generate_zone`
+- `move_to_zone`
+- `move_to_sub_zone`
+- `discover_interactions`
+- `execute_interaction`
+- `run_consistency_check`
+- `team_invite_npc`
+- `team_remove_npc`
+- `team_chat`
+- `team_generate_debug_member`
+- `player_add_item`
+- `player_equip_item`
+- `player_apply_buff`
+- `player_adjust_resource`
+- `role_set_relation`
+- `player_set_trait`
 
-## 工具调用约束
+## 4. 当前关键工具说明
+### 4.1 `get_player_state`
+返回当前完整运行时状态：
+- `world_state`
+- `player_static_data`
+- `player_runtime_data`
+- `map_snapshot`
+- `area_snapshot`
+- `team_state`
+- `quest_state`
+- `encounter_state`
+- `fate_state`
+- `role_pool`
 
-- AI 不能直接调用 HTTP API，只能返回工具调用意图。
-- 后端必须做 JSON Schema 校验；失败则返回工具错误并要求模型重试。
-- 所有写操作工具默认要求 `session_id` 存在且一致。
-- 工具执行必须记录日志（调用时间、参数、结果、错误、token 使用）。
+### 4.2 `get_story_snapshot`
+返回统一故事快照：
+- `world_revision / map_revision`
+- 当前区块与子区块
+- 当前可见 NPC
+- 当前队伍成员 ID
+- 活动任务
+- 当前命运线 / 阶段
+- 最近遭遇
 
-## 工具定义（首批）
+### 4.3 `get_entity_index`
+返回当前合法实体 ID 集合：
+- `zone_ids`
+- `sub_zone_ids`
+- `npc_ids`
+- `quest_ids`
+- `encounter_ids`
+- `fate_phase_ids`
 
-### `generate_zone`
+### 4.4 `get_npc_knowledge`
+返回 NPC 的知识边界：
+- `known_local_npc_ids`
+- `known_local_zone_ids`
+- `known_active_quest_refs`
+- `forbidden_entity_ids`
+- `response_rules`
 
-用途：生成一个或多个新地图区块并写入当前存档。
+### 4.5 `get_team_state`
+返回当前队伍状态：
+- `team_state.members`
+- `team_state.reactions`
+- 当前成员好感 / 信任
+- 最近队伍反馈
 
-输入参数：
+### 4.6 `get_role_inventory`
+返回目标 NPC 的背包与装备槽：
+- `backpack`
+- `equipment_slots`
 
+### 4.7 `team_invite_npc`
+用途：
+- 招募一个合法 NPC 入队
+
+输入：
 ```json
 {
-  "session_id": "sess_xxx",
-  "world_prompt": "剑与魔法世界",
-  "count": 1,
-  "near_player": true
+  "npc_role_id": "npc_xxx",
+  "player_prompt": "一起行动，彼此照应。"
 }
 ```
 
-参数说明：
+输出重点：
+- `accepted`
+- `chat_feedback`
+- `member`
+- `team_state`
 
-- `session_id`: 会话 ID，必填。
-- `world_prompt`: 区块生成约束提示词，必填。
-- `count`: 生成数量，默认 `1`，范围建议 `1-3`。
-- `near_player`: 是否要求靠近玩家当前位置，默认 `true`。
+### 4.8 `team_remove_npc`
+用途：
+- 让一个当前队友离队
 
-返回结果：
-
+输入：
 ```json
 {
-  "ok": true,
-  "generated": 1,
-  "zones": [
-    {
-      "zone_id": "zone_120_-80_0",
-      "name": "碎石坡驿道",
-      "x": 120,
-      "y": -80,
-      "z": 0,
-      "description": "......",
-      "tags": ["ai", "generated"]
-    }
-  ]
+  "npc_role_id": "npc_xxx",
+  "reason": "manual"
 }
 ```
 
-失败结果：
+### 4.9 `team_chat`
+用途：
+- 发送一条玩家消息到当前队伍聊天，并返回每个队友的回应
 
+输入：
 ```json
 {
-  "ok": false,
-  "error_code": "INVALID_AI_JSON",
-  "message": "模型返回结构不完整"
+  "player_message": "我们先稳住，不要惊动前面的人。"
 }
 ```
 
-### `move_to_zone`
+输出重点：
+- `replies`
+- `team_state`
+- `time_spent_min`
 
-用途：将玩家移动到目标区块，计算耗时，生成移动日志。
+说明：
+- `replies[*].response_mode` 为 `speech` 或 `action`
+- 队伍聊天会推进世界时间，并把对话写入各队友的 `dialogue_logs`
 
-输入参数：
+### 4.10 `team_generate_debug_member`
+用途：
+- 根据短 prompt 生成调试队友并直接加入当前队伍
 
-```json
-{
-  "session_id": "sess_xxx",
-  "to_zone_id": "zone_120_-80_0"
-}
-```
+## 5. 调用顺序约束
+### 5.1 一致性相关
+当问题涉及以下内容时，应优先先读状态再行动：
+- 当前世界事实
+- NPC 是否存在
+- 当前任务 / 命运阶段
+- 当前合法实体引用
 
-返回结果：
+推荐顺序：
+1. `get_story_snapshot`
+2. 必要时 `get_entity_index`
+3. 若涉及 NPC 知识边界，再调 `get_npc_knowledge`
 
-```json
-{
-  "ok": true,
-  "new_position": { "x": 120, "y": -80, "z": 0, "zone_id": "zone_120_-80_0" },
-  "duration_min": 12,
-  "movement_log_id": "log_1730000000"
-}
-```
+### 5.2 队伍相关
+- 模型想招募 NPC：
+  1. 先确认 NPC 合法存在
+  2. 必要时读 `get_team_state`
+  3. 再调 `team_invite_npc`
 
-### `get_player_state`
+- 模型想查看队友物品：
+  1. 先确认目标角色
+  2. 再调 `get_role_inventory`
 
-用途：读取玩家静态/运行时数据，辅助叙事或决策。
+- 模型想让队友整体回应：
+  1. 必要时读 `get_team_state`
+  2. 再调 `team_chat`
 
-输入参数：
+### 5.3 一致性修复
+- 当模型怀疑世界状态过期或脏引用存在时：
+  1. `get_consistency_status`
+  2. 必要时 `run_consistency_check`
+  3. 重新读取 `get_story_snapshot`
 
-```json
-{
-  "session_id": "sess_xxx"
-}
-```
+## 6. 响应与审计规则
+- 工具执行失败时必须返回 `ok=false`
+- 失败响应必须包含最小可诊断错误摘要
+- 所有写操作默认绑定当前 `session_id`
+- 后端会把工具执行摘要记录到 `tool_events`
+- 关键业务事件仍需写入 `game_logs`
 
-返回结果：
+## 7. 与一致性系统的关系
+- 任务 / 遭遇生成已经依赖：
+  - `GlobalStorySnapshot`
+  - `EntityIndex`
+  - 输出后二次校验
+- 队伍工具则在此基础上补齐了：
+  - 结构化队伍状态读取
+  - 结构化入队 / 离队
+  - 结构化队伍聊天
+  - 结构化背包读取
 
-```json
-{
-  "ok": true,
-  "player_static_data": {
-    "player_id": "player_001",
-    "name": "玩家",
-    "move_speed_mph": 4500
-  },
-  "player_runtime_data": {
-    "session_id": "sess_xxx",
-    "current_position": { "x": 0, "y": 0, "z": 0, "zone_id": "zone_0_0_0" }
-  }
-}
-```
+## 8. 前端联动
+- 调试面板展示 `tool_events`
+- 若工具写入了地图、队伍、一致性状态，前端必须刷新对应状态片段
+- 当前已接入的典型联动：
+  - 一致性状态面板
+  - 当前队伍面板
+  - 队伍聊天面板
+  - 队友背包详情模态
 
-## 错误码建议
+## 9. 后续建议
+- 将 fate 生成也彻底统一到 `allowed entity ids + structured refs`
+- 给工具错误补统一 `error_code`
+- 若后续做复杂队友协作，再单独拆出“战术工具协议”
+## 2026-03-08 Addendum
+### 新增或补强的工具能力
+- `team_generate_debug_member`
+  - 现在底层走 `generate_team_role_from_prompt(...)`
+  - prompt 不再只影响命名，而是影响完整角色概念、职业方向、语言、喜好、装备偏好和背包内容
+- `inventory_mutate`
+  - 统一处理玩家/队友的装备与卸下
+- `inventory_interact`
+  - 统一处理玩家/队友的物品观察与使用
 
-- `INVALID_ARGS`: 参数缺失或类型错误。
-- `SESSION_MISMATCH`: 会话与当前存档不一致。
-- `ZONE_NOT_FOUND`: 目标区块不存在。
-- `AI_TIMEOUT`: 上游模型超时。
-- `INVALID_AI_JSON`: 上游模型返回不可解析结构。
-- `INTERNAL_ERROR`: 未分类内部错误。
+### 队友生成工具约束
+- `team_generate_debug_member` 只接受短 prompt
+- 生成时使用固定结构化字段：
+  - `display_name`
+  - `race`
+  - `char_class`
+  - `sheet_background`
+  - `alignment`
+  - `personality`
+  - `speaking_style`
+  - `appearance`
+  - `background`
+  - `cognition`
+  - `secret`
+  - `likes`
+  - `languages`
+  - `tool_proficiencies`
+  - `skills_proficient`
+  - `features_traits`
+  - `spells`
+  - `preferred_weapon`
+  - `preferred_armor`
+  - `inventory_items`
+  - `notes`
+  - `ability_bias`
+- 后端会对这些字段做清洗，模型不能绕过后端直接写非法装备或非法数值。
 
-## 安全与风控
-
-- 工具白名单：只允许文档中注册的工具被调用。
-- 参数限流：对 `count`、文本长度、调用频率做限制。
-- 幂等策略：同一 `request_id` 的重复调用只执行一次。
-- 审计字段：`session_id`、`tool_name`、`args_hash`、`duration_ms`、`status`。
-
-## 前端联动建议
-
-- 聊天响应增加 `tool_events` 字段，显示“AI 调用了什么工具”。
-- 若 `tool_events` 包含地图变更，前端自动刷新地图快照与二维图。
-- 若工具失败，聊天区显示错误摘要，不中断会话。
-
-## 版本
-
-- 文档版本：`v0.1`
-- 状态：草案，可随实现迭代更新
-
+### Inventory 工具调用规则
+- `inventory_mutate`
+  - 入参：
+    - `owner_type`
+    - `role_id`（仅 owner_type=role 时必填）
+    - `mode`
+    - `item_id`
+    - `slot`
+- `inventory_interact`
+  - 入参：
+    - `owner_type`
+    - `role_id`（仅 owner_type=role 时必填）
+    - `item_id`
+    - `mode=inspect|use`
+    - `prompt`
+- `use` 仅允许对 `misc` 物品调用
+- 队友物品使用时，行为执行者是队友自身，不是玩家

@@ -5,9 +5,11 @@ import hashlib
 import json
 from math import ceil, sqrt
 import random
+import re
 
 from openai import OpenAI
 
+from app.core.prompt_keys import PromptKeys
 from app.core.storage import read_save_payload, storage_state, write_save_payload
 from app.core.token_usage import token_usage_store
 from app.core.prompt_table import prompt_table
@@ -41,10 +43,18 @@ from app.models.schemas import (
     MovementLog,
     NpcRoleCard,
     NpcDialogueEntry,
+    NpcConversationState,
     NpcChatRequest,
     NpcChatResponse,
     NpcGreetRequest,
     NpcGreetResponse,
+    InventoryItem,
+    InventoryOwnerRef,
+    InventoryEquipRequest,
+    InventoryUnequipRequest,
+    InventoryMutationResponse,
+    InventoryInteractRequest,
+    InventoryInteractResponse,
     PlayerRuntimeData,
     PlayerBuffAddRequest,
     PlayerBuffRemoveRequest,
@@ -72,11 +82,20 @@ from app.models.schemas import (
     RenderNode,
     RenderSubNode,
     SaveFile,
+    SceneEvent,
     WorldClock,
     WorldClockInitRequest,
     WorldClockInitResponse,
     Zone,
     ZoneSubZoneSeed,
+)
+from app.services.consistency_service import (
+    build_npc_knowledge_snapshot,
+    bump_world_revision,
+    ensure_world_state,
+    npc_guard_reply,
+    player_mentions_unknown_npc,
+    reconcile_consistency,
 )
 
 
@@ -240,18 +259,75 @@ def _pick(seed: str, options: list[str]) -> str:
     return options[_stable_int(seed) % len(options)]
 
 
+def _pick_many(seed: str, options: list[str], count: int) -> list[str]:
+    unique = [item for item in dict.fromkeys(options) if item]
+    if not unique or count <= 0:
+        return []
+    rng = random.Random(_stable_int(seed))
+    if count >= len(unique):
+        rng.shuffle(unique)
+        return unique
+    return rng.sample(unique, count)
+
+
+def _make_npc_item(
+    item_id: str,
+    name: str,
+    *,
+    item_type: str,
+    slot_type: str = "misc",
+    description: str = "",
+    rarity: str = "common",
+    value: int = 0,
+    effect: str = "",
+    attack_bonus: int = 0,
+    armor_bonus: int = 0,
+) -> InventoryItem:
+    return InventoryItem(
+        item_id=item_id,
+        name=name,
+        item_type=item_type,
+        slot_type=slot_type,  # type: ignore[arg-type]
+        description=description,
+        rarity=rarity,
+        value=value,
+        effect=effect,
+        attack_bonus=attack_bonus,
+        armor_bonus=armor_bonus,
+    )
+
+
+def _build_npc_likes(npc_id: str) -> list[str]:
+    return _pick_many(
+        f"{npc_id}:likes",
+        [
+            "热茶",
+            "地方传闻",
+            "罕见草药",
+            "旧地图",
+            "干净的武器",
+            "准时赴约",
+            "手工点心",
+            "安静的夜晚",
+            "可靠的同伴",
+            "有趣的冒险故事",
+        ],
+        3,
+    )
+
+
 def _build_npc_flavor(npc_id: str, zone_name: str, sub_name: str, sub_desc: str) -> dict[str, str]:
     personality = _pick(
         f"{npc_id}:personality",
-        ["谨慎", "豪爽", "机敏", "稳重", "多疑", "热心", "冷静", "直率"],
+        ["谨慎", "豪爽", "机敏", "稳重", "多疑", "热心", "冷静", "直率", "寡言", "健谈"],
     )
     speaking_style = _pick(
         f"{npc_id}:speech",
-        ["语速平缓，措辞克制", "说话简短直接", "喜欢举例说明", "习惯先试探再表态", "带有地方口音"],
+        ["语速平缓，措辞克制", "说话简短直接", "喜欢举例说明", "习惯先试探再表态", "带有地方口音", "偶尔会先观察再开口"],
     )
     appearance = _pick(
         f"{npc_id}:appearance",
-        ["披着旧斗篷", "佩戴铜制护符", "手上有旧伤疤", "衣着整洁但朴素", "背着工具包"],
+        ["披着旧斗篷", "佩戴铜制护符", "手上有旧伤疤", "衣着整洁但朴素", "背着工具包", "腰间挂着旧钥匙串"],
     )
     cognition = _pick(
         f"{npc_id}:cognition",
@@ -262,6 +338,16 @@ def _build_npc_flavor(npc_id: str, zone_name: str, sub_name: str, sub_desc: str)
         ["lawful_good", "neutral_good", "true_neutral", "chaotic_neutral", "lawful_neutral"],
     )
     background = f"常驻于【{zone_name}/{sub_name}】。{sub_desc[:42]}".strip()
+    secret = _pick(
+        f"{npc_id}:secret",
+        [
+            f"暗中记录【{zone_name}】来往旅人的消息",
+            f"私下藏着一份关于【{sub_name}】的旧线索",
+            "欠着某位旧识一笔没有还清的人情",
+            "曾经参与过一次不愿再提起的失败护送",
+            "手里握着一条只在必要时才会透露的情报",
+        ],
+    )
     return {
         "personality": personality,
         "speaking_style": speaking_style,
@@ -269,6 +355,7 @@ def _build_npc_flavor(npc_id: str, zone_name: str, sub_name: str, sub_desc: str)
         "background": background,
         "cognition": cognition,
         "alignment": alignment,
+        "secret": secret,
     }
 
 
@@ -282,6 +369,117 @@ def _build_npc_identity(zone_name: str, sub_name: str, sub_id: str, idx: int = 0
     return role_id, name
 
 
+def _build_npc_talkative_maximum(npc_id: str, personality: str) -> int:
+    base = 52 + (_stable_int(f"{npc_id}:talkative") % 32)
+    if any(token in personality for token in ["健谈", "豪爽", "热心"]):
+        base += 10
+    if any(token in personality for token in ["寡言", "谨慎", "多疑"]):
+        base -= 8
+    return max(35, min(96, base))
+
+
+def _class_template(char_class: str) -> dict[str, object]:
+    templates: dict[str, dict[str, object]] = {
+        "战士": {
+            "saving_throws": ["strength", "constitution"],
+            "skills": ["athletics", "intimidation"],
+            "tools": ["护甲保养工具"],
+            "features": ["第二风息", "战斗风格"],
+            "weapon": ("长剑", "近战常用制式武器", "近战力量", 2),
+            "armor": ("锁子甲", "常备护甲", 4),
+            "extras": [("磨刀石", "misc"), ("水袋", "misc")],
+            "spells": [],
+            "spell_slots_level_1": 0,
+            "hit_dice": "1d10",
+        },
+        "游荡者": {
+            "saving_throws": ["dexterity", "intelligence"],
+            "skills": ["stealth", "sleight_of_hand"],
+            "tools": ["盗贼工具"],
+            "features": ["偷袭", "巧妙动作"],
+            "weapon": ("短剑", "轻巧的近战武器", "finesse dex", 2),
+            "armor": ("皮甲", "方便行动的轻甲", 2),
+            "extras": [("开锁器", "misc"), ("藏钱袋", "misc")],
+            "spells": [],
+            "spell_slots_level_1": 0,
+            "hit_dice": "1d8",
+        },
+        "牧师": {
+            "saving_throws": ["wisdom", "charisma"],
+            "skills": ["insight", "medicine"],
+            "tools": ["圣徽保养包"],
+            "features": ["神圣感知", "祈祷仪式"],
+            "weapon": ("钉头锤", "沉稳的单手武器", "近战力量", 1),
+            "armor": ("鳞甲", "神职护甲", 3),
+            "extras": [("圣徽", "misc"), ("香料包", "misc")],
+            "spells": ["疗伤术", "祝福术", "神导术"],
+            "spell_slots_level_1": 2,
+            "hit_dice": "1d8",
+        },
+        "法师": {
+            "saving_throws": ["intelligence", "wisdom"],
+            "skills": ["arcana", "history"],
+            "tools": ["抄写工具"],
+            "features": ["奥术恢复", "法术书"],
+            "weapon": ("法杖", "施法与自卫兼用", "spell focus", 1),
+            "armor": ("法袍", "轻便衣袍", 0),
+            "extras": [("法术书", "misc"), ("墨水套装", "misc")],
+            "spells": ["魔法飞弹", "护盾术", "侦测魔法"],
+            "spell_slots_level_1": 3,
+            "hit_dice": "1d6",
+        },
+        "游侠": {
+            "saving_throws": ["strength", "dexterity"],
+            "skills": ["survival", "perception"],
+            "tools": ["猎具维护包"],
+            "features": ["偏好地形", "追踪者"],
+            "weapon": ("短弓", "远程巡猎武器", "ranged dex", 2),
+            "armor": ("皮甲", "轻便护甲", 2),
+            "extras": [("箭袋", "misc"), ("干粮包", "misc")],
+            "spells": ["猎人印记", "疗伤术"],
+            "spell_slots_level_1": 2,
+            "hit_dice": "1d10",
+        },
+        "吟游诗人": {
+            "saving_throws": ["dexterity", "charisma"],
+            "skills": ["persuasion", "performance"],
+            "tools": ["乐器"],
+            "features": ["诗人激励", "万事通"],
+            "weapon": ("细剑", "便于在表演中携带", "finesse dex", 2),
+            "armor": ("皮甲", "做工精致的轻甲", 1),
+            "extras": [("鲁特琴", "misc"), ("记事册", "misc")],
+            "spells": ["魅惑人类", "治疗真言", "塔莎狂笑术"],
+            "spell_slots_level_1": 2,
+            "hit_dice": "1d8",
+        },
+        "武僧": {
+            "saving_throws": ["strength", "dexterity"],
+            "skills": ["acrobatics", "insight"],
+            "tools": ["草药工具"],
+            "features": ["疾风连击", "气"],
+            "weapon": ("短棍", "便于训练的武器", "monk dex", 1),
+            "armor": ("练功服", "并非真正护甲", 0),
+            "extras": [("绷带卷", "misc"), ("木珠手串", "misc")],
+            "spells": [],
+            "spell_slots_level_1": 0,
+            "hit_dice": "1d8",
+        },
+        "德鲁伊": {
+            "saving_throws": ["intelligence", "wisdom"],
+            "skills": ["nature", "animal_handling"],
+            "tools": ["草药包"],
+            "features": ["自然感知", "野性变身见闻"],
+            "weapon": ("木杖", "沾着草药气味的手杖", "spell focus", 1),
+            "armor": ("皮甲", "缝着叶片的轻甲", 1),
+            "extras": [("草药袋", "misc"), ("种子囊", "misc")],
+            "spells": ["纠缠术", "疗伤术", "造水术"],
+            "spell_slots_level_1": 2,
+            "hit_dice": "1d8",
+        },
+    }
+    return templates.get(char_class, templates["战士"])
+
+
 def _build_npc_profile(npc_id: str, npc_name: str) -> PlayerStaticData:
     strength = _ability_score_with_seed(npc_id, 1)
     dexterity = _ability_score_with_seed(npc_id, 2)
@@ -290,29 +488,83 @@ def _build_npc_profile(npc_id: str, npc_name: str) -> PlayerStaticData:
     wisdom = _ability_score_with_seed(npc_id, 5)
     charisma = _ability_score_with_seed(npc_id, 6)
     level = 1 + (_stable_int(f"{npc_id}:lvl") % 5)
+    race = _pick(
+        f"{npc_id}:race",
+        ["人类", "精灵", "矮人", "半身人", "半精灵", "侏儒", "提夫林"],
+    )
+    char_class = _pick(
+        f"{npc_id}:class",
+        ["战士", "游荡者", "牧师", "法师", "游侠", "吟游诗人", "武僧", "德鲁伊"],
+    )
+    sheet_background = _pick(
+        f"{npc_id}:sheet_background",
+        ["城镇守望", "行会学徒", "旅商随员", "边境猎手", "神殿侍者", "抄写员", "草药采集者", "佣兵"],
+    )
+    alignment = _pick(
+        f"{npc_id}:sheet_alignment",
+        ["lawful_good", "neutral_good", "true_neutral", "chaotic_neutral", "lawful_neutral"],
+    )
+    template = _class_template(char_class)
     con_mod = _ability_mod(constitution)
-    hp_max = max(4, 8 + con_mod + max(level - 1, 0) * (5 + con_mod))
+    hit_dice = str(template.get("hit_dice") or "1d8")
+    hit_die_size = int(hit_dice.split("d", 1)[1]) if "d" in hit_dice else 8
+    hp_max = max(4, hit_die_size + con_mod + max(level - 1, 0) * (max(4, hit_die_size // 2 + 1) + con_mod))
     proficiency = 2 + ((level - 1) // 4)
-    armor_class = 10 + _ability_mod(dexterity)
-    speed_ft = 30
+    speed_ft = 35 if race in {"半精灵"} else 30
+    move_speed_mph = max(3200, speed_ft * 140)
     initiative_bonus = _ability_mod(dexterity)
+    weapon_name, weapon_desc, weapon_effect, weapon_bonus = template["weapon"]  # type: ignore[index]
+    armor_name, armor_desc, armor_bonus = template["armor"]  # type: ignore[index]
+    weapon_item = _make_npc_item(
+        f"{npc_id}_weapon",
+        str(weapon_name),
+        item_type="weapon",
+        slot_type="weapon",
+        description=str(weapon_desc),
+        effect=str(weapon_effect),
+        attack_bonus=int(weapon_bonus),
+        value=10 + level * 3,
+    )
+    armor_item = _make_npc_item(
+        f"{npc_id}_armor",
+        str(armor_name),
+        item_type="armor",
+        slot_type="armor",
+        description=str(armor_desc),
+        armor_bonus=int(armor_bonus),
+        value=12 + level * 3,
+    )
+    extra_items = [
+        _make_npc_item(
+            f"{npc_id}_extra_{idx}",
+            str(name),
+            item_type=str(item_type),
+            description=f"{npc_name} 随身携带的物品。",
+            value=3 + idx * 2,
+        )
+        for idx, (name, item_type) in enumerate(template["extras"], start=1)  # type: ignore[index]
+    ]
+    all_items = [weapon_item, armor_item, *extra_items]
+    spell_list = list(template.get("spells") or [])
+    first_level_slots = int(template.get("spell_slots_level_1") or 0)
+    armor_class = 10 + int(armor_bonus) + _ability_mod(dexterity)
 
     profile = PlayerStaticData(
         player_id=npc_id,
         name=npc_name,
-        move_speed_mph=4200,
+        move_speed_mph=move_speed_mph,
         role_type="npc",
         dnd5e_sheet={
             "level": level,
-            "race": "",
-            "char_class": "",
-            "background": "",
-            "alignment": "",
+            "race": race,
+            "char_class": char_class,
+            "background": sheet_background,
+            "alignment": alignment,
             "proficiency_bonus": proficiency,
             "armor_class": armor_class,
             "speed_ft": speed_ft,
             "initiative_bonus": initiative_bonus,
-            "hit_dice": "1d8",
+            "hit_dice": hit_dice,
             "hit_points": {"current": hp_max, "maximum": hp_max, "temporary": 0},
             "ability_scores": {
                 "strength": strength,
@@ -322,22 +574,167 @@ def _build_npc_profile(npc_id: str, npc_name: str) -> PlayerStaticData:
                 "wisdom": wisdom,
                 "charisma": charisma,
             },
-            "saving_throws_proficient": [],
-            "skills_proficient": [],
-            "languages": [],
-            "tool_proficiencies": [],
-            "equipment": [],
-            "features_traits": [],
-            "spells": [],
-            "notes": "",
+            "saving_throws_proficient": list(template.get("saving_throws") or []),
+            "skills_proficient": list(template.get("skills") or []),
+            "languages": ["通用语", *_pick_many(f"{npc_id}:languages", ["矮人语", "精灵语", "半身人语", "行商黑话"], 1)],
+            "tool_proficiencies": list(template.get("tools") or []),
+            "equipment": [item.name for item in all_items],
+            "equipment_slots": {
+                "weapon_item_id": weapon_item.item_id,
+                "armor_item_id": armor_item.item_id,
+            },
+            "backpack": {
+                "gold": 8 + (_stable_int(f"{npc_id}:gold") % 37),
+                "items": [item.model_dump(mode="json") for item in all_items],
+            },
+            "features_traits": list(template.get("features") or []),
+            "spells": spell_list,
+            "spell_slots_max": {
+                "level_1": first_level_slots,
+                "level_2": 0,
+                "level_3": 0,
+                "level_4": 0,
+                "level_5": 0,
+                "level_6": 0,
+                "level_7": 0,
+                "level_8": 0,
+                "level_9": 0,
+            },
+            "spell_slots_current": {
+                "level_1": first_level_slots,
+                "level_2": 0,
+                "level_3": 0,
+                "level_4": 0,
+                "level_5": 0,
+                "level_6": 0,
+                "level_7": 0,
+                "level_8": 0,
+                "level_9": 0,
+            },
+            "notes": f"常驻NPC模板：{sheet_background}，职业倾向为{char_class}。",
         },
     )
     _recompute_player_derived(profile)
     return profile
 
 
+def _spell_slots_total(sheet) -> int:
+    return sum(int(getattr(sheet, _spell_slot_field(level))) for level in range(1, 10))
+
+
+def _ensure_npc_role_complete(save: SaveFile, role: NpcRoleCard) -> bool:
+    zone_name = next((item.name for item in save.area_snapshot.zones if item.zone_id == role.zone_id), role.zone_id or "当前区域")
+    sub = next((item for item in save.area_snapshot.sub_zones if item.sub_zone_id == role.sub_zone_id), None)
+    sub_name = sub.name if sub is not None else (role.sub_zone_id or "附近")
+    sub_desc = sub.description if sub is not None else ""
+    flavor = _build_npc_flavor(role.role_id, zone_name, sub_name, sub_desc)
+    profile_template = _build_npc_profile(role.role_id, role.name)
+    changed = False
+
+    for field in ("personality", "speaking_style", "appearance", "background", "cognition", "alignment", "secret"):
+        if not getattr(role, field, ""):
+            setattr(role, field, flavor[field])
+            changed = True
+    if not role.likes:
+        role.likes = _build_npc_likes(role.role_id)
+        changed = True
+    if getattr(role, "conversation_state", None) is None:
+        role.conversation_state = NpcConversationState()
+        changed = True
+
+    target_talkative_max = _build_npc_talkative_maximum(role.role_id, role.personality)
+    if role.talkative_maximum <= 0 or (role.talkative_maximum == 100 and not role.dialogue_logs):
+        role.talkative_maximum = target_talkative_max
+        changed = True
+    if role.talkative_current > role.talkative_maximum:
+        role.talkative_current = role.talkative_maximum
+        changed = True
+    if role.talkative_current < 0:
+        role.talkative_current = 0
+        changed = True
+
+    profile = role.profile
+    template = profile_template
+    template_sheet = template.dnd5e_sheet
+    sheet = profile.dnd5e_sheet
+
+    if profile.player_id != role.role_id:
+        profile.player_id = role.role_id
+        changed = True
+    if profile.name != role.name:
+        profile.name = role.name
+        changed = True
+    if profile.role_type != "npc":
+        profile.role_type = "npc"
+        changed = True
+    if profile.move_speed_mph <= 0:
+        profile.move_speed_mph = template.move_speed_mph
+        changed = True
+
+    for field in ("race", "char_class", "background", "alignment", "hit_dice", "notes"):
+        if not getattr(sheet, field, ""):
+            setattr(sheet, field, getattr(template_sheet, field))
+            changed = True
+    if sheet.proficiency_bonus <= 0:
+        sheet.proficiency_bonus = template_sheet.proficiency_bonus
+        changed = True
+    if sheet.speed_ft <= 0:
+        sheet.speed_ft = template_sheet.speed_ft
+        changed = True
+    if sheet.hit_points.maximum <= 0:
+        sheet.hit_points.maximum = template_sheet.hit_points.maximum
+        sheet.hit_points.current = template_sheet.hit_points.current
+        changed = True
+    if not sheet.saving_throws_proficient:
+        sheet.saving_throws_proficient = list(template_sheet.saving_throws_proficient)
+        changed = True
+    if not sheet.skills_proficient:
+        sheet.skills_proficient = list(template_sheet.skills_proficient)
+        changed = True
+    if not sheet.languages:
+        sheet.languages = list(template_sheet.languages)
+        changed = True
+    if not sheet.tool_proficiencies:
+        sheet.tool_proficiencies = list(template_sheet.tool_proficiencies)
+        changed = True
+    if not sheet.features_traits:
+        sheet.features_traits = list(template_sheet.features_traits)
+        changed = True
+    if not sheet.backpack.items:
+        sheet.backpack = template_sheet.backpack.model_copy(deep=True)
+        changed = True
+    elif sheet.backpack.gold == 0 and template_sheet.backpack.gold > 0:
+        sheet.backpack.gold = template_sheet.backpack.gold
+        changed = True
+    if not sheet.equipment:
+        sheet.equipment = list(template_sheet.equipment)
+        changed = True
+    if sheet.equipment_slots.weapon_item_id is None and template_sheet.equipment_slots.weapon_item_id is not None:
+        sheet.equipment_slots.weapon_item_id = template_sheet.equipment_slots.weapon_item_id
+        changed = True
+    if sheet.equipment_slots.armor_item_id is None and template_sheet.equipment_slots.armor_item_id is not None:
+        sheet.equipment_slots.armor_item_id = template_sheet.equipment_slots.armor_item_id
+        changed = True
+    if not sheet.spells and template_sheet.spells:
+        sheet.spells = list(template_sheet.spells)
+        changed = True
+    if (_spell_slots_total(sheet.spell_slots_max) == 2 and not sheet.spells and template_sheet.spells) or _spell_slots_total(sheet.spell_slots_max) == 0:
+        if _spell_slots_total(template_sheet.spell_slots_max) >= 0:
+            sheet.spell_slots_max = template_sheet.spell_slots_max.model_copy(deep=True)
+            sheet.spell_slots_current = template_sheet.spell_slots_current.model_copy(deep=True)
+            changed = True
+    if not sheet.spells and _spell_slots_total(sheet.spell_slots_max) > 0:
+        sheet.spell_slots_max = template_sheet.spell_slots_max.model_copy(deep=True)
+        sheet.spell_slots_current = template_sheet.spell_slots_current.model_copy(deep=True)
+        changed = True
+
+    _recompute_player_derived(profile)
+    return changed
+
+
 def _ensure_role_pool_from_area(save: SaveFile) -> bool:
     changed = False
+    world_state = ensure_world_state(save)
     role_map = {r.role_id: r for r in save.role_pool}
 
     for sub in save.area_snapshot.sub_zones:
@@ -357,6 +754,8 @@ def _ensure_role_pool_from_area(save: SaveFile) -> bool:
                     name=npc.name,
                     zone_id=sub.zone_id,
                     sub_zone_id=sub.sub_zone_id,
+                    source_world_revision=world_state.world_revision,
+                    source_map_revision=world_state.map_revision,
                     state=npc.state or "idle",
                     personality=flavor["personality"],
                     speaking_style=flavor["speaking_style"],
@@ -364,9 +763,14 @@ def _ensure_role_pool_from_area(save: SaveFile) -> bool:
                     background=flavor["background"],
                     cognition=flavor["cognition"],
                     alignment=flavor["alignment"],
+                    secret=flavor["secret"],
+                    likes=_build_npc_likes(npc.npc_id),
+                    talkative_maximum=_build_npc_talkative_maximum(npc.npc_id, flavor["personality"]),
+                    talkative_current=_build_npc_talkative_maximum(npc.npc_id, flavor["personality"]),
                     profile=_build_npc_profile(npc.npc_id, npc.name),
                     relations=[],
                 )
+                _ensure_npc_role_complete(save, role)
                 save.role_pool.append(role)
                 role_map[role.role_id] = role
                 changed = True
@@ -380,8 +784,16 @@ def _ensure_role_pool_from_area(save: SaveFile) -> bool:
                 if role.sub_zone_id != sub.sub_zone_id:
                     role.sub_zone_id = sub.sub_zone_id
                     changed = True
+                if role.source_world_revision != world_state.world_revision:
+                    role.source_world_revision = world_state.world_revision
+                    changed = True
+                if role.source_map_revision != world_state.map_revision:
+                    role.source_map_revision = world_state.map_revision
+                    changed = True
                 if role.state != (npc.state or "idle"):
                     role.state = npc.state or "idle"
+                    changed = True
+                if _ensure_npc_role_complete(save, role):
                     changed = True
 
     role_ids = [r.role_id for r in save.role_pool]
@@ -401,14 +813,6 @@ def _ensure_role_pool_from_area(save: SaveFile) -> bool:
         role.relations = relations[:2]
         changed = True
 
-    # Remove relations pointing to the player; player relation is created only after interaction.
-    player_id = save.player_static_data.player_id
-    for role in save.role_pool:
-        before = len(role.relations)
-        role.relations = [r for r in role.relations if r.target_role_id != player_id]
-        if len(role.relations) != before:
-            changed = True
-
     return changed
 
 
@@ -416,19 +820,30 @@ def get_current_save(default_session_id: str = "sess_default") -> SaveFile:
     payload = read_save_payload(storage_state.save_path)
     if payload is None:
         save = _empty_save(default_session_id)
+        ensure_world_state(save)
         save_current(save)
         return save
 
     save = SaveFile.model_validate(payload)
+    ensure_world_state(save)
     if not save.player_runtime_data.session_id:
         save.player_runtime_data.session_id = save.session_id
     _recompute_player_derived(save.player_static_data)
+    changed = False
     for role in save.role_pool:
         _recompute_player_derived(role.profile)
+        if _ensure_npc_role_complete(save, role):
+            changed = True
+    if _ensure_role_pool_from_area(save):
+        changed = True
+    _, reconciled = reconcile_consistency(save, session_id=save.session_id or default_session_id, reason="load")
+    if changed or reconciled:
+        save_current(save)
     return save
 
 
 def save_current(save: SaveFile) -> None:
+    ensure_world_state(save)
     save.updated_at = _utc_now()
     save.player_runtime_data.updated_at = save.updated_at
     write_save_payload(storage_state.save_path, save.model_dump(mode="json"))
@@ -483,36 +898,302 @@ def _get_player_item(profile: PlayerStaticData, item_id: str):
     return next((item for item in profile.dnd5e_sheet.backpack.items if item.item_id == item_id), None)
 
 
-def equip_player_item(session_id: str, payload: PlayerEquipRequest) -> PlayerStaticData:
-    save = get_current_save(default_session_id=session_id)
-    save.session_id = session_id
-    profile = save.player_static_data
-    item = _get_player_item(profile, payload.item_id)
+def _resolve_inventory_owner(save: SaveFile, owner: InventoryOwnerRef) -> tuple[str, str, PlayerStaticData, NpcRoleCard | None]:
+    if owner.owner_type == "player":
+        return save.player_static_data.player_id, save.player_static_data.name, save.player_static_data, None
+    role = next((item for item in save.role_pool if item.role_id == owner.role_id), None)
+    if role is None:
+        raise KeyError("ROLE_NOT_FOUND")
+    _ensure_npc_role_complete(save, role)
+    return role.role_id, role.name, role.profile, role
+
+
+def _get_inventory_item_for_owner(profile: PlayerStaticData, item_id: str) -> InventoryItem:
+    item = next((entry for entry in profile.dnd5e_sheet.backpack.items if entry.item_id == item_id), None)
     if item is None:
         raise KeyError("ITEM_NOT_FOUND")
-    if payload.slot == "weapon" and item.slot_type != "weapon":
+    return item
+
+
+def _equip_profile_item(profile: PlayerStaticData, item_id: str, slot: str) -> InventoryItem:
+    item = _get_inventory_item_for_owner(profile, item_id)
+    if slot == "weapon" and item.slot_type != "weapon":
         raise ValueError("ITEM_SLOT_MISMATCH")
-    if payload.slot == "armor" and item.slot_type != "armor":
+    if slot == "armor" and item.slot_type != "armor":
         raise ValueError("ITEM_SLOT_MISMATCH")
-    if payload.slot == "weapon":
+    if slot == "weapon":
         profile.dnd5e_sheet.equipment_slots.weapon_item_id = item.item_id
     else:
         profile.dnd5e_sheet.equipment_slots.armor_item_id = item.item_id
+    return item
+
+
+def _unequip_profile_item(profile: PlayerStaticData, slot: str) -> str | None:
+    if slot == "weapon":
+        equipped_id = profile.dnd5e_sheet.equipment_slots.weapon_item_id
+        profile.dnd5e_sheet.equipment_slots.weapon_item_id = None
+        return equipped_id
+    equipped_id = profile.dnd5e_sheet.equipment_slots.armor_item_id
+    profile.dnd5e_sheet.equipment_slots.armor_item_id = None
+    return equipped_id
+
+
+def _build_item_interaction_prompt(
+    owner_type: str,
+    owner_name: str,
+    item: InventoryItem,
+    mode: str,
+    prompt: str,
+    action_check_result: ActionCheckResponse | None = None,
+) -> str:
+    lines = [
+        "You narrate one short RPG inventory interaction in Chinese.",
+        f"OwnerType={owner_type}",
+        f"OwnerName={owner_name}",
+        f"Mode={mode}",
+        f"ItemName={item.name}",
+        f"ItemType={item.item_type}",
+        f"ItemDescription={item.description or '-'}",
+        f"ItemEffect={item.effect or '-'}",
+        f"PlayerPrompt={prompt or '-'}",
+    ]
+    if action_check_result is not None:
+        lines.extend(
+            [
+                f"ActionSuccess={action_check_result.success}",
+                f"ActionCritical={action_check_result.critical}",
+                f"ActionNarrative={action_check_result.narrative}",
+            ]
+        )
+    lines.append("Keep it concise, grounded in current gameplay, and do not invent unrelated entities.")
+    return "\n".join(lines)
+
+
+def _fallback_inventory_interaction_reply(
+    owner_name: str,
+    item: InventoryItem,
+    mode: str,
+    prompt: str,
+    action_check_result: ActionCheckResponse | None = None,
+) -> str:
+    clean_prompt = prompt.strip()
+    if mode == "inspect":
+        focus = f" 你特别留意了：{clean_prompt}。" if clean_prompt else ""
+        effect = f" 你能感觉到它与“{item.effect}”有关。" if item.effect else ""
+        desc = item.description or "这件物品没有更多外观说明，但保存状况还算稳定。"
+        return f"{owner_name}仔细观察【{item.name}】。{desc}{effect}{focus}"
+    if action_check_result is None:
+        return f"{owner_name}尝试使用【{item.name}】。"
+    outcome = "顺利发挥了作用" if action_check_result.success else "没能稳定发挥作用"
+    effect = item.effect or "它原本的用途"
+    focus = f" 你的意图是：{clean_prompt}。" if clean_prompt else ""
+    return f"{action_check_result.narrative}\n{owner_name}使用【{item.name}】时，{effect}{outcome}。{focus}"
+
+
+def _generate_inventory_interaction_reply(
+    session_id: str,
+    config: ChatConfig | None,
+    owner_type: str,
+    owner_name: str,
+    item: InventoryItem,
+    mode: str,
+    prompt: str,
+    action_check_result: ActionCheckResponse | None = None,
+) -> str:
+    if config is not None:
+        api_key = (config.openai_api_key or "").strip()
+        model = (config.model or "").strip()
+        if api_key and model:
+            try:
+                client = OpenAI(api_key=api_key)
+                resp = client.chat.completions.create(
+                    model=model,
+                    temperature=min(max(config.temperature, 0), 2),
+                    messages=[
+                        {"role": "system", "content": "Return plain Chinese text only."},
+                        {
+                            "role": "user",
+                            "content": _build_item_interaction_prompt(owner_type, owner_name, item, mode, prompt, action_check_result),
+                        },
+                    ],
+                )
+                content = (resp.choices[0].message.content or "").strip()
+                if content:
+                    usage = getattr(resp, "usage", None)
+                    if usage is not None:
+                        token_usage_store.add(
+                            session_id,
+                            "chat",
+                            int(getattr(usage, "prompt_tokens", 0) or 0),
+                            int(getattr(usage, "completion_tokens", 0) or 0),
+                        )
+                    return content
+            except Exception:
+                pass
+    return _fallback_inventory_interaction_reply(owner_name, item, mode, prompt, action_check_result)
+
+
+def inventory_equip(payload: InventoryEquipRequest) -> InventoryMutationResponse:
+    save = get_current_save(default_session_id=payload.session_id)
+    save.session_id = payload.session_id
+    owner_id, owner_name, profile, role = _resolve_inventory_owner(save, payload.owner)
+    item = _equip_profile_item(profile, payload.item_id, payload.slot)
     _recompute_player_derived(profile)
+    if role is not None:
+        role.profile = profile
     save_current(save)
-    return profile
+    return InventoryMutationResponse(
+        session_id=payload.session_id,
+        owner=payload.owner,
+        message=f"{owner_name} 装备了【{item.name}】。",
+        player=profile if payload.owner.owner_type == "player" else None,
+        role=role,
+    )
+
+
+def inventory_unequip(payload: InventoryUnequipRequest) -> InventoryMutationResponse:
+    save = get_current_save(default_session_id=payload.session_id)
+    save.session_id = payload.session_id
+    owner_id, owner_name, profile, role = _resolve_inventory_owner(save, payload.owner)
+    equipped_id = _unequip_profile_item(profile, payload.slot)
+    equipped_name = None
+    if equipped_id:
+        equipped_name = next((item.name for item in profile.dnd5e_sheet.backpack.items if item.item_id == equipped_id), None)
+    _recompute_player_derived(profile)
+    if role is not None:
+        role.profile = profile
+    save_current(save)
+    slot_label = "武器" if payload.slot == "weapon" else "护甲"
+    return InventoryMutationResponse(
+        session_id=payload.session_id,
+        owner=payload.owner,
+        message=f"{owner_name} 卸下了{slot_label}{f'【{equipped_name}】' if equipped_name else ''}。",
+        player=profile if payload.owner.owner_type == "player" else None,
+        role=role,
+    )
+
+
+def inventory_interact(payload: InventoryInteractRequest) -> InventoryInteractResponse:
+    save = get_current_save(default_session_id=payload.session_id)
+    save.session_id = payload.session_id
+    owner_id, owner_name, profile, role = _resolve_inventory_owner(save, payload.owner)
+    item = _get_inventory_item_for_owner(profile, payload.item_id)
+    action_result: ActionCheckResponse | None = None
+    time_spent_min = 1
+    scene_events: list[SceneEvent] = []
+
+    if payload.mode == "use":
+        if item.slot_type != "misc":
+            raise ValueError("ITEM_USE_UNSUPPORTED_SLOT")
+        if item.uses_left is not None and item.uses_left <= 0:
+            raise ValueError("ITEM_DEPLETED")
+        action_result = action_check(
+            ActionCheckRequest(
+                session_id=payload.session_id,
+                action_type="item_use",
+                action_prompt=(
+                    f"owner_type={payload.owner.owner_type}; role_id={owner_id}; "
+                    f"item_id={item.item_id}; item_name={item.name}; prompt={payload.prompt.strip() or '-'}"
+                ),
+                actor_role_id=owner_id,
+                config=payload.config,
+            )
+        )
+        time_spent_min = max(1, action_result.time_spent_min)
+        save = get_current_save(default_session_id=payload.session_id)
+        save.session_id = payload.session_id
+        owner_id, owner_name, profile, role = _resolve_inventory_owner(save, payload.owner)
+        item = _get_inventory_item_for_owner(profile, payload.item_id)
+        if action_result.success and item.uses_left is not None:
+            item.uses_left = max(0, item.uses_left - 1)
+    reply = _generate_inventory_interaction_reply(
+        payload.session_id,
+        payload.config,
+        payload.owner.owner_type,
+        owner_name,
+        item,
+        payload.mode,
+        payload.prompt,
+        action_result,
+    )
+    save.game_logs.append(
+        _new_game_log(
+            payload.session_id,
+            "inventory_interact",
+            f"{owner_name} 对【{item.name}】执行了{payload.mode}。",
+            {
+                "owner_type": payload.owner.owner_type,
+                "owner_id": owner_id,
+                "item_id": item.item_id,
+                "mode": payload.mode,
+                "time_spent_min": time_spent_min,
+            },
+        )
+    )
+    if payload.owner.owner_type == "player":
+        scene_events = advance_public_scene_in_save(
+            save,
+            payload.session_id,
+            f"{payload.mode}:{item.name}; {payload.prompt.strip()}".strip(),
+            reply,
+            payload.config,
+        )
+        summary = _scene_events_to_summary(scene_events)
+        if summary:
+            reply = f"{reply}\n\n{summary}"
+    try:
+        from app.services.encounter_service import advance_active_encounter_in_save
+
+        advanced = advance_active_encounter_in_save(save, session_id=payload.session_id, minutes_elapsed=time_spent_min, config=payload.config)
+        if advanced is not None:
+            scene_events.append(
+                _new_scene_event(
+                    "encounter_background",
+                    advanced.latest_outcome_summary or advanced.scene_summary or advanced.description,
+                    metadata={"encounter_id": advanced.encounter_id},
+                )
+            )
+    except Exception:
+        pass
+    _recompute_player_derived(profile)
+    if role is not None:
+        role.profile = profile
+    save_current(save)
+    return InventoryInteractResponse(
+        session_id=payload.session_id,
+        owner=payload.owner,
+        item_id=item.item_id,
+        mode=payload.mode,
+        reply=reply,
+        time_spent_min=time_spent_min,
+        action_check=action_result,
+        player=profile if payload.owner.owner_type == "player" else None,
+        role=role,
+        scene_events=scene_events,
+    )
+
+
+def equip_player_item(session_id: str, payload: PlayerEquipRequest) -> PlayerStaticData:
+    response = inventory_equip(
+        InventoryEquipRequest(
+            session_id=session_id,
+            owner=InventoryOwnerRef(owner_type="player"),
+            item_id=payload.item_id,
+            slot=payload.slot,
+        )
+    )
+    return response.player or get_player_static(session_id)
 
 
 def unequip_player_item(session_id: str, payload: PlayerUnequipRequest) -> PlayerStaticData:
-    save = get_current_save(default_session_id=session_id)
-    save.session_id = session_id
-    if payload.slot == "weapon":
-        save.player_static_data.dnd5e_sheet.equipment_slots.weapon_item_id = None
-    else:
-        save.player_static_data.dnd5e_sheet.equipment_slots.armor_item_id = None
-    _recompute_player_derived(save.player_static_data)
-    save_current(save)
-    return save.player_static_data
+    response = inventory_unequip(
+        InventoryUnequipRequest(
+            session_id=session_id,
+            owner=InventoryOwnerRef(owner_type="player"),
+            slot=payload.slot,
+        )
+    )
+    return response.player or get_player_static(session_id)
 
 
 def add_player_buff(session_id: str, payload: PlayerBuffAddRequest) -> PlayerStaticData:
@@ -1028,6 +1709,7 @@ def generate_regions(req: RegionGenerateRequest) -> RegionGenerateResponse:
 
     save.session_id = req.session_id
     if req.force_regenerate:
+        bump_world_revision(save, world_changed=True, map_changed=True, session_id=req.session_id)
         # Force regenerate must drop stale area/NPC data from previous map generations.
         save.role_pool = []
         save.area_snapshot = AreaSnapshot(clock=save.area_snapshot.clock)
@@ -1036,6 +1718,8 @@ def generate_regions(req: RegionGenerateRequest) -> RegionGenerateResponse:
     save.map_snapshot.zones = zones
     save.area_snapshot = _area_snapshot_from_map(save)
     _ensure_role_pool_from_area(save)
+    if req.force_regenerate:
+        reconcile_consistency(save, session_id=req.session_id, reason="map_force_regenerate")
     save.player_runtime_data.session_id = req.session_id
     save.player_runtime_data.current_position = req.player_position
     save.game_logs.append(
@@ -1143,7 +1827,63 @@ def _distance_m(from_zone: Zone, to_zone: Zone) -> float:
     return sqrt(dx * dx + dy * dy)
 
 
+def _requires_encounter_escape_before_move(
+    save: SaveFile,
+    *,
+    target_zone_id: str | None,
+    target_sub_zone_id: str | None,
+) -> str | None:
+    state = save.encounter_state
+    if state is None or not state.active_encounter_id:
+        return None
+    encounter = next((item for item in state.encounters if item.encounter_id == state.active_encounter_id), None)
+    if encounter is None or encounter.status != "active" or encounter.player_presence != "engaged":
+        return None
+    if encounter.zone_id and target_zone_id and encounter.zone_id != target_zone_id:
+        return encounter.encounter_id
+    if encounter.sub_zone_id and encounter.sub_zone_id != target_sub_zone_id:
+        return encounter.encounter_id
+    return None
+
+
+def _attempt_escape_for_move(
+    *,
+    session_id: str,
+    target_zone_id: str | None,
+    target_sub_zone_id: str | None,
+    config: ChatConfig | None = None,
+) -> None:
+    save = get_current_save(default_session_id=session_id)
+    if save.session_id != session_id:
+        save.session_id = session_id
+    _ensure_area_snapshot(save)
+    encounter_id = _requires_encounter_escape_before_move(
+        save,
+        target_zone_id=target_zone_id,
+        target_sub_zone_id=target_sub_zone_id,
+    )
+    if not encounter_id:
+        return
+    from app.models.schemas import EncounterEscapeRequest
+    from app.services.encounter_service import escape_encounter
+
+    result = escape_encounter(
+        encounter_id,
+        EncounterEscapeRequest(
+            session_id=session_id,
+            config=config,
+        ),
+    )
+    if not result.escape_success:
+        raise ValueError("ENCOUNTER_ESCAPE_BLOCKED")
+
+
 def move_to_zone(req: MoveRequest) -> MoveResponse:
+    _attempt_escape_for_move(
+        session_id=req.session_id,
+        target_zone_id=req.to_zone_id,
+        target_sub_zone_id=None,
+    )
     save = get_current_save(default_session_id=req.session_id)
     if save.session_id != req.session_id:
         raise ValueError("session mismatch with current save")
@@ -1215,6 +1955,24 @@ def move_to_zone(req: MoveRequest) -> MoveResponse:
             },
         )
     )
+    try:
+        from app.services.team_service import apply_team_reactions_in_save, sync_team_members_with_player_in_save
+
+        sync_team_members_with_player_in_save(save)
+        apply_team_reactions_in_save(
+            save,
+            session_id=req.session_id,
+            trigger_kind="zone_move",
+            summary=movement_log.summary,
+        )
+    except Exception:
+        pass
+    try:
+        from app.services.encounter_service import advance_active_encounter_in_save
+
+        advance_active_encounter_in_save(save, session_id=req.session_id, minutes_elapsed=duration_min)
+    except Exception:
+        pass
     save_current(save)
 
     return MoveResponse(
@@ -1502,6 +2260,21 @@ def _world_time_payload(clock: WorldClock | None) -> tuple[str, dict[str, str | 
     return text, payload
 
 
+def _normalize_logged_speaker_content(speaker: str, speaker_name: str, content: str) -> str:
+    clean = (content or "").strip()
+    if speaker != "npc" or not clean or not speaker_name.strip():
+        return clean
+    name = speaker_name.strip()
+    if clean.startswith(name):
+        trimmed = clean[len(name) :]
+        trimmed = trimmed.lstrip(" ：:，,。.;；")
+        if trimmed.startswith("的"):
+            trimmed = trimmed[1:].lstrip(" ：:，,。.;；")
+        if trimmed:
+            return trimmed
+    return clean
+
+
 def _append_npc_dialogue(
     role: NpcRoleCard,
     speaker: str,
@@ -1509,15 +2282,18 @@ def _append_npc_dialogue(
     speaker_name: str,
     content: str,
     clock: WorldClock | None,
+    context_kind: str = "private_chat",
 ) -> None:
     world_time_text, world_time = _world_time_payload(clock)
+    normalized_content = _normalize_logged_speaker_content(speaker, speaker_name, content)
     role.dialogue_logs.append(
         NpcDialogueEntry(
             id=f"dlg_{int(datetime.now(timezone.utc).timestamp() * 1000)}_{len(role.dialogue_logs)}",
             speaker=("player" if speaker == "player" else "npc"),  # type: ignore[arg-type]
             speaker_role_id=speaker_role_id,
             speaker_name=speaker_name,
-            content=content.strip(),
+            context_kind=context_kind,  # type: ignore[arg-type]
+            content=normalized_content,
             world_time_text=world_time_text,
             world_time=world_time,
         )
@@ -1533,8 +2309,40 @@ def _build_npc_context(role: NpcRoleCard, recent_count: int = 16) -> str:
     lines: list[str] = []
     for item in role.dialogue_logs[-recent_count:]:
         who = "玩家" if item.speaker == "player" else role.name
-        lines.append(f"[{item.world_time_text}] {who}: {item.content}")
+        context_kind = item.context_kind or "private_chat"
+        lines.append(f"[{item.world_time_text}] ({context_kind}) {who}: {item.content}")
     return "\n".join(lines)
+
+
+def _build_npc_prompt_context(role: NpcRoleCard, clock: WorldClock | None, recent_count: int = 12) -> str:
+    lines = []
+    if clock is not None:
+        world_time_text, _ = _world_time_payload(clock)
+        lines.append(f"当前世界时间={world_time_text}")
+    lines.append(_npc_conversation_state_summary(role))
+    lines.append("最近对话:")
+    lines.append(_build_npc_context(role, recent_count=recent_count))
+    return "\n".join(lines)
+
+
+def _build_npc_roleplay_brief(role: NpcRoleCard) -> str:
+    traits: list[str] = []
+    if role.personality:
+        traits.append(f"性格={_trim_npc_text(role.personality, 80)}")
+    if role.speaking_style:
+        traits.append(f"说话方式={_trim_npc_text(role.speaking_style, 80)}")
+    if role.cognition:
+        traits.append(f"认知={_trim_npc_text(role.cognition, 80)}")
+    if role.alignment:
+        traits.append(f"阵营={_trim_npc_text(role.alignment, 40)}")
+    if role.likes:
+        traits.append(f"偏好={' / '.join(role.likes[:5])}")
+    traits.append(f"健谈值={role.talkative_current}/{role.talkative_maximum}")
+    if role.state == "in_team":
+        traits.append("当前是玩家队友，通常会更愿意给出实用反馈，但仍保留个人脾气。")
+    if role.secret:
+        traits.append("有不愿轻易透露的秘密，对敏感话题会收口或转移。")
+    return "；".join(traits) or "保持该 NPC 的既有个性、语气和边界。"
 
 
 def _upsert_npc_player_relation(role: NpcRoleCard, player_id: str, relation_tag: str, note: str) -> None:
@@ -1570,6 +2378,837 @@ def apply_speech_time(session_id: str, text: str, config: ChatConfig | None) -> 
     return time_spent_min
 
 
+def _parse_player_intent(player_message: str) -> dict[str, object]:
+    raw = (player_message or "").strip()
+    parsed: dict[str, object] = {}
+    if raw.startswith("{") and raw.endswith("}"):
+        try:
+            parsed = _extract_json_content(raw)
+        except Exception:
+            parsed = {}
+    action_text = str(parsed.get("action_description") or "").strip()
+    speech_text = str(parsed.get("speech_description") or "").strip()
+    action_check = parsed.get("action_check_result") if isinstance(parsed.get("action_check_result"), dict) else None
+    if not action_text and not speech_text:
+        speech_text = raw
+    display_lines: list[str] = []
+    if action_text:
+        display_lines.append(f"动作：{action_text}")
+    if speech_text:
+        display_lines.append(f"语言：{speech_text}")
+    if isinstance(action_check, dict):
+        status = "成功" if bool(action_check.get("success")) else "失败"
+        critical = str(action_check.get("critical") or "none")
+        critical_text = ""
+        if critical == "critical_success":
+            critical_text = "（大成功）"
+        elif critical == "critical_failure":
+            critical_text = "（大失败）"
+        display_lines.append(f"检定：{status}{critical_text}")
+    display_text = "\n".join(display_lines).strip() or raw
+    return {
+        "action_text": action_text,
+        "speech_text": speech_text,
+        "display_text": display_text,
+        "action_check": action_check,
+        "raw_text": raw,
+    }
+
+
+def _contains_any_token(text: str, tokens: list[str]) -> bool:
+    lowered = text.lower()
+    return any(token.lower() in lowered for token in tokens if token)
+
+
+def _world_clock_iso(clock: WorldClock | None) -> str | None:
+    if clock is None:
+        return None
+    return _clock_to_datetime(clock).isoformat()
+
+
+def _restore_npc_talkative(role: NpcRoleCard, clock: WorldClock | None) -> int:
+    if clock is None or not role.last_private_chat_at:
+        return 0
+    try:
+        delta = _clock_to_datetime(clock) - datetime.fromisoformat(role.last_private_chat_at)
+    except ValueError:
+        return 0
+    delta_min = max(0, int(delta.total_seconds() // 60))
+    recovered = max(0, (delta_min // 20) * 4)
+    if recovered <= 0:
+        return 0
+    before = role.talkative_current
+    role.talkative_current = min(role.talkative_maximum, role.talkative_current + recovered)
+    return max(0, role.talkative_current - before)
+
+
+def _npc_talkative_delta(role: NpcRoleCard, action_text: str, speech_text: str) -> int:
+    merged = f"{action_text}\n{speech_text}".strip()
+    cost = 16 if action_text and speech_text else 10
+    if not merged:
+        cost = 6
+    if role.state == "in_team":
+        cost = max(4, cost - 4)
+    bonus = 0
+    if any(like and like in merged for like in role.likes):
+        bonus += 6
+    if _contains_any_token(merged, ["谢谢", "thank", "合作", "帮忙", "一起", "冒险", "线索", "传闻"]):
+        bonus += 3
+    if _contains_any_token(merged, ["威胁", "threat", "滚开", "抢", "命令", "闭嘴"]):
+        bonus -= 8
+    if "健谈" in role.personality:
+        cost -= 3
+    if any(token in role.personality for token in ["寡言", "谨慎", "多疑"]):
+        cost += 3
+    return bonus - max(4, cost)
+
+
+def _compose_npc_reply(action_reaction: str, speech_reply: str) -> str:
+    parts = [part.strip() for part in [action_reaction, speech_reply] if part.strip()]
+    return "\n".join(parts).strip()
+
+
+def _trim_npc_text(value: str, limit: int = 72) -> str:
+    text = " ".join((value or "").split()).strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(1, limit - 1)].rstrip("，,。.;； ") + "…"
+
+
+def _clean_conversation_topic(value: str, limit: int = 16) -> str:
+    text = _trim_npc_text(value or "", limit).strip("“”\"'，,。.;； ")
+    text = re.sub(r"[吗嘛呢啊呀吧]$", "", text)
+    return text.strip()
+
+
+def _ensure_npc_conversation_state(role: NpcRoleCard) -> NpcConversationState:
+    state = getattr(role, "conversation_state", None)
+    if state is None:
+        role.conversation_state = NpcConversationState()
+    return role.conversation_state
+
+
+def _conversation_topic_from_text(text: str) -> str:
+    clean = (text or "").strip()
+    if not clean:
+        return ""
+    patterns = [
+        r"(?:什么|啥)([^，。？！?、]{1,12})",
+        r"([^，。？！?、]{1,12})是什么",
+        r"你说的([^，。？！?、]{1,12})",
+        r"关于([^，。？！?、]{1,12})",
+        r"和([^，。？！?、]{1,12})有关",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, clean)
+        if match:
+            return _clean_conversation_topic(match.group(1), 16)
+    if "什么意思" in clean or "哪件事" in clean or "这事" in clean:
+        return ""
+    return ""
+
+
+def _conversation_claim_topic(text: str) -> str:
+    clean = (text or "").strip()
+    if not clean:
+        return ""
+    patterns = [
+        r"和([^，。？！?、]{1,12})有关",
+        r"关于([^，。？！?、]{1,12})",
+        r"我说的([^，。？！?、]{1,12})",
+        r"([^，。？！?、]{1,12})这事",
+        r"去找([^，。？！?、]{1,12})",
+        r"打听([^，。？！?、]{1,12})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, clean)
+        if match:
+            return _clean_conversation_topic(match.group(1), 16)
+    return ""
+
+
+def _looks_like_explicit_follow_up(text: str) -> bool:
+    clean = (text or "").strip()
+    return any(
+        token in clean
+        for token in [
+            "你说的",
+            "你刚说的",
+            "你提到的",
+            "刚才说的",
+            "上一句",
+            "上句",
+            "刚刚提到",
+            "那个",
+            "那件事",
+            "这事",
+            "什么意思",
+            "哪件事",
+        ]
+    )
+
+
+def _topic_matches_known_topic(topic: str, known_topic: str) -> bool:
+    left = _clean_conversation_topic(topic, 16)
+    right = _clean_conversation_topic(known_topic, 16)
+    if not left or not right:
+        return False
+    return left == right or left in right or right in left
+
+
+def _npc_follow_up_topic(role: NpcRoleCard, speech_text: str) -> str:
+    state = _ensure_npc_conversation_state(role)
+    clean = (speech_text or "").strip()
+    direct = _conversation_topic_from_text(clean)
+    if direct:
+        explicit_follow_up = _looks_like_explicit_follow_up(clean)
+        question_kind = _npc_question_kind(clean)
+        known_topics = [
+            state.current_topic,
+            _conversation_claim_topic(state.last_npc_claim),
+            state.last_referenced_entity,
+        ]
+        if explicit_follow_up or any(_topic_matches_known_topic(direct, item) for item in known_topics):
+            return direct
+        if question_kind not in {"identity", "team", "destination", "interest", "reason"} and state.last_npc_claim:
+            return direct
+    if not clean:
+        return ""
+    if any(token in clean for token in ["什么意思", "哪件事", "这事", "那个", "那件", "你刚说的"]):
+        claim_topic = _conversation_claim_topic(state.last_npc_claim)
+        if claim_topic:
+            return claim_topic
+        return _trim_npc_text(state.current_topic, 16)
+    claim_topic = _conversation_claim_topic(state.last_npc_claim)
+    if claim_topic and claim_topic in clean:
+        return claim_topic
+    current_topic = _trim_npc_text(state.current_topic, 16)
+    if current_topic and current_topic in clean:
+        return current_topic
+    return ""
+
+
+def _npc_conversation_state_summary(role: NpcRoleCard) -> str:
+    state = _ensure_npc_conversation_state(role)
+    summary = [
+        f"- current_topic: {state.current_topic or 'none'}",
+        f"- last_open_question: {state.last_open_question or 'none'}",
+        f"- last_npc_claim: {state.last_npc_claim or 'none'}",
+        f"- last_player_intent: {state.last_player_intent or 'none'}",
+        f"- last_referenced_entity: {state.last_referenced_entity or 'none'}",
+        f"- last_scene_mode: {state.last_scene_mode or 'unknown'}",
+    ]
+    return "\n".join(summary)
+
+
+def _update_npc_conversation_state_from_player(
+    role: NpcRoleCard,
+    action_text: str,
+    speech_text: str,
+    player_text: str,
+) -> None:
+    state = _ensure_npc_conversation_state(role)
+    state.last_player_intent = _trim_npc_text(player_text or speech_text or action_text, 120)
+    state.last_scene_mode = "private_chat"
+    follow_up_topic = _npc_follow_up_topic(role, speech_text)
+    if follow_up_topic:
+        state.current_topic = follow_up_topic
+        state.last_referenced_entity = follow_up_topic
+    else:
+        for candidate in [*(role.likes or []), role.cognition, role.background, role.profile.dnd5e_sheet.background, role.profile.dnd5e_sheet.char_class]:
+            token = _trim_npc_text(str(candidate or ""), 16)
+            if token and token in (speech_text or ""):
+                state.current_topic = token
+                state.last_referenced_entity = token
+                break
+    if _npc_question_kind(speech_text):
+        state.last_open_question = _trim_npc_text(speech_text, 120)
+    state.updated_at = _utc_now()
+
+
+def _update_npc_conversation_state_from_reply(
+    role: NpcRoleCard,
+    speech_reply: str,
+    action_reaction: str,
+) -> None:
+    state = _ensure_npc_conversation_state(role)
+    claim_text = _trim_npc_text(speech_reply or action_reaction, 120)
+    if claim_text:
+        state.last_npc_claim = claim_text
+    state.last_scene_mode = "private_chat"
+    claim_topic = _conversation_claim_topic(speech_reply)
+    if claim_topic:
+        state.current_topic = claim_topic
+        state.last_referenced_entity = claim_topic
+    elif speech_reply and state.current_topic and state.current_topic in speech_reply:
+        state.current_topic = _trim_npc_text(state.current_topic, 16)
+    state.updated_at = _utc_now()
+
+
+def _npc_primary_topic(role: NpcRoleCard) -> str:
+    state = _ensure_npc_conversation_state(role)
+    for candidate in [
+        state.current_topic,
+        _conversation_claim_topic(state.last_npc_claim),
+        *(role.likes or []),
+        role.cognition,
+        role.background,
+        role.profile.dnd5e_sheet.background,
+        role.profile.dnd5e_sheet.char_class,
+    ]:
+        text = _trim_npc_text(str(candidate or ""), 20)
+        if text:
+            return text
+    return "眼前这摊事"
+
+
+def _npc_question_kind(speech_text: str) -> str:
+    text = (speech_text or "").strip()
+    if not text:
+        return ""
+    if _contains_any_token(text, ["队友", "同伴", "伙伴", "同行", "一伙", "跟我走", "跟着我", "跟我一起"]):
+        return "team"
+    if _contains_any_token(text, ["你是谁", "叫什么", "名字", "怎么称呼"]):
+        return "identity"
+    if _contains_any_token(text, ["想去", "去哪", "去哪里", "什么地方", "哪儿", "目的地", "先去", "有什么想去的地方"]):
+        return "destination"
+    if _contains_any_token(text, ["喜欢什么", "喜欢", "在意什么", "感兴趣", "想聊什么"]):
+        return "interest"
+    if _contains_any_token(text, ["为什么", "为何", "怎么了", "什么情况", "发生了什么"]):
+        return "reason"
+    if "？" in text or "?" in text or "吗" in text or _contains_any_token(text, ["什么", "谁", "哪", "怎么"]):
+        return "general_question"
+    return ""
+
+
+def _npc_action_has_detail(text: str) -> bool:
+    clean = (text or "").strip()
+    if len(clean) < 12:
+        return False
+    detail_tokens = ["眼", "眉", "嘴角", "肩", "手", "指", "步", "身", "视线", "呼吸", "点头", "抬", "侧", "退", "站位"]
+    return any(token in clean for token in detail_tokens)
+
+
+def _npc_speech_is_generic(text: str) -> bool:
+    clean = (text or "").strip()
+    if not clean:
+        return True
+    generic_tokens = [
+        "我听着",
+        "你继续",
+        "继续说",
+        "我在听",
+        "说下去",
+        "先把事情做稳",
+        "再继续谈",
+        "先说重点",
+        "慢慢说",
+        "看情况",
+        "之后再说",
+    ]
+    return any(token in clean for token in generic_tokens)
+
+
+def _npc_reply_matches_question(role: NpcRoleCard, question_kind: str, speech_text: str, speech_reply: str) -> bool:
+    clean = (speech_reply or "").strip()
+    if not question_kind:
+        return bool(clean)
+    follow_up_topic = _npc_follow_up_topic(role, speech_text)
+    if follow_up_topic:
+        return follow_up_topic in clean and any(token in clean for token in ["是", "因为", "最近", "意思", "麻烦", "线索", "情况"])
+    primary_topic = _trim_npc_text(_npc_primary_topic(role), 12)
+    cognition_topic = _trim_npc_text(role.cognition or "", 12)
+    tokens_by_kind = {
+        "team": ["队友", "同伴", "跟", "一起"],
+        "identity": [role.name, "名字", "叫"],
+        "destination": ["去", "地方", "线索", "地图", "传闻", "草药", "打听"],
+        "interest": ["喜欢", "在意", primary_topic],
+        "reason": ["因为", "重视", "在意", cognition_topic, primary_topic],
+        "general_question": [primary_topic, "因为", "在意"],
+    }
+    return any(token and token in clean for token in tokens_by_kind.get(question_kind, []))
+
+
+def _fallback_npc_action_reaction(
+    role: NpcRoleCard,
+    action_text: str,
+    speech_text: str,
+    action_check: dict[str, object] | None,
+) -> str:
+    merged = f"{action_text}\n{speech_text}".strip()
+    if _contains_any_token(merged, ["威胁", "threat", "抢", "闭嘴", "滚开"]):
+        return f"{role.name} 眉眼一下沉了下去，肩背也跟着绷紧，手指已经压到随身装备旁，站位明显收得更稳。"
+    if action_check is not None and not bool(action_check.get("success")):
+        if speech_text:
+            return f"{role.name} 先被你的举动逼得肩线一紧，随即往旁边让开半步，视线从你的动作一路抬到脸上，眉眼间的戒备一点没松。"
+        return f"{role.name} 下意识侧开身，把重心压回更稳的站位，手也悄悄收到了随身装备旁，神情明显冷了下来。"
+    if any(like and like in merged for like in role.likes):
+        return f"{role.name} 的眼神明显亮了一下，原本绷着的嘴角也松开些，身子不自觉地朝你这边微微转了过来。"
+    if action_text and speech_text:
+        if _contains_any_token(action_text, ["踢", "踹", "推", "拍", "抓", "拽", "扯", "撞"]):
+            return f"{role.name} 先被你的动作逼得绷紧了肩线，随后才稳住步子重新看向你，眉头还压着，却没有立刻转身走开。"
+        return f"{role.name} 先顺着你的动作看了一遍，随后抬眼和你对上视线，指尖轻轻收紧又松开，像是在判断你的来意。"
+    if speech_text:
+        return f"{role.name} 先抬眼看了你一会儿，神情还算平稳，随后轻轻点了点头，视线没有移开，等着你把话说清楚。"
+    if action_text:
+        return f"{role.name} 的目光顺着你的动作移动，呼吸放得很轻，脚下没有退开，只是先把你的举动记在心里。"
+    return f"{role.name} 抬手理了理衣袖，目光在你身上停了一瞬，脸上的神色没有松，但也没有直接拒人千里。"
+
+
+def _fallback_npc_speech_reply(
+    role: NpcRoleCard,
+    speech_text: str,
+    action_check: dict[str, object] | None,
+) -> str:
+    clean = (speech_text or "").strip()
+    if not clean:
+        return ""
+    question_kind = _npc_question_kind(clean)
+    primary_topic = _npc_primary_topic(role)
+    follow_up_topic = _npc_follow_up_topic(role, clean)
+    if action_check is not None and not bool(action_check.get("success")):
+        if follow_up_topic:
+            return f"“我说的{follow_up_topic}，是这附近最近冒出来的一桩麻烦事。我愿意解释，但你先把动作收住。”"
+        if question_kind == "team":
+            if role.state == "in_team":
+                return "“现在算。既然我已经跟着你走，这一路就先把事办稳。”"
+            return "“这话现在还说不上，你先把分寸拿稳。”"
+        if question_kind == "destination":
+            if "地图" in primary_topic or "线索" in primary_topic:
+                return "“地方我有想法，但你先别再乱来。真要走，我更想去找和旧地图有关的线索。”"
+            return f"“地方我有想法，但你先别再乱来。真要走，我更想先去摸清和{primary_topic}有关的事。”"
+        return "“先把动作收住。你要谈，可以好好谈。”"
+    if follow_up_topic:
+        return f"“我说的{follow_up_topic}，是这附近最近反复冒头的一桩麻烦事。我现在只摸到些零碎线索，还没把来路完全说死。”"
+    if question_kind == "identity":
+        return f"“{role.name}。你记住这个名字就行。”"
+    if question_kind == "team":
+        if role.state == "in_team":
+            return "“现在是。既然我在队里，就会跟着你把这段路走完。”"
+        return "“是不是队友，要看我们接下来能不能走到一条路上。”"
+    if question_kind == "destination":
+        if "地图" in primary_topic or "线索" in primary_topic:
+            return "“如果由我选，我想先去找和旧地图有关的线索。”"
+        if "草药" in primary_topic:
+            return "“真要我挑地方，我更想先去找些能用的草药。”"
+        if "传闻" in primary_topic:
+            return "“我更想先去打听传闻，地方错了，后面都白跑。”"
+        return f"“如果由我选，我想先去把和{primary_topic}有关的事摸清。”"
+    if question_kind == "interest":
+        return f"“我更在意{primary_topic}。这类话题，你提了我就愿意多说两句。”"
+    if question_kind == "reason":
+        reason_text = _trim_npc_text(role.cognition or primary_topic, 24)
+        return f"“因为{reason_text}。这事在我这儿不算小事。”"
+    if any(like and like in clean for like in role.likes):
+        return f"“{primary_topic}这事我知道一些，也愿意听你继续说。”"
+    if question_kind == "general_question":
+        return f"“我听明白了。真要说的话，我更在意{primary_topic}。”"
+    if _contains_any_token(clean, ["谢谢", "thank", "帮忙", "合作", "一起"]):
+        return "“这话我记下了。后面别松劲，我们继续走。”"
+    return f"“我听见了。和{primary_topic}有关的事，我会留心。”"
+
+
+def _normalize_npc_reply_parts(
+    role: NpcRoleCard,
+    action_text: str,
+    speech_text: str,
+    action_check: dict[str, object] | None,
+    action_reaction: str,
+    speech_reply: str,
+    *,
+    allow_action_repair: bool,
+    allow_speech_repair: bool,
+) -> tuple[str, str]:
+    normalized_action = (action_reaction or "").strip()
+    normalized_speech = (speech_reply or "").strip()
+    if allow_action_repair and not _npc_action_has_detail(normalized_action):
+        normalized_action = _fallback_npc_action_reaction(role, action_text, speech_text, action_check)
+    if allow_speech_repair and speech_text.strip():
+        question_kind = _npc_question_kind(speech_text)
+        if (
+            not normalized_speech
+            or _npc_speech_is_generic(normalized_speech)
+            or (question_kind and not _npc_reply_matches_question(role, question_kind, speech_text, normalized_speech))
+        ):
+            normalized_speech = _fallback_npc_speech_reply(role, speech_text, action_check)
+    return normalized_action.strip(), normalized_speech.strip()
+
+
+def _fallback_npc_reply_parts(
+    role: NpcRoleCard,
+    action_text: str,
+    speech_text: str,
+    action_check: dict[str, object] | None,
+) -> tuple[str, str, str]:
+    merged = f"{action_text}\n{speech_text}".strip()
+    if _contains_any_token(merged, ["威胁", "threat", "抢", "闭嘴", "滚开"]):
+        return (_fallback_npc_action_reaction(role, action_text, speech_text, action_check), "“我不喜欢这种说话方式。”", "hostile")
+    if action_check is not None and not bool(action_check.get("success")):
+        if speech_text:
+            return (_fallback_npc_action_reaction(role, action_text, speech_text, action_check), _fallback_npc_speech_reply(role, speech_text, action_check), "wary")
+        return (_fallback_npc_action_reaction(role, action_text, speech_text, action_check), "", "wary")
+    if any(like and like in merged for like in role.likes):
+        if speech_text:
+            return (_fallback_npc_action_reaction(role, action_text, speech_text, action_check), _fallback_npc_speech_reply(role, speech_text, action_check), "friendly")
+        return (_fallback_npc_action_reaction(role, action_text, speech_text, action_check), "", "friendly")
+    if action_text and not speech_text:
+        return (_fallback_npc_action_reaction(role, action_text, speech_text, action_check), "", "met")
+    return (_fallback_npc_action_reaction(role, action_text, speech_text, action_check), _fallback_npc_speech_reply(role, speech_text, action_check), "met")
+
+
+def _public_behavior_triggered(action_text: str, speech_text: str, raw_text: str) -> bool:
+    if speech_text.strip():
+        return True
+    merged = f"{action_text}\n{raw_text}".strip()
+    return _contains_any_token(merged, ["奔跑", "大喊", "砸", "挥舞", "冲向", "推开", "攻击", "打碎", "翻找"])
+
+
+def _new_scene_event(
+    kind: str,
+    content: str,
+    *,
+    actor_role_id: str = "",
+    actor_name: str = "",
+    metadata: dict[str, str | int | float | bool] | None = None,
+) -> SceneEvent:
+    return SceneEvent(
+        event_id=f"scene_{int(datetime.now(timezone.utc).timestamp() * 1000)}_{random.randint(100, 999)}",
+        kind=kind,  # type: ignore[arg-type]
+        actor_role_id=actor_role_id,
+        actor_name=actor_name,
+        content=content,
+        metadata=metadata or {},
+    )
+
+
+def _visible_public_roles(save: SaveFile) -> list[NpcRoleCard]:
+    _ensure_area_snapshot(save)
+    current_sub_zone_id = save.area_snapshot.current_sub_zone_id
+    current_sub = next((item for item in save.area_snapshot.sub_zones if item.sub_zone_id == current_sub_zone_id), None)
+    if current_sub is None:
+        return []
+    visible_ids = {npc.npc_id for npc in current_sub.npcs}
+    return [role for role in save.role_pool if role.role_id in visible_ids and role.state != "in_team" and role.sub_zone_id == current_sub.sub_zone_id]
+
+
+def _public_npc_reaction(role: NpcRoleCard, player_text: str, gm_summary: str) -> tuple[str, str]:
+    merged = f"{player_text}\n{gm_summary}".strip()
+    if _contains_any_token(merged, ["威胁", "threat", "抢", "攻击", "杀"]):
+        return (f"{role.name} 的肩背一下绷紧，手也压到了随身物件旁，眼神明显冷了下来。", "wary")
+    if _contains_any_token(merged, ["谢谢", "thank", "合作", "帮忙", "保护", "一起"]):
+        return (f"{role.name} 朝这边多看了两眼，原本收着的神情也松开了些，还轻轻点了点头。", "friendly")
+    if _contains_any_token(merged, [role.name]):
+        return (f"{role.name} 闻声转过身来，目光在你脸上停了停，像是在判断要不要靠近。", "met")
+    return (f"{role.name} 听见动静后侧过脸看了过来，脚下没有挪开，只是把你的举动先记在心里。", "met")
+
+
+def _detect_targeted_visible_npc(save: SaveFile, player_text: str) -> NpcRoleCard | None:
+    clean = (player_text or "").strip()
+    if not clean:
+        return None
+    visible_roles = _visible_public_roles(save)
+    for role in visible_roles:
+        if role.name and role.name in clean:
+            return role
+    return None
+
+
+def _fallback_targeted_public_npc_reply(
+    role: NpcRoleCard,
+    player_text: str,
+    gm_summary: str,
+) -> tuple[str, str, str]:
+    action = _fallback_npc_action_reaction(role, "", player_text, None)
+    speech = _fallback_npc_speech_reply(role, player_text, None)
+    if _contains_any_token(player_text, ["谢谢", "合作", "帮忙", "一起", "队友"]):
+        return action, speech, "friendly"
+    if _contains_any_token(player_text, ["威胁", "滚开", "抢", "攻击", "闭嘴"]):
+        return action, speech, "wary"
+    return action, speech, "met"
+
+
+def _generate_targeted_public_npc_reply(
+    save: SaveFile,
+    role: NpcRoleCard,
+    player_text: str,
+    gm_summary: str,
+    config: ChatConfig | None,
+) -> tuple[str, str, str]:
+    knowledge = build_npc_knowledge_snapshot(save, role.role_id)
+    if config is not None:
+        api_key = (config.openai_api_key or "").strip()
+        model = (config.model or "").strip()
+        if api_key and model:
+            try:
+                client = OpenAI(api_key=api_key)
+                world_time_text, _ = _world_time_payload(save.area_snapshot.clock)
+                prompt = prompt_table.render(
+                    PromptKeys.NPC_PUBLIC_TARGETED_USER,
+                    "你要扮演公开区域里被玩家喊话的NPC，只输出 JSON。",
+                    roleplay_brief=_build_npc_roleplay_brief(role),
+                    scene_summary=gm_summary or "公开区域中的即时互动",
+                    world_time_text=world_time_text,
+                    conversation_state=_npc_conversation_state_summary(role),
+                    knowledge_rules="\n".join(f"- {item}" for item in knowledge.response_rules),
+                    player_text=player_text,
+                    context=_build_npc_prompt_context(role, save.area_snapshot.clock, recent_count=8),
+                )
+                resp = client.chat.completions.create(
+                    model=model,
+                    temperature=min(max(config.temperature, 0), 2),
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": config.gm_prompt},
+                        {"role": "user", "content": prompt},
+                    ],
+                )
+                parsed = _extract_json_content((resp.choices[0].message.content or "").strip())
+                action = str(parsed.get("action_reaction") or "").strip()
+                speech = str(parsed.get("speech_reply") or "").strip()
+                relation_tag = str(parsed.get("relation_tag") or "met").strip().lower()
+                if relation_tag not in {"ally", "friendly", "met", "neutral", "wary", "hostile"}:
+                    relation_tag = "met"
+                action, speech = _normalize_npc_reply_parts(
+                    role,
+                    "",
+                    player_text,
+                    None,
+                    action,
+                    speech,
+                    allow_action_repair=False,
+                    allow_speech_repair=False,
+                )
+                if action or speech:
+                    return action, speech, relation_tag
+            except Exception:
+                pass
+    return _fallback_targeted_public_npc_reply(role, player_text, gm_summary)
+
+
+def _generate_bystander_public_reactions(
+    save: SaveFile,
+    roles: list[NpcRoleCard],
+    player_text: str,
+    gm_summary: str,
+    config: ChatConfig | None,
+) -> list[tuple[NpcRoleCard, str, str]]:
+    created: list[tuple[NpcRoleCard, str, str]] = []
+    for role in roles[:2]:
+        action_reaction = ""
+        speech_reply = ""
+        relation_tag = "met"
+        if config is not None:
+            api_key = (config.openai_api_key or "").strip()
+            model = (config.model or "").strip()
+            if api_key and model:
+                try:
+                    client = OpenAI(api_key=api_key)
+                    prompt = prompt_table.render(
+                        PromptKeys.NPC_PUBLIC_BYSTANDER_USER,
+                        "你要扮演公开区域中的旁观NPC，只输出 JSON。",
+                        roleplay_brief=_build_npc_roleplay_brief(role),
+                        scene_summary=gm_summary or "公开区域中的即时互动",
+                        player_text=player_text,
+                        gm_summary=gm_summary,
+                    )
+                    resp = client.chat.completions.create(
+                        model=model,
+                        temperature=min(max(config.temperature, 0), 2),
+                        response_format={"type": "json_object"},
+                        messages=[
+                            {"role": "system", "content": config.gm_prompt},
+                            {"role": "user", "content": prompt},
+                        ],
+                    )
+                    parsed = _extract_json_content((resp.choices[0].message.content or "").strip())
+                    action_reaction = _trim_npc_text(str(parsed.get("action_reaction") or "").strip(), 160)
+                    speech_reply = _trim_npc_text(str(parsed.get("speech_reply") or "").strip(), 120)
+                    relation_tag = str(parsed.get("relation_tag") or "met").strip().lower()
+                except Exception:
+                    action_reaction = ""
+                    speech_reply = ""
+        line = _compose_npc_reply(action_reaction, speech_reply)
+        if not line:
+            line, relation_tag = _public_npc_reaction(role, player_text, gm_summary)
+        if relation_tag not in {"friendly", "met", "wary", "hostile", "neutral"}:
+            relation_tag = "met"
+        created.append((role, line, relation_tag))
+    return created
+
+
+def advance_public_scene_in_save(
+    save: SaveFile,
+    session_id: str,
+    player_text: str,
+    gm_summary: str = "",
+    config: ChatConfig | None = None,
+) -> list[SceneEvent]:
+    _ensure_area_snapshot(save)
+    intent = _parse_player_intent(player_text)
+    action_text = str(intent["action_text"])
+    speech_text = str(intent["speech_text"])
+    display_text = str(intent["display_text"])
+    if not _public_behavior_triggered(action_text, speech_text, str(intent["raw_text"])):
+        return []
+
+    visible_roles = _visible_public_roles(save)
+    if not visible_roles:
+        return []
+
+    player_id = save.player_static_data.player_id
+    events: list[SceneEvent] = []
+    targeted_role = _detect_targeted_visible_npc(save, display_text)
+    if targeted_role is not None:
+        action_reaction, speech_reply, relation_tag = _generate_targeted_public_npc_reply(save, targeted_role, display_text, gm_summary, config)
+        _update_npc_conversation_state_from_player(targeted_role, action_text, speech_text, display_text)
+        _append_npc_dialogue(
+            role=targeted_role,
+            speaker="player",
+            speaker_role_id=player_id,
+            speaker_name=save.player_static_data.name,
+            content=display_text,
+            clock=save.area_snapshot.clock,
+            context_kind="public_targeted",
+        )
+        _update_npc_conversation_state_from_reply(targeted_role, speech_reply, action_reaction)
+        targeted_reply = _compose_npc_reply(action_reaction, speech_reply) or action_reaction or speech_reply
+        _append_npc_dialogue(
+            role=targeted_role,
+            speaker="npc",
+            speaker_role_id=targeted_role.role_id,
+            speaker_name=targeted_role.name,
+            content=targeted_reply,
+            clock=save.area_snapshot.clock,
+            context_kind="public_targeted",
+        )
+        _upsert_npc_player_relation(targeted_role, player_id, relation_tag, "公开场景针对性互动")
+        targeted_role.cognition_changes.append(f"{_utc_now()} 公开针对性互动: {display_text[:64]}")
+        targeted_role.cognition_changes = targeted_role.cognition_changes[-50:]
+        targeted_role.attitude_changes.append(f"{_utc_now()} public_targeted->{relation_tag}")
+        targeted_role.attitude_changes = targeted_role.attitude_changes[-50:]
+        events.append(
+            _new_scene_event(
+                "public_targeted_npc_reply",
+                targeted_reply,
+                actor_role_id=targeted_role.role_id,
+                actor_name=targeted_role.name,
+                metadata={"relation_tag": relation_tag},
+            )
+        )
+
+    bystander_roles = [role for role in visible_roles if targeted_role is None or role.role_id != targeted_role.role_id]
+    for role, line, relation_tag in _generate_bystander_public_reactions(save, bystander_roles, display_text, gm_summary, config):
+        _upsert_npc_player_relation(role, player_id, relation_tag, "公开场景行为记忆")
+        role.cognition_changes.append(f"{_utc_now()} 公开记忆: {display_text[:64]}")
+        role.cognition_changes = role.cognition_changes[-50:]
+        role.attitude_changes.append(f"{_utc_now()} public->{relation_tag}")
+        role.attitude_changes = role.attitude_changes[-50:]
+        events.append(
+            _new_scene_event(
+                "public_bystander_reaction",
+                line,
+                actor_role_id=role.role_id,
+                actor_name=role.name,
+                metadata={"relation_tag": relation_tag},
+            )
+        )
+
+    try:
+        from app.services.team_service import generate_team_public_replies_in_save
+
+        for reaction in generate_team_public_replies_in_save(
+            save,
+            session_id=session_id,
+            player_text=display_text,
+            scene_summary=gm_summary,
+            config=config,
+        )[:2]:
+            events.append(
+                _new_scene_event(
+                    "team_public_reaction",
+                    reaction.content,
+                    actor_role_id=reaction.member_role_id,
+                    actor_name=reaction.member_name,
+                    metadata={"trigger_kind": reaction.trigger_kind},
+                )
+            )
+    except Exception:
+        pass
+
+    if events:
+        save.game_logs.append(
+            _new_game_log(
+                session_id,
+                "public_scene_events",
+                f"公开区域产生 {len(events)} 条场景反应",
+                {"count": len(events)},
+            )
+        )
+        if any(event.kind == "public_bystander_reaction" for event in events):
+            save.game_logs.append(
+                _new_game_log(
+                    session_id,
+                    "public_npc_reaction",
+                    "公开区域触发周围NPC反应",
+                    {"count": sum(1 for event in events if event.kind == "public_bystander_reaction")},
+                )
+            )
+
+    if targeted_role is None and any(event.kind == "public_bystander_reaction" for event in events):
+        try:
+            from app.models.schemas import EncounterCheckRequest
+            from app.services.encounter_service import check_for_encounter
+
+            encounter_result = check_for_encounter(EncounterCheckRequest(session_id=session_id, trigger_kind="random_dialog", config=config))
+            if encounter_result.generated and encounter_result.encounter is not None:
+                events.append(
+                    _new_scene_event(
+                        "encounter_started",
+                        f"【遭遇触发】{encounter_result.encounter.title}\n{encounter_result.encounter.description}",
+                        metadata={
+                            "encounter_id": encounter_result.encounter.encounter_id,
+                            "encounter_title": encounter_result.encounter.title,
+                        },
+                    )
+                )
+        except Exception:
+            pass
+
+    return events[:5]
+
+
+def _scene_events_to_summary(events: list[SceneEvent]) -> str:
+    if not events:
+        return ""
+    has_public_reaction = any(
+        event.kind in {"public_bystander_reaction", "team_public_reaction"} for event in events
+    )
+    lines = []
+    for event in events:
+        prefix = event.actor_name or "场景"
+        if event.kind == "public_bystander_reaction":
+            lines.append(f"- {prefix}: {event.content}")
+        elif event.kind == "team_public_reaction":
+            lines.append(f"- 队友 {prefix}: {event.content}")
+        else:
+            lines.append(f"- {prefix}: {event.content}")
+    header = "【场景反应】"
+    if has_public_reaction:
+        header += "\n周围NPC反应："
+    return header + "\n" + "\n".join(lines)
+
+
+def apply_public_npc_reactions_in_save(
+    save: SaveFile,
+    *,
+    session_id: str,
+    player_text: str,
+    summary: str = "",
+    config: ChatConfig | None = None,
+) -> str:
+    return _scene_events_to_summary(advance_public_scene_in_save(save, session_id, player_text, summary, config))
+
+
 def npc_greet(req: NpcGreetRequest) -> NpcGreetResponse:
     save = get_current_save(default_session_id=req.session_id)
     if save.session_id != req.session_id:
@@ -1589,6 +3228,7 @@ def npc_greet(req: NpcGreetRequest) -> NpcGreetResponse:
             try:
                 client = OpenAI(api_key=api_key)
                 world_time_text, _ = _world_time_payload(save.area_snapshot.clock)
+                knowledge = build_npc_knowledge_snapshot(save, role.role_id)
                 default_prompt = (
                     "你是跑团NPC。场景是：玩家刚刚走到你面前，你注意到对方靠近并开口。"
                     "请生成第一反应式的自然招呼语。"
@@ -1596,12 +3236,13 @@ def npc_greet(req: NpcGreetRequest) -> NpcGreetResponse:
                     "语气要像面对面打招呼，内容要贴合当前地点和时间。"
                     "姓名=$name, 性格=$personality, 说话方式=$speaking_style, "
                     "外观=$appearance, 背景=$background, 认知=$cognition, 阵营=$alignment, "
-                    "当前世界时间=$world_time_text"
+                    "当前世界时间=$world_time_text, 当前知识边界=$knowledge_rules"
                 )
                 prompt = prompt_table.render(
-                    "npc.greet.user",
+                    PromptKeys.NPC_GREET_USER,
                     default_prompt,
                     name=role.name,
+                    roleplay_brief=_build_npc_roleplay_brief(role),
                     personality=role.personality,
                     speaking_style=role.speaking_style,
                     appearance=role.appearance,
@@ -1609,6 +3250,7 @@ def npc_greet(req: NpcGreetRequest) -> NpcGreetResponse:
                     cognition=role.cognition,
                     alignment=role.alignment,
                     world_time_text=world_time_text,
+                    knowledge_rules=" / ".join(knowledge.response_rules),
                 )
                 resp = client.chat.completions.create(
                     model=model,
@@ -1663,8 +3305,14 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
     role = next((r for r in save.role_pool if r.role_id == req.npc_role_id), None)
     if role is None:
         raise KeyError("ROLE_NOT_FOUND")
+    _ensure_npc_role_complete(save, role)
     player = save.player_static_data
-    player_text = req.player_message.strip()
+    intent = _parse_player_intent(req.player_message)
+    action_text = str(intent["action_text"])
+    speech_text = str(intent["speech_text"])
+    player_text = str(intent["display_text"]).strip()
+    action_check = intent["action_check"] if isinstance(intent["action_check"], dict) else None
+    _update_npc_conversation_state_from_player(role, action_text, speech_text, player_text)
     _append_npc_dialogue(
         role=role,
         speaker="player",
@@ -1674,50 +3322,111 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
         clock=save.area_snapshot.clock,
     )
 
-    reply = f"{role.name} 点点头：'我听到了。'"
-    if req.config is not None:
+    recovered_talkative = _restore_npc_talkative(role, save.area_snapshot.clock)
+    action_reaction = ""
+    speech_reply = ""
+    relation_tag = "met"
+    allow_action_repair = True
+    allow_speech_repair = True
+    scene_events: list[SceneEvent] = []
+    knowledge = build_npc_knowledge_snapshot(save, role.role_id)
+    if role.talkative_current <= 0:
+        action_reaction = f"{role.name} 明显不想继续交谈，只是移开了视线。"
+        allow_action_repair = False
+        allow_speech_repair = False
+    elif player_mentions_unknown_npc(save, role.role_id, player_text):
+        action_reaction = f"{role.name} 皱起眉，像是在确认你提到的是谁。"
+        speech_reply = npc_guard_reply()
+        allow_action_repair = False
+        allow_speech_repair = False
+    elif req.config is not None:
         api_key = (req.config.openai_api_key or "").strip()
         model = (req.config.model or "").strip()
         if api_key and model:
             try:
                 client = OpenAI(api_key=api_key)
                 world_time_text, _ = _world_time_payload(save.area_snapshot.clock)
-                context = _build_npc_context(role)
+                context = _build_npc_prompt_context(role, save.area_snapshot.clock)
+                conversation_state = _npc_conversation_state_summary(role)
                 default_prompt = (
-                    "你要扮演一个NPC与玩家直接对话。"
-                    "必须保持人设一致，结合历史对话与当前世界时间作答。"
-                    "请返回1-3句自然口语化回复，不要输出编号，不要解释规则。"
+                    "你要扮演一个NPC与玩家进行单独交互。"
+                    "必须保持人设一致，结合历史对话、当前世界时间、玩家动作与检定结果作答。"
+                    "你只能基于当前合法世界事实回答；若玩家提到不存在、已失效或不在你知识范围内的人物/区域，明确表示不知道或不确认。"
+                    "你只输出JSON，不要输出额外解释。"
+                    "JSON schema: {\"action_reaction\":\"...\",\"speech_reply\":\"...\",\"relation_tag\":\"ally|friendly|met|neutral|wary|hostile\"}。"
+                    "speech_reply 可以为空；NPC允许只做动作不说话。"
+                    "action_reaction 必须始终先写，且至少包含神态+一个可见动作或站位变化，不能只写“显得警惕”“显得冷淡”这种概括。"
+                    "如果玩家语言里包含问题、确认句或询问身份/关系/去向，speech_reply 必须直接回答该问题，不能只说“继续”“我在听”。"
+                    "如果玩家是在追问你上一轮提到的概念、名词或事件，必须先解释那个概念本身，不能切回你自己的静态喜好。"
                     "\nNPC信息: name=$name, personality=$personality, speaking_style=$speaking_style, "
-                    "appearance=$appearance, background=$background, cognition=$cognition, alignment=$alignment"
+                    "appearance=$appearance, background=$background, cognition=$cognition, alignment=$alignment, secret=$secret, likes=$likes"
                     "\n当前世界时间: $world_time_text"
+                    "\n当前健谈值: $talkative_current / $talkative_maximum"
+                    "\n当前会话状态:\n$conversation_state"
+                    "\n当前知识边界规则:\n$knowledge_rules"
+                    "\n当前可知本地NPC IDs: $known_local_npc_ids"
+                    "\n当前不可编造实体 IDs: $forbidden_entity_ids"
                     "\n历史对话(按时间顺序):\n$context"
-                    "\n玩家刚刚说: $player_text"
+                    "\n玩家动作: $player_action"
+                    "\n玩家语言: $player_speech"
+                    "\n玩家检定结果: $action_check_result"
+                    "\n玩家刚刚完整输入: $player_text"
                 )
                 prompt = prompt_table.render(
-                    "npc.chat.user",
+                    PromptKeys.NPC_CHAT_USER,
                     default_prompt,
                     name=role.name,
+                    roleplay_brief=_build_npc_roleplay_brief(role),
                     personality=role.personality,
                     speaking_style=role.speaking_style,
                     appearance=role.appearance,
                     background=role.background,
                     cognition=role.cognition,
                     alignment=role.alignment,
+                    secret=role.secret,
+                    likes=" / ".join(role.likes) or "无特殊偏好",
                     world_time_text=world_time_text,
+                    talkative_current=role.talkative_current,
+                    talkative_maximum=role.talkative_maximum,
+                    conversation_state=conversation_state,
+                    knowledge_rules="\n".join(f"- {item}" for item in knowledge.response_rules),
+                    known_local_npc_ids=",".join(knowledge.known_local_npc_ids) or "none",
+                    forbidden_entity_ids=",".join(knowledge.forbidden_entity_ids) or "none",
                     context=context,
+                    player_action=action_text or "无",
+                    player_speech=speech_text or "无",
+                    action_check_result=json.dumps(action_check or {"status": "none"}, ensure_ascii=False),
                     player_text=player_text,
                 )
                 resp = client.chat.completions.create(
                     model=model,
                     temperature=min(max(req.config.temperature, 0), 2),
+                    response_format={"type": "json_object"},
                     messages=[
                         {"role": "system", "content": req.config.gm_prompt},
                         {"role": "user", "content": prompt},
                     ],
                 )
-                content = (resp.choices[0].message.content or "").strip()
-                if content:
-                    reply = content
+                parsed = _extract_json_content((resp.choices[0].message.content or "").strip())
+                action_reaction = str(parsed.get("action_reaction") or "").strip()
+                speech_reply = str(parsed.get("speech_reply") or "").strip()
+                tag = str(parsed.get("relation_tag") or "").strip().lower()
+                if tag in {"ally", "friendly", "met", "neutral", "wary", "hostile"}:
+                    relation_tag = tag
+                forbidden_role_names = [
+                    item.name
+                    for item in save.role_pool
+                    if item.role_id not in knowledge.known_local_npc_ids and item.role_id != role.role_id
+                ]
+                generated_reply = _compose_npc_reply(action_reaction, speech_reply)
+                if any(name and name in generated_reply for name in forbidden_role_names):
+                    action_reaction = f"{role.name} 迟疑地眯起眼，显然不打算顺着这个话题说下去。"
+                    speech_reply = npc_guard_reply()
+                    allow_action_repair = False
+                    allow_speech_repair = False
+                else:
+                    allow_action_repair = False
+                    allow_speech_repair = False
                 usage = resp.usage
                 token_usage_store.add(
                     req.session_id,
@@ -1726,7 +3435,32 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
                     getattr(usage, "completion_tokens", 0) or 0,
                 )
             except Exception:
-                pass
+                action_reaction, speech_reply, relation_tag = _fallback_npc_reply_parts(role, action_text, speech_text, action_check)
+        else:
+            action_reaction, speech_reply, relation_tag = _fallback_npc_reply_parts(role, action_text, speech_text, action_check)
+    else:
+        action_reaction, speech_reply, relation_tag = _fallback_npc_reply_parts(role, action_text, speech_text, action_check)
+
+    action_reaction, speech_reply = _normalize_npc_reply_parts(
+        role,
+        action_text,
+        speech_text,
+        action_check,
+        action_reaction,
+        speech_reply,
+        allow_action_repair=allow_action_repair,
+        allow_speech_repair=allow_speech_repair,
+    )
+    action_reaction = _normalize_logged_speaker_content("npc", role.name, action_reaction)
+    speech_reply = _normalize_logged_speaker_content("npc", role.name, speech_reply)
+    if not action_reaction and not speech_reply:
+        action_reaction, speech_reply, relation_tag = _fallback_npc_reply_parts(role, action_text, speech_text, action_check)
+
+    talkative_delta = _npc_talkative_delta(role, action_text, speech_text) if role.talkative_current > 0 else 0
+    role.talkative_current = max(0, min(role.talkative_maximum, role.talkative_current + talkative_delta))
+    role.last_private_chat_at = _world_clock_iso(save.area_snapshot.clock)
+    _update_npc_conversation_state_from_reply(role, speech_reply, action_reaction)
+    reply = _compose_npc_reply(action_reaction, speech_reply) or f"{role.name} 没有给出明确回应。"
 
     _append_npc_dialogue(
         role=role,
@@ -1736,9 +3470,10 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
         content=reply,
         clock=save.area_snapshot.clock,
     )
-    relation_tag = "met"
     lower_text = player_text.lower()
-    if any(k in lower_text for k in ["谢谢", "thank", "help", "帮忙", "合作"]):
+    if relation_tag not in {"ally", "friendly", "met", "neutral", "wary", "hostile"}:
+        relation_tag = "met"
+    if relation_tag == "met" and any(k in lower_text for k in ["谢谢", "thank", "help", "帮忙", "合作"]):
         relation_tag = "friendly"
     elif any(k in lower_text for k in ["威胁", "threat", "滚开", "attack", "抢"]):
         relation_tag = "hostile"
@@ -1746,7 +3481,7 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
     role.attitude_changes.append(f"{_utc_now()} relation->{relation_tag}")
     if len(role.attitude_changes) > 50:
         role.attitude_changes = role.attitude_changes[-50:]
-    role.cognition_changes.append(f"{_utc_now()} 玩家发言: {player_text[:48]}")
+    role.cognition_changes.append(f"{_utc_now()} 单聊记忆: {player_text[:48]}")
     if len(role.cognition_changes) > 50:
         role.cognition_changes = role.cognition_changes[-50:]
     save.game_logs.append(
@@ -1754,16 +3489,53 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
             req.session_id,
             "npc_chat",
             f"玩家与 {role.name} 对话",
-            {"npc_role_id": role.role_id, "time_spent_min": time_spent_min},
+            {
+                "npc_role_id": role.role_id,
+                "time_spent_min": time_spent_min,
+                "talkative_current": role.talkative_current,
+                "talkative_recovered": recovered_talkative,
+            },
         )
     )
+    try:
+        from app.services.team_service import apply_team_reactions_in_save
+
+        apply_team_reactions_in_save(
+            save,
+            session_id=req.session_id,
+            trigger_kind="npc_chat",
+            player_text=player_text,
+            summary=reply,
+            exclude_role_ids={role.role_id},
+        )
+    except Exception:
+        pass
+    try:
+        from app.services.encounter_service import advance_active_encounter_in_save
+
+        advanced = advance_active_encounter_in_save(save, session_id=req.session_id, minutes_elapsed=time_spent_min, config=req.config)
+        if advanced is not None:
+            scene_events.append(
+                _new_scene_event(
+                    "encounter_background",
+                    advanced.latest_outcome_summary or advanced.scene_summary or advanced.description,
+                    metadata={"encounter_id": advanced.encounter_id},
+                )
+            )
+    except Exception:
+        pass
     save_current(save)
     return NpcChatResponse(
         session_id=req.session_id,
         npc_role_id=role.role_id,
         reply=reply,
+        action_reaction=action_reaction,
+        speech_reply=speech_reply,
+        talkative_current=role.talkative_current,
+        talkative_maximum=role.talkative_maximum,
         time_spent_min=time_spent_min,
         dialogue_logs=role.dialogue_logs[-20:],
+        scene_events=scene_events,
     )
 
 
@@ -1982,7 +3754,7 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
     ability_modifier = _ability_modifier(profile, ability)
 
     if requires_check:
-        dice_roll = random.randint(1, 20)
+        dice_roll = req.forced_dice_roll if req.forced_dice_roll is not None else random.randint(1, 20)
         total_score = dice_roll + ability_modifier
         if dice_roll == 1:
             critical = "critical_failure"
@@ -2019,6 +3791,7 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
         f"{profile.name} 执行了行动，耗时 {time_spent_min} 分钟。"
         f"{'检定成功。' if success else '检定失败，出现负面后果。'}"
     )
+    scene_events: list[SceneEvent] = []
     if critical == "critical_success":
         narrative = f"{profile.name} 掷出天然20，行动大成功！耗时 {time_spent_min} 分钟。"
     elif critical == "critical_failure":
@@ -2035,9 +3808,44 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
                     role.attitude_changes.append(f"{_utc_now()} action->{relation_tag}")
                     if len(role.attitude_changes) > 50:
                         role.attitude_changes = role.attitude_changes[-50:]
-                    save_current(save)
         except Exception:
             pass
+    try:
+        from app.services.team_service import apply_team_reactions_in_save
+
+        apply_team_reactions_in_save(
+            save,
+            session_id=req.session_id,
+            trigger_kind="action_check",
+            player_text=req.action_prompt,
+            summary=narrative,
+            exclude_role_ids=({actor_role_id} if actor_role_id != save.player_static_data.player_id else None),
+        )
+    except Exception:
+        pass
+    if actor_role_id == save.player_static_data.player_id:
+        scene_events = advance_public_scene_in_save(
+            save,
+            req.session_id,
+            req.action_prompt,
+            narrative,
+            req.config,
+        )
+    try:
+        from app.services.encounter_service import advance_active_encounter_in_save
+
+        advanced = advance_active_encounter_in_save(save, session_id=req.session_id, minutes_elapsed=time_spent_min, config=req.config)
+        if advanced is not None:
+            scene_events.append(
+                _new_scene_event(
+                    "encounter_background",
+                    advanced.latest_outcome_summary or advanced.scene_summary or advanced.description,
+                    metadata={"encounter_id": advanced.encounter_id},
+                )
+            )
+    except Exception:
+        pass
+    save_current(save)
 
     return ActionCheckResponse(
         session_id=req.session_id,
@@ -2055,10 +3863,17 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
         narrative=narrative,
         applied_effects=applied_effects,
         relation_tag_suggestion=relation_tag,
+        scene_events=scene_events,
     )
 
 
 def move_to_sub_zone(req: AreaMoveSubZoneRequest) -> AreaMoveResult:
+    _attempt_escape_for_move(
+        session_id=req.session_id,
+        target_zone_id=None,
+        target_sub_zone_id=req.to_sub_zone_id,
+        config=req.config,
+    )
     save = get_current_save(default_session_id=req.session_id)
     if save.session_id != req.session_id:
         raise ValueError("session mismatch with current save")
@@ -2169,6 +3984,25 @@ def move_to_sub_zone(req: AreaMoveSubZoneRequest) -> AreaMoveResult:
                     movement_feedback = txt
         except Exception:
             pass
+    try:
+        from app.services.team_service import apply_team_reactions_in_save, sync_team_members_with_player_in_save
+
+        sync_team_members_with_player_in_save(save)
+        apply_team_reactions_in_save(
+            save,
+            session_id=req.session_id,
+            trigger_kind="sub_zone_move",
+            summary=movement_feedback,
+        )
+    except Exception:
+        pass
+    try:
+        from app.services.encounter_service import advance_active_encounter_in_save
+
+        advance_active_encounter_in_save(save, session_id=req.session_id, minutes_elapsed=duration_min, config=req.config)
+    except Exception:
+        pass
+    save_current(save)
 
     return AreaMoveResult(
         ok=True,

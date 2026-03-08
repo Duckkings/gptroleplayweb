@@ -9,8 +9,19 @@ type Props = {
   savePath: PathStatus | null;
   onEnableMap: () => void;
   onOpenPlayerPanel: () => void;
+  onOpenInventory: () => void;
   onOpenNpcPool: () => void;
+  onOpenTeamPanel: () => void;
+  onGenerateDebugTeammate: () => void;
   onOpenActionPanel: () => void;
+  onGenerateQuest: () => void;
+  onGenerateFate: () => void;
+  onRegenerateFate: () => void;
+  onOpenFatePanel: () => void;
+  onShowConsistencyStatus: () => void;
+  onRunConsistencyCheck: () => void;
+  onToggleEncounterForce: () => void;
+  encounterForceEnabled: boolean;
   onSelectSaveFile: (file: File) => void;
   onClearSave: () => void;
   onPickSavePath: () => void;
@@ -24,8 +35,19 @@ export function DebugPanel({
   savePath,
   onEnableMap,
   onOpenPlayerPanel,
+  onOpenInventory,
   onOpenNpcPool,
+  onOpenTeamPanel,
+  onGenerateDebugTeammate,
   onOpenActionPanel,
+  onGenerateQuest,
+  onGenerateFate,
+  onRegenerateFate,
+  onOpenFatePanel,
+  onShowConsistencyStatus,
+  onRunConsistencyCheck,
+  onToggleEncounterForce,
+  encounterForceEnabled,
   onSelectSaveFile,
   onClearSave,
   onPickSavePath,
@@ -34,14 +56,26 @@ export function DebugPanel({
 
   return (
     <aside className={`debug-panel ${collapsed ? 'collapsed' : ''}`}>
-      <button onClick={onToggle}>{collapsed ? 'Debug' : '收起 Debug'}</button>
+      <button className="debug-toggle" onClick={onToggle}>
+        {collapsed ? 'Debug' : '收起 Debug'}
+      </button>
       {!collapsed && (
         <div className="debug-body">
-          <div className="actions">
+          <div className="debug-actions">
             <button onClick={onEnableMap}>世界地图</button>
             <button onClick={onOpenPlayerPanel}>玩家数据</button>
+            <button onClick={onOpenInventory}>物品栏</button>
             <button onClick={onOpenNpcPool}>NPC角色池</button>
+            <button onClick={onOpenTeamPanel}>当前队伍</button>
+            <button onClick={onGenerateDebugTeammate}>生成调试队友</button>
             <button onClick={onOpenActionPanel}>行为检定</button>
+            <button onClick={onGenerateQuest}>生成任务</button>
+            <button onClick={onGenerateFate}>生成命运线</button>
+            <button onClick={onRegenerateFate}>重生成命运线</button>
+            <button onClick={onOpenFatePanel}>查看命运</button>
+            <button onClick={onShowConsistencyStatus}>一致性状态</button>
+            <button onClick={onRunConsistencyCheck}>执行一致性校验</button>
+            <button onClick={onToggleEncounterForce}>{encounterForceEnabled ? '关闭100%遭遇' : '开启100%遭遇'}</button>
             <button onClick={() => saveInputRef.current?.click()}>选择存档文件</button>
             <input
               ref={saveInputRef}

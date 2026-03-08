@@ -69,7 +69,6 @@ export function MapPanel({
   const [detail, setDetail] = useState<ZoneDetail | null>(null);
   const [expandedZoneIds, setExpandedZoneIds] = useState<Record<string, boolean>>({});
   const [lastSelectedZoneId, setLastSelectedZoneId] = useState<string | null>(null);
-  const prevCurrentZoneIdRef = useRef<string>('');
   const [zoomPercent, setZoomPercent] = useState(100);
   const [pan, setPan] = useState<Point>({ x: 0, y: 0 });
   const [dragging, setDragging] = useState(false);
@@ -79,8 +78,8 @@ export function MapPanel({
   const viewInitializedRef = useRef(false);
 
   const filtered = useMemo(() => zones.filter((z) => z.name.includes(search) || z.zone_id.includes(search)), [zones, search]);
-  const areaZones = areaSnapshot?.zones ?? [];
-  const areaSubZones = areaSnapshot?.sub_zones ?? [];
+  const areaZones = useMemo(() => areaSnapshot?.zones ?? [], [areaSnapshot]);
+  const areaSubZones = useMemo(() => areaSnapshot?.sub_zones ?? [], [areaSnapshot]);
   const currentZoneId = areaSnapshot?.current_zone_id ?? playerPosition?.zone_id ?? '';
   const currentSubZoneId = areaSnapshot?.current_sub_zone_id ?? '';
   const currentSubZone = useMemo(
@@ -111,11 +110,13 @@ export function MapPanel({
   const centerX = (minX + maxX) / 2;
   const centerY = (minY + maxY) / 2;
 
-  const effectivePlayer = useMemo(() => {
-    if (playerPosition) return { x: playerPosition.x, y: playerPosition.y, zone_id: playerPosition.zone_id };
-    if (render?.player_marker) return { x: render.player_marker.x, y: render.player_marker.y, zone_id: '' };
-    return null;
-  }, [playerPosition, render?.player_marker]);
+  const effectivePlayer = playerPosition
+    ? { x: playerPosition.x, y: playerPosition.y, zone_id: playerPosition.zone_id }
+    : render?.player_marker
+      ? { x: render.player_marker.x, y: render.player_marker.y, zone_id: '' }
+      : null;
+  const effectivePlayerX = effectivePlayer?.x ?? null;
+  const effectivePlayerY = effectivePlayer?.y ?? null;
 
   const fitScale = useMemo(() => {
     const innerW = Math.max(100, boardSize.w - 60);
@@ -161,12 +162,15 @@ export function MapPanel({
   useEffect(() => {
     if (!open) return;
     if (viewInitializedRef.current) return;
+    if (effectivePlayerX === null || effectivePlayerY === null) return;
     const id = window.requestAnimationFrame(() => {
-      centerOnPlayer();
+      const px = (effectivePlayerX - centerX) * currentScale;
+      const py = (centerY - effectivePlayerY) * currentScale;
+      setPan({ x: -px, y: -py });
       viewInitializedRef.current = true;
     });
     return () => window.cancelAnimationFrame(id);
-  }, [open, effectivePlayer?.x, effectivePlayer?.y, fitScale]);
+  }, [open, effectivePlayerX, effectivePlayerY, centerX, centerY, currentScale]);
 
   useEffect(() => {
     if (!open) return;
@@ -174,16 +178,6 @@ export function MapPanel({
       viewInitializedRef.current = false;
     }
   }, [open, render?.nodes?.length]);
-
-  useEffect(() => {
-    if (!currentZoneId) return;
-    if (prevCurrentZoneIdRef.current !== currentZoneId) {
-      setExpandedZoneIds({ [currentZoneId]: true });
-      prevCurrentZoneIdRef.current = currentZoneId;
-      return;
-    }
-    setExpandedZoneIds((prev) => ({ ...prev, [currentZoneId]: true }));
-  }, [currentZoneId]);
 
   useEffect(() => {
     if (!open) return;
@@ -249,7 +243,7 @@ export function MapPanel({
               .filter((z) => z.name.includes(search) || z.zone_id.includes(search))
               .map((z) => {
                 const subZones = areaSubZones.filter((s) => s.zone_id === z.zone_id);
-                const expanded = !!expandedZoneIds[z.zone_id];
+                const expanded = expandedZoneIds[z.zone_id] ?? currentZoneId === z.zone_id;
                 return (
                   <div key={z.zone_id} className={`zone-tree-item ${currentZoneId === z.zone_id ? 'current' : ''}`}>
                     <button className="zone-name-item" onClick={() => onZoneListClick(z.zone_id)}>

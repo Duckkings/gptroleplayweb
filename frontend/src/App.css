@@ -10,10 +10,12 @@
   align-items: flex-start;
   justify-content: flex-start;
   gap: 12px;
+  flex-wrap: wrap;
 }
 
 .card {
   width: min(980px, 100%);
+  min-width: 0;
   border: 1px solid var(--border);
   border-radius: 16px;
   background: linear-gradient(160deg, #101725, var(--panel));
@@ -106,6 +108,20 @@ button:disabled {
 }
 
 .chat-card {
+  width: min(1420px, 100%);
+  display: grid;
+  gap: 12px;
+}
+
+.chat-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.9fr) minmax(320px, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.chat-main-column {
+  min-width: 0;
   display: grid;
   gap: 12px;
 }
@@ -127,6 +143,57 @@ button:disabled {
   padding: 12px;
   display: grid;
   gap: 10px;
+}
+
+.encounter-lane {
+  width: auto;
+  min-width: 0;
+  display: grid;
+  gap: 12px;
+  position: sticky;
+  top: 24px;
+}
+
+.encounter-lane-header,
+.encounter-overview,
+.encounter-conditions,
+.encounter-actions,
+.encounter-steps,
+.encounter-queue {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #0a101a;
+  padding: 12px;
+}
+
+.encounter-condition,
+.encounter-step,
+.encounter-queue-item {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  background: #121b2a;
+}
+
+.encounter-condition.done {
+  border-color: #2d725a;
+  background: #10201c;
+}
+
+.encounter-timeline {
+  display: grid;
+  gap: 8px;
+}
+
+.encounter-actions textarea {
+  width: 100%;
+  min-height: 120px;
+  border: 1px solid var(--border);
+  background: #0a0f1b;
+  border-radius: 10px;
+  color: var(--text);
+  padding: 12px;
+  resize: vertical;
 }
 
 .msg {
@@ -156,9 +223,36 @@ button:disabled {
   white-space: pre-wrap;
 }
 
+.log-payload {
+  margin: 8px 0 0;
+  padding: 8px;
+  border-radius: 8px;
+  background: #071019;
+  border: 1px solid #22324e;
+  color: #c6dcff;
+  white-space: pre-wrap;
+  overflow: auto;
+}
+
 .composer {
   display: grid;
   gap: 10px;
+}
+
+.composer-input-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.composer-input-block {
+  display: grid;
+  gap: 6px;
+}
+
+.composer-input-block label {
+  font-size: 13px;
+  color: var(--text-dim);
 }
 
 .chat-interactions {
@@ -177,6 +271,26 @@ button:disabled {
   min-height: 100px;
 }
 
+@media (max-width: 900px) {
+  .composer-input-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .role-profile-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 1180px) {
+  .chat-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .encounter-lane {
+    position: static;
+  }
+}
+
 .error {
   color: var(--danger);
   margin: 0;
@@ -188,32 +302,59 @@ button:disabled {
 
 .debug-panel {
   width: min(360px, 100%);
+  min-width: 0;
+  max-height: calc(100vh - 48px);
   align-self: stretch;
+  display: flex;
+  flex-direction: column;
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 10px;
   background: #0b1321;
+  overflow: hidden;
 }
 
 .debug-panel.collapsed {
   width: 120px;
+  max-height: none;
+  overflow: visible;
+}
+
+.debug-toggle {
+  width: 100%;
 }
 
 .debug-body {
   display: grid;
   gap: 10px;
   margin-top: 10px;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.debug-actions {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+}
+
+.debug-actions > button,
+.debug-actions > .file-button {
+  width: 100%;
+  min-width: 0;
+  text-align: left;
 }
 
 .debug-paths p {
   margin: 0 0 6px;
+  word-break: break-all;
 }
 
 .debug-entries {
   display: grid;
   gap: 8px;
-  max-height: 48vh;
-  overflow: auto;
+  min-height: 0;
 }
 
 .debug-entry {
@@ -523,10 +664,115 @@ button:disabled {
   width: min(1100px, 100%);
 }
 
+.team-panel {
+  width: min(1180px, 100%);
+}
+
+.consistency-panel {
+  width: min(1200px, 100%);
+}
+
+.consistency-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.consistency-block {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  background: #0a101a;
+}
+
+.consistency-block h3 {
+  margin: 0 0 8px;
+}
+
+.consistency-block p {
+  margin: 0 0 6px;
+}
+
+.consistency-list {
+  display: grid;
+  gap: 8px;
+  max-height: 48vh;
+  overflow: auto;
+}
+
+.consistency-item {
+  border: 1px solid #24334d;
+  border-radius: 8px;
+  padding: 10px;
+  background: #09101a;
+}
+
+.consistency-item.severity-warning {
+  border-color: #8f7a32;
+}
+
+.consistency-item.severity-error {
+  border-color: #8d3943;
+}
+
 .npc-pool-layout {
   display: grid;
   grid-template-columns: 360px 1fr;
   gap: 12px;
+}
+
+.team-layout {
+  display: grid;
+  grid-template-columns: 1.2fr 0.8fr;
+  gap: 12px;
+}
+
+.team-member-list,
+.team-reaction-list {
+  display: grid;
+  gap: 10px;
+  max-height: 62vh;
+  overflow: auto;
+}
+
+.team-member-card {
+  border: 1px solid #24334d;
+  border-radius: 10px;
+  padding: 12px;
+  background: #09101a;
+}
+
+.team-member-card p {
+  margin: 6px 0;
+}
+
+.team-member-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.team-chat-box {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 14px;
+  padding: 12px;
+  border: 1px solid #24334d;
+  border-radius: 10px;
+  background: #09101a;
+}
+
+.team-chat-box textarea {
+  width: 100%;
+  min-height: 88px;
+}
+
+.team-chat-feed {
+  display: grid;
+  gap: 8px;
+  max-height: 220px;
+  overflow: auto;
 }
 
 .npc-pool-list-block,
@@ -600,6 +846,137 @@ button:disabled {
   width: 100%;
 }
 
+.quest-panel-block,
+.fate-panel-block {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  background: #0a101a;
+}
+
+.quest-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.quest-list,
+.fate-phase-list {
+  display: grid;
+  gap: 10px;
+}
+
+.quest-card,
+.fate-card,
+.fate-phase-item {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  background: #0b1320;
+}
+
+.quest-card.tracked {
+  border-color: #78ffbb;
+}
+
+.quest-objective-list,
+.quest-log-list,
+.quest-reward-list {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.quest-detail-meta {
+  display: grid;
+  gap: 4px;
+}
+
+.quest-detail-meta p {
+  margin: 0;
+}
+
+.inventory-summary {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.inventory-summary-card,
+.inventory-item-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  background: #09101a;
+}
+
+.inventory-summary-card p,
+.inventory-item-card p,
+.inventory-item-effect {
+  margin: 0;
+}
+
+.inventory-list {
+  display: grid;
+  gap: 10px;
+}
+
+.inventory-item-head,
+.inventory-item-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.inventory-item-head {
+  margin-bottom: 8px;
+}
+
+.inventory-item-meta {
+  flex-wrap: wrap;
+  margin-top: 8px;
+  color: var(--text-dim);
+}
+
+.inventory-item-effect {
+  display: block;
+  margin-top: 8px;
+  color: #c6dcff;
+}
+
+.inventory-item-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.inventory-item-equipped {
+  margin-top: 8px;
+  color: #8ce6b6;
+}
+
+.quest-objective-item,
+.quest-log-item,
+.quest-reward-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px;
+  border-radius: 8px;
+  background: #09101a;
+  border: 1px solid #1d2a3e;
+}
+
+.modal-wide {
+  width: min(720px, 100%);
+}
+
+.modal-medium {
+  width: min(640px, 100%);
+}
+
 .modal-mask {
   position: fixed;
   inset: 0;
@@ -635,6 +1012,220 @@ button:disabled {
   padding: 10px;
 }
 
+.inventory-modal-card,
+.role-profile-modal {
+  max-height: min(86vh, 920px);
+  overflow: auto;
+}
+
+.inventory-modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.inventory-modal-header p {
+  margin: 4px 0 0;
+}
+
+.inventory-interaction-result {
+  border: 1px solid #24334d;
+  border-radius: 10px;
+  padding: 10px;
+  background: #09101a;
+}
+
+.inventory-interaction-result p {
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+}
+
+.role-profile-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.role-profile-section {
+  border: 1px solid #24334d;
+  border-radius: 10px;
+  padding: 12px;
+  background: #09101a;
+}
+
+.role-profile-section h4 {
+  margin: 0 0 8px;
+}
+
+.role-profile-section p {
+  margin: 6px 0;
+  white-space: pre-wrap;
+}
+
+.roll-modal-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background:
+    radial-gradient(circle at top, rgba(135, 206, 235, 0.18), transparent 35%),
+    rgba(2, 6, 14, 0.82);
+}
+
+.roll-modal-mask.is-clickable {
+  cursor: pointer;
+}
+
+.roll-modal-card {
+  width: min(680px, 100%);
+  display: grid;
+  gap: 14px;
+  padding: 20px;
+  border-radius: 20px;
+  border: 1px solid rgba(152, 201, 255, 0.28);
+  background:
+    linear-gradient(180deg, rgba(13, 22, 39, 0.98), rgba(8, 14, 24, 0.98));
+  box-shadow: 0 32px 80px rgba(0, 0, 0, 0.45);
+}
+
+.roll-modal-header h3,
+.roll-modal-header p,
+.roll-modal-caption {
+  margin: 0;
+}
+
+.roll-modal-header p,
+.roll-modal-caption {
+  color: var(--text-dim);
+}
+
+.roll-modal-stage {
+  display: grid;
+  place-items: center;
+  min-height: 320px;
+}
+
+.d20-die {
+  position: relative;
+  width: 220px;
+  aspect-ratio: 1;
+  display: grid;
+  place-items: center;
+  transform-style: preserve-3d;
+}
+
+.d20-core,
+.d20-glow {
+  position: absolute;
+  inset: 0;
+  clip-path: polygon(50% 1%, 82% 18%, 97% 50%, 82% 82%, 50% 99%, 18% 82%, 3% 50%, 18% 18%);
+  border-radius: 18px;
+}
+
+.d20-core {
+  border: 2px solid rgba(196, 231, 255, 0.82);
+  background:
+    linear-gradient(145deg, rgba(213, 243, 255, 0.96), rgba(58, 128, 191, 0.95) 48%, rgba(8, 29, 58, 0.98));
+  box-shadow:
+    inset 0 10px 18px rgba(255, 255, 255, 0.22),
+    inset 0 -14px 18px rgba(0, 0, 0, 0.35),
+    0 18px 40px rgba(7, 33, 66, 0.48);
+}
+
+.d20-glow {
+  inset: -10px;
+  background: radial-gradient(circle, rgba(137, 213, 255, 0.32), transparent 68%);
+  filter: blur(10px);
+  opacity: 0.85;
+}
+
+.d20-value {
+  position: relative;
+  z-index: 1;
+  font-size: 54px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  color: #f8fdff;
+  text-shadow: 0 4px 18px rgba(0, 10, 22, 0.8);
+}
+
+.d20-die.phase-ready {
+  animation: d20-idle 2.4s ease-in-out infinite;
+}
+
+.d20-die.phase-rolling {
+  animation: d20-roll 1.65s cubic-bezier(0.2, 0.9, 0.2, 1) forwards;
+}
+
+.d20-die.phase-resolving,
+.d20-die.phase-resolved,
+.d20-die.phase-error {
+  transform: rotateX(var(--roll-x)) rotateY(var(--roll-y)) rotateZ(var(--roll-z)) scale(1);
+}
+
+.roll-result-card {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+  border-radius: 14px;
+  border: 1px solid rgba(132, 177, 224, 0.24);
+  background: rgba(6, 13, 24, 0.86);
+}
+
+.roll-result-card p {
+  margin: 0;
+}
+
+.roll-result-card.is-success {
+  border-color: rgba(120, 255, 187, 0.48);
+  background: rgba(8, 31, 25, 0.88);
+}
+
+.roll-result-card.is-failure {
+  border-color: rgba(255, 138, 138, 0.44);
+  background: rgba(36, 11, 16, 0.88);
+}
+
+@keyframes d20-idle {
+  0%,
+  100% {
+    transform: rotateX(-12deg) rotateY(0deg) rotateZ(0deg) translateY(0);
+  }
+  50% {
+    transform: rotateX(12deg) rotateY(22deg) rotateZ(-10deg) translateY(-6px);
+  }
+}
+
+@keyframes d20-roll {
+  0% {
+    transform: rotateX(0deg) rotateY(0deg) rotateZ(0deg) scale(0.92);
+  }
+  55% {
+    transform: rotateX(720deg) rotateY(960deg) rotateZ(540deg) scale(1.12);
+  }
+  100% {
+    transform: rotateX(var(--roll-x)) rotateY(var(--roll-y)) rotateZ(var(--roll-z)) scale(1);
+  }
+}
+
+@media (max-width: 640px) {
+  .roll-modal-stage {
+    min-height: 240px;
+  }
+
+  .d20-die {
+    width: 180px;
+  }
+
+  .d20-value {
+    font-size: 44px;
+  }
+}
+
 .time-notice-stack {
   position: fixed;
   right: 16px;
@@ -664,6 +1255,11 @@ button:disabled {
     flex-direction: column;
   }
 
+  .debug-panel {
+    width: 100%;
+    max-height: none;
+  }
+
   .map-layout {
     grid-template-columns: 1fr;
   }
@@ -672,12 +1268,28 @@ button:disabled {
     grid-template-columns: 1fr;
   }
 
+  .team-layout {
+    grid-template-columns: 1fr;
+  }
+
   .area-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .consistency-grid {
     grid-template-columns: 1fr;
   }
 
   .actions input {
     min-width: 0;
     width: 100%;
+  }
+}
+
+@media (max-width: 1200px) {
+  .debug-panel,
+  .chat-card {
+    width: 100%;
+    max-width: 100%;
   }
 }

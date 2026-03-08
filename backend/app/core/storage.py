@@ -141,18 +141,28 @@ def _assemble_bundle(bundle_dir: Path, manifest: dict[str, Any]) -> dict[str, An
     player_data = _read_part("player_data")
     game_logs = _read_part("game_logs")
     role_pool = _read_part("role_pool", {"items": []})
+    team_state = _read_part("team_state", {})
+    world_state = _read_part("world_state", {})
+    quest_state = _read_part("quest_state", {})
+    encounter_state = _read_part("encounter_state", {})
+    fate_state = _read_part("fate_state", {})
 
     return {
-        "version": meta.get("version", "1.1.0"),
+        "version": meta.get("version", "1.2.0"),
         "session_id": meta.get("session_id", "sess_default"),
         "updated_at": meta.get("updated_at"),
         "game_log_settings": meta.get("game_log_settings", {}),
+        "world_state": world_state,
         "map_snapshot": map_snapshot,
         "area_snapshot": area_snapshot,
         "player_static_data": player_data.get("player_static_data", {}),
         "player_runtime_data": player_data.get("player_runtime_data", {}),
         "game_logs": game_logs.get("items", []),
         "role_pool": role_pool.get("items", []),
+        "team_state": team_state,
+        "quest_state": quest_state,
+        "encounter_state": encounter_state,
+        "fate_state": fate_state,
     }
 
 
@@ -186,12 +196,13 @@ def write_save_payload(save_path: Path, payload: dict[str, Any]) -> None:
         "meta": (
             "meta.json",
             {
-                "version": payload.get("version", "1.1.0"),
+                "version": payload.get("version", "1.2.0"),
                 "session_id": payload.get("session_id", "sess_default"),
                 "updated_at": payload.get("updated_at"),
                 "game_log_settings": payload.get("game_log_settings", {}),
             },
         ),
+        "world_state": ("world_state.json", payload.get("world_state", {})),
         "map_snapshot": ("map_snapshot.json", payload.get("map_snapshot", {})),
         "area_snapshot": ("area_snapshot.json", payload.get("area_snapshot", {})),
         "player_data": (
@@ -203,6 +214,10 @@ def write_save_payload(save_path: Path, payload: dict[str, Any]) -> None:
         ),
         "game_logs": ("game_logs.json", {"items": payload.get("game_logs", [])}),
         "role_pool": ("role_pool.json", {"items": payload.get("role_pool", [])}),
+        "team_state": ("team_state.json", payload.get("team_state", {})),
+        "quest_state": ("quest_state.json", payload.get("quest_state", {})),
+        "encounter_state": ("encounter_state.json", payload.get("encounter_state", {})),
+        "fate_state": ("fate_state.json", payload.get("fate_state", {})),
     }
 
     old_manifest = _load_bundle_manifest(bundle_dir) or {}

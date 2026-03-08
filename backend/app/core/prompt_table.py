@@ -51,6 +51,14 @@ class _PromptTable:
         self._load_if_needed()
         return self._items.get(key, default_text)
 
+    def has_key(self, key: str) -> bool:
+        self._load_if_needed()
+        return key in self._items
+
+    def require_keys(self, keys: list[str] | tuple[str, ...]) -> list[str]:
+        self._load_if_needed()
+        return [key for key in keys if key not in self._items]
+
     def render(self, key: str, default_template: str, **kwargs: object) -> str:
         tpl = self.get_text(key, default_template)
         safe_vars = {k: str(v) for k, v in kwargs.items()}
@@ -58,4 +66,3 @@ class _PromptTable:
 
 
 prompt_table = _PromptTable()
-

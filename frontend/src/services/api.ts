@@ -5,20 +5,42 @@
   AppConfig,
   ChatMessage,
   ChatResponse,
+  ConsistencyRunResponse,
+  ConsistencyStatusResponse,
+  EncounterActResponse,
+  EncounterCheckResponse,
+  EncounterDebugOverviewResponse,
+  EncounterEntry,
+  EncounterEscapeResponse,
+  EncounterPendingResponse,
+  EncounterRejoinResponse,
+  FateCurrentResponse,
+  FateEvaluateResponse,
+  FateGenerateResponse,
   GameLogEntry,
   GameLogSettings,
   MapSnapshot,
   MovementLog,
   NpcChatResponse,
   NpcGreetResponse,
+  NpcKnowledgeResponse,
   NpcRoleCard,
+  QuestMutationResponse,
+  QuestStateResponse,
   RoleBuff,
   InventoryItem,
+  InventoryInteractResponse,
+  InventoryMutationResponse,
   PathStatus,
   PlayerRuntimeData,
   PlayerStaticData,
   RenderResult,
   SaveFile,
+  SceneEvent,
+  StorySnapshotResponse,
+  TeamMutationResponse,
+  TeamChatResponse,
+  TeamStateResponse,
   ToolEvent,
   TokenUsageSummary,
   Usage,
@@ -100,6 +122,7 @@ export async function streamChat(
     onUsage: (usage: Usage) => void;
     onTimeSpent: (minutes: number) => void;
     onToolEvents: (events: ToolEvent[]) => void;
+    onSceneEvents: (events: SceneEvent[]) => void;
   },
   signal: AbortSignal,
   report?: DebugReporter,
@@ -149,6 +172,7 @@ export async function streamChat(
           message?: string;
           usage?: Usage;
           tool_events?: ToolEvent[];
+          scene_events?: SceneEvent[];
           time_spent_min?: number;
         };
         if (event === 'delta') {
@@ -159,6 +183,7 @@ export async function streamChat(
           handlers.onUsage(data.usage ?? { input_tokens: 0, output_tokens: 0 });
           handlers.onTimeSpent(data.time_spent_min ?? 0);
           handlers.onToolEvents(data.tool_events ?? []);
+          handlers.onSceneEvents(data.scene_events ?? []);
           handlers.onEnd();
         }
       } catch {
@@ -370,6 +395,320 @@ export async function setGameLogSettings(
   );
 }
 
+export async function getQuestState(sessionId: string, report?: DebugReporter): Promise<QuestStateResponse> {
+  return requestJson(`/quests?session_id=${encodeURIComponent(sessionId)}`, { method: 'GET' }, report);
+}
+
+export async function debugGenerateQuest(
+  payload: { session_id: string; config?: AppConfig },
+  report?: DebugReporter,
+): Promise<QuestMutationResponse> {
+  return requestJson(
+    '/quests/debug/generate',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function acceptQuest(
+  payload: { session_id: string; quest_id: string; config?: AppConfig },
+  report?: DebugReporter,
+): Promise<QuestMutationResponse> {
+  return requestJson(
+    `/quests/${encodeURIComponent(payload.quest_id)}/accept`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: payload.session_id, config: payload.config }),
+    },
+    report,
+  );
+}
+
+export async function rejectQuest(
+  payload: { session_id: string; quest_id: string; config?: AppConfig },
+  report?: DebugReporter,
+): Promise<QuestMutationResponse> {
+  return requestJson(
+    `/quests/${encodeURIComponent(payload.quest_id)}/reject`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: payload.session_id, config: payload.config }),
+    },
+    report,
+  );
+}
+
+export async function trackQuest(
+  payload: { session_id: string; quest_id: string },
+  report?: DebugReporter,
+): Promise<QuestMutationResponse> {
+  return requestJson(
+    `/quests/${encodeURIComponent(payload.quest_id)}/track?session_id=${encodeURIComponent(payload.session_id)}`,
+    { method: 'POST' },
+    report,
+  );
+}
+
+export async function evaluateAllQuests(
+  payload: { session_id: string; config?: AppConfig },
+  report?: DebugReporter,
+): Promise<QuestStateResponse> {
+  return requestJson(
+    '/quests/evaluate-all',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function getPendingEncounters(sessionId: string, report?: DebugReporter): Promise<EncounterPendingResponse> {
+  return requestJson(`/encounters/pending?session_id=${encodeURIComponent(sessionId)}`, { method: 'GET' }, report);
+}
+
+export async function checkEncounters(
+  payload: { session_id: string; trigger_kind: 'random_move' | 'random_dialog' | 'scripted' | 'quest_rule' | 'fate_rule' | 'debug_forced'; config?: AppConfig },
+  report?: DebugReporter,
+): Promise<EncounterCheckResponse> {
+  return requestJson(
+    '/encounters/check',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function presentEncounter(
+  payload: { session_id: string; encounter_id: string },
+  report?: DebugReporter,
+): Promise<{ ok: boolean; session_id: string; encounter_id: string; status: EncounterEntry['status']; encounter: EncounterEntry }> {
+  return requestJson(
+    `/encounters/${encodeURIComponent(payload.encounter_id)}/present`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: payload.session_id }),
+    },
+    report,
+  );
+}
+
+export async function actEncounter(
+  payload: { session_id: string; encounter_id: string; player_prompt: string; config?: AppConfig },
+  report?: DebugReporter,
+): Promise<EncounterActResponse> {
+  return requestJson(
+    `/encounters/${encodeURIComponent(payload.encounter_id)}/act`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: payload.session_id, player_prompt: payload.player_prompt, config: payload.config }),
+    },
+    report,
+  );
+}
+
+export async function escapeEncounter(
+  payload: { session_id: string; encounter_id: string; config?: AppConfig },
+  report?: DebugReporter,
+): Promise<EncounterEscapeResponse> {
+  return requestJson(
+    `/encounters/${encodeURIComponent(payload.encounter_id)}/escape`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: payload.session_id, config: payload.config }),
+    },
+    report,
+  );
+}
+
+export async function rejoinEncounter(
+  payload: { session_id: string; encounter_id: string },
+  report?: DebugReporter,
+): Promise<EncounterRejoinResponse> {
+  return requestJson(
+    `/encounters/${encodeURIComponent(payload.encounter_id)}/rejoin`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: payload.session_id }),
+    },
+    report,
+  );
+}
+
+export async function getEncounterDebugOverview(sessionId: string, report?: DebugReporter): Promise<EncounterDebugOverviewResponse> {
+  return requestJson(`/encounters/debug/overview?session_id=${encodeURIComponent(sessionId)}`, { method: 'GET' }, report);
+}
+
+export async function toggleEncounterForce(
+  payload: { session_id: string; enabled?: boolean },
+  report?: DebugReporter,
+): Promise<{ ok: boolean; session_id: string; enabled: boolean }> {
+  return requestJson(
+    '/encounters/debug/force-toggle',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function getFateState(sessionId: string, report?: DebugReporter): Promise<FateCurrentResponse> {
+  return requestJson(`/fate/current?session_id=${encodeURIComponent(sessionId)}`, { method: 'GET' }, report);
+}
+
+export async function generateFate(
+  payload: { session_id: string; config?: AppConfig },
+  report?: DebugReporter,
+): Promise<FateGenerateResponse> {
+  return requestJson(
+    '/fate/debug/generate',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function regenerateFate(
+  payload: { session_id: string; config?: AppConfig },
+  report?: DebugReporter,
+): Promise<FateGenerateResponse> {
+  return requestJson(
+    '/fate/debug/regenerate',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function evaluateFate(
+  payload: { session_id: string; config?: AppConfig },
+  report?: DebugReporter,
+): Promise<FateEvaluateResponse> {
+  return requestJson(
+    '/fate/evaluate',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function getStorySnapshot(sessionId: string, report?: DebugReporter): Promise<StorySnapshotResponse> {
+  return requestJson(`/story/snapshot?session_id=${encodeURIComponent(sessionId)}`, { method: 'GET' }, report);
+}
+
+export async function getConsistencyStatus(sessionId: string, report?: DebugReporter): Promise<ConsistencyStatusResponse> {
+  return requestJson(`/consistency/status?session_id=${encodeURIComponent(sessionId)}`, { method: 'GET' }, report);
+}
+
+export async function runConsistencyCheck(sessionId: string, report?: DebugReporter): Promise<ConsistencyRunResponse> {
+  return requestJson(
+    '/consistency/run',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId }),
+    },
+    report,
+  );
+}
+
+export async function getNpcKnowledge(
+  sessionId: string,
+  npcRoleId: string,
+  report?: DebugReporter,
+): Promise<NpcKnowledgeResponse> {
+  return requestJson(`/npc/${encodeURIComponent(npcRoleId)}/knowledge?session_id=${encodeURIComponent(sessionId)}`, { method: 'GET' }, report);
+}
+
+export async function getTeamState(sessionId: string, report?: DebugReporter): Promise<TeamStateResponse> {
+  return requestJson(`/team?session_id=${encodeURIComponent(sessionId)}`, { method: 'GET' }, report);
+}
+
+export async function inviteNpcToTeam(
+  payload: { session_id: string; npc_role_id: string; player_prompt?: string; config?: AppConfig },
+  report?: DebugReporter,
+): Promise<TeamMutationResponse> {
+  return requestJson(
+    '/team/invite',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function leaveNpcFromTeam(
+  payload: { session_id: string; npc_role_id: string; reason?: string; config?: AppConfig },
+  report?: DebugReporter,
+): Promise<TeamMutationResponse> {
+  return requestJson(
+    '/team/leave',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function generateDebugTeammate(
+  payload: { session_id: string; prompt: string; config?: AppConfig },
+  report?: DebugReporter,
+): Promise<TeamMutationResponse> {
+  return requestJson(
+    '/team/debug/generate',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function sendTeamChat(
+  payload: { session_id: string; player_message: string; config?: AppConfig },
+  report?: DebugReporter,
+): Promise<TeamChatResponse> {
+  return requestJson(
+    '/team/chat',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
 export async function getPlayerStatic(sessionId: string, report?: DebugReporter): Promise<PlayerStaticData> {
   return requestJson(`/player/static?session_id=${encodeURIComponent(sessionId)}`, { method: 'GET' }, report);
 }
@@ -406,6 +745,67 @@ export async function unequipPlayerItem(
   return requestJson(
     `/player/equipment/unequip?session_id=${encodeURIComponent(sessionId)}`,
     { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) },
+    report,
+  );
+}
+
+export async function equipInventoryItem(
+  payload: {
+    session_id: string;
+    owner: { owner_type: 'player' | 'role'; role_id: string | null };
+    item_id: string;
+    slot: 'weapon' | 'armor';
+  },
+  report?: DebugReporter,
+): Promise<InventoryMutationResponse> {
+  return requestJson(
+    '/inventory/equip',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function unequipInventoryItem(
+  payload: {
+    session_id: string;
+    owner: { owner_type: 'player' | 'role'; role_id: string | null };
+    slot: 'weapon' | 'armor';
+  },
+  report?: DebugReporter,
+): Promise<InventoryMutationResponse> {
+  return requestJson(
+    '/inventory/unequip',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function interactInventoryItem(
+  payload: {
+    session_id: string;
+    owner: { owner_type: 'player' | 'role'; role_id: string | null };
+    item_id: string;
+    mode: 'inspect' | 'use';
+    prompt: string;
+    config?: AppConfig;
+  },
+  report?: DebugReporter,
+): Promise<InventoryInteractResponse> {
+  return requestJson(
+    '/inventory/interact',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
     report,
   );
 }
@@ -762,6 +1162,7 @@ export async function runActionCheck(
     action_type: 'attack' | 'check' | 'item_use';
     action_prompt: string;
     actor_role_id?: string;
+    forced_dice_roll?: number;
     config?: AppConfig;
   },
   report?: DebugReporter,

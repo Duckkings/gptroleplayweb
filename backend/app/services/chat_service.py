@@ -7,15 +7,23 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
+from app.core.prompt_keys import PromptKeys
 from app.core.prompt_table import prompt_table
 from app.models.schemas import (
     AreaDiscoverInteractionsRequest,
     AreaExecuteInteractionRequest,
     AreaMoveSubZoneRequest,
     ChatRequest,
+    EncounterActRequest,
+    EncounterEscapeRequest,
+    EncounterRejoinRequest,
+    InventoryEquipRequest,
+    InventoryInteractRequest,
+    InventoryUnequipRequest,
     Message,
     MoveRequest,
     InventoryItem,
+    InventoryOwnerRef,
     PlayerBuffAddRequest,
     PlayerBuffRemoveRequest,
     PlayerEquipRequest,
@@ -25,9 +33,13 @@ from app.models.schemas import (
     PlayerSpellSetRequest,
     PlayerSpellSlotAdjustRequest,
     PlayerStaminaAdjustRequest,
+    TeamChatRequest,
     PlayerUnequipRequest,
     RoleBuff,
     RoleRelationSetRequest,
+    TeamDebugGenerateRequest,
+    TeamInviteRequest,
+    TeamLeaveRequest,
     ToolEvent,
     Usage,
 )
@@ -52,10 +64,22 @@ from app.services.world_service import (
     remove_player_skill,
     remove_player_spell,
     set_role_relation,
+    inventory_equip,
+    inventory_interact,
+    inventory_unequip,
     unequip_player_item,
     move_to_sub_zone,
     move_to_zone,
 )
+from app.services.encounter_service import act_on_encounter, escape_encounter, get_encounter_debug_overview, rejoin_encounter
+from app.services.consistency_service import (
+    build_entity_index,
+    build_global_story_snapshot,
+    build_npc_knowledge_snapshot,
+    collect_consistency_issues,
+    reconcile_consistency,
+)
+from app.services.team_service import generate_debug_teammate, get_team_state, invite_npc_to_team, leave_npc_from_team, team_chat
 
 logger = logging.getLogger("roleplay.tools")
 
@@ -85,8 +109,8 @@ def _build_messages(payload: ChatRequest) -> list[dict[str, Any]]:
         {
             "role": "system",
             "content": prompt_table.get_text(
-                "chat.context_rule",
-                "Context rule: ignore prior chat history. Use tools to fetch state when needed.",
+                PromptKeys.CHAT_CONTEXT_RULE,
+                "Context rule: prefer the current structured game state, scene state, recent dialogue history, and active encounter state. Do not ignore current conversation state. Use tools to fetch fresh facts when needed.",
             ),
         },
         {
@@ -94,6 +118,13 @@ def _build_messages(payload: ChatRequest) -> list[dict[str, Any]]:
             "content": prompt_table.get_text(
                 "chat.map_awareness_rule",
                 "Map awareness rule: if movement target is ambiguous or you need available destinations, call get_map_index first to fetch current zone index.",
+            ),
+        },
+        {
+            "role": "system",
+            "content": prompt_table.get_text(
+                "chat.story_snapshot_rule",
+                "Story consistency rule: when you need current world facts about quests, fate, encounters, or legal NPCs, call get_story_snapshot or get_player_state first.",
             ),
         },
     ]
@@ -165,8 +196,238 @@ def _tools_schema() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "get_player_state",
-                "description": "Return player static/runtime/map state as JSON for confirmation.",
+                "description": "Return player static/runtime/map/world/quest/fate/encounter state as JSON for confirmation.",
                 "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_story_snapshot",
+                "description": "Return the unified structured world snapshot including revisions, current area, available NPCs, active quests, fate phase, and recent encounters.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_entity_index",
+                "description": "Return legal entity ids for zones, sub-zones, NPCs, quests, encounters, and fate phases. Scope can be global/current_zone/current_sub_zone.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "scope": {"type": "string", "enum": ["global", "current_zone", "current_sub_zone"]},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_consistency_status",
+                "description": "Return current world revision information and detected consistency issues.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_active_encounters",
+                "description": "Return the current active or escaped encounter, queued encounters, and encounter summary.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_consistency_check",
+                "description": "Run one consistency reconciliation pass and return whether stale content was invalidated.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_npc_knowledge",
+                "description": "Return the knowledge boundary snapshot for one NPC. Use when asking what an NPC should or should not know.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "npc_role_id": {"type": "string"},
+                    },
+                    "required": ["npc_role_id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_team_state",
+                "description": "Return the current team state, active members, affinity, trust, and recent team reactions.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "team_invite_npc",
+                "description": "Invite one NPC into the current team. Use only with a legal npc_role_id from get_story_snapshot/get_entity_index/role_pool.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "npc_role_id": {"type": "string"},
+                        "player_prompt": {"type": "string"},
+                    },
+                    "required": ["npc_role_id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "team_remove_npc",
+                "description": "Remove one NPC from the current team.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "npc_role_id": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["npc_role_id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_role_inventory",
+                "description": "Return one NPC role inventory/backpack and equipment information.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "role_id": {"type": "string"},
+                    },
+                    "required": ["role_id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "inventory_mutate",
+                "description": "Equip or unequip one backpack item for player or one teammate role.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "owner_type": {"type": "string", "enum": ["player", "role"]},
+                        "role_id": {"type": "string"},
+                        "mode": {"type": "string", "enum": ["equip", "unequip"]},
+                        "item_id": {"type": "string"},
+                        "slot": {"type": "string", "enum": ["weapon", "armor"]},
+                    },
+                    "required": ["owner_type", "mode", "slot"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "inventory_interact",
+                "description": "Inspect or use one backpack item for player or one teammate role.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "owner_type": {"type": "string", "enum": ["player", "role"]},
+                        "role_id": {"type": "string"},
+                        "item_id": {"type": "string"},
+                        "mode": {"type": "string", "enum": ["inspect", "use"]},
+                        "prompt": {"type": "string"},
+                    },
+                    "required": ["owner_type", "item_id", "mode"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "team_chat",
+                "description": "Send one player message into current party chat and return each current teammate response.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "player_message": {"type": "string"},
+                    },
+                    "required": ["player_message"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "team_generate_debug_member",
+                "description": "Generate a debug teammate directly into the current team from a short prompt.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {"type": "string"},
+                    },
+                    "required": ["prompt"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "encounter_act",
+                "description": "Advance the current encounter by one player action step.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "encounter_id": {"type": "string"},
+                        "player_prompt": {"type": "string"},
+                    },
+                    "required": ["encounter_id", "player_prompt"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "encounter_escape",
+                "description": "Attempt to escape from the current active encounter.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "encounter_id": {"type": "string"},
+                    },
+                    "required": ["encounter_id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "encounter_rejoin",
+                "description": "Rejoin an escaped encounter after returning to its original location.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "encounter_id": {"type": "string"},
+                    },
+                    "required": ["encounter_id"],
+                    "additionalProperties": False,
+                },
             },
         },
         {
@@ -510,12 +771,488 @@ async def _handle_tool_call(payload: ChatRequest, tool_call: Any) -> tuple[dict[
         save = get_current_save(default_session_id=payload.session_id)
         result = {
             "ok": True,
+            "world_state": save.world_state.model_dump(mode="json"),
             "player_static_data": save.player_static_data.model_dump(mode="json"),
             "player_runtime_data": save.player_runtime_data.model_dump(mode="json"),
             "map_snapshot": save.map_snapshot.model_dump(mode="json"),
+            "area_snapshot": save.area_snapshot.model_dump(mode="json"),
+            "team_state": save.team_state.model_dump(mode="json"),
+            "quest_state": save.quest_state.model_dump(mode="json"),
+            "encounter_state": save.encounter_state.model_dump(mode="json"),
+            "fate_state": save.fate_state.model_dump(mode="json"),
+            "role_pool": [item.model_dump(mode="json") for item in save.role_pool],
         }
         event = ToolEvent(tool_name="get_player_state", ok=True, summary="player state returned")
         logger.info("tool_call get_player_state ok")
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(result, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "get_story_snapshot":
+        save = get_current_save(default_session_id=payload.session_id)
+        snapshot = build_global_story_snapshot(save)
+        result = {"ok": True, "snapshot": snapshot.model_dump(mode="json")}
+        event = ToolEvent(
+            tool_name="get_story_snapshot",
+            ok=True,
+            summary="story snapshot returned",
+            payload={"world_revision": snapshot.world_revision, "map_revision": snapshot.map_revision},
+        )
+        logger.info("tool_call get_story_snapshot ok")
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(result, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "get_entity_index":
+        try:
+            args = json.loads(arg_text)
+        except Exception:
+            args = {}
+        scope = str(args.get("scope") or "global").strip() or "global"
+        save = get_current_save(default_session_id=payload.session_id)
+        index = build_entity_index(save, scope=scope)
+        result = {"ok": True, **index.model_dump(mode="json")}
+        event = ToolEvent(
+            tool_name="get_entity_index",
+            ok=True,
+            summary=f"entity index returned: {scope}",
+            payload={"npc_count": len(index.npc_ids), "zone_count": len(index.zone_ids)},
+        )
+        logger.info("tool_call get_entity_index ok: scope=%s", scope)
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(result, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "get_consistency_status":
+        save = get_current_save(default_session_id=payload.session_id)
+        issues = collect_consistency_issues(save)
+        result = {
+            "ok": True,
+            "world_state": save.world_state.model_dump(mode="json"),
+            "issue_count": len(issues),
+            "issues": [item.model_dump(mode="json") for item in issues],
+        }
+        event = ToolEvent(
+            tool_name="get_consistency_status",
+            ok=True,
+            summary=f"consistency issues: {len(issues)}",
+            payload={"issue_count": len(issues)},
+        )
+        logger.info("tool_call get_consistency_status ok: issue_count=%s", len(issues))
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(result, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "get_active_encounters":
+        response = get_encounter_debug_overview(payload.session_id)
+        result = {"ok": True, **response.model_dump(mode="json")}
+        event = ToolEvent(
+            tool_name="get_active_encounters",
+            ok=True,
+            summary=response.summary,
+            payload={
+                "queued_count": len(response.queued_encounters),
+                "has_active": response.active_encounter is not None,
+            },
+        )
+        logger.info("tool_call get_active_encounters ok")
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(result, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "run_consistency_check":
+        save = get_current_save(default_session_id=payload.session_id)
+        issues, changed = reconcile_consistency(save, session_id=payload.session_id, reason="tool")
+        save_current(save)
+        result = {
+            "ok": True,
+            "changed": changed,
+            "world_state": save.world_state.model_dump(mode="json"),
+            "issue_count": len(issues),
+            "issues": [item.model_dump(mode="json") for item in issues],
+        }
+        event = ToolEvent(
+            tool_name="run_consistency_check",
+            ok=True,
+            summary=f"consistency check finished: changed={changed}",
+            payload={"changed": changed, "issue_count": len(issues)},
+        )
+        logger.info("tool_call run_consistency_check ok: changed=%s issue_count=%s", changed, len(issues))
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(result, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "get_npc_knowledge":
+        try:
+            args = json.loads(arg_text)
+        except Exception:
+            args = {}
+        npc_role_id = str(args.get("npc_role_id") or "").strip()
+        if not npc_role_id:
+            event = ToolEvent(tool_name="get_npc_knowledge", ok=False, summary="npc_role_id is required")
+            return (
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps({"ok": False, "error": "npc_role_id_required"}, ensure_ascii=False),
+                },
+                event,
+            )
+        save = get_current_save(default_session_id=payload.session_id)
+        try:
+            snapshot = build_npc_knowledge_snapshot(save, npc_role_id)
+        except KeyError:
+            event = ToolEvent(tool_name="get_npc_knowledge", ok=False, summary="role not found")
+            return (
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps({"ok": False, "error": "role_not_found"}, ensure_ascii=False),
+                },
+                event,
+            )
+        result = {"ok": True, "snapshot": snapshot.model_dump(mode="json")}
+        event = ToolEvent(tool_name="get_npc_knowledge", ok=True, summary="npc knowledge returned")
+        logger.info("tool_call get_npc_knowledge ok: npc_role_id=%s", npc_role_id)
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(result, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "get_team_state":
+        response = get_team_state(payload.session_id)
+        result = {"ok": True, **response.model_dump(mode="json")}
+        event = ToolEvent(
+            tool_name="get_team_state",
+            ok=True,
+            summary=f"team state returned: {len(response.members)} members",
+            payload={"member_count": len(response.members)},
+        )
+        logger.info("tool_call get_team_state ok: member_count=%s", len(response.members))
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(result, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "team_invite_npc":
+        try:
+            args = json.loads(arg_text)
+            npc_role_id = str(args.get("npc_role_id") or "").strip()
+            player_prompt = str(args.get("player_prompt") or "").strip()
+            response = invite_npc_to_team(
+                TeamInviteRequest(session_id=payload.session_id, npc_role_id=npc_role_id, player_prompt=player_prompt)
+            )
+            result = {"ok": True, **response.model_dump(mode="json")}
+            event = ToolEvent(
+                tool_name="team_invite_npc",
+                ok=response.accepted,
+                summary=("team invite accepted" if response.accepted else "team invite rejected"),
+                payload={"npc_role_id": npc_role_id, "accepted": response.accepted},
+            )
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="team_invite_npc", ok=False, summary=f"team invite failed: {exc}")
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(result, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "team_remove_npc":
+        try:
+            args = json.loads(arg_text)
+            npc_role_id = str(args.get("npc_role_id") or "").strip()
+            reason = str(args.get("reason") or "").strip()
+            response = leave_npc_from_team(TeamLeaveRequest(session_id=payload.session_id, npc_role_id=npc_role_id, reason=reason))
+            result = {"ok": True, **response.model_dump(mode="json")}
+            event = ToolEvent(
+                tool_name="team_remove_npc",
+                ok=True,
+                summary="team member removed",
+                payload={"npc_role_id": npc_role_id},
+            )
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="team_remove_npc", ok=False, summary=f"team remove failed: {exc}")
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(result, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "get_role_inventory":
+        try:
+            args = json.loads(arg_text)
+            role_id = str(args.get("role_id") or "").strip()
+        except Exception:
+            role_id = ""
+        if not role_id:
+            event = ToolEvent(tool_name="get_role_inventory", ok=False, summary="role_id is required")
+            return (
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps({"ok": False, "error": "role_id_required"}, ensure_ascii=False),
+                },
+                event,
+            )
+        save = get_current_save(default_session_id=payload.session_id)
+        role = next((item for item in save.role_pool if item.role_id == role_id), None)
+        if role is None:
+            event = ToolEvent(tool_name="get_role_inventory", ok=False, summary="role not found")
+            return (
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps({"ok": False, "error": "role_not_found"}, ensure_ascii=False),
+                },
+                event,
+            )
+        result = {
+            "ok": True,
+            "role_id": role.role_id,
+            "name": role.name,
+            "backpack": role.profile.dnd5e_sheet.backpack.model_dump(mode="json"),
+            "equipment_slots": role.profile.dnd5e_sheet.equipment_slots.model_dump(mode="json"),
+        }
+        event = ToolEvent(tool_name="get_role_inventory", ok=True, summary="role inventory returned")
+        logger.info("tool_call get_role_inventory ok: role_id=%s", role_id)
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(result, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "inventory_mutate":
+        try:
+            args = json.loads(arg_text)
+            owner_type = str(args.get("owner_type") or "player").strip().lower()
+            role_id = str(args.get("role_id") or "").strip() or None
+            mode = str(args.get("mode") or "equip").strip().lower()
+            slot = str(args.get("slot") or "").strip().lower()
+            owner = InventoryOwnerRef(owner_type=owner_type, role_id=role_id)
+            if mode == "unequip":
+                response = inventory_unequip(payload=InventoryUnequipRequest(session_id=payload.session_id, owner=owner, slot=slot))  # type: ignore[arg-type]
+            else:
+                response = inventory_equip(
+                    payload=InventoryEquipRequest(
+                        session_id=payload.session_id,
+                        owner=owner,
+                        item_id=str(args.get("item_id") or "").strip(),
+                        slot=slot,  # type: ignore[arg-type]
+                    )
+                )
+            result = {"ok": True, **response.model_dump(mode="json")}
+            event = ToolEvent(tool_name="inventory_mutate", ok=True, summary=response.message or f"{mode} ok")
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="inventory_mutate", ok=False, summary=f"inventory mutate failed: {exc}")
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "inventory_interact":
+        try:
+            args = json.loads(arg_text)
+            owner = InventoryOwnerRef(
+                owner_type=str(args.get("owner_type") or "player").strip().lower(),
+                role_id=(str(args.get("role_id") or "").strip() or None),
+            )
+            response = inventory_interact(
+                payload=InventoryInteractRequest(
+                    session_id=payload.session_id,
+                    owner=owner,
+                    item_id=str(args.get("item_id") or "").strip(),
+                    mode=str(args.get("mode") or "inspect").strip().lower(),  # type: ignore[arg-type]
+                    prompt=str(args.get("prompt") or "").strip(),
+                )
+            )
+            result = {"ok": True, **response.model_dump(mode="json")}
+            event = ToolEvent(tool_name="inventory_interact", ok=True, summary=f"{response.mode} ok")
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="inventory_interact", ok=False, summary=f"inventory interact failed: {exc}")
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "team_chat":
+        try:
+            args = json.loads(arg_text)
+            player_message = str(args.get("player_message") or "").strip()
+            response = team_chat(TeamChatRequest(session_id=payload.session_id, player_message=player_message))
+            result = {"ok": True, **response.model_dump(mode="json")}
+            event = ToolEvent(
+                tool_name="team_chat",
+                ok=True,
+                summary=f"team chat returned: {len(response.replies)} replies",
+                payload={"reply_count": len(response.replies)},
+            )
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="team_chat", ok=False, summary=f"team chat failed: {exc}")
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(result, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "team_generate_debug_member":
+        try:
+            args = json.loads(arg_text)
+            prompt = str(args.get("prompt") or "").strip()
+            response = generate_debug_teammate(TeamDebugGenerateRequest(session_id=payload.session_id, prompt=prompt))
+            result = {"ok": True, **response.model_dump(mode="json")}
+            event = ToolEvent(
+                tool_name="team_generate_debug_member",
+                ok=True,
+                summary="debug teammate generated",
+                payload={"role_id": response.member.role_id if response.member is not None else ""},
+            )
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="team_generate_debug_member", ok=False, summary=f"debug teammate failed: {exc}")
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(result, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "encounter_act":
+        try:
+            args = json.loads(arg_text)
+            encounter_id = str(args.get("encounter_id") or "").strip()
+            player_prompt = str(args.get("player_prompt") or "").strip()
+            response = act_on_encounter(
+                encounter_id,
+                EncounterActRequest(
+                    session_id=payload.session_id,
+                    player_prompt=player_prompt,
+                ),
+            )
+            result = {"ok": True, **response.model_dump(mode="json")}
+            event = ToolEvent(
+                tool_name="encounter_act",
+                ok=True,
+                summary=f"encounter {response.status}",
+                payload={"encounter_id": response.encounter_id, "time_spent_min": response.time_spent_min},
+            )
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="encounter_act", ok=False, summary=f"encounter act failed: {exc}")
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(result, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "encounter_escape":
+        try:
+            args = json.loads(arg_text)
+            encounter_id = str(args.get("encounter_id") or "").strip()
+            response = escape_encounter(
+                encounter_id,
+                EncounterEscapeRequest(
+                    session_id=payload.session_id,
+                ),
+            )
+            result = {"ok": True, **response.model_dump(mode="json")}
+            event = ToolEvent(
+                tool_name="encounter_escape",
+                ok=True,
+                summary=f"escape {'ok' if response.escape_success else 'failed'}",
+                payload={"encounter_id": response.encounter_id, "escape_success": response.escape_success},
+            )
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="encounter_escape", ok=False, summary=f"encounter escape failed: {exc}")
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(result, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "encounter_rejoin":
+        try:
+            args = json.loads(arg_text)
+            encounter_id = str(args.get("encounter_id") or "").strip()
+            response = rejoin_encounter(
+                encounter_id,
+                EncounterRejoinRequest(
+                    session_id=payload.session_id,
+                ),
+            )
+            result = {"ok": True, **response.model_dump(mode="json")}
+            event = ToolEvent(
+                tool_name="encounter_rejoin",
+                ok=True,
+                summary=f"rejoin {response.status}",
+                payload={"encounter_id": response.encounter_id},
+            )
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="encounter_rejoin", ok=False, summary=f"encounter rejoin failed: {exc}")
         return (
             {
                 "role": "tool",

@@ -15,6 +15,21 @@ from app.models.schemas import (
     AreaCurrentResponse,
     AreaDiscoverInteractionsRequest,
     AreaDiscoverInteractionsResponse,
+    EncounterActRequest,
+    EncounterActResponse,
+    EncounterCheckRequest,
+    EncounterCheckResponse,
+    EncounterDebugOverviewResponse,
+    EncounterEscapeRequest,
+    EncounterEscapeResponse,
+    EncounterForceToggleRequest,
+    EncounterForceToggleResponse,
+    EncounterHistoryResponse,
+    EncounterPendingResponse,
+    EncounterPresentRequest,
+    EncounterPresentResponse,
+    EncounterRejoinRequest,
+    EncounterRejoinResponse,
     AreaExecuteInteractionRequest,
     AreaExecuteInteractionResponse,
     ActionCheckRequest,
@@ -24,6 +39,20 @@ from app.models.schemas import (
     BehaviorDescribeRequest,
     BehaviorDescribeResponse,
     ChatConfig,
+    FateCurrentResponse,
+    FateEvaluateRequest,
+    FateEvaluateResponse,
+    FateGenerateRequest,
+    FateGenerateResponse,
+    ConsistencyRunRequest,
+    ConsistencyRunResponse,
+    ConsistencyStatusResponse,
+    EntityIndexResponse,
+    InventoryEquipRequest,
+    InventoryInteractRequest,
+    InventoryInteractResponse,
+    InventoryMutationResponse,
+    InventoryUnequipRequest,
     GameLogAddRequest,
     GameLogListResponse,
     GameLogSettings,
@@ -53,6 +82,12 @@ from app.models.schemas import (
     PlayerUnequipRequest,
     RegionGenerateRequest,
     RegionGenerateResponse,
+    QuestEvaluateAllRequest,
+    QuestActionRequest,
+    QuestEvaluateRequest,
+    QuestMutationResponse,
+    QuestPublishRequest,
+    QuestStateResponse,
     RolePoolListResponse,
     RoleRelationSetRequest,
     RoleRelationUpsertRequest,
@@ -63,16 +98,27 @@ from app.models.schemas import (
     SaveFile,
     SaveImportRequest,
     SaveSetRequest,
+    StorySnapshotResponse,
+    TeamDebugGenerateRequest,
+    TeamInviteRequest,
+    TeamLeaveRequest,
+    TeamChatRequest,
+    TeamChatResponse,
+    TeamMutationResponse,
+    TeamStateResponse,
     TokenUsageResponse,
     ValidateConfigResponse,
     ValidateError,
     WorldClockInitRequest,
     WorldClockInitResponse,
+    NpcKnowledgeResponse,
 )
 from app.services.chat_service import MissingAPIKeyError, chat_once
 from app.services.world_service import (
     AIBehaviorError,
     AIRegionGenerationError,
+    _new_scene_event,
+    advance_public_scene_in_save,
     clear_current_save,
     describe_behavior,
     add_game_log,
@@ -113,9 +159,50 @@ from app.services.world_service import (
     set_game_log_settings,
     set_player_runtime,
     set_player_static,
+    inventory_equip,
+    inventory_interact,
+    inventory_unequip,
     unequip_player_item,
     init_world_clock,
     npc_greet,
+)
+from app.services.encounter_service import (
+    act_on_encounter,
+    advance_active_encounter_in_save,
+    check_for_encounter,
+    escape_encounter,
+    get_encounter_debug_overview,
+    get_encounter_history,
+    get_pending_encounters,
+    present_encounter,
+    rejoin_encounter,
+    set_debug_force_toggle,
+)
+from app.services.fate_service import evaluate_fate_state, generate_fate, get_fate_state, regenerate_fate
+from app.services.quest_service import (
+    accept_quest,
+    debug_generate_quest,
+    evaluate_all_quests,
+    evaluate_quest,
+    get_quest_state,
+    publish_quest,
+    reject_quest,
+    track_quest,
+)
+from app.services.consistency_service import (
+    build_entity_index,
+    build_global_story_snapshot,
+    build_npc_knowledge_snapshot,
+    collect_consistency_issues,
+    reconcile_consistency,
+)
+from app.services.team_service import (
+    apply_team_reactions,
+    generate_debug_teammate,
+    get_team_state,
+    invite_npc_to_team,
+    leave_npc_from_team,
+    team_chat,
 )
 
 router = APIRouter(prefix="/api/v1", tags=["api"])
@@ -153,6 +240,32 @@ async def chat(payload: ChatRequest) -> ChatResponse:
     except APIError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
+    scene_events = []
+    if last_user is not None:
+        try:
+            save = get_current_save(default_session_id=payload.session_id)
+            if save.session_id != payload.session_id:
+                save.session_id = payload.session_id
+            scene_events = advance_public_scene_in_save(
+                save,
+                session_id=payload.session_id,
+                player_text=last_user.content,
+                gm_summary=reply.content,
+                config=payload.config,
+            )
+            advanced = advance_active_encounter_in_save(save, session_id=payload.session_id, minutes_elapsed=time_spent_min, config=payload.config)
+            if advanced is not None:
+                scene_events.append(
+                    _new_scene_event(
+                        "encounter_background",
+                        advanced.latest_outcome_summary or advanced.scene_summary or advanced.description,
+                        metadata={"encounter_id": advanced.encounter_id},
+                    )
+                )
+            save_current(save)
+        except Exception:
+            pass
+
     token_usage_store.add(payload.session_id, "chat", usage.input_tokens, usage.output_tokens)
     if last_user is not None:
         add_game_log(
@@ -169,11 +282,22 @@ async def chat(payload: ChatRequest) -> ChatResponse:
             message=reply.content,
         )
     )
+    if last_user is not None:
+        try:
+            apply_team_reactions(
+                payload.session_id,
+                trigger_kind="main_chat",
+                player_text=last_user.content,
+                summary=reply.content,
+            )
+        except Exception:
+            pass
     return ChatResponse(
         session_id=payload.session_id,
         reply=reply,
         usage=usage,
         tool_events=tool_events,
+        scene_events=scene_events,
         time_spent_min=time_spent_min,
     )
 
@@ -187,8 +311,33 @@ async def chat_sse(payload: ChatRequest) -> StreamingResponse:
         yield "event: start\ndata: {\"session_id\":\"%s\"}\n\n" % payload.session_id
         last_user = next((m for m in reversed(payload.messages) if m.role == "user"), None)
         time_spent_min = apply_speech_time(payload.session_id, last_user.content, payload.config) if last_user is not None else 0
+        scene_events = []
         try:
             reply, usage, tool_events = await chat_once(payload)
+            if last_user is not None:
+                try:
+                    save = get_current_save(default_session_id=payload.session_id)
+                    if save.session_id != payload.session_id:
+                        save.session_id = payload.session_id
+                    scene_events = advance_public_scene_in_save(
+                        save,
+                        session_id=payload.session_id,
+                        player_text=last_user.content,
+                        gm_summary=reply.content,
+                        config=payload.config,
+                    )
+                    advanced = advance_active_encounter_in_save(save, session_id=payload.session_id, minutes_elapsed=time_spent_min, config=payload.config)
+                    if advanced is not None:
+                        scene_events.append(
+                            _new_scene_event(
+                                "encounter_background",
+                                advanced.latest_outcome_summary or advanced.scene_summary or advanced.description,
+                                metadata={"encounter_id": advanced.encounter_id},
+                            )
+                        )
+                    save_current(save)
+                except Exception:
+                    pass
             data = json.dumps({"content": reply.content}, ensure_ascii=False)
             yield f"event: delta\ndata: {data}\n\n"
         except MissingAPIKeyError:
@@ -220,10 +369,21 @@ async def chat_sse(payload: ChatRequest) -> StreamingResponse:
                 message=reply.content,
             )
         )
+        if last_user is not None:
+            try:
+                apply_team_reactions(
+                    payload.session_id,
+                    trigger_kind="main_chat",
+                    player_text=last_user.content,
+                    summary=reply.content,
+                )
+            except Exception:
+                pass
         usage_data = json.dumps(
             {
                 "usage": {"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens},
                 "tool_events": [ev.model_dump(mode="json") for ev in tool_events],
+                "scene_events": [ev.model_dump(mode="json") for ev in scene_events],
                 "time_spent_min": time_spent_min,
             },
             ensure_ascii=False,
@@ -369,6 +529,210 @@ async def game_log_settings_set(session_id: str, payload: GameLogSettings) -> Ga
     return set_game_log_settings(session_id, payload)
 
 
+@router.get("/quests", response_model=QuestStateResponse)
+async def quest_state_get(session_id: str) -> QuestStateResponse:
+    return get_quest_state(session_id)
+
+
+@router.get("/quests/current", response_model=QuestStateResponse)
+async def quest_current_get(session_id: str) -> QuestStateResponse:
+    return get_quest_state(session_id)
+
+
+@router.post("/quests/publish", response_model=QuestMutationResponse)
+async def quest_publish(payload: QuestPublishRequest) -> QuestMutationResponse:
+    try:
+        return publish_quest(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/quests/debug/generate", response_model=QuestMutationResponse)
+async def quest_debug_generate(payload: FateGenerateRequest) -> QuestMutationResponse:
+    return debug_generate_quest(payload.session_id, payload.config)
+
+
+@router.post("/quests/{quest_id}/accept", response_model=QuestMutationResponse)
+async def quest_accept(quest_id: str, payload: QuestActionRequest) -> QuestMutationResponse:
+    try:
+        return accept_quest(payload.session_id, quest_id, payload.config)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="quest not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/quests/{quest_id}/reject", response_model=QuestMutationResponse)
+async def quest_reject(quest_id: str, payload: QuestActionRequest) -> QuestMutationResponse:
+    try:
+        return reject_quest(payload.session_id, quest_id, payload.config)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="quest not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/quests/{quest_id}/track", response_model=QuestMutationResponse)
+async def quest_track(quest_id: str, session_id: str) -> QuestMutationResponse:
+    try:
+        return track_quest(session_id, quest_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="quest not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/quests/{quest_id}/evaluate", response_model=QuestMutationResponse)
+async def quest_evaluate(quest_id: str, payload: QuestEvaluateRequest) -> QuestMutationResponse:
+    if payload.quest_id != quest_id:
+        raise HTTPException(status_code=409, detail="quest id mismatch")
+    try:
+        return evaluate_quest(payload)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="quest not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/quests/evaluate-all", response_model=QuestStateResponse)
+async def quest_evaluate_all(payload: QuestEvaluateAllRequest) -> QuestStateResponse:
+    return evaluate_all_quests(payload)
+
+
+@router.get("/encounters/pending", response_model=EncounterPendingResponse)
+async def encounter_pending(session_id: str) -> EncounterPendingResponse:
+    return get_pending_encounters(session_id)
+
+
+@router.get("/encounters/history", response_model=EncounterHistoryResponse)
+async def encounter_history(session_id: str) -> EncounterHistoryResponse:
+    return get_encounter_history(session_id)
+
+
+@router.post("/encounters/check", response_model=EncounterCheckResponse)
+async def encounter_check(payload: EncounterCheckRequest) -> EncounterCheckResponse:
+    try:
+        return check_for_encounter(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/encounters/{encounter_id}/present", response_model=EncounterPresentResponse)
+async def encounter_present(encounter_id: str, payload: EncounterPresentRequest) -> EncounterPresentResponse:
+    try:
+        return present_encounter(encounter_id, payload)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="encounter not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/encounters/{encounter_id}/act", response_model=EncounterActResponse)
+async def encounter_act(encounter_id: str, payload: EncounterActRequest) -> EncounterActResponse:
+    try:
+        return act_on_encounter(encounter_id, payload)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="encounter not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/encounters/{encounter_id}/escape", response_model=EncounterEscapeResponse)
+async def encounter_escape(encounter_id: str, payload: EncounterEscapeRequest) -> EncounterEscapeResponse:
+    try:
+        return escape_encounter(encounter_id, payload)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="encounter not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/encounters/{encounter_id}/rejoin", response_model=EncounterRejoinResponse)
+async def encounter_rejoin(encounter_id: str, payload: EncounterRejoinRequest) -> EncounterRejoinResponse:
+    try:
+        return rejoin_encounter(encounter_id, payload)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="encounter not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/encounters/debug/force-toggle", response_model=EncounterForceToggleResponse)
+async def encounter_force_toggle(payload: EncounterForceToggleRequest) -> EncounterForceToggleResponse:
+    return set_debug_force_toggle(payload)
+
+
+@router.get("/encounters/debug/overview", response_model=EncounterDebugOverviewResponse)
+async def encounter_debug_overview(session_id: str) -> EncounterDebugOverviewResponse:
+    return get_encounter_debug_overview(session_id)
+
+
+@router.get("/fate/current", response_model=FateCurrentResponse)
+async def fate_current(session_id: str) -> FateCurrentResponse:
+    return get_fate_state(session_id)
+
+
+@router.post("/fate/debug/generate", response_model=FateGenerateResponse)
+async def fate_debug_generate(payload: FateGenerateRequest) -> FateGenerateResponse:
+    try:
+        return generate_fate(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/fate/debug/regenerate", response_model=FateGenerateResponse)
+async def fate_debug_regenerate(payload: FateGenerateRequest) -> FateGenerateResponse:
+    return regenerate_fate(payload)
+
+
+@router.post("/fate/evaluate", response_model=FateEvaluateResponse)
+async def fate_evaluate(payload: FateEvaluateRequest) -> FateEvaluateResponse:
+    return evaluate_fate_state(payload)
+
+
+@router.get("/story/snapshot", response_model=StorySnapshotResponse)
+async def story_snapshot_get(session_id: str) -> StorySnapshotResponse:
+    save = get_current_save(default_session_id=session_id)
+    if save.session_id != session_id:
+        save.session_id = session_id
+        save_current(save)
+    return StorySnapshotResponse(session_id=session_id, snapshot=build_global_story_snapshot(save))
+
+
+@router.get("/story/entity-index", response_model=EntityIndexResponse)
+async def story_entity_index_get(session_id: str, scope: str | None = None) -> EntityIndexResponse:
+    save = get_current_save(default_session_id=session_id)
+    if save.session_id != session_id:
+        save.session_id = session_id
+        save_current(save)
+    return build_entity_index(save, scope=(scope or "global"))
+
+
+@router.get("/consistency/status", response_model=ConsistencyStatusResponse)
+async def consistency_status_get(session_id: str) -> ConsistencyStatusResponse:
+    save = get_current_save(default_session_id=session_id)
+    if save.session_id != session_id:
+        save.session_id = session_id
+        save_current(save)
+    issues = collect_consistency_issues(save)
+    return ConsistencyStatusResponse(session_id=session_id, world_state=save.world_state, issue_count=len(issues), issues=issues)
+
+
+@router.post("/consistency/run", response_model=ConsistencyRunResponse)
+async def consistency_run(payload: ConsistencyRunRequest) -> ConsistencyRunResponse:
+    save = get_current_save(default_session_id=payload.session_id)
+    save.session_id = payload.session_id
+    issues, changed = reconcile_consistency(save, session_id=payload.session_id, reason="manual")
+    save_current(save)
+    return ConsistencyRunResponse(
+        session_id=payload.session_id,
+        world_state=save.world_state,
+        issue_count=len(issues),
+        issues=issues,
+        changed=changed,
+    )
+
+
 @router.get("/token-usage", response_model=TokenUsageResponse)
 async def token_usage(session_id: str) -> TokenUsageResponse:
     return token_usage_store.get(session_id)
@@ -397,6 +761,42 @@ async def player_equip_item(session_id: str, payload: PlayerEquipRequest) -> Pla
 @router.post("/player/equipment/unequip", response_model=PlayerStaticData)
 async def player_unequip_item(session_id: str, payload: PlayerUnequipRequest) -> PlayerStaticData:
     return unequip_player_item(session_id, payload)
+
+
+@router.post("/inventory/equip", response_model=InventoryMutationResponse)
+async def inventory_equip_item(payload: InventoryEquipRequest) -> InventoryMutationResponse:
+    try:
+        return inventory_equip(payload)
+    except KeyError as exc:
+        code = str(exc)
+        if "ROLE_NOT_FOUND" in code:
+            raise HTTPException(status_code=404, detail="role not found")
+        raise HTTPException(status_code=404, detail="item not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/inventory/unequip", response_model=InventoryMutationResponse)
+async def inventory_unequip_item(payload: InventoryUnequipRequest) -> InventoryMutationResponse:
+    try:
+        return inventory_unequip(payload)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="role not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/inventory/interact", response_model=InventoryInteractResponse)
+async def inventory_interact_item(payload: InventoryInteractRequest) -> InventoryInteractResponse:
+    try:
+        return inventory_interact(payload)
+    except KeyError as exc:
+        code = str(exc)
+        if "ROLE_NOT_FOUND" in code:
+            raise HTTPException(status_code=404, detail="role not found")
+        raise HTTPException(status_code=404, detail="item not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 @router.post("/player/buffs/add", response_model=PlayerStaticData)
@@ -521,6 +921,63 @@ async def npc_chat_run(payload: NpcChatRequest) -> NpcChatResponse:
         return npc_chat(payload)
     except KeyError:
         raise HTTPException(status_code=404, detail="role not found")
+
+
+@router.get("/npc/{npc_role_id}/knowledge", response_model=NpcKnowledgeResponse)
+async def npc_knowledge_get(npc_role_id: str, session_id: str) -> NpcKnowledgeResponse:
+    save = get_current_save(default_session_id=session_id)
+    if save.session_id != session_id:
+        save.session_id = session_id
+        save_current(save)
+    try:
+        snapshot = build_npc_knowledge_snapshot(save, npc_role_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="role not found")
+    return NpcKnowledgeResponse(session_id=session_id, npc_role_id=npc_role_id, snapshot=snapshot)
+
+
+@router.get("/team", response_model=TeamStateResponse)
+async def team_state_get(session_id: str) -> TeamStateResponse:
+    try:
+        return get_team_state(session_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/team/invite", response_model=TeamMutationResponse)
+async def team_invite_run(payload: TeamInviteRequest) -> TeamMutationResponse:
+    try:
+        return invite_npc_to_team(payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/team/leave", response_model=TeamMutationResponse)
+async def team_leave_run(payload: TeamLeaveRequest) -> TeamMutationResponse:
+    try:
+        return leave_npc_from_team(payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/team/debug/generate", response_model=TeamMutationResponse)
+async def team_debug_generate_run(payload: TeamDebugGenerateRequest) -> TeamMutationResponse:
+    try:
+        return generate_debug_teammate(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/team/chat", response_model=TeamChatResponse)
+async def team_chat_run(payload: TeamChatRequest) -> TeamChatResponse:
+    try:
+        return team_chat(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.post("/npc/chat/stream")

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import type { GameLogEntry } from '../types/app';
 
 type Props = {
@@ -10,11 +10,7 @@ type Props = {
 };
 
 export function GameLogPanel({ open, items, aiFetchLimit, onClose, onSetLimit }: Props) {
-  const [draft, setDraft] = useState(String(aiFetchLimit));
-
-  useEffect(() => {
-    setDraft(String(aiFetchLimit));
-  }, [aiFetchLimit, open]);
+  const [draft, setDraft] = useState(() => String(aiFetchLimit));
 
   if (!open) return null;
 
@@ -23,7 +19,7 @@ export function GameLogPanel({ open, items, aiFetchLimit, onClose, onSetLimit }:
       <header className="chat-header">
         <div>
           <h2>游戏日志</h2>
-          <p>记录玩家输入和系统反馈。AI 拉取默认条数可配置。</p>
+          <p>记录玩家输入和系统反馈，AI 拉取默认条数也可以在这里调整。</p>
         </div>
         <div className="actions">
           <button onClick={onClose}>关闭日志</button>
@@ -51,6 +47,7 @@ export function GameLogPanel({ open, items, aiFetchLimit, onClose, onSetLimit }:
           <article key={item.id} className="msg assistant">
             <strong>{item.kind}</strong>
             <p>{item.message}</p>
+            {item.payload && Object.keys(item.payload).length > 0 && <pre className="log-payload">{JSON.stringify(item.payload, null, 2)}</pre>}
             <p>{new Date(item.created_at).toLocaleString()}</p>
           </article>
         ))}

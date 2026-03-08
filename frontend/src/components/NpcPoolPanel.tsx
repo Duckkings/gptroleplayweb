@@ -6,9 +6,12 @@ type Props = {
   total: number;
   search: string;
   selected: NpcRoleCard | null;
+  teamMemberIds: string[];
   onSearch: (next: string) => void;
   onRefresh: () => void;
   onSelect: (roleId: string) => void;
+  onInviteTeam: (roleId: string, npcName: string) => void;
+  onLeaveTeam: (roleId: string) => void;
   onClose: () => void;
 };
 
@@ -18,9 +21,12 @@ export function NpcPoolPanel({
   total,
   search,
   selected,
+  teamMemberIds,
   onSearch,
   onRefresh,
   onSelect,
+  onInviteTeam,
+  onLeaveTeam,
   onClose,
 }: Props) {
   if (!open) return null;
@@ -61,6 +67,15 @@ export function NpcPoolPanel({
           {!selected && <p className="hint">点击左侧 NPC 查看角色卡。</p>}
           {selected && (
             <>
+              {teamMemberIds.includes(selected.role_id) ? (
+                <div className="actions">
+                  <button onClick={() => onLeaveTeam(selected.role_id)}>移出队伍</button>
+                </div>
+              ) : (
+                <div className="actions">
+                  <button onClick={() => onInviteTeam(selected.role_id, selected.name)}>邀请入队</button>
+                </div>
+              )}
               <h3>{selected.name}</h3>
               <p>ID: {selected.role_id}</p>
               <p>区域: {selected.zone_id ?? '-'} / 子区: {selected.sub_zone_id ?? '-'}</p>
@@ -71,10 +86,26 @@ export function NpcPoolPanel({
               <p>背景: {selected.background || '-'}</p>
               <p>认知: {selected.cognition || '-'}</p>
               <p>阵营: {selected.alignment || '-'}</p>
+              <p>秘密: {selected.secret || '-'}</p>
+              <p>喜好: {selected.likes.join('、') || '-'}</p>
+              <p>
+                健谈值: {selected.talkative_current}/{selected.talkative_maximum}
+              </p>
               <p>等级: {selected.profile.dnd5e_sheet.level}</p>
+              <p>
+                种族/职业: {selected.profile.dnd5e_sheet.race || '-'} / {selected.profile.dnd5e_sheet.char_class || '-'}
+              </p>
+              <p>职业背景: {selected.profile.dnd5e_sheet.background || '-'}</p>
               <p>
                 HP: {selected.profile.dnd5e_sheet.hit_points.current}/{selected.profile.dnd5e_sheet.hit_points.maximum}
               </p>
+              <p>语言: {selected.profile.dnd5e_sheet.languages.join(', ') || '无'}</p>
+              <p>熟练技能: {selected.profile.dnd5e_sheet.skills_proficient.join(', ') || '无'}</p>
+              <p>工具熟练: {selected.profile.dnd5e_sheet.tool_proficiencies.join(', ') || '无'}</p>
+              <p>特质: {selected.profile.dnd5e_sheet.features_traits.join(', ') || '无'}</p>
+              <p>法术: {selected.profile.dnd5e_sheet.spells.join(', ') || '无'}</p>
+              <p>金币: {selected.profile.dnd5e_sheet.backpack.gold}</p>
+              <p>背包物品: {selected.profile.dnd5e_sheet.backpack.items.map((item) => item.name).join(', ') || '无'}</p>
               <p>
                 STR/DEX/CON/INT/WIS/CHA: {selected.profile.dnd5e_sheet.ability_scores.strength}/
                 {selected.profile.dnd5e_sheet.ability_scores.dexterity}/

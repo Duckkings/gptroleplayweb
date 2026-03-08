@@ -1,174 +1,97 @@
-﻿# 技术文档（Roleplay Web）
-
+# 技术文档（Roleplay Web）
 ## 设计来源
-- docs/design/gamedesign/gamedesign.md
-- docs/design/gamedesign/areadesign.md
-- docs/design/gamedesign/roledesign.md
+- `docs/design/gamedesign/gamedesign.md`
+- `docs/design/gamedesign/roledesign.md`
+- `docs/design/gamedesign/teamdesign.md`
 
-本文档描述当前代码实现（更新于 2026-02-26），并定义后续开发的文档维护方式。
+更新于 `2026-03-08`。
 
-## 1. 文档分层规范
+## 1. 文档分层
+- 设计文档：`docs/design/gamedesign/*.md`
+  - 描述玩法目标、体验规则、优先级与取舍。
+- 技术文档：`docs/technical/*.md`
+  - 描述数据模型、接口契约、状态机、校验规则、实现边界。
+- 模块 README：各代码目录下的 `README.md`
+  - 描述模块职责、导出接口与依赖关系。
 
-以后统一采用三层文档，避免每次开发都通读全部代码：
+维护规则：
+- 只要接口、状态、存档结构或前端交互发生变化，必须同步更新对应技术文档。
 
-- 设计文档（`docs/design/gamedesign/*.md`）
-  - 讲玩法目标、体验规则、取舍。
-  - 不写具体代码细节。
-- 技术文档（本文件 + `docs/technical/area-technical.md`）
-  - 讲数据结构、接口契约、算法、错误码。
-- 模块文档（每个代码模块目录下 `README.md`）
-  - 讲模块职责、导出接口、调用方法、依赖关系。
-
-维护原则：功能改动必须同步更新对应层级文档。
-
-## 2. 项目结构
-
-```txt
-gptroleplayweb/
-  backend/
-    app/
-      api/
-      core/
-      models/
-      services/
-      main.py
-    tests/
-  frontend/
-    src/
-      components/
-      services/
-      types/
-      App.tsx
-  docs/
-    design/
-      gamedesign/
-        gamedesign.md
-        areadesign.md
-    technical/
-      technical.md
-      area-technical.md
-      role-technical.md
-      save-technical.md
-      gameplay-core-technical.md
-```
+## 2. 当前专题文档
+- `docs/technical/gameplay-core-technical.md`
+- `docs/technical/role-technical.md`
+- `docs/technical/save-technical.md`
+- `docs/technical/fate-technical.md`
+- `docs/technical/quest-technical.md`
+- `docs/technical/encounter-technical.md`
+- `docs/technical/team-technical.md`
+- `docs/technical/ai-tool-protocol.md`
 
 ## 3. 当前系统能力概览
+### 3.1 聊天与 AI 工具
+- 主聊天支持工具调用，后端统一执行业务逻辑并回注模型。
+- NPC 单聊具备问候、知识边界、结构化对话日志。
+- AI 工具层已覆盖玩家状态、故事快照、一致性状态、NPC 知识边界、队伍状态、角色背包等只读能力。
+- AI 工具层已覆盖入队、离队、调试队友生成、队伍聊天、玩家资源修改等写入能力。
 
-### 3.1 聊天与工具调用
-- `POST /api/v1/chat`
-- `POST /api/v1/chat/stream`
-- `POST /api/v1/npc/greet`
-- `POST /api/v1/npc/chat`
-- `POST /api/v1/npc/chat/stream`
+### 3.2 世界、一致性与叙事
+- 使用 `world_revision / map_revision` 管控地图重生成后的内容失效。
+- 命运线、任务、遭遇都绑定来源 revision，并带实体引用校验。
+- NPC 回答会受 `NpcKnowledgeSnapshot` 约束，避免引用当前世界中不存在的人物或地点。
 
-特性：
-- 仅发送最后一条玩家输入（不带完整聊天历史）。
-- 后端统一代理工具调用并回注模型。
-- `tool_events` 回传前端调试面板。
-- NPC 单聊将结构化聊天记录写入角色卡（含世界日期/时间），并在生成时回带历史上下文。
-- 玩家发言会按 token 粗估消耗时间，推进世界时钟并弹出时间提示。
+### 3.3 角色与队伍
+- 玩家、NPC、怪物共用统一角色底座：`PlayerStaticData + Dnd5eCharacterSheet`。
+- `NpcRoleCard` 承载个性、背景、关系、认知变化、对话日志。
+- 队伍系统当前已实现：
+  - 邀请 NPC 入队
+  - 调试队友生成与离队销毁
+  - 队友跟随同步
+  - 主聊天 / 单聊 / 移动 / 检定后的队友反馈
+  - 队伍聊天 `team_chat`
+  - 队友背包详情查看
 
-### 3.2 世界地图与区块
-- `POST /api/v1/world-map/regions/generate`
-- `POST /api/v1/world-map/render`
-- `POST /api/v1/world-map/move`
-- `POST /api/v1/world/clock/init`
-- `GET /api/v1/world/area/current`
-- `POST /api/v1/world/area/move-sub-zone`
-- `POST /api/v1/world/area/interactions/discover`
-- `POST /api/v1/world/area/interactions/execute`
+### 3.4 存档与日志
+- 逻辑层统一对象仍是 `SaveFile`。
+- 物理存储为 pointer + bundle 分片。
+- 队伍相关持久化包括：
+  - `team_state`
+  - 队友对话日志（保存在 `role_pool` 的 `NpcRoleCard.dialogue_logs`）
+  - `game_logs` 中的 `team_join / team_leave / team_reaction / team_chat / team_debug_generate`
 
-特性：
-- 大区块范围圈、子区块点位都可渲染。
-- 子区块跨区移动可计算耗时并推进时钟。
-- 交互支持即时发现与占位执行。
+## 4. 当前实现策略
+项目保持“规则代码负责事实，AI 负责文本”的边界：
+- 后端负责：
+  - 存档读写
+  - revision 与失效
+  - 实体合法性校验
+  - 队伍成员状态、跟随、离队
+  - 关系与资源写入
+- AI 负责：
+  - 主叙事与 NPC 文本
+  - 任务 / 遭遇草稿文案
+  - 入队判断的可选补强
+  - 队伍聊天的逐成员回应
 
-### 3.3 存档与日志
-- 逻辑上仍使用 `SaveFile`，物理存储改为分片 bundle（`current-save.json` 指针 + `*.bundle` 分片文件，按块增量写入）。
-- 游戏日志记录玩家输入、GM 回复、移动、区块刷新、占位交互。
-- Token 使用量按 `chat/map_generation/movement_narration` 聚合统计。
+## 5. 本轮新增关注点
+- 读取 `roledesign.md` 后，角色技术文档补齐了结构化对话日志、背包查看、队伍复用角色卡的约束。
+- 读取 `teamdesign.md` 后，落地了新队伍设计：
+  - 独立队伍面板
+  - 队伍聊天
+  - 队友背包详情
+  - AI 工具 `team_chat`
+- 相关技术文档已同步更新，不再只记录“入队/离队/跟随”。
 
-## 4. AI 生成与逻辑控制关系（实现策略）
+## 6. 建议阅读顺序
+1. 对应设计文档
+2. 对应专题技术文档
+3. 相关模块 README
+4. 相关代码实现与测试
 
-当前采用“AI 生成内容，逻辑锁定规则”的混合模式：
-
-- 逻辑层硬约束：
-  - 坐标、半径、数量、非重叠、耗时、时钟推进。
-  - schema 校验、去重、fallback。
-- AI 层软约束：
-  - 名称、描述、叙事、发现候选。
-
-这样可以避免：
-- 纯逻辑导致内容僵化。
-- 纯 prompt 导致状态不可控。
-
-## 5. 模块文档索引
-
-### 后端
-- `backend/app/api/README.md`
-- `backend/app/core/README.md`
-- `backend/app/models/README.md`
-- `backend/app/services/README.md`
-
-### 前端
-- `frontend/src/components/README.md`
-- `frontend/src/services/README.md`
-- `frontend/src/types/README.md`
-
-## 6. 开发时快速理解流程（建议固定执行）
-
-每次做新功能，先按顺序读：
-
-1. 对应设计文档（例如 `docs/design/gamedesign/areadesign.md`）。
-2. 对应技术文档（例如 `docs/technical/area-technical.md`、`docs/technical/role-technical.md`、`docs/technical/save-technical.md`、`docs/technical/gameplay-core-technical.md`）。
-3. 模块 README（例如 `backend/app/services/README.md`）。
-4. 只读与本功能直接相关的代码文件。
-
-目标：把“全仓库重读”降到“按模块定点阅读”。
-
-## 7. 文档更新约定（提交前检查）
-
-涉及以下变更时必须同步文档：
-- 新增/修改 API 请求或响应字段。
-- 规则变化（耗时、坐标、状态推进、生成策略）。
-- 存档结构变化。
-- 前端交互流程变化（面板、弹窗、按钮行为）。
-
-建议在 PR 描述固定附：
-- 变更的设计文档路径。
-- 变更的技术文档路径。
-- 变更的模块 README 路径。
-
-## 8. 运行与验证
-
-后端：
+## 7. 常用回归
 ```powershell
 cd backend
-python -m venv .venv314
-.\.venv314\Scripts\Activate.ps1
-pip install -r requirements.txt
-uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+python -m unittest discover -s tests -p "test_area_logic.py"
+python -m unittest discover -s tests -p "test_consistency_service.py"
+python -m unittest discover -s tests -p "test_quest_fate_encounter.py"
+python -m unittest discover -s tests -p "test_team_service.py"
 ```
-
-前端：
-```powershell
-cd frontend
-npm install
-npm run dev
-```
-
-区块最小回归：
-```powershell
-cd backend
-python -m unittest tests.test_area_logic
-```
-
-
-
-
-
-
-
-
-
-
