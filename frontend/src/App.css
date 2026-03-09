@@ -107,6 +107,57 @@ button:disabled {
   margin: 12px 0;
 }
 
+.config-grid {
+  display: grid;
+  gap: 12px;
+  margin: 16px 0;
+}
+
+.config-section {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #0a101a;
+  padding: 14px;
+  display: grid;
+  gap: 12px;
+}
+
+.config-section label,
+.config-fields {
+  display: grid;
+  gap: 8px;
+}
+
+.config-section label span {
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.config-card input,
+.config-card select,
+.config-card textarea {
+  width: 100%;
+  border: 1px solid var(--border);
+  background: #0a0f1b;
+  border-radius: 10px;
+  color: var(--text);
+  padding: 12px;
+}
+
+.config-card select {
+  appearance: none;
+}
+
+.checkbox-line {
+  display: flex !important;
+  align-items: center;
+  gap: 10px;
+}
+
+.checkbox-line input {
+  width: auto;
+}
+
 .chat-card {
   width: min(1420px, 100%);
   display: grid;

@@ -2,7 +2,6 @@
 
 import json
 import logging
-import os
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -43,6 +42,7 @@ from app.models.schemas import (
     ToolEvent,
     Usage,
 )
+from app.services.ai_adapter import build_completion_options, create_async_client
 from app.services.world_service import (
     add_player_buff,
     add_player_item,
@@ -150,10 +150,10 @@ def _sum_usage(base: Usage, extra: Usage) -> Usage:
 
 
 def _client(payload: ChatRequest) -> AsyncOpenAI:
-    api_key = payload.config.openai_api_key or os.getenv("OPENAI_API_KEY")
+    api_key = payload.config.api_key
     if not api_key:
-        raise MissingAPIKeyError("openai_api_key is not set")
-    return AsyncOpenAI(api_key=api_key)
+        raise MissingAPIKeyError("api_key is not set")
+    return create_async_client(payload.config, client_cls=AsyncOpenAI)
 
 
 def _tools_schema() -> list[dict[str, Any]]:
@@ -1624,8 +1624,7 @@ async def chat_once(payload: ChatRequest) -> tuple[Message, Usage, list[ToolEven
     for _ in range(4):
         response = await client.chat.completions.create(
             model=payload.config.model,
-            temperature=payload.config.temperature,
-            max_tokens=payload.config.max_tokens,
+            **build_completion_options(payload.config),
             messages=messages,
             tools=_tools_schema(),
             tool_choice="auto",

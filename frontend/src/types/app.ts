@@ -1,17 +1,56 @@
-﻿export type UIConfig = {
+export type UIConfig = {
   theme: string;
+};
+
+export type AIProvider = 'openai' | 'deepseek';
+
+export type AppRuntimeConfig = {
+  temperature?: number;
+  max_tokens?: number;
+  max_completion_tokens?: number;
 };
 
 export type AppConfig = {
   version: string;
-  openai_api_key: string;
+  provider: AIProvider;
+  api_key: string;
+  base_url_override?: string | null;
   model: string;
   stream: boolean;
-  temperature: number;
-  max_tokens: number;
+  runtime: AppRuntimeConfig;
   gm_prompt: string;
   speech_time_per_50_tokens_min: number;
   ui?: UIConfig;
+};
+
+export type ModelCapabilityProfile =
+  | 'openai_gpt5'
+  | 'openai_standard'
+  | 'deepseek_chat'
+  | 'deepseek_reasoner'
+  | 'generic_compatible';
+
+export type ModelCapabilityInfo = {
+  id: string;
+  label: string;
+  capability_profile: ModelCapabilityProfile;
+  supported_params: Array<'temperature' | 'max_tokens' | 'max_completion_tokens'>;
+  defaults: Record<string, string | number | boolean>;
+  warning?: string | null;
+};
+
+export type ValidateConfigResponse = {
+  valid: boolean;
+  errors: Array<{ field: string; message: string }>;
+  normalized_config?: AppConfig | null;
+};
+
+export type ModelDiscoverResponse = {
+  models: ModelCapabilityInfo[];
+};
+
+export type ModelProfileResponse = {
+  model: ModelCapabilityInfo;
 };
 
 export type ChatRole = 'user' | 'assistant' | 'system';
@@ -1165,13 +1204,17 @@ export const defaultTeamState: TeamState = {
 };
 
 export const defaultConfig: AppConfig = {
-  version: '1.0.0',
-  openai_api_key: 'sk-xxxx',
-  model: 'gpt-4.1-mini',
+  version: '2.0.0',
+  provider: 'openai',
+  api_key: 'sk-xxxx',
+  base_url_override: '',
+  model: 'gpt-5',
   stream: true,
-  temperature: 0.8,
-  max_tokens: 1200,
-  gm_prompt: '你是本次跑团的叙述者。请保持叙事一致、节奏紧凑，聚焦环境、人物与事件推进。',
+  runtime: {
+    temperature: 0.8,
+    max_completion_tokens: 1200,
+  },
+  gm_prompt: '?????????????????????????????????????',
   speech_time_per_50_tokens_min: 1,
   ui: {
     theme: 'dark',

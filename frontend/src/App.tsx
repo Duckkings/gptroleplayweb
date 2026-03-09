@@ -23,6 +23,7 @@ import {
   checkEncounters,
   clearSave,
   debugGenerateQuest,
+  discoverConfigModels,
   discoverAreaInteractions,
   describeBehavior,
   escapeEncounter,
@@ -36,6 +37,7 @@ import {
   getGameLogs,
   getGameLogSettings,
   getConfigPath,
+  getConfigModelProfile,
   getCurrentArea,
   getCurrentSave,
   getFateState,
@@ -101,6 +103,7 @@ import {
   type GlobalStorySnapshot,
   type InventoryOwnerRef,
   type MapSnapshot,
+  type ModelCapabilityInfo,
   type PathStatus,
   type PlayerRuntimeData,
   type PlayerStaticData,
@@ -148,6 +151,40 @@ const EMPTY_TOKEN_USAGE: TokenUsageSummary = {
     movement_narration: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
   },
 };
+
+const MODEL_PARAM_LABELS: Record<'temperature' | 'max_tokens' | 'max_completion_tokens', string> = {
+  temperature: 'Temperature',
+  max_tokens: 'Max Tokens',
+  max_completion_tokens: 'Max Completion Tokens',
+};
+
+function applyModelProfile(config: AppConfig, profile: ModelCapabilityInfo | null): AppConfig {
+  if (!profile) {
+    return { ...config, runtime: {} };
+  }
+  const runtime: AppConfig['runtime'] = {};
+  for (const key of profile.supported_params) {
+    const current = config.runtime?.[key];
+    const fallback = profile.defaults[key];
+    if (typeof current === 'number') {
+      runtime[key] = current;
+      continue;
+    }
+    if (typeof fallback === 'number') {
+      runtime[key] = fallback;
+    }
+  }
+  return { ...config, runtime };
+}
+
+function resetProviderSelection(config: AppConfig, updates: Partial<AppConfig>): AppConfig {
+  return {
+    ...config,
+    ...updates,
+    model: '',
+    runtime: {},
+  };
+}
 const DEFAULT_ACTION_CHECK_ROLL_STATE: ActionCheckRollState = {
   open: false,
   phase: 'ready',
@@ -175,8 +212,13 @@ function App() {
   const [error, setError] = useState('');
   const [configHint, setConfigHint] = useState('');
   const [sessionId, setSessionId] = useState(() => `sess_${Date.now()}`);
-  const [configJson, setConfigJson] = useState(() => JSON.stringify(defaultConfig, null, 2));
   const [configPath, setCfgPath] = useState<PathStatus | null>(null);
+  const [configDraft, setConfigDraft] = useState<AppConfig>(defaultConfig);
+  const [configModels, setConfigModels] = useState<ModelCapabilityInfo[]>([]);
+  const [configProfile, setConfigProfile] = useState<ModelCapabilityInfo | null>(null);
+  const [configModelsLoading, setConfigModelsLoading] = useState(false);
+  const [configProfileLoading, setConfigProfileLoading] = useState(false);
+  const [manualModelMode, setManualModelMode] = useState(false);
 
   const [debugCollapsed, setDebugCollapsed] = useState(true);
   const [debugEntries, setDebugEntries] = useState<ApiDebugEntry[]>([]);
@@ -254,6 +296,44 @@ function App() {
     if (chatState === 'error') return `错误: ${error}`;
     return '就绪';
   }, [chatState, error]);
+
+  useEffect(() => {
+    if (view !== 'config') return;
+    const model = configDraft.model.trim();
+    if (!model) {
+      setConfigProfile(null);
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      setConfigProfileLoading(true);
+      try {
+        const result = await getConfigModelProfile(
+          {
+            provider: configDraft.provider,
+            model,
+            api_key: configDraft.api_key,
+            base_url_override: configDraft.base_url_override,
+          },
+          report,
+        );
+        if (cancelled) return;
+        setConfigProfile(result.model);
+        setConfigDraft((prev) => (prev.model.trim() === model ? applyModelProfile(prev, result.model) : prev));
+      } catch (e) {
+        if (cancelled) return;
+        setConfigProfile(null);
+        setError(e instanceof Error ? e.message : '模型能力解析失败');
+      } finally {
+        if (!cancelled) setConfigProfileLoading(false);
+      }
+    }, 250);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [view, configDraft.provider, configDraft.base_url_override, configDraft.api_key, configDraft.model]);
+
   const currentSubZone = useMemo(() => {
     if (!areaSnapshot?.current_sub_zone_id) return null;
     return areaSnapshot.sub_zones.find((s) => s.sub_zone_id === areaSnapshot.current_sub_zone_id) ?? null;
@@ -716,8 +796,10 @@ function App() {
 
   const onNewConfig = () => {
     setConfigReturnView('boot');
-    setConfig(defaultConfig);
-    setConfigJson(JSON.stringify(defaultConfig, null, 2));
+    setConfigDraft(defaultConfig);
+    setConfigModels([]);
+    setConfigProfile(null);
+    setManualModelMode(true);
     setError('');
     setConfigHint('');
     setView('config');
@@ -725,7 +807,10 @@ function App() {
 
   const onOpenConfigFromChat = () => {
     setConfigReturnView('chat');
-    setConfigJson(JSON.stringify(config, null, 2));
+    setConfigDraft(config);
+    setConfigModels([]);
+    setConfigProfile(null);
+    setManualModelMode(true);
     setError('');
     setConfigHint('');
     setView('config');
@@ -733,19 +818,21 @@ function App() {
 
   const onLoadConfigFile = async (file: File) => {
     const text = await file.text();
-    setConfigJson(text);
     setError('');
     setConfigHint('');
     try {
-      const parsed = JSON.parse(text) as AppConfig;
+      const parsed = JSON.parse(text) as unknown;
       const result = await validateConfig(parsed, report);
       if (!result.valid) {
         setError(`配置校验失败: ${formatValidateErrors(result.errors)}`);
         setView('config');
         return;
       }
-      setConfig(parsed);
-      setConfigJson(JSON.stringify(parsed, null, 2));
+      const normalized = result.normalized_config ?? defaultConfig;
+      setConfigDraft(normalized);
+      setConfigModels([]);
+      setConfigProfile(null);
+      setManualModelMode(true);
       setConfigHint('本地配置校验通过，请确认后点击“校验并进入聊天”。');
       setView('config');
     } catch (e) {
@@ -764,23 +851,99 @@ function App() {
     }
   };
 
-  const onValidateConfigText = async () => {
+  const onConfigProviderChange = (provider: AppConfig['provider']) => {
+    setConfigDraft((prev) => resetProviderSelection(prev, { provider }));
+    setConfigModels([]);
+    setConfigProfile(null);
+    setManualModelMode(false);
+    setError('');
+    setConfigHint('');
+  };
+
+  const onConfigApiKeyChange = (api_key: string) => {
+    setConfigDraft((prev) => resetProviderSelection(prev, { api_key }));
+    setConfigModels([]);
+    setConfigProfile(null);
+    setManualModelMode(false);
+    setError('');
+    setConfigHint('');
+  };
+
+  const onConfigBaseUrlChange = (base_url_override: string) => {
+    setConfigDraft((prev) => resetProviderSelection(prev, { base_url_override }));
+    setConfigModels([]);
+    setConfigProfile(null);
+    setManualModelMode(false);
+    setError('');
+    setConfigHint('');
+  };
+
+  const onConfigModelChange = (model: string) => {
+    setConfigDraft((prev) => ({ ...prev, model }));
+    setError('');
+    setConfigHint('');
+  };
+
+  const onConfigRuntimeChange = (key: keyof AppConfig['runtime'], rawValue: string) => {
+    const value = rawValue.trim();
+    setConfigDraft((prev) => ({
+      ...prev,
+      runtime: {
+        ...prev.runtime,
+        [key]: value ? Number(value) : undefined,
+      },
+    }));
+  };
+
+  const onFetchConfigModels = async () => {
+    const apiKey = configDraft.api_key.trim();
+    if (!apiKey) {
+      setError('请先填写 API Key。');
+      return;
+    }
+    setError('');
+    setConfigHint('');
+    setConfigModelsLoading(true);
+    try {
+      const result = await discoverConfigModels(
+        {
+          provider: configDraft.provider,
+          api_key: apiKey,
+          base_url_override: configDraft.base_url_override,
+        },
+        report,
+      );
+      setConfigModels(result.models);
+      setManualModelMode(false);
+      setConfigHint(`已加载 ${result.models.length} 个模型。`);
+    } catch (e) {
+      setConfigModels([]);
+      setManualModelMode(true);
+      setError(e instanceof Error ? e.message : '模型列表拉取失败');
+      setConfigHint('模型列表拉取失败，已切换为手动输入模型名。');
+    } finally {
+      setConfigModelsLoading(false);
+    }
+  };
+
+  const onValidateAndSaveConfig = async () => {
     setError('');
     setConfigHint('');
     try {
-      const parsed = JSON.parse(configJson) as AppConfig;
-      const result = await validateConfig(parsed, report);
+      const result = await validateConfig(configDraft, report);
       if (!result.valid) {
         setError(`配置校验失败: ${formatValidateErrors(result.errors)}`);
         return;
       }
-      await saveConfig(parsed, report);
-      setConfig(parsed);
+      const normalized = result.normalized_config ?? configDraft;
+      await saveConfig(normalized, report);
+      setConfig(normalized);
+      setConfigDraft(normalized);
       setView('chat');
       setChatState('idle');
       setConfigHint('配置已保存到后端路径。');
     } catch (e) {
-      setError(`JSON 格式错误: ${e instanceof Error ? e.message : '配置解析失败'}`);
+      setError(e instanceof Error ? e.message : '配置保存失败');
     }
   };
 
@@ -2105,15 +2268,146 @@ function App() {
       <main className="app-shell">
         <section className="card config-card">
           <h1>配置编辑</h1>
-          <p>请确认配置内容（含 openai_api_key），确认后再进入聊天。</p>
-          <div className="actions">
-            <button onClick={() => void onPickConfigPath()}>选择配置文件夹</button>
+          <p>选择服务商、填写 API Key、拉取模型，再按模型能力配置参数。</p>
+          <div className="config-grid">
+            <div className="config-section">
+              <h2>连接</h2>
+              <label>
+                <span>服务商</span>
+                <select value={configDraft.provider} onChange={(e) => onConfigProviderChange(e.target.value as AppConfig['provider'])}>
+                  <option value="openai">OpenAI</option>
+                  <option value="deepseek">DeepSeek</option>
+                </select>
+              </label>
+              <label>
+                <span>API Key</span>
+                <input
+                  type="password"
+                  value={configDraft.api_key}
+                  onChange={(e) => onConfigApiKeyChange(e.target.value)}
+                  placeholder="输入 API Key"
+                />
+              </label>
+              <label>
+                <span>自定义 Base URL</span>
+                <input
+                  type="text"
+                  value={configDraft.base_url_override ?? ''}
+                  onChange={(e) => onConfigBaseUrlChange(e.target.value)}
+                  placeholder={configDraft.provider === 'deepseek' ? '默认 https://api.deepseek.com' : '留空使用官方地址'}
+                />
+              </label>
+              <div className="actions">
+                <button onClick={() => void onFetchConfigModels()} disabled={configModelsLoading}>
+                  {configModelsLoading ? '加载模型中...' : '获取模型'}
+                </button>
+                <button type="button" onClick={() => setManualModelMode((prev) => !prev)}>
+                  {manualModelMode ? '使用下拉选择' : '手动输入模型'}
+                </button>
+              </div>
+            </div>
+
+            <div className="config-section">
+              <h2>模型</h2>
+              {!manualModelMode ? (
+                <label>
+                  <span>模型列表</span>
+                  <select value={configDraft.model} onChange={(e) => onConfigModelChange(e.target.value)}>
+                    <option value="">请选择模型</option>
+                    {configModels.map((item) => (
+                      <option key={item.id} value={item.id}>
+                        {item.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : (
+                <label>
+                  <span>手动模型名</span>
+                  <input
+                    type="text"
+                    value={configDraft.model}
+                    onChange={(e) => onConfigModelChange(e.target.value)}
+                    placeholder="例如 gpt-5 / deepseek-chat"
+                  />
+                </label>
+              )}
+              <p className="hint">
+                {configProfileLoading
+                  ? '正在解析模型能力...'
+                  : configProfile
+                    ? `能力档位: ${configProfile.capability_profile}`
+                    : '选择模型后自动解析可配置参数。'}
+              </p>
+              {configProfile?.warning && <p className="hint">{configProfile.warning}</p>}
+            </div>
+
+            <div className="config-section">
+              <h2>参数</h2>
+              {configProfile ? (
+                <div className="config-fields">
+                  {configProfile.supported_params.map((paramKey) => (
+                    <label key={paramKey}>
+                      <span>{MODEL_PARAM_LABELS[paramKey]}</span>
+                      <input
+                        type="number"
+                        step={paramKey === 'temperature' ? '0.1' : '1'}
+                        value={configDraft.runtime[paramKey] ?? ''}
+                        onChange={(e) => onConfigRuntimeChange(paramKey, e.target.value)}
+                      />
+                    </label>
+                  ))}
+                </div>
+              ) : (
+                <p className="hint">当前模型尚未解析，参数区暂不可用。</p>
+              )}
+            </div>
+
+            <div className="config-section">
+              <h2>通用</h2>
+              <label className="checkbox-line">
+                <input
+                  type="checkbox"
+                  checked={configDraft.stream}
+                  onChange={(e) => setConfigDraft((prev) => ({ ...prev, stream: e.target.checked }))}
+                />
+                <span>启用流式输出</span>
+              </label>
+              <label>
+                <span>每 50 tokens 折算分钟</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={30}
+                  value={configDraft.speech_time_per_50_tokens_min}
+                  onChange={(e) =>
+                    setConfigDraft((prev) => ({
+                      ...prev,
+                      speech_time_per_50_tokens_min: Number(e.target.value || 1),
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>GM Prompt</span>
+                <textarea
+                  value={configDraft.gm_prompt}
+                  onChange={(e) => setConfigDraft((prev) => ({ ...prev, gm_prompt: e.target.value }))}
+                />
+              </label>
+            </div>
+
+            <div className="config-section">
+              <h2>存储</h2>
+              <div className="actions">
+                <button onClick={() => void onPickConfigPath()}>选择配置文件夹</button>
+              </div>
+              {configPath && <p className="hint">当前配置路径: {configPath.path}</p>}
+            </div>
           </div>
-          {configPath && <p className="hint">当前配置路径: {configPath.path}</p>}
-          <textarea value={configJson} onChange={(e) => setConfigJson(e.target.value)} />
           <div className="actions">
             <button onClick={() => setView(configReturnView)}>返回</button>
-            <button onClick={() => void onValidateConfigText()}>校验并进入聊天</button>
+            <button onClick={() => void onValidateAndSaveConfig()}>校验并进入聊天</button>
           </div>
           {configHint && <p className="hint">{configHint}</p>}
           {error && <p className="error">{error}</p>}

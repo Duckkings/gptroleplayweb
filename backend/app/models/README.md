@@ -7,7 +7,7 @@
 Main file: `backend/app/models/schemas.py`
 
 ## Model Groups
-- Chat: `ChatConfig`, `ChatRequest`, `ChatResponse`, `ToolEvent`
+- Chat: `ChatConfig`, `ChatRuntimeConfig`, `ChatRequest`, `ChatResponse`, `ToolEvent`
 - Map: `Zone`, `MapSnapshot`, `RenderMapResponse`, `MoveResponse`
 - Area: `AreaZone`, `AreaSubZone`, `AreaSnapshot`, `AreaMoveResult`
 - Interactions: `AreaInteraction`, `AreaNpc`, `AreaDiscoverInteractionsResponse`

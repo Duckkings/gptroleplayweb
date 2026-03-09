@@ -22,6 +22,7 @@ from app.models.schemas import (
     QuestState,
     QuestStateResponse,
 )
+from app.services.ai_adapter import build_completion_options, create_sync_client
 from app.services.consistency_service import (
     build_entity_index,
     build_global_story_snapshot,
@@ -307,10 +308,10 @@ def _ai_generate_quest_draft(save, source: str, config: ChatConfig | None) -> Qu
         sub_name=sub_name,
     )
     try:
-        client = OpenAI(api_key=api_key)
+        client = create_sync_client(config, client_cls=OpenAI)
         resp = client.chat.completions.create(
             model=model,
-            temperature=min(max(config.temperature, 0), 2),
+            **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": prompt_table.get_text("quest.generate.system", "你只输出 JSON。")},
@@ -433,10 +434,10 @@ def _ai_generate_quest_draft_guarded(save, source: str, config: ChatConfig | Non
         pending_quest_ids=_prompt_list(snapshot.pending_quest_ids),
     )
     try:
-        client = OpenAI(api_key=api_key)
+        client = create_sync_client(config, client_cls=OpenAI)
         resp = client.chat.completions.create(
             model=model,
-            temperature=min(max(config.temperature, 0), 2),
+            **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": prompt_table.get_text("quest.generate.system", "Return JSON only.")},

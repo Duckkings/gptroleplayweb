@@ -89,6 +89,7 @@ from app.models.schemas import (
     Zone,
     ZoneSubZoneSeed,
 )
+from app.services.ai_adapter import build_completion_options, create_sync_client
 from app.services.consistency_service import (
     build_npc_knowledge_snapshot,
     bump_world_revision,
@@ -1005,10 +1006,10 @@ def _generate_inventory_interaction_reply(
         model = (config.model or "").strip()
         if api_key and model:
             try:
-                client = OpenAI(api_key=api_key)
+                client = create_sync_client(config, client_cls=OpenAI)
                 resp = client.chat.completions.create(
                     model=model,
-                    temperature=min(max(config.temperature, 0), 2),
+                    **build_completion_options(config),
                     messages=[
                         {"role": "system", "content": "Return plain Chinese text only."},
                         {
@@ -1548,10 +1549,10 @@ def _ai_discover_interactions(config: ChatConfig, sub_zone: AreaSubZone, intent:
     if not api_key or not model:
         raise AIRegionGenerationError("discover_interactions: 缺少模型配置")
 
-    client = OpenAI(api_key=api_key)
+    client = create_sync_client(config, client_cls=OpenAI)
     resp = client.chat.completions.create(
         model=model,
-        temperature=min(max(config.temperature, 0), 2),
+        **build_completion_options(config),
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": prompt_table.get_text("world.discover.system", "你是可交互内容生成器，只输出 JSON。")},
@@ -1575,10 +1576,10 @@ def _ai_generate_zones(session_id: str, center: Position, count: int, world_prom
         raise AIRegionGenerationError("缺少有效的模型配置或 API Key")
 
     try:
-        client = OpenAI(api_key=api_key)
+        client = create_sync_client(config, client_cls=OpenAI)
         resp = client.chat.completions.create(
             model=model,
-            temperature=min(max(config.temperature, 0), 2),
+            **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": prompt_table.get_text("world.region.system", "你是地图设计器，只输出 JSON。")},
@@ -2940,7 +2941,7 @@ def _generate_targeted_public_npc_reply(
         model = (config.model or "").strip()
         if api_key and model:
             try:
-                client = OpenAI(api_key=api_key)
+                client = create_sync_client(config, client_cls=OpenAI)
                 world_time_text, _ = _world_time_payload(save.area_snapshot.clock)
                 prompt = prompt_table.render(
                     PromptKeys.NPC_PUBLIC_TARGETED_USER,
@@ -2955,7 +2956,7 @@ def _generate_targeted_public_npc_reply(
                 )
                 resp = client.chat.completions.create(
                     model=model,
-                    temperature=min(max(config.temperature, 0), 2),
+                    **build_completion_options(config),
                     response_format={"type": "json_object"},
                     messages=[
                         {"role": "system", "content": config.gm_prompt},
@@ -3002,7 +3003,7 @@ def _generate_bystander_public_reactions(
             model = (config.model or "").strip()
             if api_key and model:
                 try:
-                    client = OpenAI(api_key=api_key)
+                    client = create_sync_client(config, client_cls=OpenAI)
                     prompt = prompt_table.render(
                         PromptKeys.NPC_PUBLIC_BYSTANDER_USER,
                         "你要扮演公开区域中的旁观NPC，只输出 JSON。",
@@ -3013,7 +3014,7 @@ def _generate_bystander_public_reactions(
                     )
                     resp = client.chat.completions.create(
                         model=model,
-                        temperature=min(max(config.temperature, 0), 2),
+                        **build_completion_options(config),
                         response_format={"type": "json_object"},
                         messages=[
                             {"role": "system", "content": config.gm_prompt},
@@ -3226,7 +3227,7 @@ def npc_greet(req: NpcGreetRequest) -> NpcGreetResponse:
         model = (req.config.model or "").strip()
         if api_key and model:
             try:
-                client = OpenAI(api_key=api_key)
+                client = create_sync_client(req.config, client_cls=OpenAI)
                 world_time_text, _ = _world_time_payload(save.area_snapshot.clock)
                 knowledge = build_npc_knowledge_snapshot(save, role.role_id)
                 default_prompt = (
@@ -3254,7 +3255,7 @@ def npc_greet(req: NpcGreetRequest) -> NpcGreetResponse:
                 )
                 resp = client.chat.completions.create(
                     model=model,
-                    temperature=min(max(req.config.temperature, 0), 2),
+                    **build_completion_options(req.config),
                     messages=[
                         {"role": "system", "content": req.config.gm_prompt},
                         {"role": "user", "content": prompt},
@@ -3344,7 +3345,7 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
         model = (req.config.model or "").strip()
         if api_key and model:
             try:
-                client = OpenAI(api_key=api_key)
+                client = create_sync_client(req.config, client_cls=OpenAI)
                 world_time_text, _ = _world_time_payload(save.area_snapshot.clock)
                 context = _build_npc_prompt_context(role, save.area_snapshot.clock)
                 conversation_state = _npc_conversation_state_summary(role)
@@ -3400,7 +3401,7 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
                 )
                 resp = client.chat.completions.create(
                     model=model,
-                    temperature=min(max(req.config.temperature, 0), 2),
+                    **build_completion_options(req.config),
                     response_format={"type": "json_object"},
                     messages=[
                         {"role": "system", "content": req.config.gm_prompt},
@@ -3639,10 +3640,10 @@ def _ai_action_plan(req: ActionCheckRequest) -> dict[str, int | bool | str]:
             action_type=req.action_type,
             action_prompt=req.action_prompt,
         )
-        client = OpenAI(api_key=api_key)
+        client = create_sync_client(req.config, client_cls=OpenAI)
         resp = client.chat.completions.create(
             model=model,
-            temperature=min(max(req.config.temperature, 0), 2),
+            **build_completion_options(req.config),
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": prompt_table.get_text("action.plan.system", "你只输出JSON。")},
@@ -3696,7 +3697,7 @@ def _suggest_relation_tag(req: ActionCheckRequest, success: bool, critical: str)
         model = (req.config.model or "").strip()
         if api_key and model:
             try:
-                client = OpenAI(api_key=api_key)
+                client = create_sync_client(req.config, client_cls=OpenAI)
                 default_prompt = (
                     "基于互动行为和结果，输出JSON: {\"relation_tag\":\"ally|friendly|neutral|wary|hostile\"}。"
                     "action_prompt=$action_prompt; success=$success; critical=$critical"
@@ -3710,7 +3711,7 @@ def _suggest_relation_tag(req: ActionCheckRequest, success: bool, critical: str)
                 )
                 resp = client.chat.completions.create(
                     model=model,
-                    temperature=min(max(req.config.temperature, 0), 2),
+                    **build_completion_options(req.config),
                     response_format={"type": "json_object"},
                     messages=[
                         {"role": "system", "content": prompt_table.get_text("relation.tag.system", "你只输出JSON。")},
@@ -3957,7 +3958,7 @@ def move_to_sub_zone(req: AreaMoveSubZoneRequest) -> AreaMoveResult:
             api_key = (req.config.openai_api_key or "").strip()
             model = (req.config.model or "").strip()
             if api_key and model:
-                client = OpenAI(api_key=api_key)
+                client = create_sync_client(req.config, client_cls=OpenAI)
                 default_prompt = (
                     "你是跑团GM。基于以下移动结果写一段50-120字叙事。"
                     "不要编号，不要选项。"
@@ -3973,7 +3974,7 @@ def move_to_sub_zone(req: AreaMoveSubZoneRequest) -> AreaMoveResult:
                 )
                 resp = client.chat.completions.create(
                     model=model,
-                    temperature=min(max(req.config.temperature, 0), 2),
+                    **build_completion_options(req.config),
                     messages=[
                         {"role": "system", "content": req.config.gm_prompt},
                         {"role": "user", "content": prompt},
@@ -4126,7 +4127,7 @@ def describe_behavior(session_id: str, movement_log: MovementLog, config: ChatCo
         raise AIBehaviorError("缺少有效的模型配置或 API Key")
 
     try:
-        client = OpenAI(api_key=api_key)
+        client = create_sync_client(config, client_cls=OpenAI)
         default_prompt = (
             "你是跑团GM。"
             "请根据移动日志生成一段简短但有氛围感的叙事反馈，100-180字。"
@@ -4142,7 +4143,7 @@ def describe_behavior(session_id: str, movement_log: MovementLog, config: ChatCo
         )
         resp = client.chat.completions.create(
             model=model,
-            temperature=min(max(config.temperature, 0), 2),
+            **build_completion_options(config),
             messages=[
                 {"role": "system", "content": config.gm_prompt},
                 {"role": "user", "content": prompt},
@@ -4163,5 +4164,4 @@ def describe_behavior(session_id: str, movement_log: MovementLog, config: ChatCo
         raise
     except Exception as exc:
         raise AIBehaviorError(str(exc)) from exc
-
 

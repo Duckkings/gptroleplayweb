@@ -1,7 +1,7 @@
 ﻿from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -10,16 +10,65 @@ class UIConfig(BaseModel):
     theme: str = Field(default="dark")
 
 
+class ChatRuntimeConfig(BaseModel):
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    max_tokens: int | None = Field(default=None, gt=0)
+    max_completion_tokens: int | None = Field(default=None, gt=0)
+
+
 class ChatConfig(BaseModel):
-    version: str = Field(default="1.0.0")
-    openai_api_key: str = Field(..., min_length=1)
+    version: str = Field(default="2.0.0")
+    provider: Literal["openai", "deepseek"] = "openai"
+    api_key: str = Field(..., min_length=1)
+    base_url_override: str | None = None
     model: str = Field(..., min_length=1)
     stream: bool
-    temperature: float = Field(default=0.8, ge=0, le=2)
-    max_tokens: int = Field(default=1200, gt=0)
+    runtime: ChatRuntimeConfig = Field(default_factory=ChatRuntimeConfig)
     gm_prompt: str = Field(..., min_length=1)
     speech_time_per_50_tokens_min: int = Field(default=1, ge=1, le=30)
     ui: UIConfig | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_fields(cls, raw: Any) -> Any:
+        if not isinstance(raw, dict):
+            return raw
+        data = dict(raw)
+        runtime_raw = data.get("runtime")
+        runtime = dict(runtime_raw) if isinstance(runtime_raw, dict) else {}
+
+        if "openai_api_key" in data and "api_key" not in data:
+            data["api_key"] = data.pop("openai_api_key")
+        if "provider" not in data:
+            data["provider"] = "openai"
+        if "temperature" in data and "temperature" not in runtime:
+            runtime["temperature"] = data.pop("temperature")
+        if "max_tokens" in data and "max_tokens" not in runtime:
+            runtime["max_tokens"] = data.pop("max_tokens")
+        if "max_completion_tokens" in data and "max_completion_tokens" not in runtime:
+            runtime["max_completion_tokens"] = data.pop("max_completion_tokens")
+        data["runtime"] = runtime
+        return data
+
+    @property
+    def openai_api_key(self) -> str:
+        return self.api_key
+
+    @property
+    def temperature(self) -> float:
+        return self.runtime.temperature if self.runtime.temperature is not None else 0.8
+
+    @property
+    def max_tokens(self) -> int:
+        if self.runtime.max_tokens is not None:
+            return self.runtime.max_tokens
+        if self.runtime.max_completion_tokens is not None:
+            return self.runtime.max_completion_tokens
+        return 1200
+
+    @property
+    def max_completion_tokens(self) -> int | None:
+        return self.runtime.max_completion_tokens
 
 
 class ValidateError(BaseModel):
@@ -30,6 +79,37 @@ class ValidateError(BaseModel):
 class ValidateConfigResponse(BaseModel):
     valid: bool
     errors: list[ValidateError]
+    normalized_config: ChatConfig | None = None
+
+
+class ModelProfileRequest(BaseModel):
+    provider: Literal["openai", "deepseek"]
+    api_key: str = Field(default="", min_length=0)
+    model: str = Field(default="", min_length=0)
+    base_url_override: str | None = None
+
+
+class ModelCapabilityInfo(BaseModel):
+    id: str = Field(..., min_length=1)
+    label: str = Field(..., min_length=1)
+    capability_profile: Literal[
+        "openai_gpt5",
+        "openai_standard",
+        "deepseek_chat",
+        "deepseek_reasoner",
+        "generic_compatible",
+    ]
+    supported_params: list[Literal["temperature", "max_tokens", "max_completion_tokens"]] = Field(default_factory=list)
+    defaults: dict[str, int | float | bool | str] = Field(default_factory=dict)
+    warning: str | None = None
+
+
+class ModelDiscoverResponse(BaseModel):
+    models: list[ModelCapabilityInfo] = Field(default_factory=list)
+
+
+class ModelProfileResponse(BaseModel):
+    model: ModelCapabilityInfo
 
 
 class Message(BaseModel):

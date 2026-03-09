@@ -28,6 +28,7 @@ from app.models.schemas import (
     TeamState,
     TeamStateResponse,
 )
+from app.services.ai_adapter import build_completion_options, create_sync_client
 from app.services.consistency_service import build_npc_knowledge_snapshot
 from app.services.world_service import (
     _ability_mod,
@@ -170,7 +171,7 @@ def _build_invite_decision(save, role: NpcRoleCard, req: TeamInviteRequest) -> t
         model = (config.model or "").strip()
         if api_key and model:
             try:
-                client = OpenAI(api_key=api_key)
+                client = create_sync_client(config, client_cls=OpenAI)
                 zone_name, sub_name = _current_player_area_names(save)
                 prompt_text = (
                     "You decide whether one NPC should join the player's party. Return JSON only.\n"
@@ -182,7 +183,7 @@ def _build_invite_decision(save, role: NpcRoleCard, req: TeamInviteRequest) -> t
                 )
                 resp = client.chat.completions.create(
                     model=model,
-                    temperature=min(max(config.temperature, 0), 2),
+                    **build_completion_options(config),
                     response_format={"type": "json_object"},
                     messages=[
                         {"role": "system", "content": "Return JSON only."},
@@ -721,10 +722,10 @@ def _ai_team_role_spec(save, prompt: str, config, source: str) -> dict[str, Any]
         f"Current area={zone_name}/{sub_name}. Source={source}. Player prompt={prompt}."
     )
     try:
-        client = OpenAI(api_key=api_key)
+        client = create_sync_client(config, client_cls=OpenAI)
         resp = client.chat.completions.create(
             model=model,
-            temperature=min(max(config.temperature, 0), 2),
+            **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": "Return JSON only."},
@@ -1034,7 +1035,7 @@ def _ai_team_chat_reply(save, role: NpcRoleCard, player_text: str, config) -> tu
     if not api_key or not model:
         return None
     try:
-        client = OpenAI(api_key=api_key)
+        client = create_sync_client(config, client_cls=OpenAI)
         knowledge = build_npc_knowledge_snapshot(save, role.role_id)
         world_time_text, _ = _world_time_payload(save.area_snapshot.clock)
         context = _build_npc_context(role, recent_count=10)
@@ -1075,7 +1076,7 @@ def _ai_team_chat_reply(save, role: NpcRoleCard, player_text: str, config) -> tu
         )
         resp = client.chat.completions.create(
             model=model,
-            temperature=min(max(config.temperature, 0), 2),
+            **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": config.gm_prompt},
@@ -1251,7 +1252,7 @@ def _ai_team_public_reply(save, role: NpcRoleCard, player_text: str, scene_summa
     if not api_key or not model:
         return None
     try:
-        client = OpenAI(api_key=api_key)
+        client = create_sync_client(config, client_cls=OpenAI)
         zone_name, sub_name = _current_player_area_names(save)
         prompt = prompt_table.render(
             PromptKeys.TEAM_PUBLIC_REACTION_USER,
@@ -1265,7 +1266,7 @@ def _ai_team_public_reply(save, role: NpcRoleCard, player_text: str, scene_summa
         )
         resp = client.chat.completions.create(
             model=model,
-            temperature=min(max(config.temperature, 0), 2),
+            **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": config.gm_prompt},

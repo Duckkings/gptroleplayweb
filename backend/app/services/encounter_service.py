@@ -43,6 +43,7 @@ from app.services.consistency_service import (
     extract_entity_refs_from_encounter,
     validate_entity_refs,
 )
+from app.services.ai_adapter import build_completion_options, create_sync_client
 from app.services.world_service import _advance_clock, _default_world_clock, get_current_save, save_current
 
 
@@ -373,10 +374,10 @@ def _ai_generate_encounter(save, trigger_kind: str, config: ChatConfig | None) -
         phase_title=phase_title,
     )
     try:
-        client = OpenAI(api_key=api_key)
+        client = create_sync_client(config, client_cls=OpenAI)
         resp = client.chat.completions.create(
             model=model,
-            temperature=min(max(config.temperature, 0), 2),
+            **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": prompt_table.get_text("encounter.generate.system", "你只输出 JSON。")},
@@ -455,10 +456,10 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
         active_quests=_prompt_list([f"{quest.quest_id}:{quest.title}" for quest in snapshot.active_quests]),
     )
     try:
-        client = OpenAI(api_key=api_key)
+        client = create_sync_client(config, client_cls=OpenAI)
         resp = client.chat.completions.create(
             model=model,
-            temperature=min(max(config.temperature, 0), 2),
+            **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": prompt_table.get_text("encounter.generate.system", "你只输出 JSON。所有文本字段使用简体中文。")},
@@ -706,10 +707,10 @@ def _ai_resolve_encounter(encounter: EncounterEntry, req: EncounterActRequest) -
         visible_npcs="none",
     )
     try:
-        client = OpenAI(api_key=api_key)
+        client = create_sync_client(config, client_cls=OpenAI)
         resp = client.chat.completions.create(
             model=model,
-            temperature=min(max(config.temperature, 0), 2),
+            **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": prompt_table.get_text("encounter.resolve.system", "\u4f60\u53ea\u8f93\u51fa JSON\u3002\u6240\u6709\u6587\u672c\u5b57\u6bb5\u4f7f\u7528\u7b80\u4f53\u4e2d\u6587\u3002")},
@@ -888,7 +889,7 @@ def advance_active_encounter_in_save(save, *, session_id: str, minutes_elapsed: 
         model = (config.model or "").strip()
         if api_key and model:
             try:
-                client = OpenAI(api_key=api_key)
+                client = create_sync_client(config, client_cls=OpenAI)
                 prompt = prompt_table.render(
                     PromptKeys.ENCOUNTER_BACKGROUND_TICK_USER,
                     "\u4f60\u8981\u5728\u540e\u53f0\u63a8\u8fdb\u4e00\u4e2a\u906d\u9047\uff0c\u53ea\u80fd\u8fd4\u56de JSON\u3002\u6240\u6709\u6587\u672c\u5b57\u6bb5\u4f7f\u7528\u7b80\u4f53\u4e2d\u6587\u3002",
@@ -901,7 +902,7 @@ def advance_active_encounter_in_save(save, *, session_id: str, minutes_elapsed: 
                 )
                 resp = client.chat.completions.create(
                     model=model,
-                    temperature=min(max(config.temperature, 0), 2),
+                    **build_completion_options(config),
                     response_format={"type": "json_object"},
                     messages=[
                         {"role": "system", "content": prompt_table.get_text("encounter.generate.system", "\u4f60\u53ea\u8f93\u51fa JSON\u3002\u6240\u6709\u6587\u672c\u5b57\u6bb5\u4f7f\u7528\u7b80\u4f53\u4e2d\u6587\u3002")},

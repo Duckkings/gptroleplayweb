@@ -62,6 +62,9 @@ from app.models.schemas import (
     HealthResponse,
     MoveRequest,
     MoveResponse,
+    ModelDiscoverResponse,
+    ModelProfileRequest,
+    ModelProfileResponse,
     NpcChatRequest,
     NpcChatResponse,
     NpcGreetRequest,
@@ -113,6 +116,7 @@ from app.models.schemas import (
     WorldClockInitResponse,
     NpcKnowledgeResponse,
 )
+from app.services.ai_adapter import discover_models, resolve_model_profile
 from app.services.chat_service import MissingAPIKeyError, chat_once
 from app.services.world_service import (
     AIBehaviorError,
@@ -216,15 +220,39 @@ async def health() -> HealthResponse:
 @router.post("/config/validate", response_model=ValidateConfigResponse)
 async def validate_config(payload: dict) -> ValidateConfigResponse:
     try:
-        ChatConfig.model_validate(payload)
+        config = ChatConfig.model_validate(payload)
     except ValidationError as exc:
         errors = [
             ValidateError(field=".".join(str(p) for p in err["loc"]), message=err["msg"])
             for err in exc.errors()
         ]
-        return ValidateConfigResponse(valid=False, errors=errors)
+        return ValidateConfigResponse(valid=False, errors=errors, normalized_config=None)
 
-    return ValidateConfigResponse(valid=True, errors=[])
+    return ValidateConfigResponse(valid=True, errors=[], normalized_config=config)
+
+
+@router.post("/config/models/discover", response_model=ModelDiscoverResponse)
+async def config_model_discover(payload: ModelProfileRequest) -> ModelDiscoverResponse:
+    api_key = (payload.api_key or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="api_key is required")
+    try:
+        return ModelDiscoverResponse(
+            models=discover_models(payload.provider, api_key, payload.base_url_override)
+        )
+    except Exception as exc:
+        message = str(exc) or "model discovery failed"
+        lowered = message.lower()
+        status_code = 401 if "api key" in lowered or "authentication" in lowered else 502
+        raise HTTPException(status_code=status_code, detail=message)
+
+
+@router.post("/config/models/profile", response_model=ModelProfileResponse)
+async def config_model_profile(payload: ModelProfileRequest) -> ModelProfileResponse:
+    model = (payload.model or "").strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="model is required")
+    return ModelProfileResponse(model=resolve_model_profile(payload.provider, model).to_schema())
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -234,7 +262,7 @@ async def chat(payload: ChatRequest) -> ChatResponse:
     try:
         reply, usage, tool_events = await chat_once(payload)
     except MissingAPIKeyError:
-        raise HTTPException(status_code=401, detail="openai_api_key is not configured in config")
+        raise HTTPException(status_code=401, detail="api_key is not configured in config")
     except RateLimitError as exc:
         raise HTTPException(status_code=429, detail=str(exc))
     except APIError as exc:
@@ -341,7 +369,7 @@ async def chat_sse(payload: ChatRequest) -> StreamingResponse:
             data = json.dumps({"content": reply.content}, ensure_ascii=False)
             yield f"event: delta\ndata: {data}\n\n"
         except MissingAPIKeyError:
-            data = json.dumps({"code": 401, "message": "openai_api_key is not configured in config"})
+            data = json.dumps({"code": 401, "message": "api_key is not configured in config"})
             yield f"event: error\ndata: {data}\n\n"
             return
         except RateLimitError as exc:
@@ -419,7 +447,11 @@ async def get_config_data() -> dict:
     path = storage_state.config_path
     if not path.exists():
         raise HTTPException(status_code=404, detail="config file not found")
-    return read_json(path)
+    data = read_json(path)
+    try:
+        return ChatConfig.model_validate(data).model_dump(mode="json")
+    except ValidationError:
+        return data
 
 
 @router.post("/storage/config")

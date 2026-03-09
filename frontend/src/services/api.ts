@@ -20,6 +20,8 @@
   GameLogEntry,
   GameLogSettings,
   MapSnapshot,
+  ModelDiscoverResponse,
+  ModelProfileResponse,
   MovementLog,
   NpcChatResponse,
   NpcGreetResponse,
@@ -44,6 +46,7 @@
   ToolEvent,
   TokenUsageSummary,
   Usage,
+  ValidateConfigResponse,
   Zone,
 } from '../types/app';
 
@@ -76,15 +79,45 @@ async function requestJson<T>(endpoint: string, init: RequestInit, report?: Debu
 }
 
 export async function validateConfig(
-  config: AppConfig,
+  config: unknown,
   report?: DebugReporter,
-): Promise<{ valid: boolean; errors: Array<{ field: string; message: string }> }> {
+): Promise<ValidateConfigResponse> {
   return requestJson(
     '/config/validate',
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(config),
+    },
+    report,
+  );
+}
+
+export async function discoverConfigModels(
+  payload: { provider: 'openai' | 'deepseek'; api_key: string; base_url_override?: string | null },
+  report?: DebugReporter,
+): Promise<ModelDiscoverResponse> {
+  return requestJson(
+    '/config/models/discover',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function getConfigModelProfile(
+  payload: { provider: 'openai' | 'deepseek'; model: string; api_key?: string; base_url_override?: string | null },
+  report?: DebugReporter,
+): Promise<ModelProfileResponse> {
+  return requestJson(
+    '/config/models/profile',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
     },
     report,
   );

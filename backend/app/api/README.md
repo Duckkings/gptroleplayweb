@@ -8,7 +8,7 @@
 Main file: `backend/app/api/routes.py`
 
 ## Route Groups (`/api/v1`)
-- Base: `/health`, `/config/validate`
+- Base: `/health`, `/config/validate`, `/config/models/discover`, `/config/models/profile`
 - Chat: `/chat`, `/chat/stream`
 - Storage/Saves: `/storage/*`, `/saves/*`
 - Map: `/world-map/regions/generate`, `/world-map/render`, `/world-map/move`
