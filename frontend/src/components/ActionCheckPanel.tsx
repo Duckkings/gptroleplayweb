@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import type { ActionCheckResult, NpcRoleCard } from '../types/app';
 
 type Props = {
@@ -16,18 +16,14 @@ export function ActionCheckPanel({ open, npcs, playerRoleId, lastResult, busy = 
   const [actionPrompt, setActionPrompt] = useState('');
   const [actorRoleId, setActorRoleId] = useState(() => playerRoleId);
 
-  useEffect(() => {
-    setActorRoleId(playerRoleId);
-  }, [playerRoleId, open]);
-
   if (!open) return null;
 
   return (
     <section className="action-panel card">
       <header className="chat-header">
         <div>
-          <h2>行为检定验证</h2>
-          <p>用于验证 `attack`、`check`、`item_use` 的检定流程与时间消耗。</p>
+          <h2>行为检定调试</h2>
+          <p>这里会先规划 DC、检定目标和属性，再按玩家或 NPC 的流程结算。</p>
         </div>
         <button onClick={onClose} disabled={busy}>
           关闭
@@ -71,21 +67,26 @@ export function ActionCheckPanel({ open, npcs, playerRoleId, lastResult, busy = 
             onClick={() => onRun({ action_type: actionType, action_prompt: actionPrompt.trim(), actor_role_id: actorRoleId })}
             disabled={busy || !actionPrompt.trim()}
           >
-            {busy ? '投骰中...' : '执行检定'}
+            {busy ? '检定处理中...' : '执行检定'}
           </button>
         </div>
       </div>
 
       <section className="action-result">
-        {!lastResult && <p className="hint">暂无结果。</p>}
+        {!lastResult && <p className="hint">暂无最近一次检定结果。</p>}
         {lastResult && (
           <>
+            <p>
+              执行者: {lastResult.actor_name} | 类型: {lastResult.actor_kind}
+            </p>
             <p>
               结果: {lastResult.success ? '成功' : '失败'} | {lastResult.critical}
             </p>
             <p>
-              能力: {lastResult.ability_used}({lastResult.ability_modifier}) | DC: {lastResult.dc} | 掷骰: {lastResult.dice_roll ?? '-'} | 总分:{' '}
-              {lastResult.total_score ?? '-'}
+              检定目标: {lastResult.check_task} | 属性: {lastResult.ability_used}({lastResult.ability_modifier})
+            </p>
+            <p>
+              DC: {lastResult.dc} | 掷骰: {lastResult.dice_roll ?? '-'} | 总分: {lastResult.total_score ?? '-'}
             </p>
             <p>耗时: {lastResult.time_spent_min} 分钟</p>
             <p>叙事: {lastResult.narrative}</p>

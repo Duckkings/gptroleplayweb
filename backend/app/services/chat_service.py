@@ -44,10 +44,19 @@ from app.models.schemas import (
 )
 from app.services.ai_adapter import build_completion_options, create_async_client
 from app.services.world_service import (
+    _active_encounter_for_current_sub_zone,
+    _build_scene_context_payload,
+    _new_scene_event,
+    _parse_player_intent,
+    _record_sub_zone_chat_turn,
+    _visible_public_roles,
     add_player_buff,
     add_player_item,
     add_player_skill,
     add_player_spell,
+    advance_public_scene_in_save,
+    apply_speech_time,
+    build_main_turn_context_json,
     consume_spell_slots,
     consume_stamina,
     discover_interactions,
@@ -70,8 +79,9 @@ from app.services.world_service import (
     unequip_player_item,
     move_to_sub_zone,
     move_to_zone,
+    save_current,
 )
-from app.services.encounter_service import act_on_encounter, escape_encounter, get_encounter_debug_overview, rejoin_encounter
+from app.services.encounter_service import act_on_encounter, advance_active_encounter_from_main_chat_in_save, advance_active_encounter_in_save, escape_encounter, get_encounter_debug_overview, rejoin_encounter
 from app.services.consistency_service import (
     build_entity_index,
     build_global_story_snapshot,
@@ -90,13 +100,23 @@ class MissingAPIKeyError(RuntimeError):
 
 def _build_messages(payload: ChatRequest) -> list[dict[str, Any]]:
     last_user = next((m for m in reversed(payload.messages) if m.role == "user"), None)
+    context_json = "{}"
+    if last_user is not None:
+        try:
+            save = get_current_save(default_session_id=payload.session_id)
+            if save.session_id != payload.session_id:
+                save.session_id = payload.session_id
+                save_current(save)
+            context_json = build_main_turn_context_json(save, last_user.content, recent_turn_count=8)
+        except Exception:
+            context_json = "{}"
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": payload.config.gm_prompt},
         {
             "role": "system",
             "content": prompt_table.get_text(
-                "chat.narration_rule",
-                "Narration rule: act as a story narrator. Do not output numbered action choices unless the player explicitly asks for options.",
+                PromptKeys.CHAT_NARRATION_RULE,
+                "Narration rule: as GM, only describe environment, objects, situation changes, system results, and encounter state progression. Do not directly speak as visible NPCs or teammates. If a visible NPC should respond, leave that response for the scene event system.",
             ),
         },
         {
@@ -127,6 +147,14 @@ def _build_messages(payload: ChatRequest) -> list[dict[str, Any]]:
                 "Story consistency rule: when you need current world facts about quests, fate, encounters, or legal NPCs, call get_story_snapshot or get_player_state first.",
             ),
         },
+        {
+            "role": "system",
+            "content": prompt_table.render(
+                PromptKeys.CHAT_TURN_CONTEXT_USER,
+                "当前结构化主回合上下文如下，请把它当作本轮叙事事实基础，不要忽略并行遭遇与地区最近回合。\n$main_turn_context_json",
+                main_turn_context_json=context_json,
+            ),
+        },
     ]
     if last_user is not None:
         messages.append({"role": "user", "content": last_user.content})
@@ -154,6 +182,294 @@ def _client(payload: ChatRequest) -> AsyncOpenAI:
     if not api_key:
         raise MissingAPIKeyError("api_key is not set")
     return create_async_client(payload.config, client_cls=AsyncOpenAI)
+
+
+def _contains_any_token(text: str, tokens: list[str]) -> bool:
+    lowered = text.lower()
+    return any(token.lower() in lowered for token in tokens if token)
+
+
+def _find_zone_target(save, text: str):
+    clean = (text or "").strip()
+    if not clean:
+        return None
+    for zone in save.map_snapshot.zones:
+        if zone.zone_id and zone.zone_id in clean:
+            return zone
+        if zone.name and zone.name in clean:
+            return zone
+    return None
+
+
+def _find_sub_zone_target(save, text: str):
+    clean = (text or "").strip()
+    if not clean:
+        return None
+    for sub_zone in save.area_snapshot.sub_zones:
+        if sub_zone.sub_zone_id and sub_zone.sub_zone_id in clean:
+            return sub_zone
+        if sub_zone.name and sub_zone.name in clean:
+            return sub_zone
+    return None
+
+
+def _find_named_role(save, text: str, *, team_only: bool = False, visible_only: bool = False):
+    clean = (text or "").strip()
+    if not clean:
+        return None
+    allowed_ids: set[str] | None = None
+    if team_only:
+        allowed_ids = {item.role_id for item in save.team_state.members}
+    elif visible_only:
+        allowed_ids = {item.role_id for item in _visible_public_roles(save)}
+    for role in save.role_pool:
+        if allowed_ids is not None and role.role_id not in allowed_ids:
+            continue
+        if role.role_id and role.role_id in clean:
+            return role
+        if role.name and role.name in clean:
+            return role
+    return None
+
+
+def _find_inventory_item(items: list[InventoryItem], text: str):
+    clean = (text or "").strip()
+    if not clean:
+        return None
+    for item in items:
+        if item.item_id and item.item_id in clean:
+            return item
+        if item.name and item.name in clean:
+            return item
+    return None
+
+
+def _encounter_scene_events(encounter, *, reply: str, include_situation: bool = True) -> list[Any]:
+    events: list[Any] = []
+    if include_situation:
+        events.append(
+            _new_scene_event(
+                "encounter_situation_update",
+                f"局势值变为 {encounter.situation_value}/100，趋势为 {encounter.situation_trend}。",
+                metadata={
+                    "encounter_id": encounter.encounter_id,
+                    "encounter_title": encounter.title,
+                    "situation_value": encounter.situation_value,
+                },
+            )
+        )
+    events.append(
+        _new_scene_event(
+            "encounter_resolution" if encounter.status == "resolved" else "encounter_progress",
+            reply,
+            metadata={
+                "encounter_id": encounter.encounter_id,
+                "encounter_title": encounter.title,
+                "status": encounter.status,
+            },
+        )
+    )
+    return events
+
+
+def route_main_turn_intent(session_id: str, parsed_intent: dict[str, object], config) -> dict[str, Any]:
+    save = get_current_save(default_session_id=session_id)
+    if save.session_id != session_id:
+        save.session_id = session_id
+        save_current(save)
+    action_text = str(parsed_intent.get("action_text") or "").strip()
+    speech_text = str(parsed_intent.get("speech_text") or "").strip()
+    display_text = str(parsed_intent.get("display_text") or "").strip()
+    merged = "\n".join(part for part in [action_text, speech_text, display_text] if part).strip()
+    active_encounter = _active_encounter_for_current_sub_zone(save)
+    tool_events: list[ToolEvent] = []
+
+    if bool(parsed_intent.get("passive_turn")):
+        tool_events.append(ToolEvent(tool_name="route_main_turn_intent", ok=True, summary="passive_turn routed"))
+        return {
+            "handled": True,
+            "reply": Message(role="assistant", content="你暂时按住动作，让当前局势自行推进一轮。"),
+            "tool_events": tool_events,
+            "scene_events": [],
+            "time_spent_min": 1,
+            "skip_encounter_main_chat_advance": False,
+        }
+
+    zone_tokens = ["前往", "去", "移动到", "进入", "赶去", "travel", "move", "go to"]
+    if _contains_any_token(merged, zone_tokens):
+        sub_zone = _find_sub_zone_target(save, merged)
+        if sub_zone is not None and sub_zone.sub_zone_id != save.area_snapshot.current_sub_zone_id:
+            moved = move_to_sub_zone(AreaMoveSubZoneRequest(session_id=session_id, to_sub_zone_id=sub_zone.sub_zone_id, config=config))
+            tool_events.append(ToolEvent(tool_name="move_to_sub_zone", ok=True, summary=f"moved to {sub_zone.sub_zone_id}", payload={"duration_min": moved.duration_min}))
+            return {
+                "handled": True,
+                "reply": Message(role="assistant", content=moved.movement_feedback),
+                "tool_events": tool_events,
+                "scene_events": [],
+                "time_spent_min": moved.duration_min,
+                "skip_encounter_main_chat_advance": False,
+            }
+        zone = _find_zone_target(save, merged)
+        if zone is not None:
+            from_zone_id = (
+                (save.player_runtime_data.current_position.zone_id if save.player_runtime_data.current_position else None)
+                or (save.map_snapshot.player_position.zone_id if save.map_snapshot.player_position else None)
+                or save.area_snapshot.current_zone_id
+                or zone.zone_id
+            )
+            moved = move_to_zone(
+                MoveRequest(
+                    session_id=session_id,
+                    from_zone_id=from_zone_id,
+                    to_zone_id=zone.zone_id,
+                    player_name=save.player_static_data.name,
+                )
+            )
+            tool_events.append(ToolEvent(tool_name="move_to_zone", ok=True, summary=f"moved to {zone.zone_id}", payload={"duration_min": moved.duration_min}))
+            return {
+                "handled": True,
+                "reply": Message(role="assistant", content=moved.movement_log.summary),
+                "tool_events": tool_events,
+                "scene_events": [],
+                "time_spent_min": moved.duration_min,
+                "skip_encounter_main_chat_advance": False,
+            }
+
+    if active_encounter is not None:
+        if active_encounter.player_presence == "away" and _contains_any_token(merged, ["回去", "返回遭遇", "重新加入", "rejoin"]):
+            result = rejoin_encounter(active_encounter.encounter_id, EncounterRejoinRequest(session_id=session_id, config=config))
+            tool_events.append(ToolEvent(tool_name="encounter_rejoin", ok=True, summary=f"rejoined {result.encounter_id}"))
+            return {
+                "handled": True,
+                "reply": Message(role="assistant", content=result.reply),
+                "tool_events": tool_events,
+                "scene_events": _encounter_scene_events(result.encounter, reply=result.reply),
+                "time_spent_min": 1,
+                "skip_encounter_main_chat_advance": True,
+            }
+        if active_encounter.player_presence == "engaged" and _contains_any_token(merged, ["离开", "逃离", "脱身", "撤退", "escape"]):
+            result = escape_encounter(active_encounter.encounter_id, EncounterEscapeRequest(session_id=session_id, config=config))
+            tool_events.append(ToolEvent(tool_name="encounter_escape", ok=True, summary=f"escape {'ok' if result.escape_success else 'failed'}"))
+            return {
+                "handled": True,
+                "reply": Message(role="assistant", content=result.reply),
+                "tool_events": tool_events,
+                "scene_events": _encounter_scene_events(result.encounter, reply=result.reply),
+                "time_spent_min": result.time_spent_min,
+                "skip_encounter_main_chat_advance": True,
+            }
+        if active_encounter.player_presence == "engaged" and merged:
+            result = act_on_encounter(
+                active_encounter.encounter_id,
+                EncounterActRequest(
+                    session_id=session_id,
+                    player_prompt=display_text or merged,
+                    config=config,
+                ),
+            )
+            tool_events.append(ToolEvent(tool_name="encounter_act", ok=True, summary=f"encounter {result.status}", payload={"time_spent_min": result.time_spent_min}))
+            return {
+                "handled": True,
+                "reply": Message(role="assistant", content=result.reply),
+                "tool_events": tool_events,
+                "scene_events": _encounter_scene_events(result.encounter, reply=result.reply),
+                "time_spent_min": result.time_spent_min,
+                "skip_encounter_main_chat_advance": True,
+            }
+
+    if _contains_any_token(merged, ["加入队伍", "入队", "跟我走", "同行", "invite", "join team"]):
+        role = _find_named_role(save, merged, visible_only=True) or _find_named_role(save, merged)
+        if role is not None:
+            result = invite_npc_to_team(TeamInviteRequest(session_id=session_id, npc_role_id=role.role_id, player_prompt=merged, config=config))
+            tool_events.append(ToolEvent(tool_name="team_invite_npc", ok=result.accepted, summary=result.chat_feedback[:80] or "invite attempted"))
+            return {
+                "handled": True,
+                "reply": Message(role="assistant", content=result.chat_feedback or f"{role.name} 对你的邀请做出了回应。"),
+                "tool_events": tool_events,
+                "scene_events": [],
+                "time_spent_min": 1,
+                "skip_encounter_main_chat_advance": False,
+            }
+    if _contains_any_token(merged, ["离队", "退出队伍", "走吧", "leave team", "dismiss"]):
+        role = _find_named_role(save, merged, team_only=True)
+        if role is not None:
+            result = leave_npc_from_team(TeamLeaveRequest(session_id=session_id, npc_role_id=role.role_id, reason=merged, config=config))
+            tool_events.append(ToolEvent(tool_name="team_remove_npc", ok=True, summary=result.chat_feedback[:80] or "member removed"))
+            return {
+                "handled": True,
+                "reply": Message(role="assistant", content=result.chat_feedback or f"{role.name} 离开了队伍。"),
+                "tool_events": tool_events,
+                "scene_events": [],
+                "time_spent_min": 1,
+                "skip_encounter_main_chat_advance": False,
+            }
+
+    inventory_tokens = ["装备", "穿上", "拿上", "equip", "卸下", "脱下", "unequip", "查看", "检查", "inspect", "使用", "用掉", "use"]
+    if _contains_any_token(merged, inventory_tokens):
+        owner = InventoryOwnerRef(owner_type="player")
+        owner_role = _find_named_role(save, merged, team_only=True)
+        owner_items = save.player_static_data.dnd5e_sheet.backpack.items
+        if owner_role is not None:
+            owner = InventoryOwnerRef(owner_type="role", role_id=owner_role.role_id)
+            owner_items = owner_role.profile.dnd5e_sheet.backpack.items
+        item = _find_inventory_item(owner_items, merged)
+        if item is not None:
+            if _contains_any_token(merged, ["装备", "穿上", "拿上", "equip"]):
+                slot = "armor" if item.slot_type == "armor" or _contains_any_token(merged, ["护甲", "盔甲", "armor"]) else "weapon"
+                result = inventory_equip(InventoryEquipRequest(session_id=session_id, owner=owner, item_id=item.item_id, slot=slot))  # type: ignore[arg-type]
+                tool_events.append(ToolEvent(tool_name="inventory_mutate", ok=True, summary=result.message[:80] or "equip ok"))
+                return {
+                    "handled": True,
+                    "reply": Message(role="assistant", content=result.message or f"已装备 {item.name}。"),
+                    "tool_events": tool_events,
+                    "scene_events": [],
+                    "time_spent_min": 1,
+                    "skip_encounter_main_chat_advance": False,
+                }
+            if _contains_any_token(merged, ["卸下", "脱下", "unequip"]):
+                slot = "armor" if item.slot_type == "armor" or _contains_any_token(merged, ["护甲", "盔甲", "armor"]) else "weapon"
+                result = inventory_unequip(InventoryUnequipRequest(session_id=session_id, owner=owner, slot=slot))  # type: ignore[arg-type]
+                tool_events.append(ToolEvent(tool_name="inventory_mutate", ok=True, summary=result.message[:80] or "unequip ok"))
+                return {
+                    "handled": True,
+                    "reply": Message(role="assistant", content=result.message or f"已卸下 {item.name}。"),
+                    "tool_events": tool_events,
+                    "scene_events": [],
+                    "time_spent_min": 1,
+                    "skip_encounter_main_chat_advance": False,
+                }
+            mode = "use" if _contains_any_token(merged, ["使用", "用掉", "use"]) else "inspect"
+            result = inventory_interact(
+                InventoryInteractRequest(
+                    session_id=session_id,
+                    owner=owner,
+                    item_id=item.item_id,
+                    mode=mode,  # type: ignore[arg-type]
+                    prompt=merged,
+                    config=config,
+                )
+            )
+            tool_events.append(ToolEvent(tool_name="inventory_interact", ok=True, summary=result.reply[:80] or "item interaction ok"))
+            return {
+                "handled": True,
+                "reply": Message(role="assistant", content=result.reply),
+                "tool_events": tool_events,
+                "scene_events": list(result.scene_events or []),
+                "time_spent_min": result.time_spent_min,
+                "skip_encounter_main_chat_advance": False,
+            }
+
+    visible_role = _find_named_role(save, merged, visible_only=True)
+    if visible_role is not None:
+        tool_events.append(ToolEvent(tool_name="route_main_turn_target_npc", ok=True, summary=f"public scene target={visible_role.role_id}"))
+    return {
+        "handled": False,
+        "reply": None,
+        "tool_events": tool_events,
+        "scene_events": [],
+        "time_spent_min": 0,
+        "skip_encounter_main_chat_advance": False,
+    }
 
 
 def _tools_schema() -> list[dict[str, Any]]:
@@ -205,6 +521,59 @@ def _tools_schema() -> list[dict[str, Any]]:
             "function": {
                 "name": "get_story_snapshot",
                 "description": "Return the unified structured world snapshot including revisions, current area, available NPCs, active quests, fate phase, and recent encounters.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_quest_state",
+                "description": "Return current quest state, pending offers, and tracked quest.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_fate_state",
+                "description": "Return the current fate line and phase state.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_area_reputation",
+                "description": "Return current or specified sub-zone reputation score and band.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "sub_zone_id": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_role_drives",
+                "description": "Return desire and story beat summaries for one role, the team, or the current sub-zone.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "role_id": {"type": "string"},
+                        "scope": {"type": "string", "enum": ["role", "team", "current_sub_zone"]},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_public_scene_state",
+                "description": "Return current public scene state including reputation, visible roles, surfaced drives, active encounter, and candidate actors.",
                 "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
             },
         },
@@ -426,6 +795,36 @@ def _tools_schema() -> list[dict[str, Any]]:
                         "encounter_id": {"type": "string"},
                     },
                     "required": ["encounter_id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "quest_track",
+                "description": "Set one active quest as the tracked quest.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "quest_id": {"type": "string"},
+                    },
+                    "required": ["quest_id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "quest_evaluate",
+                "description": "Evaluate one quest against current world state.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "quest_id": {"type": "string"},
+                    },
+                    "required": ["quest_id"],
                     "additionalProperties": False,
                 },
             },
@@ -810,6 +1209,114 @@ async def _handle_tool_call(payload: ChatRequest, tool_call: Any) -> tuple[dict[
                 "tool_call_id": tool_call_id,
                 "content": json.dumps(result, ensure_ascii=False),
             },
+            event,
+        )
+
+    if tool_name == "get_quest_state":
+        from app.services.quest_service import get_quest_state
+
+        response = get_quest_state(payload.session_id)
+        result = {"ok": True, **response.model_dump(mode="json")}
+        event = ToolEvent(
+            tool_name="get_quest_state",
+            ok=True,
+            summary=f"quest state returned: {len(response.quest_state.quests)} quests",
+            payload={"quest_count": len(response.quest_state.quests)},
+        )
+        logger.info("tool_call get_quest_state ok")
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "get_fate_state":
+        from app.services.fate_service import get_fate_state
+
+        response = get_fate_state(payload.session_id)
+        result = {"ok": True, **response.model_dump(mode="json")}
+        event = ToolEvent(
+            tool_name="get_fate_state",
+            ok=True,
+            summary="fate state returned",
+            payload={"has_current_fate": bool(response.fate_state.current_fate is not None)},
+        )
+        logger.info("tool_call get_fate_state ok")
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "get_area_reputation":
+        try:
+            args = json.loads(arg_text)
+        except Exception:
+            args = {}
+        from app.services.reputation_service import get_area_reputation
+
+        response = get_area_reputation(payload.session_id, sub_zone_id=str(args.get("sub_zone_id") or "").strip() or None)
+        result = {"ok": True, **response.model_dump(mode="json")}
+        current_entry = response.current_entry
+        event = ToolEvent(
+            tool_name="get_area_reputation",
+            ok=True,
+            summary=(
+                f"reputation {current_entry.score}/100 ({current_entry.band})"
+                if current_entry is not None
+                else "reputation state returned"
+            ),
+            payload={"has_current_entry": bool(current_entry is not None)},
+        )
+        logger.info("tool_call get_area_reputation ok")
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "get_role_drives":
+        try:
+            args = json.loads(arg_text)
+        except Exception:
+            args = {}
+        from app.models.schemas import RoleDrivesResponse
+        from app.services.roleplay_service import build_role_drive_summaries
+
+        save = get_current_save(default_session_id=payload.session_id)
+        role_id = str(args.get("role_id") or "").strip() or None
+        scope = str(args.get("scope") or ("role" if role_id else "current_sub_zone")).strip() or "current_sub_zone"
+        if scope not in {"role", "team", "current_sub_zone"}:
+            scope = "current_sub_zone"
+        response = RoleDrivesResponse(
+            session_id=payload.session_id,
+            scope=scope,  # type: ignore[arg-type]
+            items=build_role_drive_summaries(save, scope=("current_sub_zone" if scope == "role" and role_id is None else scope), role_id=role_id),
+        )
+        result = {"ok": True, **response.model_dump(mode="json")}
+        event = ToolEvent(
+            tool_name="get_role_drives",
+            ok=True,
+            summary=f"role drives returned: {len(response.items)} roles",
+            payload={"role_count": len(response.items)},
+        )
+        logger.info("tool_call get_role_drives ok")
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "get_public_scene_state":
+        from app.services.public_scene_service import get_public_scene_state
+
+        response = get_public_scene_state(payload.session_id)
+        result = {"ok": True, **response.model_dump(mode="json")}
+        event = ToolEvent(
+            tool_name="get_public_scene_state",
+            ok=True,
+            summary=f"public scene candidates: {len(response.public_scene_state.candidate_actors)}",
+            payload={"candidate_count": len(response.public_scene_state.candidate_actors)},
+        )
+        logger.info("tool_call get_public_scene_state ok")
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
             event,
         )
 
@@ -1262,6 +1769,51 @@ async def _handle_tool_call(payload: ChatRequest, tool_call: Any) -> tuple[dict[
             event,
         )
 
+    if tool_name == "quest_track":
+        try:
+            args = json.loads(arg_text)
+            quest_id = str(args.get("quest_id") or "").strip()
+            from app.services.quest_service import track_quest
+
+            response = track_quest(payload.session_id, quest_id)
+            result = {"ok": True, **response.model_dump(mode="json")}
+            event = ToolEvent(
+                tool_name="quest_track",
+                ok=True,
+                summary=response.chat_feedback[:80] or "quest tracked",
+                payload={"quest_id": response.quest_id},
+            )
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="quest_track", ok=False, summary=f"quest track failed: {exc}")
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "quest_evaluate":
+        try:
+            args = json.loads(arg_text)
+            quest_id = str(args.get("quest_id") or "").strip()
+            from app.models.schemas import QuestEvaluateRequest
+            from app.services.quest_service import evaluate_quest
+
+            response = evaluate_quest(QuestEvaluateRequest(session_id=payload.session_id, quest_id=quest_id, config=payload.config))
+            result = {"ok": True, **response.model_dump(mode="json")}
+            event = ToolEvent(
+                tool_name="quest_evaluate",
+                ok=True,
+                summary=response.chat_feedback[:80] or "quest evaluated",
+                payload={"quest_id": response.quest_id, "status": response.status},
+            )
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="quest_evaluate", ok=False, summary=f"quest evaluate failed: {exc}")
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
     if tool_name == "get_map_index":
         save = get_current_save(default_session_id=payload.session_id)
         current_zone_id = (
@@ -1649,3 +2201,91 @@ async def chat_once(payload: ChatRequest) -> tuple[Message, Usage, list[ToolEven
             messages.append(tool_msg)
 
     return Message(role="assistant", content="Tool call limit reached. Please simplify your request."), usage_sum, tool_events
+
+
+async def resolve_main_chat_turn(payload: ChatRequest) -> tuple[Message, Usage, list[ToolEvent], list[Any], int, str | None]:
+    last_user = next((m for m in reversed(payload.messages) if m.role == "user"), None)
+    parsed_intent: dict[str, object] = _parse_player_intent(last_user.content) if last_user is not None else {}
+    routed = route_main_turn_intent(payload.session_id, parsed_intent, payload.config) if last_user is not None else {
+        "handled": False,
+        "reply": None,
+        "tool_events": [],
+        "scene_events": [],
+        "time_spent_min": 0,
+        "skip_encounter_main_chat_advance": False,
+    }
+    if last_user is not None and bool(parsed_intent.get("passive_turn")) and not bool(routed.get("handled")):
+        save = get_current_save(default_session_id=payload.session_id)
+        if save.session_id != payload.session_id:
+            save.session_id = payload.session_id
+            save_current(save)
+        active_encounter = _active_encounter_for_current_sub_zone(save)
+        if active_encounter is None or active_encounter.status != "active" or active_encounter.player_presence != "engaged":
+            raise ValueError("PASSIVE_TURN_REQUIRES_ACTIVE_ENCOUNTER")
+    if bool(routed.get("handled")):
+        time_spent_min = int(routed.get("time_spent_min") or 0)
+        reply = routed.get("reply") or Message(role="assistant", content="")
+        usage = Usage()
+        tool_events = list(routed.get("tool_events") or [])
+        scene_events: list[Any] = list(routed.get("scene_events") or [])
+    else:
+        time_spent_min = apply_speech_time(payload.session_id, last_user.content, payload.config) if last_user is not None else 0
+        reply, usage, tool_events = await chat_once(payload)
+        tool_events = [*list(routed.get("tool_events") or []), *tool_events]
+        scene_events = []
+    archived_sub_zone_turn_id: str | None = None
+    if last_user is not None:
+        save = get_current_save(default_session_id=payload.session_id)
+        if save.session_id != payload.session_id:
+            save.session_id = payload.session_id
+        if not bool(routed.get("skip_encounter_main_chat_advance")):
+            encounter_events = advance_active_encounter_from_main_chat_in_save(
+                save,
+                session_id=payload.session_id,
+                player_text=last_user.content,
+                gm_narration=reply.content,
+                time_spent_min=time_spent_min,
+                config=payload.config,
+            )
+            scene_events.extend(encounter_events)
+        scene_context = _build_scene_context_payload(
+            save,
+            player_text=last_user.content,
+            gm_narration=reply.content,
+            recent_turn_count=4,
+        )
+        public_events = advance_public_scene_in_save(
+            save,
+            session_id=payload.session_id,
+            player_text=last_user.content,
+            gm_summary=reply.content,
+            scene_context=scene_context,
+            config=payload.config,
+        )
+        scene_events.extend(public_events)
+        background_advanced = advance_active_encounter_in_save(
+            save,
+            session_id=payload.session_id,
+            minutes_elapsed=time_spent_min,
+            config=payload.config,
+        )
+        if background_advanced is not None:
+            scene_events.append(
+                _new_scene_event(
+                    "encounter_background",
+                    background_advanced.latest_outcome_summary or background_advanced.scene_summary or background_advanced.description,
+                    metadata={"encounter_id": background_advanced.encounter_id, "encounter_title": background_advanced.title},
+                )
+            )
+        archived_sub_zone_turn_id = _record_sub_zone_chat_turn(
+            save,
+            source="main_chat",
+            player_mode=("passive" if bool(parsed_intent.get("passive_turn")) else "active"),
+            player_action=str(parsed_intent["action_text"]),
+            player_speech=str(parsed_intent["speech_text"]),
+            player_action_check=(parsed_intent["action_check"] if isinstance(parsed_intent["action_check"], dict) else None),
+            gm_narration=reply.content,
+            events=scene_events,
+        )
+        save_current(save)
+    return reply, usage, tool_events, scene_events, time_spent_min, archived_sub_zone_turn_id

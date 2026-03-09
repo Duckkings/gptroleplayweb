@@ -224,6 +224,8 @@ def sync_team_members_with_player_in_save(save) -> bool:
         if role.state != "in_team":
             role.state = "in_team"
             changed = True
+        if _ensure_npc_role_complete(save, role):
+            changed = True
         _remove_area_presence(save, role.role_id)
     if changed:
         _touch_state(state)
@@ -308,6 +310,7 @@ def invite_npc_to_team(req: TeamInviteRequest) -> TeamMutationResponse:
     )
     state.members.append(member)
     role.state = "in_team"
+    _ensure_npc_role_complete(save, role)
     sync_team_members_with_player_in_save(save)
     _remove_area_presence(save, role.role_id)
     relation = next((item for item in role.relations if item.target_role_id == save.player_static_data.player_id), None)
@@ -1244,7 +1247,7 @@ def _build_reaction(role: NpcRoleCard, trigger_kind: str, player_text: str, summ
         return (f"{role.name} 点了点头，似乎更愿意继续跟着你。", 1, 1)
     return (f"{role.name} 记下了这件事，但暂时没有多说什么。", 0, 0)
 
-def _ai_team_public_reply(save, role: NpcRoleCard, player_text: str, scene_summary: str, config) -> tuple[str, str, int, int] | None:
+def _ai_team_public_reply(save, role: NpcRoleCard, player_text: str, scene_summary: str, scene_context, config) -> tuple[str, str, int, int] | None:
     if config is None:
         return None
     api_key = (config.openai_api_key or "").strip()
@@ -1262,7 +1265,8 @@ def _ai_team_public_reply(save, role: NpcRoleCard, player_text: str, scene_summa
             player_text=player_text,
             gm_summary=scene_summary,
             area_text=f"{zone_name} / {sub_name}",
-            context=_build_npc_prompt_context(role, save.area_snapshot.clock, recent_count=8),
+            context=_build_npc_prompt_context(role, save.area_snapshot.clock, recent_count=8, save=save),
+            scene_context_json=json.dumps(scene_context or {}, ensure_ascii=False),
         )
         resp = client.chat.completions.create(
             model=model,
@@ -1300,18 +1304,26 @@ def generate_team_public_replies_in_save(
     session_id: str,
     player_text: str,
     scene_summary: str,
+    scene_context=None,
     config=None,
+    exclude_role_ids: set[str] | None = None,
+    max_replies: int = 2,
 ) -> list[TeamReaction]:
     state = ensure_team_state(save)
     if not state.members:
         return []
     sync_team_members_with_player_in_save(save)
+    excluded = exclude_role_ids or set()
     created: list[TeamReaction] = []
-    for member in list(state.members)[:2]:
+    for member in list(state.members):
+        if member.role_id in excluded:
+            continue
+        if len(created) >= max(0, max_replies):
+            break
         role = next((item for item in save.role_pool if item.role_id == member.role_id), None)
         if role is None:
             continue
-        generated = _ai_team_public_reply(save, role, player_text, scene_summary, config)
+        generated = _ai_team_public_reply(save, role, player_text, scene_summary, scene_context, config)
         if generated is None:
             content = f"{role.name} 先侧过脸看了看四周，手指在衣摆边轻轻收紧，暂时没有抢着出声。"
             response_mode = "action"

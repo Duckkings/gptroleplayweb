@@ -4,14 +4,8 @@ import type { EncounterEntry } from '../types/app';
 type Props = {
   encounter: EncounterEntry | null;
   queuedEncounters: EncounterEntry[];
-  prompt: string;
   busy?: boolean;
-  readOnly?: boolean;
   canRejoin?: boolean;
-  onPromptChange: (value: string) => void;
-  onSubmitAction: (encounterId: string, prompt: string) => void;
-  onEscape: (encounterId: string) => void;
-  onRejoin: (encounterId: string) => void;
 };
 
 const STATUS_LABEL: Record<EncounterEntry['status'], string> = {
@@ -23,22 +17,14 @@ const STATUS_LABEL: Record<EncounterEntry['status'], string> = {
   invalidated: '已失效',
 };
 
-export function EncounterLane({
-  encounter,
-  queuedEncounters,
-  prompt,
-  busy = false,
-  readOnly = false,
-  canRejoin = false,
-  onPromptChange,
-  onSubmitAction,
-  onEscape,
-  onRejoin,
-}: Props) {
-  if (!encounter && queuedEncounters.length === 0) return null;
+const TREND_LABEL: Record<EncounterEntry['situation_trend'], string> = {
+  improving: '上升',
+  stable: '稳定',
+  worsening: '恶化',
+};
 
-  const actionable = encounter && encounter.status === 'active' && encounter.player_presence === 'engaged';
-  const rejoinable = encounter && encounter.player_presence === 'away' && encounter.status !== 'resolved' && canRejoin;
+export function EncounterLane({ encounter, queuedEncounters, busy = false, canRejoin = false }: Props) {
+  if (!encounter && queuedEncounters.length === 0) return null;
 
   return (
     <aside className="card encounter-lane">
@@ -54,8 +40,18 @@ export function EncounterLane({
           <section className="encounter-overview">
             <strong>{encounter.title}</strong>
             <p>{encounter.description}</p>
-            {encounter.scene_summary && <p>当前局势：{encounter.scene_summary}</p>}
-            {encounter.latest_outcome_summary && <p>最近进展：{encounter.latest_outcome_summary}</p>}
+            <p>
+              局势值: {encounter.situation_value}/100
+              {encounter.situation_start_value ? `（起始 ${encounter.situation_start_value}）` : ''}
+            </p>
+            <p>趋势: {TREND_LABEL[encounter.situation_trend]}</p>
+            {encounter.scene_summary && <p>当前局势: {encounter.scene_summary}</p>}
+            {encounter.latest_outcome_summary && <p>最近进展: {encounter.latest_outcome_summary}</p>}
+            {encounter.last_outcome_package?.narrative_summary && <p>结果摘要: {encounter.last_outcome_package.narrative_summary}</p>}
+            <p className="hint">遭遇推进请直接在主聊天输入。</p>
+            {busy && <p className="hint">遭遇状态同步中...</p>}
+            {encounter.player_presence === 'away' && !canRejoin && <p className="hint">返回遭遇发生地后会自动重新接入。</p>}
+            {encounter.player_presence === 'away' && canRejoin && <p className="hint">已回到遭遇地点，系统正在尝试自动重新接入。</p>}
           </section>
 
           <section className="encounter-conditions">
@@ -69,28 +65,6 @@ export function EncounterLane({
             ))}
           </section>
 
-          <section className="encounter-actions">
-            <h3>遭遇行动</h3>
-            <textarea
-              value={prompt}
-              onChange={(e) => onPromptChange(e.target.value)}
-              placeholder={actionable ? '描述你接下来在遭遇中的行动...' : '当前遭遇暂不可直接推进。'}
-              disabled={busy || readOnly || !actionable}
-            />
-            <div className="actions">
-              <button onClick={() => encounter && onSubmitAction(encounter.encounter_id, prompt.trim())} disabled={busy || readOnly || !actionable || !prompt.trim()}>
-                {busy ? '处理中...' : '执行动作'}
-              </button>
-              <button onClick={() => encounter && onEscape(encounter.encounter_id)} disabled={busy || readOnly || !actionable}>
-                尝试逃离
-              </button>
-              <button onClick={() => encounter && onRejoin(encounter.encounter_id)} disabled={busy || readOnly || !rejoinable}>
-                重返遭遇
-              </button>
-            </div>
-            {!actionable && encounter.player_presence === 'away' && !canRejoin && <p className="hint">回到遭遇发生地点后，才能重新介入。</p>}
-          </section>
-
           <section className="encounter-steps">
             <h3>最近步骤</h3>
             <EncounterTimeline steps={encounter.steps ?? []} />
@@ -102,11 +76,14 @@ export function EncounterLane({
 
       {queuedEncounters.length > 0 && (
         <section className="encounter-queue">
-          <h3>待排队遭遇</h3>
+          <h3>排队遭遇</h3>
           {queuedEncounters.map((item) => (
             <article key={item.encounter_id} className="encounter-queue-item">
               <strong>{item.title}</strong>
               <p>{item.description}</p>
+              <p>
+                预设局势: {item.situation_value}/100 / {TREND_LABEL[item.situation_trend]}
+              </p>
             </article>
           ))}
         </section>

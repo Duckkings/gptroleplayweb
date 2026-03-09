@@ -1,6 +1,8 @@
 ﻿import tempfile
 import unittest
+import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.core.storage import storage_state
@@ -24,6 +26,7 @@ from app.models.schemas import (
 )
 from app.services.world_service import (
     AIRegionGenerationError,
+    _ai_generate_zones,
     _validate_discovered_interactions,
     clear_current_save,
     discover_interactions,
@@ -245,6 +248,61 @@ class AreaLogicTests(unittest.TestCase):
         self.assertEqual(sorted({z.zone_id for z in updated.area_snapshot.zones}), ['zone_new'])
         self.assertNotIn('npc_old', [r.role_id for r in updated.role_pool])
         self.assertTrue(all((r.zone_id == 'zone_new') for r in updated.role_pool))
+
+    def test_ai_generate_zones_accepts_nested_zone_payload_and_partial_count(self) -> None:
+        config = ChatConfig(
+            version='1.0.0',
+            openai_api_key='sk-test',
+            model='gpt-4.1-mini',
+            stream=False,
+            temperature=0.8,
+            max_tokens=256,
+            gm_prompt='test',
+        )
+        content = json.dumps(
+            {
+                'map': {
+                    'zones': [
+                        {
+                            'name': '港埠区',
+                            'zone_type': 'coast',
+                            'size': 'small',
+                            'radius_m': 120,
+                            'x': 30,
+                            'y': 40,
+                            'description': '一片靠海的小港埠。',
+                            'tags': ['port'],
+                            'sub_zones': [
+                                {'name': '码头', 'offset_x': 10, 'offset_y': 0, 'offset_z': 0, 'description': '停靠船只'},
+                                {'name': '仓储区', 'offset_x': -20, 'offset_y': 15, 'offset_z': 0, 'description': '堆放货物'},
+                                {'name': '鱼市', 'offset_x': 15, 'offset_y': -18, 'offset_z': 0, 'description': '清晨喧闹'},
+                            ],
+                        }
+                    ]
+                }
+            },
+            ensure_ascii=False,
+        )
+        fake_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+            usage=SimpleNamespace(prompt_tokens=12, completion_tokens=34),
+        )
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_: fake_response))
+        )
+
+        with patch('app.services.world_service.create_sync_client', return_value=fake_client):
+            zones = _ai_generate_zones(
+                'sess_nested_zone_payload',
+                Position(x=0, y=0, z=0, zone_id='zone_0_0_0'),
+                2,
+                '沿海贸易小镇',
+                config,
+            )
+
+        self.assertEqual(len(zones), 1)
+        self.assertEqual(zones[0].name, '港埠区')
+        self.assertEqual(zones[0].zone_type, 'coast')
 
 
 if __name__ == '__main__':

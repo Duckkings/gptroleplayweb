@@ -20,6 +20,8 @@ from app.models.schemas import (
     EncounterCheckResponse,
     EncounterDebugOverviewResponse,
     EncounterEntry,
+    EncounterOutcomeChange,
+    EncounterOutcomePackage,
     EncounterEscapeRequest,
     EncounterEscapeResponse,
     EncounterForceToggleRequest,
@@ -35,6 +37,8 @@ from app.models.schemas import (
     EncounterStepEntry,
     EncounterTerminationCondition,
     GameLogEntry,
+    InventoryItem,
+    RoleBuff,
 )
 from app.services.consistency_service import (
     build_entity_index,
@@ -44,7 +48,8 @@ from app.services.consistency_service import (
     validate_entity_refs,
 )
 from app.services.ai_adapter import build_completion_options, create_sync_client
-from app.services.world_service import _advance_clock, _default_world_clock, get_current_save, save_current
+from app.services.world_service import _advance_clock, _default_world_clock, _new_scene_event, _parse_player_intent, get_current_save, save_current
+from app.services.reputation_service import apply_sub_zone_reputation_delta, get_current_sub_zone_reputation
 
 
 def _utc_now() -> str:
@@ -100,6 +105,268 @@ def _current_active_encounter(state: EncounterState) -> EncounterEntry | None:
     if encounter is None or encounter.status not in {"active", "escaped"}:
         return None
     return encounter
+
+
+def _clamp(value: int, lower: int, upper: int) -> int:
+    return max(lower, min(upper, int(value)))
+
+
+def _check_bonus_from_result(action_result: ActionCheckResponse | None) -> int:
+    if action_result is None:
+        return 0
+    if action_result.critical == "critical_success":
+        return 8
+    if action_result.critical == "critical_failure":
+        return -8
+    return 4 if action_result.success else -4
+
+
+def _check_bonus_from_player_prompt(player_prompt: str) -> int:
+    parsed = _parse_player_intent(player_prompt)
+    action_check = parsed.get("action_check") if isinstance(parsed.get("action_check"), dict) else None
+    if not isinstance(action_check, dict):
+        return 0
+    critical = str(action_check.get("critical") or "none")
+    if critical == "critical_success":
+        return 8
+    if critical == "critical_failure":
+        return -8
+    return 4 if bool(action_check.get("success")) else -4
+
+
+def _player_low_resources(save) -> bool:
+    sheet = save.player_static_data.dnd5e_sheet
+    hp_ratio = 1.0 if sheet.hit_points.maximum <= 0 else (sheet.hit_points.current / max(1, sheet.hit_points.maximum))
+    stamina_ratio = 1.0 if sheet.stamina_maximum <= 0 else (sheet.stamina_current / max(1, sheet.stamina_maximum))
+    return hp_ratio < 0.3 or stamina_ratio < 0.3
+
+
+def _calculate_initial_situation_value(save, encounter: EncounterEntry) -> int:
+    value = 50
+    reputation = get_current_sub_zone_reputation(save, create=True)
+    score = reputation.score if reputation is not None else 50
+    if score >= 70:
+        value += 10
+    elif score <= 30:
+        value -= 10
+    tracked = next((item for item in save.quest_state.quests if item.status == "active" and item.is_tracked), None)
+    if tracked is not None and (
+        tracked.quest_id in encounter.related_quest_ids
+        or (tracked.fate_phase_id and tracked.fate_phase_id in encounter.related_fate_phase_ids)
+    ):
+        value += 5
+    current_fate = save.fate_state.current_fate
+    if current_fate is not None and current_fate.current_phase_id and current_fate.current_phase_id in encounter.related_fate_phase_ids:
+        value += 5
+    if _player_low_resources(save):
+        value -= 5
+    if getattr(save.team_state, "members", []):
+        value += 5
+    return _clamp(value, 20, 80)
+
+
+def _refresh_participants(save, encounter: EncounterEntry) -> None:
+    participant_ids = [member.role_id for member in getattr(save.team_state, "members", [])]
+    if encounter.npc_role_id and encounter.npc_role_id not in participant_ids:
+        participant_ids.append(encounter.npc_role_id)
+    encounter.participant_role_ids = participant_ids
+
+
+def _initialize_encounter_state(save, encounter: EncounterEntry) -> None:
+    if encounter.presented_at is None:
+        encounter.presented_at = _utc_now()
+    encounter.situation_start_value = _calculate_initial_situation_value(save, encounter)
+    encounter.situation_value = encounter.situation_start_value
+    encounter.situation_trend = "stable"
+    _refresh_participants(save, encounter)
+
+
+def _situation_result(encounter: EncounterEntry) -> str:
+    if encounter.situation_value >= 50:
+        return "success"
+    return "failure"
+
+
+def _fallback_situation_delta(encounter: EncounterEntry, player_prompt: str) -> int:
+    clean = (player_prompt or "").strip()
+    positive_tokens = ["查清", "确认", "解决", "稳住", "保护", "帮忙", "观察", "谈判", "说服", "追上"]
+    negative_tokens = ["逃跑", "失手", "激怒", "闹大", "攻击", "乱来", "威胁", "拖延"]
+    delta = 0
+    if any(token in clean for token in positive_tokens):
+        delta += 4
+    if any(token in clean for token in negative_tokens):
+        delta -= 4
+    if encounter.type == "npc" and any(token in clean for token in ["安抚", "谈", "说", "解释"]):
+        delta += 2
+    return _clamp(delta, -8, 8)
+
+
+def _sanitize_outcome_package(encounter: EncounterEntry, package: EncounterOutcomePackage) -> EncounterOutcomePackage:
+    result = package.result if package.result in {"success", "failure"} else _situation_result(encounter)
+    rep_delta = int(package.reputation_delta or 0)
+    if result == "success":
+        rep_delta = _clamp(rep_delta if rep_delta > 0 else 6, 4, 12)
+    else:
+        rep_delta = -_clamp(abs(rep_delta if rep_delta < 0 else -6), 4, 12)
+    items: list[InventoryItem] = []
+    for index, item in enumerate(package.item_rewards[:2], start=1):
+        items.append(
+            item.model_copy(
+                update={
+                    "item_id": item.item_id or f"{encounter.encounter_id}_reward_{index}",
+                    "item_type": "misc",
+                    "slot_type": "misc",
+                    "quantity": max(1, int(item.quantity or 1)),
+                }
+            )
+        )
+    return EncounterOutcomePackage(
+        result=result,  # type: ignore[arg-type]
+        reputation_delta=rep_delta,
+        npc_relation_deltas=[
+            EncounterOutcomeChange(
+                target_id=item.target_id,
+                delta=_clamp(item.delta, -4, 4),
+                summary=(item.summary or "")[:120],
+            )
+            for item in package.npc_relation_deltas[:4]
+            if (item.target_id or "").strip()
+        ],
+        team_deltas=[
+            EncounterOutcomeChange(
+                target_id=item.target_id,
+                delta=_clamp(item.delta, -4, 4),
+                summary=(item.summary or "")[:120],
+            )
+            for item in package.team_deltas[:4]
+            if (item.target_id or "").strip()
+        ],
+        item_rewards=items,
+        buff_rewards=[item.model_copy() for item in package.buff_rewards[:2]],
+        resource_deltas=[str(item)[:120] for item in package.resource_deltas[:4]],
+        narrative_summary=(package.narrative_summary or encounter.latest_outcome_summary or encounter.scene_summary or encounter.description)[:240],
+    )
+
+
+def _fallback_outcome_package(save, encounter: EncounterEntry) -> EncounterOutcomePackage:
+    result = _situation_result(encounter)
+    relation_delta = 2 if result == "success" else -2
+    team_delta = 1 if result == "success" else -1
+    rep_abs = _clamp(abs(encounter.situation_value - 50) // 5 + 4, 4, 12)
+    item_rewards: list[InventoryItem] = []
+    if result == "success" and encounter.situation_value >= 75:
+        item_rewards.append(
+            InventoryItem(
+                item_id=f"{encounter.encounter_id}_token",
+                name=f"{encounter.title}的纪念物",
+                item_type="misc",
+                slot_type="misc",
+                description="一件在遭遇善后后留下的杂项物件。",
+                quantity=1,
+                value=max(1, encounter.situation_value // 10),
+            )
+        )
+    return EncounterOutcomePackage(
+        result=result,  # type: ignore[arg-type]
+        reputation_delta=(rep_abs if result == "success" else -rep_abs),
+        npc_relation_deltas=(
+            [EncounterOutcomeChange(target_id=encounter.npc_role_id, delta=relation_delta, summary="遭遇结果影响了关键 NPC 对玩家的判断。")]
+            if encounter.npc_role_id
+            else []
+        ),
+        team_deltas=[
+            EncounterOutcomeChange(
+                target_id=member.role_id,
+                delta=team_delta,
+                summary=("共同处理遭遇提升了默契。" if result == "success" else "遭遇失利让队伍一时紧张。"),
+            )
+            for member in getattr(save.team_state, "members", [])[:3]
+        ],
+        item_rewards=item_rewards,
+        buff_rewards=[],
+        resource_deltas=[],
+        narrative_summary=(encounter.latest_outcome_summary or encounter.scene_summary or encounter.description)[:240],
+    )
+
+
+def _apply_outcome_package(save, session_id: str, encounter: EncounterEntry, package: EncounterOutcomePackage) -> list[str]:
+    applied_summaries: list[str] = []
+    if package.reputation_delta:
+        entry, _ = apply_sub_zone_reputation_delta(
+            save,
+            session_id=session_id,
+            delta=_clamp(package.reputation_delta, -12, 12),
+            reason=f"遭遇《{encounter.title}》结算",
+            append_scene_event=False,
+            append_log=True,
+        )
+        if entry is not None:
+            applied_summaries.append(f"区域声望 {package.reputation_delta:+d} -> {entry.score}/100")
+    for change in package.npc_relation_deltas:
+        role = next((item for item in save.role_pool if item.role_id == change.target_id), None)
+        if role is None:
+            continue
+        relation = next((item for item in role.relations if item.target_role_id == save.player_static_data.player_id), None)
+        current_tag = relation.relation_tag if relation is not None else "neutral"
+        ladder = ["hostile", "wary", "neutral", "met", "friendly", "ally"]
+        try:
+            idx = ladder.index(current_tag)
+        except ValueError:
+            idx = ladder.index("neutral")
+        next_idx = _clamp(idx + (1 if change.delta > 0 else -1), 0, len(ladder) - 1) if change.delta != 0 else idx
+        if relation is None:
+            from app.models.schemas import RoleRelation
+
+            role.relations.append(RoleRelation(target_role_id=save.player_static_data.player_id, relation_tag=ladder[next_idx], note="遭遇结算"))
+        else:
+            relation.relation_tag = ladder[next_idx]
+            relation.note = "遭遇结算"
+        applied_summaries.append(f"{role.name} 关系 {change.delta:+d}")
+    for change in package.team_deltas:
+        member = next((item for item in getattr(save.team_state, "members", []) if item.role_id == change.target_id), None)
+        if member is None:
+            continue
+        member.affinity = _clamp(member.affinity + change.delta * 3, 0, 100)
+        member.trust = _clamp(member.trust + change.delta * 2, 0, 100)
+        applied_summaries.append(f"{member.name} 默契 {change.delta:+d}")
+    for item in package.item_rewards:
+        save.player_static_data.dnd5e_sheet.backpack.items.append(item.model_copy())
+        applied_summaries.append(f"获得物品：{item.name}")
+    for buff in package.buff_rewards:
+        if not any(item.buff_id == buff.buff_id for item in save.player_static_data.dnd5e_sheet.buffs):
+            save.player_static_data.dnd5e_sheet.buffs.append(buff.model_copy())
+            applied_summaries.append(f"获得效果：{buff.name}")
+    for resource in package.resource_deltas:
+        applied_summaries.append(resource)
+    encounter.last_outcome_package = package
+    _append_game_log(
+        save,
+        session_id,
+        "encounter_outcome_package",
+        package.narrative_summary or f"遭遇《{encounter.title}》完成结算。",
+        {
+            "encounter_id": encounter.encounter_id,
+            "result": package.result,
+            "reputation_delta": package.reputation_delta,
+        },
+    )
+    return applied_summaries
+
+
+def _finalize_encounter_if_needed(save, state: EncounterState, encounter: EncounterEntry, *, session_id: str) -> tuple[EncounterOutcomePackage | None, list[str]]:
+    if not _encounter_should_resolve(encounter):
+        return None, []
+    encounter.status = "resolved"
+    encounter.resolved_at = _utc_now()
+    if encounter.encounter_id in state.pending_ids:
+        state.pending_ids = [item for item in state.pending_ids if item != encounter.encounter_id]
+    if state.active_encounter_id == encounter.encounter_id:
+        state.active_encounter_id = None
+    package = _sanitize_outcome_package(encounter, _fallback_outcome_package(save, encounter))
+    applied = _apply_outcome_package(save, session_id, encounter, package)
+    resolution_text = package.narrative_summary or encounter.latest_outcome_summary or encounter.scene_summary or encounter.description
+    _append_step(encounter, kind="resolution", content=resolution_text)
+    return package, applied
 
 
 def _append_step(
@@ -199,6 +466,8 @@ def _apply_termination_updates(encounter: EncounterEntry, updates: object) -> bo
 
 
 def _encounter_should_resolve(encounter: EncounterEntry) -> bool:
+    if encounter.situation_value <= 0 or encounter.situation_value >= 100:
+        return True
     return any(item.satisfied for item in encounter.termination_conditions)
 
 
@@ -587,6 +856,10 @@ def check_for_encounter(req: EncounterCheckRequest) -> EncounterCheckResponse:
     encounter = _ai_generate_encounter_guarded(save, req.trigger_kind, req.config) or _fallback_encounter(save, req.trigger_kind)
     encounter.source_world_revision = world_state.world_revision
     encounter.source_map_revision = world_state.map_revision
+    encounter.situation_start_value = _calculate_initial_situation_value(save, encounter)
+    encounter.situation_value = encounter.situation_start_value
+    encounter.situation_trend = "stable"
+    _refresh_participants(save, encounter)
     base_refs = extract_entity_refs_from_encounter(encounter)
     unique_refs: dict[tuple[str, str], EntityRef] = {}
     for ref in [*base_refs, *(encounter.entity_refs or [])]:
@@ -638,6 +911,7 @@ def present_encounter(encounter_id: str, req: EncounterPresentRequest) -> Encoun
         encounter.presented_at = _utc_now()
         encounter.player_presence = "engaged"
         encounter.last_advanced_at = encounter.presented_at
+        _initialize_encounter_state(save, encounter)
         if not encounter.termination_conditions:
             encounter.termination_conditions = _default_termination_conditions(encounter.type)
         encounter.scene_summary = encounter.scene_summary or encounter.description
@@ -687,9 +961,12 @@ def _ai_resolve_encounter(encounter: EncounterEntry, req: EncounterActRequest) -
     default_prompt = (
         "\u4f60\u8981\u63a8\u8fdb\u4e00\u4e2a\u8dd1\u56e2\u906d\u9047\u6b65\u9aa4\uff0c\u53ea\u80fd\u8fd4\u56de JSON\u3002\n"
         "reply \u548c scene_summary \u5fc5\u987b\u4f7f\u7528\u7b80\u4f53\u4e2d\u6587\uff0c\u4e0d\u5141\u8bb8\u8f93\u51fa\u82f1\u6587\u53d9\u4e8b\u3002\n"
+        "\u4f60\u53ea\u80fd\u63cf\u5199\u73af\u5883\u3001\u4e8b\u7269\u3001\u5c40\u52bf\u3001\u76ee\u6807\u53cd\u9988\u548c\u7cfb\u7edf\u6027\u53d8\u5316\uff0c\u4e0d\u5141\u8bb8\u4ee3\u66ff\u73b0\u573a NPC \u6216\u961f\u53cb\u53d1\u8a00\u3002\n"
+        "\u82e5\u73a9\u5bb6\u672c\u8f6e\u9009\u62e9\u65c1\u89c2\u4e0e\u7b49\u5f85\uff0c\u5c31\u628a\u8fd9\u4e00\u8f6e\u89c6\u4e3a\u5c40\u52bf\u81ea\u884c\u63a8\u8fdb\uff0c\u4e0d\u8981\u7f16\u9020\u73a9\u5bb6\u4e3b\u52a8\u52a8\u4f5c\u3002\n"
         "JSON schema: "
         "{\"reply\":\"...\",\"time_spent_min\":1,\"scene_summary\":\"...\","
-        "\"step_kind\":\"gm_update|npc_reaction|team_reaction|resolution\","
+        "\"situation_delta_hint\":0,"
+        "\"step_kind\":\"gm_update|resolution\","
         "\"termination_updates\":[{\"condition_index\":0,\"satisfied\":true}]}"
     )
     prompt = prompt_table.render(
@@ -723,7 +1000,7 @@ def _ai_resolve_encounter(encounter: EncounterEntry, req: EncounterActRequest) -
         if not reply:
             return None
         step_kind = str(parsed.get("step_kind") or "gm_update").strip().lower()
-        if step_kind not in {"gm_update", "npc_reaction", "team_reaction", "resolution"}:
+        if step_kind not in {"gm_update", "resolution"}:
             step_kind = "gm_update"
         scene_summary = _force_chinese_text(parsed.get("scene_summary"), encounter.scene_summary or encounter.description, limit=240)
         termination_updates = parsed.get("termination_updates")
@@ -733,6 +1010,7 @@ def _ai_resolve_encounter(encounter: EncounterEntry, req: EncounterActRequest) -
             "reply": reply,
             "time_spent_min": minutes,
             "scene_summary": scene_summary,
+            "situation_delta_hint": _clamp(int(parsed.get("situation_delta_hint") or 0), -8, 8),
             "step_kind": step_kind,
             "termination_updates": termination_updates,
         }
@@ -770,10 +1048,14 @@ def act_on_encounter(encounter_id: str, req: EncounterActRequest) -> EncounterAc
     if encounter.status == "queued":
         encounter.status = "active"
         encounter.presented_at = _utc_now()
+        encounter.player_presence = "engaged"
+        _initialize_encounter_state(save, encounter)
     if encounter.status == "escaped":
         encounter.status = "active"
         encounter.player_presence = "engaged"
         state.active_encounter_id = encounter.encounter_id
+    if encounter.presented_at is None:
+        _initialize_encounter_state(save, encounter)
 
     _append_step(
         encounter,
@@ -787,12 +1069,14 @@ def act_on_encounter(encounter_id: str, req: EncounterActRequest) -> EncounterAc
     if resolved is None:
         reply, time_spent_min = _resolve_fallback_reply(encounter, req.player_prompt)
         next_scene_summary, termination_updates, step_kind = _fallback_step_updates(encounter, req.player_prompt)
+        situation_delta_hint = _fallback_situation_delta(encounter, req.player_prompt)
     else:
         reply = str(resolved.get("reply") or "").strip()
         time_spent_min = max(1, min(30, int(resolved.get("time_spent_min") or 1)))
         next_scene_summary = str(resolved.get("scene_summary") or "").strip() or encounter.scene_summary or encounter.description
         termination_updates = resolved.get("termination_updates") if isinstance(resolved.get("termination_updates"), list) else []
         step_kind = str(resolved.get("step_kind") or "gm_update")
+        situation_delta_hint = _clamp(int(resolved.get("situation_delta_hint") or 0), -8, 8)
     if save.area_snapshot.clock is None:
         save.area_snapshot.clock = _default_world_clock()
     save.area_snapshot.clock = _advance_clock(save.area_snapshot.clock, time_spent_min)
@@ -801,15 +1085,19 @@ def act_on_encounter(encounter_id: str, req: EncounterActRequest) -> EncounterAc
     encounter.last_advanced_at = _utc_now()
     _append_step(encounter, kind=step_kind, content=reply)
     _apply_termination_updates(encounter, termination_updates)
-    if _encounter_should_resolve(encounter):
-        encounter.status = "resolved"
-        encounter.resolved_at = _utc_now()
-        if encounter.encounter_id in state.pending_ids:
-            state.pending_ids = [item for item in state.pending_ids if item != encounter.encounter_id]
-        if state.active_encounter_id == encounter.encounter_id:
-            state.active_encounter_id = None
-        _append_step(encounter, kind="resolution", content=reply)
+    situation_delta = _clamp(situation_delta_hint + _check_bonus_from_player_prompt(req.player_prompt), -20, 20)
+    if situation_delta != 0:
+        encounter.situation_value = _clamp(encounter.situation_value + situation_delta, 0, 100)
+        encounter.situation_trend = "improving" if situation_delta > 0 else "worsening"
     else:
+        encounter.situation_trend = "stable"
+    outcome_package, applied_outcome_summaries = _finalize_encounter_if_needed(
+        save,
+        state,
+        encounter,
+        session_id=req.session_id,
+    )
+    if outcome_package is None:
         encounter.status = "active"
         state.active_encounter_id = encounter.encounter_id
 
@@ -819,6 +1107,10 @@ def act_on_encounter(encounter_id: str, req: EncounterActRequest) -> EncounterAc
         reply=reply,
         time_spent_min=time_spent_min,
         quest_updates=[f"{quest_id}:progress" for quest_id in encounter.related_quest_ids],
+        situation_delta=situation_delta,
+        situation_value_after=encounter.situation_value,
+        reputation_delta=(outcome_package.reputation_delta if outcome_package is not None else 0),
+        applied_outcome_summaries=applied_outcome_summaries,
     )
     state.history.append(resolution)
     state.history = state.history[-80:]
@@ -875,6 +1167,151 @@ def act_on_encounter(encounter_id: str, req: EncounterActRequest) -> EncounterAc
     )
 
 
+def advance_active_encounter_from_main_chat_in_save(
+    save,
+    *,
+    session_id: str,
+    player_text: str,
+    gm_narration: str,
+    time_spent_min: int,
+    config: ChatConfig | None = None,
+) -> list:
+    state = _state(save)
+    encounter = _current_active_encounter(state)
+    if encounter is None or encounter.status != "active" or encounter.player_presence != "engaged":
+        return []
+    if encounter.zone_id and save.area_snapshot.current_zone_id and encounter.zone_id != save.area_snapshot.current_zone_id:
+        return []
+    if encounter.sub_zone_id and save.area_snapshot.current_sub_zone_id and encounter.sub_zone_id != save.area_snapshot.current_sub_zone_id:
+        return []
+    if encounter.presented_at is None:
+        _initialize_encounter_state(save, encounter)
+
+    parsed_intent = _parse_player_intent(player_text)
+    passive_turn = bool(parsed_intent.get("passive_turn"))
+    passive_text = "【玩家旁观】玩家本轮选择观察与等待，不主动行动。"
+    display_text = passive_text if passive_turn else str(parsed_intent.get("display_text") or player_text).strip()
+    if any(token in display_text for token in ["离开", "逃离", "脱身", "撤退", "先撤", "转身跑", "脱离遭遇"]):
+        reply = f"你暂时从《{encounter.title}》里抽身离开，但事态并未真正停下。"
+        encounter.status = "escaped"
+        encounter.player_presence = "away"
+        encounter.latest_outcome_summary = reply
+        encounter.last_advanced_at = _utc_now()
+        _append_step(encounter, kind="escape_attempt", content=reply)
+        for index, condition in enumerate(encounter.termination_conditions):
+            if condition.kind == "player_escapes":
+                _apply_termination_updates(encounter, [{"condition_index": index, "satisfied": True}])
+                break
+        state.active_encounter_id = encounter.encounter_id
+        _append_game_log(
+            save,
+            session_id,
+            "encounter_escape",
+            reply,
+            {"encounter_id": encounter.encounter_id, "from_main_chat": True},
+        )
+        _touch_state(state)
+        return [
+            _new_scene_event(
+                "encounter_progress",
+                reply,
+                metadata={"encounter_id": encounter.encounter_id, "encounter_title": encounter.title, "status": encounter.status},
+            )
+        ]
+
+    _append_step(
+        encounter,
+        kind="player_action",
+        actor_type="player",
+        actor_id=save.player_static_data.player_id,
+        actor_name=save.player_static_data.name,
+        content=display_text or gm_narration or "玩家继续应对当前遭遇。",
+    )
+    resolved = _ai_resolve_encounter(
+        encounter,
+        EncounterActRequest(
+            session_id=session_id,
+            encounter_id=encounter.encounter_id,
+            player_prompt=f"{display_text}\nGM叙事：{gm_narration}".strip(),
+            config=config,
+        ),
+    )
+    if resolved is None:
+        reply, _ = _resolve_fallback_reply(encounter, display_text or gm_narration)
+        next_scene_summary, termination_updates, step_kind = _fallback_step_updates(encounter, display_text or gm_narration)
+        situation_delta_hint = _fallback_situation_delta(encounter, display_text or gm_narration)
+    else:
+        reply = str(resolved.get("reply") or "").strip()
+        next_scene_summary = str(resolved.get("scene_summary") or "").strip() or encounter.scene_summary or encounter.description
+        termination_updates = resolved.get("termination_updates") if isinstance(resolved.get("termination_updates"), list) else []
+        step_kind = str(resolved.get("step_kind") or "gm_update")
+        situation_delta_hint = _clamp(int(resolved.get("situation_delta_hint") or 0), -8, 8)
+
+    encounter.scene_summary = next_scene_summary
+    encounter.latest_outcome_summary = reply
+    encounter.last_advanced_at = _utc_now()
+    _append_step(encounter, kind=step_kind, content=reply)
+    _apply_termination_updates(encounter, termination_updates)
+    situation_delta = _clamp(situation_delta_hint + _check_bonus_from_player_prompt(player_text), -20, 20)
+    if situation_delta != 0:
+        encounter.situation_value = _clamp(encounter.situation_value + situation_delta, 0, 100)
+        encounter.situation_trend = "improving" if situation_delta > 0 else "worsening"
+    else:
+        encounter.situation_trend = "stable"
+    event_kind = "encounter_progress"
+    outcome_package, applied_outcome_summaries = _finalize_encounter_if_needed(
+        save,
+        state,
+        encounter,
+        session_id=session_id,
+    )
+    if outcome_package is not None:
+        event_kind = "encounter_resolution"
+    else:
+        encounter.status = "active"
+        state.active_encounter_id = encounter.encounter_id
+    state.history.append(
+        EncounterResolution(
+            encounter_id=encounter.encounter_id,
+            player_prompt=display_text or player_text,
+            reply=reply,
+            time_spent_min=max(0, time_spent_min),
+            quest_updates=[f"{quest_id}:progress" for quest_id in encounter.related_quest_ids],
+            situation_delta=situation_delta,
+            situation_value_after=encounter.situation_value,
+            reputation_delta=(outcome_package.reputation_delta if outcome_package is not None else 0),
+            applied_outcome_summaries=applied_outcome_summaries,
+        )
+    )
+    state.history = state.history[-80:]
+    _append_game_log(
+        save,
+        session_id,
+        ("encounter_resolved" if event_kind == "encounter_resolution" else "encounter_progress"),
+        reply,
+        {"encounter_id": encounter.encounter_id, "from_main_chat": True, "time_spent_min": time_spent_min},
+    )
+    _touch_state(state)
+    events = [
+        _new_scene_event(
+            "encounter_situation_update",
+            f"局势值变为 {encounter.situation_value}/100，趋势为 {encounter.situation_trend}。",
+            metadata={
+                "encounter_id": encounter.encounter_id,
+                "encounter_title": encounter.title,
+                "situation_value": encounter.situation_value,
+                "situation_delta": situation_delta,
+            },
+        ),
+        _new_scene_event(
+            event_kind,
+            reply,
+            metadata={"encounter_id": encounter.encounter_id, "encounter_title": encounter.title, "status": encounter.status},
+        ),
+    ]
+    return events
+
+
 def advance_active_encounter_in_save(save, *, session_id: str, minutes_elapsed: int, config: ChatConfig | None = None) -> EncounterEntry | None:
     state = _state(save)
     encounter = _current_active_encounter(state)
@@ -882,6 +1319,8 @@ def advance_active_encounter_in_save(save, *, session_id: str, minutes_elapsed: 
         return None
     if minutes_elapsed <= 0:
         return None
+    if encounter.presented_at is None:
+        _initialize_encounter_state(save, encounter)
 
     reply = f"\u4f60\u79bb\u5f00\u73b0\u573a\u540e\uff0c\u300a{encounter.title}\u300b\u4ecd\u5728\u540e\u53f0\u63a8\u8fdb\uff0c\u5c40\u52bf\u6084\u6084\u53d1\u751f\u4e86\u53d8\u5316\u3002"
     if config is not None:
@@ -921,23 +1360,98 @@ def advance_active_encounter_in_save(save, *, session_id: str, minutes_elapsed: 
                 pass
 
     encounter.background_tick_count += 1
+    background_delta = -_clamp(max(1, minutes_elapsed // 10), 1, 6)
+    encounter.situation_value = _clamp(encounter.situation_value + background_delta, 0, 100)
+    encounter.situation_trend = "worsening" if background_delta < 0 else "stable"
     encounter.latest_outcome_summary = reply
     encounter.last_advanced_at = _utc_now()
     _append_step(encounter, kind="background_tick", content=reply)
-    if _encounter_should_resolve(encounter):
-        encounter.status = "resolved"
-        encounter.resolved_at = _utc_now()
-        if state.active_encounter_id == encounter.encounter_id:
-            state.active_encounter_id = None
+    _finalize_encounter_if_needed(save, state, encounter, session_id=session_id)
     _append_game_log(
         save,
         session_id,
         "encounter_background_tick",
         reply,
-        {"encounter_id": encounter.encounter_id, "minutes_elapsed": minutes_elapsed},
+        {
+            "encounter_id": encounter.encounter_id,
+            "minutes_elapsed": minutes_elapsed,
+            "situation_value": encounter.situation_value,
+            "situation_delta": background_delta,
+        },
     )
     _touch_state(state)
     return encounter
+
+
+def apply_active_encounter_situation_delta_in_save(
+    save,
+    *,
+    session_id: str,
+    delta: int,
+    summary: str,
+    actor_role_id: str = "",
+    actor_name: str = "",
+) -> list:
+    state = _state(save)
+    encounter = _current_active_encounter(state)
+    if encounter is None or encounter.status not in {"active", "escaped"}:
+        return []
+    if encounter.presented_at is None:
+        _initialize_encounter_state(save, encounter)
+    applied = _clamp(delta, -20, 20)
+    if applied == 0:
+        return []
+    encounter.situation_value = _clamp(encounter.situation_value + applied, 0, 100)
+    encounter.situation_trend = "improving" if applied > 0 else "worsening"
+    encounter.latest_outcome_summary = (summary or encounter.latest_outcome_summary or encounter.scene_summary or encounter.description)[:240]
+    encounter.last_advanced_at = _utc_now()
+    _append_step(
+        encounter,
+        kind=("team_reaction" if actor_role_id and any(item.role_id == actor_role_id for item in getattr(save.team_state, "members", [])) else "npc_reaction"),
+        actor_type=("team" if actor_role_id and any(item.role_id == actor_role_id for item in getattr(save.team_state, "members", [])) else "npc"),
+        actor_id=actor_role_id,
+        actor_name=actor_name,
+        content=encounter.latest_outcome_summary,
+    )
+    outcome_package, _ = _finalize_encounter_if_needed(save, state, encounter, session_id=session_id)
+    _append_game_log(
+        save,
+        session_id,
+        "encounter_situation_update",
+        encounter.latest_outcome_summary,
+        {
+            "encounter_id": encounter.encounter_id,
+            "situation_value": encounter.situation_value,
+            "situation_delta": applied,
+        },
+    )
+    events = [
+        _new_scene_event(
+            "encounter_situation_update",
+            f"局势值变为 {encounter.situation_value}/100，趋势为 {encounter.situation_trend}。",
+            actor_role_id=actor_role_id,
+            actor_name=actor_name,
+            metadata={
+                "encounter_id": encounter.encounter_id,
+                "encounter_title": encounter.title,
+                "situation_value": encounter.situation_value,
+                "situation_delta": applied,
+            },
+        )
+    ]
+    if outcome_package is not None:
+        events.append(
+            _new_scene_event(
+                "encounter_resolution",
+                outcome_package.narrative_summary or encounter.latest_outcome_summary or encounter.scene_summary or encounter.description,
+                metadata={
+                    "encounter_id": encounter.encounter_id,
+                    "encounter_title": encounter.title,
+                    "status": encounter.status,
+                },
+            )
+        )
+    return events
 
 
 def escape_encounter(encounter_id: str, req: EncounterEscapeRequest) -> EncounterEscapeResponse:
@@ -957,6 +1471,7 @@ def escape_encounter(encounter_id: str, req: EncounterEscapeRequest) -> Encounte
             action_type="check",
             action_prompt=f"encounter_escape; encounter_id={encounter.encounter_id}; title={encounter.title}",
             actor_role_id=save.player_static_data.player_id,
+            allow_backend_roll=True,
             config=req.config,
         )
     )
@@ -1035,6 +1550,128 @@ def get_encounter_debug_overview(session_id: str) -> EncounterDebugOverviewRespo
     queued = _pending_entries(state)
     if active is not None:
         summary = f"当前活跃遭遇: {active.title} / {active.status} / {active.player_presence}"
+    elif queued:
+        summary = f"待处理遭遇数: {len(queued)}"
+    else:
+        summary = "当前没有活跃或待处理遭遇。"
+    return EncounterDebugOverviewResponse(
+        session_id=session_id,
+        active_encounter=active,
+        queued_encounters=queued,
+        summary=summary,
+    )
+
+
+def escape_encounter(encounter_id: str, req: EncounterEscapeRequest) -> EncounterEscapeResponse:
+    save = get_current_save(default_session_id=req.session_id)
+    save.session_id = req.session_id
+    state = _state(save)
+    encounter = _find_encounter(state, encounter_id)
+    if encounter.status != "active" or encounter.player_presence != "engaged":
+        raise ValueError("ENCOUNTER_INVALID_STATUS")
+    if encounter.presented_at is None:
+        _initialize_encounter_state(save, encounter)
+
+    from app.models.schemas import ActionCheckRequest
+    from app.services.world_service import action_check
+
+    action_result: ActionCheckResponse = action_check(
+        ActionCheckRequest(
+            session_id=req.session_id,
+            action_type="check",
+            action_prompt=f"encounter_escape; encounter_id={encounter.encounter_id}; title={encounter.title}",
+            actor_role_id=save.player_static_data.player_id,
+            allow_backend_roll=True,
+            config=req.config,
+        )
+    )
+    escape_success = bool(action_result.success)
+    if escape_success:
+        encounter.status = "escaped"
+        encounter.player_presence = "away"
+        state.active_encounter_id = encounter.encounter_id
+        encounter.situation_value = _clamp(encounter.situation_value + 4, 0, 100)
+        encounter.situation_trend = "improving"
+        reply = f"你暂时从《{encounter.title}》里抽身离开，但事情还在你身后继续发展。"
+        for index, condition in enumerate(encounter.termination_conditions):
+            if condition.kind == "player_escapes":
+                _apply_termination_updates(encounter, [{"condition_index": index, "satisfied": True}])
+                break
+    else:
+        encounter.situation_value = _clamp(encounter.situation_value - 4, 0, 100)
+        encounter.situation_trend = "worsening"
+        reply = f"你试图从《{encounter.title}》里脱身，但局势没有给你留下完整的脱离空档。"
+    encounter.latest_outcome_summary = reply
+    encounter.last_advanced_at = _utc_now()
+    _append_step(encounter, kind="escape_attempt", content=reply)
+    _append_game_log(
+        save,
+        req.session_id,
+        "encounter_escape",
+        reply,
+        {
+            "encounter_id": encounter.encounter_id,
+            "escape_success": escape_success,
+            "situation_value": encounter.situation_value,
+        },
+    )
+    _touch_state(state)
+    save_current(save)
+    return EncounterEscapeResponse(
+        session_id=req.session_id,
+        encounter_id=encounter.encounter_id,
+        status=encounter.status,
+        reply=reply,
+        time_spent_min=action_result.time_spent_min,
+        escape_success=escape_success,
+        encounter=encounter,
+        encounter_state=state,
+        action_check=action_result,
+    )
+
+
+def rejoin_encounter(encounter_id: str, req: EncounterRejoinRequest) -> EncounterRejoinResponse:
+    save = get_current_save(default_session_id=req.session_id)
+    save.session_id = req.session_id
+    state = _state(save)
+    encounter = _find_encounter(state, encounter_id)
+    if encounter.status not in {"active", "escaped"} or encounter.player_presence != "away":
+        raise ValueError("ENCOUNTER_INVALID_STATUS")
+    if encounter.zone_id != save.area_snapshot.current_zone_id or encounter.sub_zone_id != save.area_snapshot.current_sub_zone_id:
+        raise ValueError("ENCOUNTER_REJOIN_AREA_MISMATCH")
+    if encounter.presented_at is None:
+        _initialize_encounter_state(save, encounter)
+
+    reply = f"你重新回到了《{encounter.title}》发生的地点，局势再次把你卷了进去。"
+    encounter.status = "active"
+    encounter.player_presence = "engaged"
+    encounter.situation_value = _clamp(encounter.situation_value + 2, 0, 100)
+    encounter.situation_trend = "improving"
+    encounter.latest_outcome_summary = reply
+    encounter.last_advanced_at = _utc_now()
+    state.active_encounter_id = encounter.encounter_id
+    _append_step(encounter, kind="gm_update", content=reply)
+    _touch_state(state)
+    save_current(save)
+    return EncounterRejoinResponse(
+        session_id=req.session_id,
+        encounter_id=encounter.encounter_id,
+        status=encounter.status,
+        reply=reply,
+        encounter=encounter,
+        encounter_state=state,
+    )
+
+
+def get_encounter_debug_overview(session_id: str) -> EncounterDebugOverviewResponse:
+    save = get_current_save(default_session_id=session_id)
+    if save.session_id != session_id:
+        save.session_id = session_id
+    state = _state(save)
+    active = _current_active_encounter(state)
+    queued = _pending_entries(state)
+    if active is not None:
+        summary = f"当前活跃遭遇: {active.title} / {active.status} / {active.player_presence} / 局势 {active.situation_value}/100"
     elif queued:
         summary = f"待处理遭遇数: {len(queued)}"
     else:

@@ -20,6 +20,7 @@ from app.models.schemas import (
 )
 from app.services.encounter_service import (
     act_on_encounter,
+    advance_active_encounter_from_main_chat_in_save,
     advance_active_encounter_in_save,
     check_for_encounter,
     escape_encounter,
@@ -101,11 +102,14 @@ class EncounterServiceTests(unittest.TestCase):
         action_result = ActionCheckResponse(
             session_id=sid,
             actor_role_id="player_001",
+            actor_name="Player",
+            actor_kind="player",
             action_type="check",
             requires_check=True,
             ability_used="dexterity",
             ability_modifier=2,
             dc=10,
+            check_task="从遭遇中脱身",
             dice_roll=18,
             total_score=20,
             success=True,
@@ -254,6 +258,143 @@ class EncounterServiceTests(unittest.TestCase):
 
         self.assertRegex(result.reply, r"[\u4e00-\u9fff]")
         self.assertRegex(result.encounter.scene_summary, r"[\u4e00-\u9fff]")
+
+    def test_main_chat_advances_active_encounter_and_returns_scene_event(self) -> None:
+        sid = "sess_encounter_main_chat_progress"
+        self._seed_context(sid)
+        save = get_current_save(sid)
+        encounter = EncounterEntry(
+            encounter_id="enc_main_chat",
+            type="event",
+            status="active",
+            title="Main Chat Clash",
+            description="Trouble erupts in the square.",
+            zone_id="zone_town",
+            sub_zone_id="sub_town_1",
+            player_presence="engaged",
+            scene_summary="The square is unstable.",
+            termination_conditions=[
+                EncounterTerminationCondition(condition_id="cond_goal", kind="target_resolved", description="Resolve it")
+            ],
+        )
+        save.encounter_state.encounters = [encounter]
+        save.encounter_state.active_encounter_id = encounter.encounter_id
+
+        with patch(
+            "app.services.encounter_service._ai_resolve_encounter",
+            return_value={
+                "reply": "The clash pushes closer to the player.",
+                "scene_summary": "The clash closes in.",
+                "step_kind": "gm_update",
+                "termination_updates": [],
+            },
+        ):
+            events = advance_active_encounter_from_main_chat_in_save(
+                save,
+                session_id=sid,
+                player_text='{"input_type":"player_intent_v1","action_description":"I brace myself","speech_description":"Hold the line"}',
+                gm_narration="Dust kicks up across the square.",
+                time_spent_min=2,
+                config=None,
+            )
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0].kind, "encounter_situation_update")
+        self.assertEqual(events[1].kind, "encounter_progress")
+        self.assertEqual(save.encounter_state.encounters[0].latest_outcome_summary, "The clash pushes closer to the player.")
+        self.assertEqual(save.encounter_state.encounters[0].scene_summary, "The clash closes in.")
+        self.assertEqual(save.encounter_state.encounters[0].steps[-1].kind, "gm_update")
+
+    def test_main_chat_can_resolve_active_encounter(self) -> None:
+        sid = "sess_encounter_main_chat_resolution"
+        self._seed_context(sid)
+        save = get_current_save(sid)
+        encounter = EncounterEntry(
+            encounter_id="enc_main_chat_resolve",
+            type="event",
+            status="active",
+            title="Resolved by Main Chat",
+            description="One decisive exchange remains.",
+            zone_id="zone_town",
+            sub_zone_id="sub_town_1",
+            player_presence="engaged",
+            scene_summary="The final beat is here.",
+            termination_conditions=[
+                EncounterTerminationCondition(condition_id="cond_goal", kind="target_resolved", description="Resolve it")
+            ],
+        )
+        save.encounter_state.encounters = [encounter]
+        save.encounter_state.active_encounter_id = encounter.encounter_id
+
+        with patch(
+            "app.services.encounter_service._ai_resolve_encounter",
+            return_value={
+                "reply": "The last obstacle gives way.",
+                "scene_summary": "The scene settles.",
+                "step_kind": "resolution",
+                "termination_updates": [{"condition_index": 0, "satisfied": True}],
+            },
+        ):
+            events = advance_active_encounter_from_main_chat_in_save(
+                save,
+                session_id=sid,
+                player_text='{"input_type":"player_intent_v1","action_description":"I finish the fight","speech_description":"It is over"}',
+                gm_narration="The final exchange lands.",
+                time_spent_min=2,
+                config=None,
+            )
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0].kind, "encounter_situation_update")
+        self.assertEqual(events[1].kind, "encounter_resolution")
+        self.assertEqual(save.encounter_state.encounters[0].status, "resolved")
+        self.assertIsNone(save.encounter_state.active_encounter_id)
+
+    def test_main_chat_passive_turn_appends_observe_step(self) -> None:
+        sid = "sess_encounter_main_chat_passive"
+        self._seed_context(sid)
+        save = get_current_save(sid)
+        encounter = EncounterEntry(
+            encounter_id="enc_main_chat_passive",
+            type="event",
+            status="active",
+            title="Passive Watch",
+            description="The scene keeps moving without direct player action.",
+            zone_id="zone_town",
+            sub_zone_id="sub_town_1",
+            player_presence="engaged",
+            scene_summary="The crowd is unsettled.",
+            termination_conditions=[
+                EncounterTerminationCondition(condition_id="cond_goal", kind="target_resolved", description="Resolve it")
+            ],
+        )
+        save.encounter_state.encounters = [encounter]
+        save.encounter_state.active_encounter_id = encounter.encounter_id
+
+        with patch(
+            "app.services.encounter_service._ai_resolve_encounter",
+            return_value={
+                "reply": "The crowd shifts on its own while the player watches.",
+                "scene_summary": "The tension keeps building.",
+                "step_kind": "gm_update",
+                "termination_updates": [],
+            },
+        ):
+            events = advance_active_encounter_from_main_chat_in_save(
+                save,
+                session_id=sid,
+                player_text='{"input_type":"player_intent_v1","passive_turn":true,"passive_mode":"observe"}',
+                gm_narration="The player holds back and watches the square.",
+                time_spent_min=1,
+                config=None,
+            )
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0].kind, "encounter_situation_update")
+        self.assertEqual(events[1].kind, "encounter_progress")
+        self.assertEqual(save.encounter_state.encounters[0].steps[-2].kind, "player_action")
+        self.assertEqual(save.encounter_state.encounters[0].steps[-2].content, "【玩家旁观】玩家本轮选择观察与等待，不主动行动。")
+        self.assertEqual(save.encounter_state.history[-1].player_prompt, "【玩家旁观】玩家本轮选择观察与等待，不主动行动。")
 
 
 if __name__ == "__main__":

@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react';
-import type { InventoryItem, PlayerStaticData, QuestState, RoleBuff } from '../types/app';
+import type { InventoryItem, PlayerStaticData, QuestState, RoleBuff, SubZoneReputationEntry } from '../types/app';
 import { QuestPanel } from './QuestPanel';
 
 type Props = {
   open: boolean;
   value: PlayerStaticData;
   questState: QuestState;
+  currentReputation: SubZoneReputationEntry | null;
   onClose: () => void;
   onSave: (next: PlayerStaticData) => void;
   onTrackQuest: (questId: string) => void;
@@ -19,7 +20,7 @@ function parseLines(text: string): string[] {
     .filter(Boolean);
 }
 
-export function PlayerPanel({ open, value, questState, onClose, onSave, onTrackQuest, onEvaluateQuest }: Props) {
+export function PlayerPanel({ open, value, questState, currentReputation, onClose, onSave, onTrackQuest, onEvaluateQuest }: Props) {
   const [draft, setDraft] = useState<PlayerStaticData>(value);
   const [newItemName, setNewItemName] = useState('');
   const [newItemType, setNewItemType] = useState<'weapon' | 'armor' | 'misc'>('misc');
@@ -107,6 +108,10 @@ export function PlayerPanel({ open, value, questState, onClose, onSave, onTrackQ
       </header>
 
       <div className="player-form">
+        <label>
+          当前子区块声望
+          <input type="text" value={currentReputation ? `${currentReputation.score}/100 (${currentReputation.band})` : '-'} readOnly />
+        </label>
         <label>
           玩家 ID
           <input type="text" value={draft.player_id} onChange={(e) => setDraft((p) => ({ ...p, player_id: e.target.value }))} />

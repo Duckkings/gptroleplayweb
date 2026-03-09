@@ -177,6 +177,96 @@ button:disabled {
   gap: 12px;
 }
 
+.subzone-context-panel {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #0a101a;
+  padding: 12px;
+  display: grid;
+  gap: 12px;
+}
+
+.subzone-context-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.subzone-context-header h3 {
+  margin: 0 0 6px;
+}
+
+.subzone-context-list {
+  display: grid;
+  gap: 10px;
+  max-height: 52vh;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.subzone-context-turn {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #121b2a;
+  padding: 10px;
+  display: grid;
+  gap: 10px;
+}
+
+.subzone-context-turn-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.subzone-context-meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.subzone-context-turn-header span {
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.subzone-context-turn-body {
+  display: grid;
+  gap: 6px;
+}
+
+.subzone-context-turn-body p {
+  margin: 0;
+  color: var(--text);
+  white-space: pre-wrap;
+}
+
+.subzone-context-events {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.subzone-context-event {
+  display: grid;
+  gap: 4px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  padding-top: 8px;
+}
+
+.subzone-context-event strong {
+  color: var(--accent);
+}
+
+.subzone-context-event span {
+  color: var(--text);
+  white-space: pre-wrap;
+}
+
 .chat-header {
   display: flex;
   justify-content: space-between;
@@ -194,6 +284,24 @@ button:disabled {
   padding: 12px;
   display: grid;
   gap: 10px;
+}
+
+.current-output-panel {
+  min-height: 220px;
+}
+
+.current-output-header {
+  display: grid;
+  gap: 4px;
+}
+
+.current-output-header h3,
+.current-output-header p {
+  margin: 0;
+}
+
+.current-output-header p {
+  color: var(--text-dim);
 }
 
 .encounter-lane {

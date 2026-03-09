@@ -1,8 +1,10 @@
 ﻿import { useEffect, useMemo, useRef, useState } from 'react';
 import './App.css';
+import { useEffectEvent } from 'react';
 import { DebugPanel } from './components/DebugPanel';
 import { ConsistencyPanel } from './components/ConsistencyPanel';
 import { EncounterLane } from './components/EncounterLane';
+import { EncounterModal } from './components/EncounterModal';
 import { FatePanel } from './components/FatePanel';
 import { GameLogPanel } from './components/GameLogPanel';
 import { InventoryModal } from './components/InventoryModal';
@@ -14,19 +16,18 @@ import { QuestInspectModal } from './components/QuestInspectModal';
 import { QuestModal } from './components/QuestModal';
 import { RoleInventoryModal } from './components/RoleInventoryModal';
 import { RoleProfileModal } from './components/RoleProfileModal';
+import { SubZoneContextPanel } from './components/SubZoneContextPanel';
 import { TeamPanel } from './components/TeamPanel';
 import { ActionCheckPanel } from './components/ActionCheckPanel';
 import { ActionCheckRollModal } from './components/ActionCheckRollModal';
 import {
   acceptQuest,
-  actEncounter,
   checkEncounters,
   clearSave,
   debugGenerateQuest,
   discoverConfigModels,
   discoverAreaInteractions,
   describeBehavior,
-  escapeEncounter,
   equipInventoryItem,
   evaluateAllQuests,
   evaluateFate,
@@ -61,6 +62,7 @@ import {
   sendTeamChat,
   pickConfigPath,
   pickSavePath,
+  planActionCheck,
   presentEncounter,
   regenerateFate,
   rejectQuest,
@@ -90,6 +92,7 @@ import {
   defaultQuestState,
   defaultTeamState,
   defaultWorldState,
+  type ActionCheckPlan,
   type ApiDebugEntry,
   type ActionCheckResult,
   type EncounterEntry,
@@ -113,6 +116,7 @@ import {
   type RenderResult,
   type SaveFile,
   type SceneEvent,
+  type SubZoneReputationEntry,
   type TeamChatReply,
   type TeamState,
   type TokenUsageSummary,
@@ -121,17 +125,28 @@ import {
 type View = 'boot' | 'config' | 'chat';
 type ChatState = 'idle' | 'sending' | 'streaming' | 'error';
 type ChatMode = 'main' | 'npc';
+type MainOutputStatus = 'idle' | 'streaming' | 'awaiting_archive' | 'error';
+type MainOutput = {
+  source_kind: 'main_turn' | 'system_output';
+  reply_text: string;
+  scene_events: SceneEvent[];
+  archived_sub_zone_turn_id: string | null;
+  status: MainOutputStatus;
+};
 type ActionCheckPayload = {
   action_type: 'attack' | 'check' | 'item_use';
   action_prompt: string;
   actor_role_id?: string;
   source_context: 'main_chat' | 'npc_chat' | 'encounter_lane' | 'action_panel' | 'area_item' | 'inventory_item';
   post_close_output: 'main_chat' | 'suppress';
+  resolution_context?: 'standalone' | 'embedded';
+  skip_if_no_check?: boolean;
 };
 type ActionCheckRollPhase = 'ready' | 'rolling' | 'resolving' | 'resolved' | 'error';
 type ActionCheckRollState = {
   open: boolean;
   phase: ActionCheckRollPhase;
+  plan: ActionCheckPlan | null;
   rollValue: number | null;
   result: ActionCheckResult | null;
   errorMessage: string;
@@ -157,6 +172,54 @@ const MODEL_PARAM_LABELS: Record<'temperature' | 'max_tokens' | 'max_completion_
   max_tokens: 'Max Tokens',
   max_completion_tokens: 'Max Completion Tokens',
 };
+const MAIN_OUTPUT_SCENE_EVENT_KINDS = new Set<SceneEvent['kind']>([
+  'public_targeted_npc_reply',
+  'public_bystander_reaction',
+  'team_public_reaction',
+  'public_actor_resolution',
+  'role_desire_surface',
+  'companion_story_surface',
+  'reputation_update',
+  'encounter_started',
+  'encounter_background',
+  'encounter_situation_update',
+]);
+
+function sceneEventEncounterTitle(event: SceneEvent): string {
+  const fromMetadata = typeof event.metadata?.encounter_title === 'string' ? event.metadata.encounter_title.trim() : '';
+  if (fromMetadata) return fromMetadata;
+  const firstLine = (event.content ?? '').split('\n')[0]?.trim() ?? '';
+  if (!firstLine) return '未知遭遇';
+  return firstLine.replace(/^【遭遇触发】/, '').trim() || '未知遭遇';
+}
+
+function sceneEventToMessage(event: SceneEvent): ChatMessage {
+  if (event.kind === 'encounter_started') {
+    return { role: 'assistant', content: `【遭遇触发】${sceneEventEncounterTitle(event)}，详见右侧并行遭遇栏。` };
+  }
+  const labelMap: Record<SceneEvent['kind'], string> = {
+    public_targeted_npc_reply: '公开目标回复',
+    public_bystander_reaction: '旁观反应',
+    team_public_reaction: '队友反应',
+    public_actor_resolution: '公开轮次',
+    role_desire_surface: '角色欲望',
+    companion_story_surface: '队友故事',
+    reputation_update: '区域声望',
+    encounter_started: '遭遇触发',
+    encounter_progress: '遭遇推进',
+    encounter_resolution: '遭遇结算',
+    encounter_background: '遭遇后台',
+    encounter_situation_update: '局势值',
+  };
+  const header = event.actor_name ? `【${labelMap[event.kind]} / ${event.actor_name}】` : `【${labelMap[event.kind]}】`;
+  return { role: 'assistant', content: `${header}\n${event.content}` };
+}
+
+function selectCurrentReputation(save: SaveFile): SubZoneReputationEntry | null {
+  const subZoneId = save.area_snapshot?.current_sub_zone_id ?? null;
+  if (!subZoneId) return null;
+  return save.reputation_state?.entries?.find((item) => item.sub_zone_id === subZoneId) ?? null;
+}
 
 function applyModelProfile(config: AppConfig, profile: ModelCapabilityInfo | null): AppConfig {
   if (!profile) {
@@ -188,6 +251,7 @@ function resetProviderSelection(config: AppConfig, updates: Partial<AppConfig>):
 const DEFAULT_ACTION_CHECK_ROLL_STATE: ActionCheckRollState = {
   open: false,
   phase: 'ready',
+  plan: null,
   rollValue: null,
   result: null,
   errorMessage: '',
@@ -198,7 +262,7 @@ function App() {
   const [view, setView] = useState<View>('boot');
   const [configReturnView, setConfigReturnView] = useState<View>('boot');
   const [config, setConfig] = useState<AppConfig>(defaultConfig);
-  const [mainMessages, setMainMessages] = useState<ChatMessage[]>([]);
+  const [currentMainOutput, setCurrentMainOutput] = useState<MainOutput | null>(null);
   const [npcChatMessages, setNpcChatMessages] = useState<Record<string, ChatMessage[]>>({});
   const [chatMode, setChatMode] = useState<ChatMode>('main');
   const [activeNpcChat, setActiveNpcChat] = useState<{ npcId: string; npcName: string } | null>(null);
@@ -231,6 +295,7 @@ function App() {
   const [mapOpen, setMapOpen] = useState(false);
   const [logOpen, setLogOpen] = useState(false);
   const [areaSnapshot, setAreaSnapshot] = useState<AreaSnapshot | null>(null);
+  const [currentReputation, setCurrentReputation] = useState<SubZoneReputationEntry | null>(null);
   const [questState, setQuestState] = useState<QuestState>(defaultQuestState);
   const [encounterState, setEncounterState] = useState<EncounterState>(defaultEncounterState);
   const [fateState, setFateState] = useState<FateState>(defaultFateState);
@@ -282,13 +347,15 @@ function App() {
   const [aiWaitingText, setAiWaitingText] = useState('正在等待 AI 生成...');
   const [questModalBusy, setQuestModalBusy] = useState(false);
   const [encounterModalBusy, setEncounterModalBusy] = useState(false);
-  const [activeEncounterInput, setActiveEncounterInput] = useState('');
+  const [encounterModalEncounterId, setEncounterModalEncounterId] = useState<string | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
   const configFileInputRef = useRef<HTMLInputElement | null>(null);
   const announcedEncounterIdsRef = useRef<Set<string>>(new Set());
+  const autoRejoinEncounterIdRef = useRef<string | null>(null);
   const pendingActionCheckRef = useRef<ActionCheckPayload | null>(null);
-  const actionCheckPromiseRef = useRef<{ resolve: (result: ActionCheckResult) => void; reject: (error: Error) => void } | null>(null);
+  const actionCheckPromiseRef = useRef<{ resolve: (result: ActionCheckResult | null) => void; reject: (error: Error) => void } | null>(null);
+  const actionInputRef = useRef<HTMLTextAreaElement | null>(null);
 
   const statusText = useMemo(() => {
     if (chatState === 'sending') return '发送中...';
@@ -374,24 +441,25 @@ function App() {
       activeEncounter.zone_id === areaSnapshot?.current_zone_id &&
       (activeEncounter.sub_zone_id ? activeEncounter.sub_zone_id === areaSnapshot?.current_sub_zone_id : true),
   );
+  const encounterModalEncounter = useMemo(() => {
+    if (!encounterModalEncounterId) return null;
+    return encounterState.encounters.find((item) => item.encounter_id === encounterModalEncounterId) ?? null;
+  }, [encounterState.encounters, encounterModalEncounterId]);
+  const encounterModalOpen = Boolean(encounterModalEncounter);
   const blockingModalOpen = Boolean(
-    pendingQuest || mapPromptDialogOpen || aiWaiting || actionCheckRollState.open || encounterModalBusy,
+    pendingQuest || mapPromptDialogOpen || aiWaiting || actionCheckRollState.open || encounterModalBusy || encounterModalOpen,
   );
   const hasActionInput = actionInput.trim().length > 0;
   const hasSpeechInput = speechInput.trim().length > 0;
   const canSend =
-    (chatMode === 'npc' ? hasActionInput || hasSpeechInput : hasActionInput && hasSpeechInput) &&
+    (chatMode === 'npc' ? hasActionInput || hasSpeechInput : hasActionInput || hasSpeechInput) &&
     (chatState === 'idle' || chatState === 'error') &&
     !blockingModalOpen;
+  const canAutoAdvance = chatMode === 'main' && encounterEngaged && (chatState === 'idle' || chatState === 'error') && !blockingModalOpen;
 
   const tokenTotal = tokenUsage.total.total_tokens;
-  const displayedMessages =
-    chatMode === 'main' ? mainMessages : activeNpcChat ? (npcChatMessages[activeNpcChat.npcId] ?? []) : [];
-  const setDisplayedMessages = (next: ChatMessage[] | ((prev: ChatMessage[]) => ChatMessage[])) => {
-    if (chatMode === 'main') {
-      setMainMessages((prev) => (typeof next === 'function' ? next(prev) : next));
-      return;
-    }
+  const npcDisplayedMessages = activeNpcChat ? (npcChatMessages[activeNpcChat.npcId] ?? []) : [];
+  const setNpcDisplayedMessages = (next: ChatMessage[] | ((prev: ChatMessage[]) => ChatMessage[])) => {
     const npcId = activeNpcChat?.npcId;
     if (!npcId) return;
     setNpcChatMessages((prev) => {
@@ -404,60 +472,72 @@ function App() {
   const showAlreadyTherePopup = (text: string): void => {
     window.alert(text);
   };
+  const filterMainOutputSceneEvents = (sceneEvents: SceneEvent[] = []): SceneEvent[] =>
+    sceneEvents.filter((event) => MAIN_OUTPUT_SCENE_EVENT_KINDS.has(event.kind));
+  const setMainOutput = (
+    sourceKind: MainOutput['source_kind'],
+    replyText: string,
+    sceneEvents: SceneEvent[] = [],
+    options?: { archivedSubZoneTurnId?: string | null; status?: MainOutputStatus },
+  ): void => {
+    const trimmedReply = replyText.trim();
+    if (trimmedReply && isAlreadyThereHint(trimmedReply)) {
+      showAlreadyTherePopup(replyText);
+      return;
+    }
+    const visibleSceneEvents = filterMainOutputSceneEvents(sceneEvents);
+    if (!trimmedReply && visibleSceneEvents.length === 0) {
+      setCurrentMainOutput(null);
+      return;
+    }
+    setCurrentMainOutput({
+      source_kind: sourceKind,
+      reply_text: replyText,
+      scene_events: visibleSceneEvents,
+      archived_sub_zone_turn_id: options?.archivedSubZoneTurnId ?? null,
+      status: options?.status ?? 'idle',
+    });
+  };
   const setAssistantOnly = (text: string): void => {
     if (isAlreadyThereHint(text)) {
       showAlreadyTherePopup(text);
       return;
     }
-    setDisplayedMessages([{ role: 'assistant', content: text }]);
+    if (chatMode === 'npc') {
+      setNpcDisplayedMessages([{ role: 'assistant', content: text }]);
+      return;
+    }
+    setMainOutput('system_output', text);
   };
   const setMainAssistantOnly = (text: string): void => {
     if (isAlreadyThereHint(text)) {
       showAlreadyTherePopup(text);
       return;
     }
-    setMainMessages([{ role: 'assistant', content: text }]);
+    setMainOutput('system_output', text);
   };
-  const sceneEventEncounterTitle = (event: SceneEvent): string => {
-    const fromMetadata = typeof event.metadata?.encounter_title === 'string' ? event.metadata.encounter_title.trim() : '';
-    if (fromMetadata) return fromMetadata;
-    const firstLine = (event.content ?? '').split('\n')[0]?.trim() ?? '';
-    if (!firstLine) return '未知遭遇';
-    return firstLine.replace(/^【遭遇触发】/, '').trim() || '未知遭遇';
-  };
-  const sceneEventToMessage = (event: SceneEvent): ChatMessage => {
-    if (event.kind === 'encounter_started') {
-      return { role: 'assistant', content: `【遭遇触发】${sceneEventEncounterTitle(event)}，详见右侧并行遭遇栏。` };
+  const mainOutputMessages = useMemo(() => {
+    if (!currentMainOutput) return [];
+    const nextMessages: ChatMessage[] = [];
+    if (currentMainOutput.reply_text.trim()) {
+      nextMessages.push({ role: 'assistant', content: currentMainOutput.reply_text });
     }
-    const labelMap: Record<SceneEvent['kind'], string> = {
-      public_targeted_npc_reply: '公开目标回复',
-      public_bystander_reaction: '旁观反应',
-      team_public_reaction: '队友反应',
-      encounter_started: '遭遇触发',
-      encounter_progress: '遭遇推进',
-      encounter_background: '遭遇后台',
-    };
-    const header = event.actor_name ? `【${labelMap[event.kind]} / ${event.actor_name}】` : `【${labelMap[event.kind]}】`;
-    return { role: 'assistant', content: `${header}\n${event.content}` };
-  };
-  const setMainNarrativeMessages = (replyText: string, sceneEvents: SceneEvent[] = []): void => {
-    const trimmedReply = replyText.trim();
-    if (trimmedReply && isAlreadyThereHint(trimmedReply)) {
-      showAlreadyTherePopup(replyText);
-      return;
-    }
-    const nextMessages: ChatMessage[] = trimmedReply
-      ? [{ role: 'assistant', content: replyText }, ...sceneEvents.map(sceneEventToMessage)]
-      : sceneEvents.map(sceneEventToMessage);
-    if (nextMessages.length === 0) {
-      return;
-    }
-    setMainMessages(nextMessages);
-  };
-  const forceReturnToMainChat = (_reason: 'encounter_interrupt' | 'manual' | 'narrative_switch') => {
+    nextMessages.push(...currentMainOutput.scene_events.map(sceneEventToMessage));
+    return nextMessages;
+  }, [currentMainOutput]);
+  const forceReturnToMainChat = (reason: 'encounter_interrupt' | 'manual' | 'narrative_switch') => {
+    void reason;
     setChatMode('main');
     setActiveNpcChat(null);
     clearPlayerInput();
+  };
+  const forceReturnToMainChatEvent = useEffectEvent((reason: 'encounter_interrupt' | 'manual' | 'narrative_switch') => {
+    forceReturnToMainChat(reason);
+  });
+  const focusMainActionInput = () => {
+    window.setTimeout(() => {
+      actionInputRef.current?.focus();
+    }, 0);
   };
   const replaceCachedRoleCard = (role: NpcRoleCard) => {
     setNpcPoolItems((prev) => {
@@ -476,41 +556,29 @@ function App() {
       setTimeNotices((prev) => prev.filter((n) => n.id !== id));
     }, 3200);
   };
-  const logsToMessages = (logs: GameLogEntry[]): ChatMessage[] => {
-    let lastAssistant: string | null = null;
-    for (const item of logs) {
-      if (item.kind === 'gm_reply' || item.kind === 'move' || item.kind === 'area_move') {
-        lastAssistant = item.message;
-      }
-    }
-    return lastAssistant ? [{ role: 'assistant', content: lastAssistant }] : [];
-  };
   const dialogueLogsToMessages = (role: NpcRoleCard): ChatMessage[] =>
     (role.dialogue_logs ?? []).map((item) => ({
       role: item.speaker === 'player' ? 'user' : 'assistant',
       content: `[${item.world_time_text}] ${item.speaker_name}: ${item.content}`,
     }));
-  const formatEncounterChatMessage = (encounter: EncounterEntry): string =>
-    `【遭遇触发】${encounter.title}，详见右侧并行遭遇栏。`;
   const buildStructuredPlayerInput = (
     actionDescription: string,
     speechDescription: string,
     actionCheckResult?: ActionCheckResult | null,
+    options?: { passiveTurn?: boolean; passiveMode?: 'observe' },
   ): string =>
     JSON.stringify(
       {
         input_type: 'player_intent_v1',
         action_description: actionDescription,
         speech_description: speechDescription,
+        passive_turn: options?.passiveTurn || undefined,
+        passive_mode: options?.passiveTurn ? options?.passiveMode ?? 'observe' : undefined,
         action_check_result: actionCheckResult
           ? {
+              check_task: actionCheckResult.check_task,
               success: actionCheckResult.success,
               critical: actionCheckResult.critical,
-              narrative: actionCheckResult.narrative,
-              dice_roll: actionCheckResult.dice_roll,
-              total_score: actionCheckResult.total_score,
-              dc: actionCheckResult.dc,
-              ability_used: actionCheckResult.ability_used,
             }
           : undefined,
       },
@@ -536,8 +604,6 @@ function App() {
     }
     return lines.join('\n');
   };
-  const shouldCheckNpcRequest = (speechDescription: string): boolean =>
-    /(请|帮|借|给我|告诉我|能否|可以吗|愿不愿意|拜托)/.test(speechDescription.trim());
   const shouldLeaveNpcChatByIntent = (actionDescription: string, speechDescription: string): boolean =>
     /(离开|转身|告辞|先走|退开|退出|回到主聊天)/.test(`${actionDescription}\n${speechDescription}`.trim());
   const clearPlayerInput = () => {
@@ -547,6 +613,15 @@ function App() {
   const resetActionCheckRollState = () => {
     setActionCheckRollState(DEFAULT_ACTION_CHECK_ROLL_STATE);
   };
+
+  useEffect(() => {
+    if (!currentMainOutput || currentMainOutput.source_kind !== 'main_turn') return;
+    const archivedTurnId = currentMainOutput.archived_sub_zone_turn_id;
+    if (!archivedTurnId) return;
+    const turns = currentSubZone?.chat_context?.recent_turns ?? [];
+    if (!turns.some((turn) => turn.turn_id === archivedTurnId)) return;
+    setCurrentMainOutput(null);
+  }, [currentMainOutput, currentSubZone]);
 
   const report = (entry: { endpoint: string; status: number; ok: boolean; detail?: string; usage?: { input_tokens: number; output_tokens: number } }) => {
     setDebugEntries((prev) => [
@@ -589,19 +664,12 @@ function App() {
     }
   };
 
-  const registerAnnouncedEncounters = (events: SceneEvent[]) => {
-    for (const event of events) {
-      if (event.kind !== 'encounter_started') continue;
-      const encounterId = typeof event.metadata?.encounter_id === 'string' ? event.metadata.encounter_id : '';
-      if (encounterId) {
-        announcedEncounterIdsRef.current.add(encounterId);
-      }
-    }
-  };
-
   const syncEncounterLaneAfterSceneEvents = async (events: SceneEvent[]) => {
-    registerAnnouncedEncounters(events);
-    if (events.some((event) => event.kind === 'encounter_started')) {
+    if (
+      events.some((event) =>
+        ['encounter_started', 'encounter_background', 'encounter_progress', 'encounter_resolution', 'encounter_situation_update'].includes(event.kind),
+      )
+    ) {
       await refreshEncounterState(sessionId);
     }
   };
@@ -646,10 +714,13 @@ function App() {
       if (save.session_id !== sid) return;
       setMapSnapshot(toMapSnapshot(save));
       setAreaSnapshot(save.area_snapshot ?? null);
+      setCurrentReputation(selectCurrentReputation(save));
       setQuestState(save.quest_state ?? defaultQuestState);
       setEncounterState(save.encounter_state ?? defaultEncounterState);
       setFateState(save.fate_state ?? defaultFateState);
       setTeamState(save.team_state ?? defaultTeamState);
+      setNpcPoolItems(save.role_pool ?? []);
+      setNpcPoolTotal((save.role_pool ?? []).length);
       setTeamChatReplies([]);
       setTeamChatBusy(false);
       setWorldState(save.world_state ?? defaultWorldState);
@@ -708,17 +779,20 @@ function App() {
         setSvPath(svPath);
         setMapSnapshot(toMapSnapshot(save));
         setAreaSnapshot(save.area_snapshot ?? null);
+        setCurrentReputation(selectCurrentReputation(save));
         setQuestState(save.quest_state ?? defaultQuestState);
         setEncounterState(save.encounter_state ?? defaultEncounterState);
         setFateState(save.fate_state ?? defaultFateState);
         setTeamState(save.team_state ?? defaultTeamState);
+        setNpcPoolItems(save.role_pool ?? []);
+        setNpcPoolTotal((save.role_pool ?? []).length);
         setTeamChatReplies([]);
         setTeamChatBusy(false);
         setWorldState(save.world_state ?? defaultWorldState);
         setConsistencyIssues([]);
         setConsistencyIssueCount(0);
         setStorySnapshot(null);
-        setMainMessages(logsToMessages(save.game_logs ?? []));
+        setCurrentMainOutput(null);
         const sid = save.session_id || `sess_${Date.now()}`;
         setSessionId(sid);
         setTokenUsage({ ...EMPTY_TOKEN_USAGE, session_id: sid });
@@ -760,36 +834,74 @@ function App() {
 
   useEffect(() => {
     announcedEncounterIdsRef.current = new Set();
+    autoRejoinEncounterIdRef.current = null;
   }, [sessionId]);
+
+  const presentPendingEncounterEvent = useEffectEvent(async (encounterId: string) => {
+    try {
+      setEncounterModalBusy(true);
+      forceReturnToMainChat('encounter_interrupt');
+      await presentEncounter({ session_id: sessionId, encounter_id: encounterId }, report);
+      const state = await getPendingEncounters(sessionId, report);
+      setEncounterState(state.encounter_state ?? defaultEncounterState);
+    } catch {
+      // Ignore encounter present failures.
+    } finally {
+      setEncounterModalBusy(false);
+    }
+  });
+
+  const autoRejoinEncounterEvent = useEffectEvent(async (encounter: EncounterEntry) => {
+    try {
+      setEncounterModalBusy(true);
+      forceReturnToMainChat('encounter_interrupt');
+      const response = await rejoinEncounter({ session_id: sessionId, encounter_id: encounter.encounter_id }, report);
+      setEncounterState(response.encounter_state ?? defaultEncounterState);
+      setMainAssistantOnly(response.reply);
+      await refreshGameLogs(sessionId);
+      await syncStateFromSave(sessionId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '自动重返遭遇失败');
+    } finally {
+      setEncounterModalBusy(false);
+    }
+  });
 
   useEffect(() => {
     if (pendingQuest || !pendingEncounter) return;
     const encounterId = pendingEncounter.encounter_id;
-    const announceIfNeeded = () => {
-      if (announcedEncounterIdsRef.current.has(encounterId)) return;
-      announcedEncounterIdsRef.current.add(encounterId);
-      forceReturnToMainChat('encounter_interrupt');
-      setMainAssistantOnly(formatEncounterChatMessage(pendingEncounter));
-      setActiveEncounterInput('');
-    };
     if (pendingEncounter.status === 'active' || pendingEncounter.status === 'escaped') {
-      announceIfNeeded();
+      if (announcedEncounterIdsRef.current.has(encounterId) || encounterModalEncounterId === encounterId) return;
+      forceReturnToMainChatEvent('encounter_interrupt');
+      setEncounterModalEncounterId(encounterId);
       return;
     }
     if (pendingEncounter.status !== 'queued') return;
     if (activeEncounter?.encounter_id) return;
-    void (async () => {
-      try {
-        forceReturnToMainChat('encounter_interrupt');
-        await presentEncounter({ session_id: sessionId, encounter_id: encounterId }, report);
-        announceIfNeeded();
-        const state = await getPendingEncounters(sessionId, report);
-        setEncounterState(state.encounter_state ?? defaultEncounterState);
-      } catch {
-        // Ignore encounter present failures.
-      }
-    })();
-  }, [pendingQuest, pendingEncounter, activeEncounter?.encounter_id, sessionId]);
+    void presentPendingEncounterEvent(encounterId);
+  }, [pendingQuest, pendingEncounter, activeEncounter?.encounter_id, encounterModalEncounterId]);
+
+  useEffect(() => {
+    if (!canRejoinActiveEncounter || !activeEncounter) {
+      autoRejoinEncounterIdRef.current = null;
+      return;
+    }
+    if (pendingQuest || mapPromptDialogOpen || aiWaiting || actionCheckRollState.open || encounterModalBusy || encounterModalOpen) {
+      return;
+    }
+    if (autoRejoinEncounterIdRef.current === activeEncounter.encounter_id) return;
+    autoRejoinEncounterIdRef.current = activeEncounter.encounter_id;
+    void autoRejoinEncounterEvent(activeEncounter);
+  }, [
+    canRejoinActiveEncounter,
+    activeEncounter,
+    pendingQuest,
+    mapPromptDialogOpen,
+    aiWaiting,
+    actionCheckRollState.open,
+    encounterModalBusy,
+    encounterModalOpen,
+  ]);
 
   const formatValidateErrors = (errors: Array<{ field: string; message: string }>) =>
     errors.map((e) => `${e.field}: ${e.message}`).join('; ');
@@ -958,16 +1070,67 @@ function App() {
     await syncStateFromSave(sessionId);
   };
 
-  const performActionCheckWithRoll = (payload: ActionCheckPayload): Promise<ActionCheckResult> => {
+  const performActionCheckWithRoll = async (payload: ActionCheckPayload): Promise<ActionCheckResult | null> => {
     if (actionCheckPromiseRef.current) {
-      return Promise.reject(new Error('已有检定进行中，请先完成当前投骰。'));
+      throw new Error('已有检定进行中，请先完成当前投骰。');
+    }
+    const plan = await planActionCheck(
+      {
+        session_id: sessionId,
+        action_type: payload.action_type,
+        action_prompt: payload.action_prompt,
+        actor_role_id: payload.actor_role_id,
+        config,
+      },
+      report,
+    );
+    if (!plan.requires_check) {
+      if (payload.skip_if_no_check) {
+        return null;
+      }
+      return runActionCheck(
+        {
+          session_id: sessionId,
+          action_type: payload.action_type,
+          action_prompt: payload.action_prompt,
+          actor_role_id: plan.actor_role_id,
+          resolution_context: payload.resolution_context ?? 'standalone',
+          planned_ability_used: plan.ability_used,
+          planned_dc: plan.dc,
+          planned_time_spent_min: plan.time_spent_min,
+          planned_requires_check: plan.requires_check,
+          planned_check_task: plan.check_task,
+          config,
+        },
+        report,
+      );
+    }
+    if (plan.actor_kind === 'npc') {
+      return runActionCheck(
+        {
+          session_id: sessionId,
+          action_type: payload.action_type,
+          action_prompt: payload.action_prompt,
+          actor_role_id: plan.actor_role_id,
+          allow_backend_roll: true,
+          resolution_context: payload.resolution_context ?? 'standalone',
+          planned_ability_used: plan.ability_used,
+          planned_dc: plan.dc,
+          planned_time_spent_min: plan.time_spent_min,
+          planned_requires_check: plan.requires_check,
+          planned_check_task: plan.check_task,
+          config,
+        },
+        report,
+      );
     }
     pendingActionCheckRef.current = payload;
     setActionCheckRollState({
       ...DEFAULT_ACTION_CHECK_ROLL_STATE,
       open: true,
+      plan,
     });
-    return new Promise<ActionCheckResult>((resolve, reject) => {
+    return new Promise<ActionCheckResult | null>((resolve, reject) => {
       actionCheckPromiseRef.current = { resolve, reject };
     });
   };
@@ -975,7 +1138,8 @@ function App() {
   const onTriggerActionCheckRoll = () => {
     if (actionCheckRollState.phase !== 'ready') return;
     const payload = pendingActionCheckRef.current;
-    if (!payload) return;
+    const plan = actionCheckRollState.plan;
+    if (!payload || !plan) return;
     const rollValue = Math.floor(Math.random() * 20) + 1;
     const rotation = {
       x: 1080 + Math.floor(Math.random() * 720),
@@ -985,6 +1149,7 @@ function App() {
     setActionCheckRollState({
       open: true,
       phase: 'rolling',
+      plan,
       rollValue,
       result: null,
       errorMessage: '',
@@ -1003,8 +1168,14 @@ function App() {
               session_id: sessionId,
               action_type: payload.action_type,
               action_prompt: payload.action_prompt,
-              actor_role_id: payload.actor_role_id,
+              actor_role_id: plan.actor_role_id,
               forced_dice_roll: rollValue,
+              resolution_context: payload.resolution_context ?? 'standalone',
+              planned_ability_used: plan.ability_used,
+              planned_dc: plan.dc,
+              planned_time_spent_min: plan.time_spent_min,
+              planned_requires_check: plan.requires_check,
+              planned_check_task: plan.check_task,
               config,
             },
             report,
@@ -1051,17 +1222,23 @@ function App() {
     const sceneEvents = result.scene_events ?? [];
     const mirroredEvents =
       sourceContext === 'npc_chat'
-        ? sceneEvents.filter((event) => event.kind === 'encounter_started' || event.kind === 'encounter_background' || event.kind === 'encounter_progress')
+        ? sceneEvents.filter(
+            (event) =>
+              event.kind === 'encounter_started' ||
+              event.kind === 'encounter_background' ||
+              event.kind === 'encounter_progress' ||
+              event.kind === 'encounter_resolution' ||
+              event.kind === 'encounter_situation_update',
+          )
         : sceneEvents;
     const encounterStarted = mirroredEvents.some((event) => event.kind === 'encounter_started');
     if (encounterStarted && sourceContext === 'npc_chat') {
       forceReturnToMainChat('encounter_interrupt');
-      setActiveEncounterInput('');
     }
     if (postCloseOutput === 'main_chat') {
-      setMainNarrativeMessages(result.narrative, mirroredEvents);
+      setMainOutput('system_output', result.narrative, mirroredEvents);
     } else if (mirroredEvents.length > 0) {
-      setMainNarrativeMessages('', mirroredEvents);
+      setMainOutput('system_output', '', mirroredEvents);
     }
     await syncEncounterLaneAfterSceneEvents(mirroredEvents);
     return encounterStarted;
@@ -1210,65 +1387,180 @@ function App() {
     }
   };
 
-  const onSubmitEncounter = async (encounterId: string, prompt: string) => {
-    if (!prompt.trim()) return;
+  const onCloseEncounterModal = () => {
+    if (encounterModalEncounterId) {
+      announcedEncounterIdsRef.current.add(encounterModalEncounterId);
+    }
+    setEncounterModalEncounterId(null);
+    forceReturnToMainChat('encounter_interrupt');
+    focusMainActionInput();
+  };
+
+  const submitMainChatTurn = async ({
+    actionDescription,
+    speechDescription,
+    actionCheckResult = null,
+    passiveTurn = false,
+    passiveMode = 'observe',
+  }: {
+    actionDescription: string;
+    speechDescription: string;
+    actionCheckResult?: ActionCheckResult | null;
+    passiveTurn?: boolean;
+    passiveMode?: 'observe';
+  }) => {
+    const structuredInput = buildStructuredPlayerInput(
+      actionDescription,
+      speechDescription,
+      actionCheckResult,
+      passiveTurn ? { passiveTurn: true, passiveMode } : undefined,
+    );
+    const nextMessages: ChatMessage[] = [{ role: 'user', content: structuredInput }];
+    const speakReason = passiveTurn ? '自动推进' : '发言';
+    setLastActionInput(passiveTurn ? '' : actionDescription);
+    setLastSpeechInput(passiveTurn ? '' : speechDescription);
+    if (!passiveTurn) {
+      clearPlayerInput();
+    }
+    setError('');
+    const effectivePrompt = `${config.gm_prompt}\n${NARRATOR_STYLE_PROMPT}${godMode ? `\n${GOD_MODE_PROMPT}` : ''}`;
+    const effectiveConfig: AppConfig = { ...config, gm_prompt: effectivePrompt };
+
+    if (config.stream) {
+      setChatState('streaming');
+      const controller = new AbortController();
+      abortRef.current = controller;
+      let streamedSceneEvents: SceneEvent[] = [];
+      let streamedReply = '';
+
+      setCurrentMainOutput({
+        source_kind: 'main_turn',
+        reply_text: '',
+        scene_events: [],
+        archived_sub_zone_turn_id: null,
+        status: 'streaming',
+      });
+
+      try {
+        await streamChat(
+          {
+            session_id: sessionId,
+            config: effectiveConfig,
+            messages: nextMessages,
+          },
+          {
+            onDelta: (delta) => {
+              streamedReply = `${streamedReply}${delta}`;
+              setCurrentMainOutput((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      reply_text: streamedReply,
+                      status: 'streaming',
+                    }
+                  : prev,
+              );
+            },
+            onError: (message) => {
+              setError(message);
+              setCurrentMainOutput((prev) => (prev ? { ...prev, status: 'error' } : prev));
+              setChatState('error');
+            },
+            onUsage: (usage) => {
+              report({ endpoint: '/chat/stream', status: 200, ok: true, usage });
+            },
+            onTimeSpent: (minutes) => {
+              pushTimeNotice(minutes, speakReason);
+            },
+            onToolEvents: (events) => {
+              if (events.length > 0) {
+                setConfigHint(`本轮触发工具调用 ${events.length} 次`);
+                setDebugEntries((prev) => [
+                  ...events.map((event) => ({
+                    endpoint: `/tool/${event.tool_name}`,
+                    status: event.ok ? 200 : 500,
+                    ok: event.ok,
+                    detail: event.summary,
+                    at: new Date().toLocaleTimeString(),
+                  })),
+                  ...prev,
+                ].slice(0, 20));
+              }
+            },
+            onSceneEvents: (events) => {
+              streamedSceneEvents = events;
+            },
+            onEnd: ({ archived_sub_zone_turn_id }) => {
+              abortRef.current = null;
+              if (streamedReply && isAlreadyThereHint(streamedReply)) {
+                showAlreadyTherePopup(streamedReply);
+                setCurrentMainOutput(null);
+              } else {
+                setMainOutput('main_turn', streamedReply, streamedSceneEvents, {
+                  archivedSubZoneTurnId: archived_sub_zone_turn_id ?? null,
+                  status: 'awaiting_archive',
+                });
+              }
+              setChatState('idle');
+              void (async () => {
+                await syncEncounterLaneAfterSceneEvents(streamedSceneEvents);
+                await refreshAreaSnapshot();
+                await refreshTokenUsage(sessionId);
+                await runNarrativeChecks('random_dialog');
+              })();
+            },
+          },
+          controller.signal,
+          report,
+        );
+      } catch (e) {
+        abortRef.current = null;
+        if (!controller.signal.aborted) {
+          setError(e instanceof Error ? e.message : '流式请求失败');
+          setCurrentMainOutput((prev) => (prev ? { ...prev, status: 'error' } : prev));
+          setChatState('error');
+        }
+      }
+      return;
+    }
+
+    setChatState('sending');
     try {
-      setEncounterModalBusy(true);
-      forceReturnToMainChat('encounter_interrupt');
-      const response = await actEncounter(
+      const response = await sendChat(
         {
           session_id: sessionId,
-          encounter_id: encounterId,
-          player_prompt: prompt.trim(),
-          config,
+          config: effectiveConfig,
+          messages: nextMessages,
         },
         report,
       );
-      setActiveEncounterInput('');
-      setMainAssistantOnly(response.reply);
-      setEncounterState(response.encounter_state ?? defaultEncounterState);
-      pushTimeNotice(response.time_spent_min, `遭遇:${response.encounter.title}`);
-      await refreshNarrativeState(sessionId);
-      await refreshGameLogs(sessionId);
-      await syncStateFromSave(sessionId);
+      await syncEncounterLaneAfterSceneEvents(response.scene_events ?? []);
+      setMainOutput('main_turn', response.reply.content, response.scene_events ?? [], {
+        archivedSubZoneTurnId: response.archived_sub_zone_turn_id ?? null,
+        status: 'awaiting_archive',
+      });
+      await refreshAreaSnapshot();
+      pushTimeNotice(response.time_spent_min ?? 0, speakReason);
+      if ((response.tool_events?.length ?? 0) > 0) {
+        setConfigHint(`本轮触发工具调用 ${response.tool_events?.length ?? 0} 次`);
+        setDebugEntries((prev) => [
+          ...(response.tool_events ?? []).map((event) => ({
+            endpoint: `/tool/${event.tool_name}`,
+            status: event.ok ? 200 : 500,
+            ok: event.ok,
+            detail: event.summary,
+            at: new Date().toLocaleTimeString(),
+          })),
+          ...prev,
+        ].slice(0, 20));
+      }
+      await refreshTokenUsage(sessionId);
+      await runNarrativeChecks('random_dialog');
+      setChatState('idle');
     } catch (e) {
-      setError(e instanceof Error ? e.message : '处理遭遇失败');
-    } finally {
-      setEncounterModalBusy(false);
-    }
-  };
-
-  const onEscapeEncounter = async (encounterId: string) => {
-    try {
-      setEncounterModalBusy(true);
-      forceReturnToMainChat('encounter_interrupt');
-      const response = await escapeEncounter({ session_id: sessionId, encounter_id: encounterId, config }, report);
-      setEncounterState(response.encounter_state ?? defaultEncounterState);
-      setMainNarrativeMessages(response.reply, response.action_check?.scene_events ?? []);
-      await syncEncounterLaneAfterSceneEvents(response.action_check?.scene_events ?? []);
-      pushTimeNotice(response.time_spent_min, `逃离遭遇:${response.encounter.title}`);
-      await refreshGameLogs(sessionId);
-      await syncStateFromSave(sessionId);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : '逃离遭遇失败');
-    } finally {
-      setEncounterModalBusy(false);
-    }
-  };
-
-  const onRejoinEncounter = async (encounterId: string) => {
-    try {
-      setEncounterModalBusy(true);
-      forceReturnToMainChat('encounter_interrupt');
-      const response = await rejoinEncounter({ session_id: sessionId, encounter_id: encounterId }, report);
-      setEncounterState(response.encounter_state ?? defaultEncounterState);
-      setMainAssistantOnly(response.reply);
-      await refreshGameLogs(sessionId);
-      await syncStateFromSave(sessionId);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : '重返遭遇失败');
-    } finally {
-      setEncounterModalBusy(false);
+      setError(e instanceof Error ? e.message : '请求失败');
+      setCurrentMainOutput((prev) => (prev?.source_kind === 'main_turn' ? { ...prev, status: 'error' } : prev));
+      setChatState('error');
     }
   };
 
@@ -1276,34 +1568,30 @@ function App() {
     if (blockingModalOpen) return;
     const actionDescription = actionInput.trim();
     const speechDescription = speechInput.trim();
-    if (chatMode === 'npc' ? !actionDescription && !speechDescription : !actionDescription || !speechDescription) {
-      setError(chatMode === 'npc' ? 'NPC 单聊至少需要输入动作或语言其中一项。' : '请按规则填写动作描述和语言描述，两项都不能为空。');
+    if (chatMode === 'npc' ? !actionDescription && !speechDescription : !actionDescription && !speechDescription) {
+      setError(chatMode === 'npc' ? 'NPC 单聊至少需要输入动作或语言其中一项。' : '主聊天至少需要输入动作或语言其中一项。');
       return;
     }
     if (chatMode === 'npc' && activeNpcChat) {
       let actionCheckResult: ActionCheckResult | null = null;
-      const shouldRunNpcCheck = actionDescription.length > 0 || shouldCheckNpcRequest(speechDescription);
       const shouldLeaveAfterReply = shouldLeaveNpcChatByIntent(actionDescription, speechDescription);
-      if (shouldRunNpcCheck) {
-        try {
-          actionCheckResult = await performActionCheckWithRoll({
-            action_type: 'check',
-            action_prompt: `npc_id=${activeNpcChat.npcId}; action=${actionDescription || '-'}; speech=${speechDescription || '-'}`,
-            actor_role_id: playerStatic.player_id,
-            source_context: 'npc_chat',
-            post_close_output: 'suppress',
-          });
+      try {
+        actionCheckResult = await performActionCheckWithRoll({
+          action_type: 'check',
+          action_prompt: `npc_id=${activeNpcChat.npcId}; action=${actionDescription || '-'}; speech=${speechDescription || '-'}`,
+          actor_role_id: playerStatic.player_id,
+          source_context: 'npc_chat',
+          post_close_output: 'suppress',
+          resolution_context: 'embedded',
+          skip_if_no_check: true,
+        });
+        if (actionCheckResult) {
           setLastActionResult(actionCheckResult);
-          const interruptedByEncounter = await publishActionCheckOutcome(actionCheckResult, 'npc_chat', 'suppress');
           pushTimeNotice(actionCheckResult.time_spent_min, `NPC交互检定:${activeNpcChat.npcName}`);
-          if (interruptedByEncounter) {
-            await refreshNpcPool(npcPoolSearch);
-            return;
-          }
-        } catch (e) {
-          setError(e instanceof Error ? e.message : 'NPC交互检定失败');
-          return;
         }
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'NPC交互检定失败');
+        return;
       }
       const structuredInput = buildStructuredPlayerInput(actionDescription, speechDescription, actionCheckResult);
       const previewInput = buildPreviewPlayerInput(actionDescription, speechDescription, actionCheckResult);
@@ -1413,134 +1701,30 @@ function App() {
       }
       return;
     }
-    const structuredInput = buildStructuredPlayerInput(actionDescription, speechDescription);
-    const npcSystemMessage: ChatMessage[] =
-      chatMode === 'npc' && activeNpcChat
-        ? [{ role: 'system', content: `当前对话对象为 NPC「${activeNpcChat.npcName}」，请只以该 NPC 身份做出回应。` }]
-        : [];
-    const nextMessages: ChatMessage[] = [...npcSystemMessage, { role: 'user', content: structuredInput }];
-    const speakReason = chatMode === 'npc' && activeNpcChat ? `发言:${activeNpcChat.npcName}` : '发言';
-    setLastActionInput(actionDescription);
-    setLastSpeechInput(speechDescription);
-    clearPlayerInput();
-    setError('');
-    const effectivePrompt = `${config.gm_prompt}\n${NARRATOR_STYLE_PROMPT}${godMode ? `\n${GOD_MODE_PROMPT}` : ''}`;
-    const effectiveConfig: AppConfig = { ...config, gm_prompt: effectivePrompt };
-
-    if (config.stream) {
-      setChatState('streaming');
-      const controller = new AbortController();
-      abortRef.current = controller;
-      let streamedSceneEvents: SceneEvent[] = [];
-
-      setDisplayedMessages([{ role: 'assistant', content: '' }]);
-
-      try {
-        await streamChat(
-          {
-            session_id: sessionId,
-            config: effectiveConfig,
-            messages: nextMessages,
-          },
-          {
-            onDelta: (delta) => {
-              setDisplayedMessages((prev) => {
-                const current = prev[0]?.role === 'assistant' ? prev[0].content : '';
-                const next = `${current}${delta}`;
-                return [{ role: 'assistant', content: next }];
-              });
-            },
-            onError: (message) => {
-              setError(message);
-              setChatState('error');
-            },
-            onUsage: (usage) => {
-              report({ endpoint: '/chat/stream', status: 200, ok: true, usage });
-            },
-            onTimeSpent: (minutes) => {
-              pushTimeNotice(minutes, speakReason);
-            },
-            onToolEvents: (events) => {
-              if (events.length > 0) {
-                setConfigHint(`本轮触发工具调用 ${events.length} 次`);
-                setDebugEntries((prev) => [
-                  ...events.map((event) => ({
-                    endpoint: `/tool/${event.tool_name}`,
-                    status: event.ok ? 200 : 500,
-                    ok: event.ok,
-                    detail: event.summary,
-                    at: new Date().toLocaleTimeString(),
-                  })),
-                  ...prev,
-                ].slice(0, 20));
-              }
-            },
-            onSceneEvents: (events) => {
-              streamedSceneEvents = events;
-            },
-            onEnd: () => {
-              registerAnnouncedEncounters(streamedSceneEvents);
-              setDisplayedMessages((prev) => {
-                const text = prev[0]?.role === 'assistant' ? prev[0].content : '';
-                if (text && isAlreadyThereHint(text)) {
-                  showAlreadyTherePopup(text);
-                  return [];
-                }
-                return [...prev, ...streamedSceneEvents.map(sceneEventToMessage)];
-              });
-              setChatState('idle');
-              void (async () => {
-                await syncEncounterLaneAfterSceneEvents(streamedSceneEvents);
-                await refreshTokenUsage(sessionId);
-                await runNarrativeChecks('random_dialog');
-              })();
-            },
-          },
-          controller.signal,
-          report,
-        );
-      } catch (e) {
-        if (!controller.signal.aborted) {
-          setError(e instanceof Error ? e.message : '流式请求失败');
-          setChatState('error');
-        }
+    let actionCheckResult: ActionCheckResult | null = null;
+    try {
+      actionCheckResult = await performActionCheckWithRoll({
+        action_type: 'check',
+        action_prompt: `main_chat; action=${actionDescription || '-'}; speech=${speechDescription || '-'}`,
+        actor_role_id: playerStatic.player_id,
+        source_context: 'main_chat',
+        post_close_output: 'suppress',
+        resolution_context: 'embedded',
+        skip_if_no_check: true,
+      });
+      if (actionCheckResult) {
+        setLastActionResult(actionCheckResult);
       }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '主聊天检定失败');
       return;
     }
+    await submitMainChatTurn({ actionDescription, speechDescription, actionCheckResult });
+  };
 
-    setChatState('sending');
-    try {
-      const response = await sendChat(
-        {
-          session_id: sessionId,
-          config: effectiveConfig,
-          messages: nextMessages,
-        },
-        report,
-      );
-      await syncEncounterLaneAfterSceneEvents(response.scene_events ?? []);
-      setMainNarrativeMessages(response.reply.content, response.scene_events ?? []);
-      pushTimeNotice(response.time_spent_min ?? 0, speakReason);
-      if ((response.tool_events?.length ?? 0) > 0) {
-        setConfigHint(`本轮触发工具调用 ${response.tool_events?.length ?? 0} 次`);
-        setDebugEntries((prev) => [
-          ...(response.tool_events ?? []).map((event) => ({
-            endpoint: `/tool/${event.tool_name}`,
-            status: event.ok ? 200 : 500,
-            ok: event.ok,
-            detail: event.summary,
-            at: new Date().toLocaleTimeString(),
-          })),
-          ...prev,
-        ].slice(0, 20));
-      }
-      await refreshTokenUsage(sessionId);
-      await runNarrativeChecks('random_dialog');
-      setChatState('idle');
-    } catch (e) {
-      setError(e instanceof Error ? e.message : '请求失败');
-      setChatState('error');
-    }
+  const onAutoAdvanceTurn = async () => {
+    if (!canAutoAdvance) return;
+    await submitMainChatTurn({ actionDescription: '', speechDescription: '', passiveTurn: true, passiveMode: 'observe' });
   };
 
   const onStop = () => {
@@ -1558,7 +1742,7 @@ function App() {
   const onClear = () => {
     abortRef.current?.abort();
     abortRef.current = null;
-    setMainMessages([]);
+    setCurrentMainOutput(null);
     setNpcChatMessages({});
     setChatMode('main');
     setActiveNpcChat(null);
@@ -1574,7 +1758,7 @@ function App() {
     setItemInteractionLastReply('');
     setQuestInspectOpen(false);
     setEncounterModalBusy(false);
-    setActiveEncounterInput('');
+    setEncounterModalEncounterId(null);
     clearPlayerInput();
     setLastActionInput('');
     setLastSpeechInput('');
@@ -1771,7 +1955,13 @@ function App() {
 
   const onRunActionCheck = async (payload: { action_type: 'attack' | 'check' | 'item_use'; action_prompt: string; actor_role_id?: string }) => {
     try {
-      const result = await performActionCheckWithRoll({ ...payload, source_context: 'action_panel', post_close_output: 'main_chat' });
+      const result = await performActionCheckWithRoll({
+        ...payload,
+        source_context: 'action_panel',
+        post_close_output: 'main_chat',
+        resolution_context: 'standalone',
+      });
+      if (!result) return;
       setLastActionResult(result);
       await publishActionCheckOutcome(result, 'action_panel', 'main_chat');
       pushTimeNotice(result.time_spent_min, '行为检定');
@@ -1785,6 +1975,14 @@ function App() {
   const refreshAreaSnapshot = async () => {
     const area = await getCurrentArea(sessionId, report);
     setAreaSnapshot(area.area_snapshot);
+    try {
+      const save = await getCurrentSave(report);
+      if (save.session_id === sessionId) {
+        setCurrentReputation(selectCurrentReputation(save));
+      }
+    } catch {
+      // Ignore reputation refresh failures.
+    }
   };
 
   const onInitAreaClock = async () => {
@@ -1826,6 +2024,10 @@ function App() {
   };
 
   const onUseAreaItem = async (interactionId: string, itemName: string) => {
+    if (encounterEngaged) {
+      setError('遭遇进行中，请直接在主聊天描述动作或发言。');
+      return;
+    }
     const prompt = window.prompt(`你想如何使用/观察【${itemName}】？`);
     if (!prompt || !prompt.trim()) return;
     try {
@@ -1835,7 +2037,9 @@ function App() {
         actor_role_id: playerStatic.player_id,
         source_context: 'area_item',
         post_close_output: 'main_chat',
+        resolution_context: 'standalone',
       });
+      if (!result) return;
       setLastActionResult(result);
       await publishActionCheckOutcome(result, 'area_item', 'main_chat');
       pushTimeNotice(result.time_spent_min, `物品使用:${itemName}`);
@@ -1846,6 +2050,10 @@ function App() {
   };
 
   const onEnterNpcChat = async (npcId: string, npcName: string) => {
+    if (encounterEngaged) {
+      setError('遭遇进行中，请直接在主聊天描述动作或发言。');
+      return;
+    }
     setChatMode('npc');
     setActiveNpcChat({ npcId, npcName });
     clearPlayerInput();
@@ -1919,6 +2127,21 @@ function App() {
     try {
       setItemInteractionBusy(true);
       forceReturnToMainChat('narrative_switch');
+      let actionCheckResult: ActionCheckResult | null = null;
+      if (itemInteractionMode === 'use') {
+        actionCheckResult = await performActionCheckWithRoll({
+          action_type: 'item_use',
+          action_prompt: `owner_type=${itemInteractionOwner.owner_type}; role_id=${itemInteractionOwner.role_id ?? playerStatic.player_id}; item_id=${itemInteractionItem.itemId}; item_name=${itemInteractionItem.itemName}; prompt=${itemInteractionPrompt.trim() || '-'}`,
+          actor_role_id: itemInteractionOwner.owner_type === 'role' ? (itemInteractionOwner.role_id ?? undefined) : playerStatic.player_id,
+          source_context: 'inventory_item',
+          post_close_output: 'suppress',
+          resolution_context: 'embedded',
+          skip_if_no_check: false,
+        });
+        if (actionCheckResult) {
+          setLastActionResult(actionCheckResult);
+        }
+      }
       const response = await interactInventoryItem(
         {
           session_id: sessionId,
@@ -1926,6 +2149,7 @@ function App() {
           item_id: itemInteractionItem.itemId,
           mode: itemInteractionMode,
           prompt: itemInteractionPrompt.trim(),
+          action_check: actionCheckResult,
           config,
         },
         report,
@@ -1934,7 +2158,7 @@ function App() {
       if (response.role) replaceCachedRoleCard(response.role);
       setItemInteractionLastReply(response.reply);
       await syncEncounterLaneAfterSceneEvents(response.scene_events ?? []);
-      setMainNarrativeMessages(response.reply, response.scene_events ?? []);
+      setMainOutput('system_output', response.reply, response.scene_events ?? []);
       pushTimeNotice(
         response.time_spent_min,
         `${itemInteractionMode === 'inspect' ? '观察物品' : '使用物品'}:${itemInteractionItem.itemName}`,
@@ -2103,17 +2327,20 @@ function App() {
       setTokenUsage({ ...EMPTY_TOKEN_USAGE, session_id: save.session_id });
       setMapSnapshot(toMapSnapshot(save));
       setAreaSnapshot(save.area_snapshot ?? null);
+      setCurrentReputation(selectCurrentReputation(save));
       setQuestState(save.quest_state ?? defaultQuestState);
       setEncounterState(save.encounter_state ?? defaultEncounterState);
       setFateState(save.fate_state ?? defaultFateState);
       setTeamState(save.team_state ?? defaultTeamState);
+      setNpcPoolItems(save.role_pool ?? []);
+      setNpcPoolTotal((save.role_pool ?? []).length);
       setTeamChatReplies([]);
       setTeamChatBusy(false);
       setWorldState(save.world_state ?? defaultWorldState);
       setConsistencyIssues([]);
       setConsistencyIssueCount(0);
       setStorySnapshot(null);
-      setMainMessages(logsToMessages(save.game_logs ?? []));
+      setCurrentMainOutput(null);
       setPlayerStaticState(save.player_static_data ?? defaultPlayerStaticData);
       setPlayerRuntimeState(
         save.player_runtime_data ?? {
@@ -2137,8 +2364,8 @@ function App() {
       setItemInteractionItem(null);
       setItemInteractionPrompt('');
       setItemInteractionLastReply('');
-      setActiveEncounterInput('');
       setEncounterModalBusy(false);
+      setEncounterModalEncounterId(null);
       setMapOpen(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : '导入存档失败');
@@ -2151,10 +2378,13 @@ function App() {
       const save = await clearSave(sessionId, report);
       setMapSnapshot(toMapSnapshot(save));
       setAreaSnapshot(save.area_snapshot ?? null);
+      setCurrentReputation(selectCurrentReputation(save));
       setQuestState(save.quest_state ?? defaultQuestState);
       setEncounterState(save.encounter_state ?? defaultEncounterState);
       setFateState(save.fate_state ?? defaultFateState);
       setTeamState(save.team_state ?? defaultTeamState);
+      setNpcPoolItems(save.role_pool ?? []);
+      setNpcPoolTotal((save.role_pool ?? []).length);
       setTeamChatReplies([]);
       setTeamChatBusy(false);
       setWorldState(save.world_state ?? defaultWorldState);
@@ -2186,13 +2416,13 @@ function App() {
       setLogOpen(false);
       setMapEnabled(false);
       setMapPromptDialogOpen(false);
-      setMainMessages([]);
+      setCurrentMainOutput(null);
       setNpcChatMessages({});
       setChatMode('main');
       setActiveNpcChat(null);
       setQuestInspectOpen(false);
-      setActiveEncounterInput('');
       setEncounterModalBusy(false);
+      setEncounterModalEncounterId(null);
       clearPlayerInput();
       setLastActionInput('');
       setLastSpeechInput('');
@@ -2398,6 +2628,138 @@ function App() {
             </div>
 
             <div className="config-section">
+              <h2>Sub-Zone 调试</h2>
+              <div className="config-fields">
+                <label>
+                  <span>small 最小数</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={20}
+                    value={configDraft.sub_zone_debug.small_min_count}
+                    onChange={(e) =>
+                      setConfigDraft((prev) => ({
+                        ...prev,
+                        sub_zone_debug: {
+                          ...prev.sub_zone_debug,
+                          small_min_count: Number(e.target.value || 1),
+                        },
+                      }))
+                    }
+                  />
+                </label>
+                <label>
+                  <span>small 最大数</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={20}
+                    value={configDraft.sub_zone_debug.small_max_count}
+                    onChange={(e) =>
+                      setConfigDraft((prev) => ({
+                        ...prev,
+                        sub_zone_debug: {
+                          ...prev.sub_zone_debug,
+                          small_max_count: Number(e.target.value || 1),
+                        },
+                      }))
+                    }
+                  />
+                </label>
+                <label>
+                  <span>medium 最小数</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={30}
+                    value={configDraft.sub_zone_debug.medium_min_count}
+                    onChange={(e) =>
+                      setConfigDraft((prev) => ({
+                        ...prev,
+                        sub_zone_debug: {
+                          ...prev.sub_zone_debug,
+                          medium_min_count: Number(e.target.value || 1),
+                        },
+                      }))
+                    }
+                  />
+                </label>
+                <label>
+                  <span>medium 最大数</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={30}
+                    value={configDraft.sub_zone_debug.medium_max_count}
+                    onChange={(e) =>
+                      setConfigDraft((prev) => ({
+                        ...prev,
+                        sub_zone_debug: {
+                          ...prev.sub_zone_debug,
+                          medium_max_count: Number(e.target.value || 1),
+                        },
+                      }))
+                    }
+                  />
+                </label>
+                <label>
+                  <span>large 最小数</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={40}
+                    value={configDraft.sub_zone_debug.large_min_count}
+                    onChange={(e) =>
+                      setConfigDraft((prev) => ({
+                        ...prev,
+                        sub_zone_debug: {
+                          ...prev.sub_zone_debug,
+                          large_min_count: Number(e.target.value || 1),
+                        },
+                      }))
+                    }
+                  />
+                </label>
+                <label>
+                  <span>large 最大数</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={40}
+                    value={configDraft.sub_zone_debug.large_max_count}
+                    onChange={(e) =>
+                      setConfigDraft((prev) => ({
+                        ...prev,
+                        sub_zone_debug: {
+                          ...prev.sub_zone_debug,
+                          large_max_count: Number(e.target.value || 1),
+                        },
+                      }))
+                    }
+                  />
+                </label>
+                <label>
+                  <span>发现交互上限</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={10}
+                    value={configDraft.sub_zone_debug.discover_interaction_limit}
+                    onChange={(e) =>
+                      setConfigDraft((prev) => ({
+                        ...prev,
+                        sub_zone_debug: {
+                          ...prev.sub_zone_debug,
+                          discover_interaction_limit: Number(e.target.value || 1),
+                        },
+                      }))
+                    }
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div className="config-section">
               <h2>存储</h2>
               <div className="actions">
                 <button onClick={() => void onPickConfigPath()}>选择配置文件夹</button>
@@ -2473,15 +2835,33 @@ function App() {
 
         <div className="chat-grid">
           <div className="chat-main-column">
-            <section className="messages">
-              {displayedMessages.length === 0 && <p className="hint">{chatMode === 'npc' ? '你已接近该 NPC，可输入动作或语言开始交互。' : '开始你的第一条叙事输入。'}</p>}
-              {displayedMessages.map((m, index) => (
-                <article key={`${m.role}_${index}`} className={`msg ${m.role}`}>
-                  <strong>{m.role === 'user' ? '你' : m.role === 'assistant' ? 'GM' : 'System'}</strong>
-                  <p>{m.content}</p>
-                </article>
-              ))}
-            </section>
+            {chatMode === 'main' && <SubZoneContextPanel subZone={currentSubZone} />}
+
+            {chatMode === 'main' ? (
+              <section className="messages current-output-panel">
+                <header className="current-output-header">
+                  <h3>当前轮输出</h3>
+                  <p>{currentMainOutput?.source_kind === 'system_output' ? '系统反馈' : '临时输出，归档后会自动收起'}</p>
+                </header>
+                {mainOutputMessages.length === 0 && <p className="hint">主聊天历史已经收进上方地区上下文，这里只显示当前轮输出或系统反馈。</p>}
+                {mainOutputMessages.map((m, index) => (
+                  <article key={`${m.role}_${index}`} className={`msg ${m.role}`}>
+                    <strong>{m.role === 'user' ? '你' : m.role === 'assistant' ? 'GM' : 'System'}</strong>
+                    <p>{m.content}</p>
+                  </article>
+                ))}
+              </section>
+            ) : (
+              <section className="messages">
+                {npcDisplayedMessages.length === 0 && <p className="hint">你已接近该 NPC，可输入动作或语言开始交互。</p>}
+                {npcDisplayedMessages.map((m, index) => (
+                  <article key={`${m.role}_${index}`} className={`msg ${m.role}`}>
+                    <strong>{m.role === 'user' ? '你' : m.role === 'assistant' ? 'GM' : 'System'}</strong>
+                    <p>{m.content}</p>
+                  </article>
+                ))}
+              </section>
+            )}
 
             {chatMode === 'main' && (
               <section className="chat-interactions">
@@ -2492,16 +2872,17 @@ function App() {
                       if (!currentSubZone) return;
                       void onDiscoverAreaInteraction(currentSubZone.sub_zone_id, '观察周围细节');
                     }}
-                    disabled={!currentSubZone}
+                    disabled={!currentSubZone || encounterEngaged}
                   >
                     +发现新交互
                   </button>
                   {(currentSubZone?.key_interactions ?? []).map((it) => (
-                    <button key={it.interaction_id} onClick={() => void onUseAreaItem(it.interaction_id, it.name)}>
+                    <button key={it.interaction_id} onClick={() => void onUseAreaItem(it.interaction_id, it.name)} disabled={encounterEngaged}>
                       {it.name}
                     </button>
                   ))}
                   {(currentSubZone?.key_interactions?.length ?? 0) === 0 && <p className="hint">当前暂无可互动物品。</p>}
+                  {encounterEngaged && <p className="hint">遭遇进行中，请直接在主聊天描述动作或发言。</p>}
                 </div>
               </section>
             )}
@@ -2516,6 +2897,7 @@ function App() {
                     </button>
                   ))}
                   {(currentSubZone?.npcs?.length ?? 0) === 0 && <p className="hint">当前暂无可交互NPC。</p>}
+                  {encounterEngaged && <p className="hint">遭遇进行中，请直接在主聊天描述动作或发言。</p>}
                 </div>
               </section>
             )}
@@ -2533,9 +2915,16 @@ function App() {
                   <label htmlFor="action-input">动作描述</label>
                   <textarea
                     id="action-input"
+                    ref={actionInputRef}
                     value={actionInput}
                     onChange={(e) => setActionInput(e.target.value)}
-                    placeholder={pendingQuest ? '请先处理当前任务弹窗。' : chatMode === 'npc' ? '例如：我把徽记放到桌上，向前一步观察他的反应。' : '例如：我走到石门前，举起火把检查门缝。'}
+                    placeholder={
+                      pendingQuest
+                        ? '请先处理当前任务弹窗。'
+                        : chatMode === 'npc'
+                          ? '例如：我把徽记放到桌上，向前一步观察他的反应。'
+                          : '例如：我走到石门前检查门缝，或只写“我拔剑戒备”。'
+                    }
                     disabled={chatState === 'sending' || chatState === 'streaming' || blockingModalOpen}
                   />
                 </div>
@@ -2545,7 +2934,13 @@ function App() {
                     id="speech-input"
                     value={speechInput}
                     onChange={(e) => setSpeechInput(e.target.value)}
-                    placeholder={pendingQuest ? '请先处理当前任务弹窗。' : chatMode === 'npc' ? '例如：我低声说：“我想打听这里最近的怪事。”' : '例如：我低声说：“先别出声，我听到里面有动静。”'}
+                    placeholder={
+                      pendingQuest
+                        ? '请先处理当前任务弹窗。'
+                        : chatMode === 'npc'
+                          ? '例如：我低声说：“我想打听这里最近的怪事。”'
+                          : '例如：我低声说：“先别出声，我听到里面有动静。”，也可以只写语言。'
+                    }
                     disabled={chatState === 'sending' || chatState === 'streaming' || blockingModalOpen}
                   />
                 </div>
@@ -2553,13 +2948,18 @@ function App() {
               <p className="hint">
                 {chatMode === 'npc'
                   ? 'NPC 单聊支持只输入动作或只输入语言；若包含动作或向 NPC 提要求，会先进入检定，再把结果一并发给 NPC。'
-                  : '输入规则：动作描述写“你做了什么”，语言描述写“你说了什么”，提交时会按结构化格式发送给 AI。'}
+                  : '主聊天支持只输入动作、只输入语言，或动作加语言一起输入；提交时会按结构化格式发送给 AI。'}
               </p>
               <div className="actions">
                 <label className="god-mode-toggle">
                   <input type="checkbox" checked={godMode} onChange={(e) => setGodMode(e.target.checked)} />
                   上帝模式
                 </label>
+                {chatMode === 'main' && encounterEngaged && (
+                  <button disabled={!canAutoAdvance} onClick={() => void onAutoAdvanceTurn()}>
+                    自动推进 1 轮
+                  </button>
+                )}
                 {chatState === 'streaming' && <button onClick={onStop}>停止生成</button>}
                 <button onClick={onRetry}>重新生成</button>
                 <button disabled={!canSend} onClick={() => void onSend()}>
@@ -2574,14 +2974,8 @@ function App() {
           <EncounterLane
             encounter={activeEncounter}
             queuedEncounters={queuedEncounters}
-            prompt={activeEncounterInput}
             busy={encounterModalBusy}
-            readOnly={Boolean(pendingQuest)}
             canRejoin={canRejoinActiveEncounter}
-            onPromptChange={setActiveEncounterInput}
-            onSubmitAction={(encounterId, prompt) => void onSubmitEncounter(encounterId, prompt)}
-            onEscape={(encounterId) => void onEscapeEncounter(encounterId)}
-            onRejoin={(encounterId) => void onRejoinEncounter(encounterId)}
           />
         </div>
       </section>
@@ -2607,6 +3001,7 @@ function App() {
         open={playerPanelOpen}
         value={playerStatic}
         questState={questState}
+        currentReputation={currentReputation}
         onClose={() => setPlayerPanelOpen(false)}
         onSave={(next) => void onSavePlayerStatic(next)}
         onTrackQuest={(questId) => void onTrackQuest(questId)}
@@ -2763,6 +3158,8 @@ function App() {
         onReject={(questId) => void onRejectQuest(questId)}
       />
 
+      <EncounterModal encounter={pendingQuest ? null : encounterModalEncounter} busy={encounterModalBusy} onContinue={onCloseEncounterModal} />
+
       <QuestInspectModal quest={questInspectOpen ? currentQuest : null} onClose={() => setQuestInspectOpen(false)} />
 
       <ItemInteractionModal
@@ -2780,6 +3177,7 @@ function App() {
       <ActionCheckRollModal
         open={actionCheckRollState.open}
         phase={actionCheckRollState.phase}
+        plan={actionCheckRollState.plan}
         rollValue={actionCheckRollState.rollValue}
         result={actionCheckRollState.result}
         errorMessage={actionCheckRollState.errorMessage}

@@ -10,6 +10,16 @@ export type AppRuntimeConfig = {
   max_completion_tokens?: number;
 };
 
+export type SubZoneDebugConfig = {
+  small_min_count: number;
+  small_max_count: number;
+  medium_min_count: number;
+  medium_max_count: number;
+  large_min_count: number;
+  large_max_count: number;
+  discover_interaction_limit: number;
+};
+
 export type AppConfig = {
   version: string;
   provider: AIProvider;
@@ -20,6 +30,7 @@ export type AppConfig = {
   runtime: AppRuntimeConfig;
   gm_prompt: string;
   speech_time_per_50_tokens_min: number;
+  sub_zone_debug: SubZoneDebugConfig;
   ui?: UIConfig;
 };
 
@@ -88,6 +99,7 @@ export type ChatResponse = {
   tool_events?: ToolEvent[];
   scene_events?: SceneEvent[];
   time_spent_min: number;
+  archived_sub_zone_turn_id?: string | null;
 };
 
 export type ToolEvent = {
@@ -103,9 +115,15 @@ export type SceneEvent = {
     | 'public_targeted_npc_reply'
     | 'public_bystander_reaction'
     | 'team_public_reaction'
+    | 'public_actor_resolution'
+    | 'role_desire_surface'
+    | 'companion_story_surface'
+    | 'reputation_update'
     | 'encounter_started'
     | 'encounter_progress'
-    | 'encounter_background';
+    | 'encounter_resolution'
+    | 'encounter_background'
+    | 'encounter_situation_update';
   actor_role_id: string | null;
   actor_name: string;
   content: string;
@@ -186,9 +204,25 @@ export type SaveFile = {
   player_runtime_data: PlayerRuntimeData;
   role_pool: NpcRoleCard[];
   team_state: TeamState;
+  reputation_state: ReputationState;
   quest_state: QuestState;
   encounter_state: EncounterState;
   fate_state: FateState;
+  updated_at: string;
+};
+
+export type SubZoneReputationEntry = {
+  sub_zone_id: string;
+  zone_id: string | null;
+  score: number;
+  band: 'hostile' | 'cold' | 'neutral' | 'trusted' | 'favored';
+  recent_reasons: string[];
+  updated_at: string;
+};
+
+export type ReputationState = {
+  version: string;
+  entries: SubZoneReputationEntry[];
   updated_at: string;
 };
 
@@ -288,12 +322,17 @@ export type EncounterEntry = {
   player_presence: 'engaged' | 'away';
   related_quest_ids: string[];
   related_fate_phase_ids: string[];
+  participant_role_ids: string[];
   generated_prompt_tags: string[];
   allow_player_prompt: boolean;
   termination_conditions: EncounterTerminationCondition[];
   steps: EncounterStepEntry[];
   scene_summary: string;
   latest_outcome_summary: string;
+  situation_start_value: number;
+  situation_value: number;
+  situation_trend: 'improving' | 'stable' | 'worsening';
+  last_outcome_package: EncounterOutcomePackage | null;
   background_tick_count: number;
   created_at: string;
   presented_at: string | null;
@@ -325,7 +364,28 @@ export type EncounterResolution = {
   reply: string;
   time_spent_min: number;
   quest_updates: string[];
+  situation_delta: number;
+  situation_value_after: number;
+  reputation_delta: number;
+  applied_outcome_summaries: string[];
   created_at: string;
+};
+
+export type EncounterOutcomeChange = {
+  target_id: string;
+  delta: number;
+  summary: string;
+};
+
+export type EncounterOutcomePackage = {
+  result: 'success' | 'failure';
+  reputation_delta: number;
+  npc_relation_deltas: EncounterOutcomeChange[];
+  team_deltas: EncounterOutcomeChange[];
+  item_rewards: InventoryItem[];
+  buff_rewards: RoleBuff[];
+  resource_deltas: string[];
+  narrative_summary: string;
 };
 
 export type EncounterState = {
@@ -497,6 +557,47 @@ export type AreaNpc = {
   state: string;
 };
 
+export type SubZoneChatTurnEvent = {
+  event_kind:
+    | 'encounter_progress'
+    | 'encounter_resolution'
+    | 'npc_reply'
+    | 'team_reply'
+    | 'system_notice'
+    | 'public_actor_resolution'
+    | 'role_desire_surface'
+    | 'companion_story_surface'
+    | 'reputation_update'
+    | 'encounter_situation_update';
+  actor_type: 'npc' | 'team' | 'system';
+  actor_id: string;
+  actor_name: string;
+  content: string;
+};
+
+export type SubZoneChatTurn = {
+  turn_id: string;
+  source: 'main_chat' | 'encounter' | 'system';
+  player_mode: 'active' | 'passive';
+  world_time_text: string;
+  world_time: Record<string, string | number>;
+  player_action: string;
+  player_speech: string;
+  player_action_check: Record<string, string | number | boolean>;
+  gm_narration: string;
+  active_encounter_id: string | null;
+  active_encounter_title: string;
+  active_encounter_status: string;
+  events: SubZoneChatTurnEvent[];
+  created_at: string;
+};
+
+export type SubZoneChatContext = {
+  version: string;
+  recent_turns: SubZoneChatTurn[];
+  updated_at: string;
+};
+
 export type AreaSubZone = {
   sub_zone_id: string;
   zone_id: string;
@@ -507,6 +608,7 @@ export type AreaSubZone = {
   generated_mode: 'pre' | 'instant';
   key_interactions: AreaInteraction[];
   npcs: AreaNpc[];
+  chat_context: SubZoneChatContext;
 };
 
 export type AreaZone = {
@@ -756,6 +858,33 @@ export type NpcConversationState = {
   last_scene_mode: string;
 };
 
+export type RoleDesire = {
+  desire_id: string;
+  kind: 'item' | 'place' | 'info' | 'bond' | 'secret' | 'help';
+  title: string;
+  summary: string;
+  intensity: number;
+  status: 'latent' | 'active' | 'surfaced' | 'quest_linked' | 'resolved' | 'expired';
+  visibility: 'hidden' | 'hinted' | 'explicit';
+  preferred_surface: 'public_scene' | 'team_chat' | 'area_arrival' | 'encounter_aftermath' | 'private_chat';
+  target_refs: EntityRef[];
+  linked_quest_id: string | null;
+  cooldown_until: string | null;
+  last_surfaced_at: string | null;
+};
+
+export type RoleStoryBeat = {
+  beat_id: string;
+  title: string;
+  summary: string;
+  affinity_required: number;
+  min_days_in_team: number;
+  status: 'locked' | 'ready' | 'surfaced' | 'completed' | 'cooldown';
+  preferred_surface: 'team_chat' | 'area_arrival' | 'passive_turn' | 'encounter_aftermath';
+  last_surfaced_at: string | null;
+  completed_at: string | null;
+};
+
 export type NpcRoleCard = {
   role_id: string;
   name: string;
@@ -773,9 +902,12 @@ export type NpcRoleCard = {
   alignment: string;
   secret: string;
   likes: string[];
+  desires: RoleDesire[];
+  story_beats: RoleStoryBeat[];
   talkative_current: number;
   talkative_maximum: number;
   last_private_chat_at: string | null;
+  last_public_turn_at: string | null;
   profile: PlayerStaticData;
   relations: RoleRelation[];
   cognition_changes: string[];
@@ -810,11 +942,14 @@ export type ActionCheckResult = {
   ok: boolean;
   session_id: string;
   actor_role_id: string;
+  actor_name: string;
+  actor_kind: 'player' | 'npc';
   action_type: 'attack' | 'check' | 'item_use';
   requires_check: boolean;
   ability_used: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
   ability_modifier: number;
   dc: number;
+  check_task: string;
   dice_roll: number | null;
   total_score: number | null;
   success: boolean;
@@ -824,6 +959,21 @@ export type ActionCheckResult = {
   applied_effects: string[];
   relation_tag_suggestion: string | null;
   scene_events?: SceneEvent[];
+};
+
+export type ActionCheckPlan = {
+  ok: boolean;
+  session_id: string;
+  actor_role_id: string;
+  actor_name: string;
+  actor_kind: 'player' | 'npc';
+  action_type: 'attack' | 'check' | 'item_use';
+  requires_check: boolean;
+  ability_used: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
+  ability_modifier: number;
+  dc: number;
+  time_spent_min: number;
+  check_task: string;
 };
 
 export type WorldState = {
@@ -875,6 +1025,22 @@ export type StoryQuestSummary = {
   source: string;
 };
 
+export type RoleDriveSummary = {
+  role_id: string;
+  name: string;
+  desires: RoleDesire[];
+  story_beats: RoleStoryBeat[];
+};
+
+export type PublicSceneActorCandidate = {
+  role_id: string;
+  name: string;
+  actor_type: 'npc' | 'team';
+  priority_reason: string;
+  surfaced_desire_ids: string[];
+  surfaced_story_beat_ids: string[];
+};
+
 export type GlobalStorySnapshot = {
   session_id: string;
   world_revision: number;
@@ -897,6 +1063,18 @@ export type GlobalStorySnapshot = {
   current_fate_phase_id: string | null;
   recent_encounter_ids: string[];
   recent_game_log_refs: string[];
+};
+
+export type PublicSceneState = {
+  session_id: string;
+  current_zone_id: string | null;
+  current_sub_zone_id: string | null;
+  current_reputation: SubZoneReputationEntry | null;
+  visible_npcs: StoryNpcSummary[];
+  team_members: StoryNpcSummary[];
+  candidate_actors: PublicSceneActorCandidate[];
+  surfaced_drives: RoleDriveSummary[];
+  active_encounter: EncounterEntry | null;
 };
 
 export type NpcKnowledgeSnapshot = {
@@ -969,6 +1147,26 @@ export type StorySnapshotResponse = {
   snapshot: GlobalStorySnapshot;
 };
 
+export type ReputationStateResponse = {
+  ok: boolean;
+  session_id: string;
+  reputation_state: ReputationState;
+  current_entry: SubZoneReputationEntry | null;
+};
+
+export type RoleDrivesResponse = {
+  ok: boolean;
+  session_id: string;
+  scope: 'role' | 'team' | 'current_sub_zone';
+  items: RoleDriveSummary[];
+};
+
+export type PublicSceneStateResponse = {
+  ok: boolean;
+  session_id: string;
+  public_scene_state: PublicSceneState;
+};
+
 export type NpcKnowledgeResponse = {
   ok: boolean;
   session_id: string;
@@ -1026,6 +1224,7 @@ export type InventoryInteractRequest = {
   item_id: string;
   mode: 'inspect' | 'use';
   prompt: string;
+  action_check?: ActionCheckResult | null;
   config?: AppConfig;
 };
 
@@ -1203,6 +1402,12 @@ export const defaultTeamState: TeamState = {
   updated_at: new Date(0).toISOString(),
 };
 
+export const defaultReputationState: ReputationState = {
+  version: '0.1.0',
+  entries: [],
+  updated_at: new Date(0).toISOString(),
+};
+
 export const defaultConfig: AppConfig = {
   version: '2.0.0',
   provider: 'openai',
@@ -1216,6 +1421,15 @@ export const defaultConfig: AppConfig = {
   },
   gm_prompt: '?????????????????????????????????????',
   speech_time_per_50_tokens_min: 1,
+  sub_zone_debug: {
+    small_min_count: 3,
+    small_max_count: 5,
+    medium_min_count: 5,
+    medium_max_count: 10,
+    large_min_count: 8,
+    large_max_count: 15,
+    discover_interaction_limit: 3,
+  },
   ui: {
     theme: 'dark',
   },

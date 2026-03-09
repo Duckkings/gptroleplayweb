@@ -2,13 +2,17 @@ import type { EncounterEntry } from '../types/app';
 
 type Props = {
   encounter: EncounterEntry | null;
-  prompt: string;
   busy?: boolean;
-  onPromptChange: (value: string) => void;
-  onSubmit: (encounterId: string, prompt: string) => void;
+  onContinue: () => void;
 };
 
-export function EncounterModal({ encounter, prompt, busy = false, onPromptChange, onSubmit }: Props) {
+const TREND_LABEL: Record<EncounterEntry['situation_trend'], string> = {
+  improving: '上升',
+  stable: '稳定',
+  worsening: '恶化',
+};
+
+export function EncounterModal({ encounter, busy = false, onContinue }: Props) {
   if (!encounter) return null;
 
   return (
@@ -17,15 +21,17 @@ export function EncounterModal({ encounter, prompt, busy = false, onPromptChange
         <h3>遭遇事件</h3>
         <strong>{encounter.title}</strong>
         <p>{encounter.description}</p>
-        <textarea
-          value={prompt}
-          onChange={(e) => onPromptChange(e.target.value)}
-          placeholder="输入你打算采取的动作..."
-          disabled={busy}
-        />
+        <p>
+          局势值: {encounter.situation_value}/100
+          {encounter.situation_start_value ? `（起始 ${encounter.situation_start_value}）` : ''}
+        </p>
+        <p>趋势: {TREND_LABEL[encounter.situation_trend]}</p>
+        {encounter.scene_summary && <p>当前局势: {encounter.scene_summary}</p>}
+        {encounter.last_outcome_package?.narrative_summary && <p>上次结果: {encounter.last_outcome_package.narrative_summary}</p>}
+        <p>关闭后请在主聊天中描述你的动作或发言。</p>
         <div className="actions">
-          <button onClick={() => onSubmit(encounter.encounter_id, prompt.trim())} disabled={busy || !prompt.trim()}>
-            {busy ? '处理中...' : '执行动作'}
+          <button onClick={onContinue} disabled={busy}>
+            {busy ? '处理中...' : '继续'}
           </button>
         </div>
       </div>

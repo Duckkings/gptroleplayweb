@@ -142,6 +142,7 @@ def _assemble_bundle(bundle_dir: Path, manifest: dict[str, Any]) -> dict[str, An
     game_logs = _read_part("game_logs")
     role_pool = _read_part("role_pool", {"items": []})
     team_state = _read_part("team_state", {})
+    reputation_state = _read_part("reputation_state", {})
     world_state = _read_part("world_state", {})
     quest_state = _read_part("quest_state", {})
     encounter_state = _read_part("encounter_state", {})
@@ -160,6 +161,7 @@ def _assemble_bundle(bundle_dir: Path, manifest: dict[str, Any]) -> dict[str, An
         "game_logs": game_logs.get("items", []),
         "role_pool": role_pool.get("items", []),
         "team_state": team_state,
+        "reputation_state": reputation_state,
         "quest_state": quest_state,
         "encounter_state": encounter_state,
         "fate_state": fate_state,
@@ -215,6 +217,7 @@ def write_save_payload(save_path: Path, payload: dict[str, Any]) -> None:
         "game_logs": ("game_logs.json", {"items": payload.get("game_logs", [])}),
         "role_pool": ("role_pool.json", {"items": payload.get("role_pool", [])}),
         "team_state": ("team_state.json", payload.get("team_state", {})),
+        "reputation_state": ("reputation_state.json", payload.get("reputation_state", {})),
         "quest_state": ("quest_state.json", payload.get("quest_state", {})),
         "encounter_state": ("encounter_state.json", payload.get("encounter_state", {})),
         "fate_state": ("fate_state.json", payload.get("fate_state", {})),

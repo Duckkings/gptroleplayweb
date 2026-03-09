@@ -33,6 +33,8 @@ from app.models.schemas import (
     AreaExecuteInteractionRequest,
     AreaExecuteInteractionResponse,
     ActionCheckRequest,
+    ActionCheckPlanRequest,
+    ActionCheckPlanResponse,
     ActionCheckResponse,
     AreaMoveResult,
     AreaMoveSubZoneRequest,
@@ -83,8 +85,11 @@ from app.models.schemas import (
     PlayerStaticData,
     PlayerStaminaAdjustRequest,
     PlayerUnequipRequest,
+    PublicSceneStateResponse,
+    ReputationStateResponse,
     RegionGenerateRequest,
     RegionGenerateResponse,
+    RoleDrivesResponse,
     QuestEvaluateAllRequest,
     QuestActionRequest,
     QuestEvaluateRequest,
@@ -117,17 +122,15 @@ from app.models.schemas import (
     NpcKnowledgeResponse,
 )
 from app.services.ai_adapter import discover_models, resolve_model_profile
-from app.services.chat_service import MissingAPIKeyError, chat_once
+from app.services.chat_service import MissingAPIKeyError, resolve_main_chat_turn
 from app.services.world_service import (
     AIBehaviorError,
     AIRegionGenerationError,
-    _new_scene_event,
-    advance_public_scene_in_save,
     clear_current_save,
     describe_behavior,
     add_game_log,
     action_check,
-    apply_speech_time,
+    plan_action_check,
     discover_interactions,
     execute_interaction,
     equip_player_item,
@@ -157,6 +160,8 @@ from app.services.world_service import (
     import_save,
     move_to_zone,
     move_to_sub_zone,
+    NpcChatConfigError,
+    NpcChatGenerationError,
     npc_chat,
     render_map,
     save_current,
@@ -172,7 +177,6 @@ from app.services.world_service import (
 )
 from app.services.encounter_service import (
     act_on_encounter,
-    advance_active_encounter_in_save,
     check_for_encounter,
     escape_encounter,
     get_encounter_debug_overview,
@@ -183,6 +187,7 @@ from app.services.encounter_service import (
     set_debug_force_toggle,
 )
 from app.services.fate_service import evaluate_fate_state, generate_fate, get_fate_state, regenerate_fate
+from app.services.public_scene_service import get_public_scene_state
 from app.services.quest_service import (
     accept_quest,
     debug_generate_quest,
@@ -193,6 +198,8 @@ from app.services.quest_service import (
     reject_quest,
     track_quest,
 )
+from app.services.reputation_service import get_area_reputation
+from app.services.roleplay_service import build_role_drive_summaries
 from app.services.consistency_service import (
     build_entity_index,
     build_global_story_snapshot,
@@ -201,7 +208,6 @@ from app.services.consistency_service import (
     reconcile_consistency,
 )
 from app.services.team_service import (
-    apply_team_reactions,
     generate_debug_teammate,
     get_team_state,
     invite_npc_to_team,
@@ -257,44 +263,20 @@ async def config_model_profile(payload: ModelProfileRequest) -> ModelProfileResp
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(payload: ChatRequest) -> ChatResponse:
-    last_user = next((m for m in reversed(payload.messages) if m.role == "user"), None)
-    time_spent_min = apply_speech_time(payload.session_id, last_user.content, payload.config) if last_user is not None else 0
     try:
-        reply, usage, tool_events = await chat_once(payload)
+        reply, usage, tool_events, scene_events, time_spent_min, archived_sub_zone_turn_id = await resolve_main_chat_turn(payload)
     except MissingAPIKeyError:
         raise HTTPException(status_code=401, detail="api_key is not configured in config")
+    except ValueError as exc:
+        if str(exc) == "PASSIVE_TURN_REQUIRES_ACTIVE_ENCOUNTER":
+            raise HTTPException(status_code=409, detail=str(exc))
+        raise
     except RateLimitError as exc:
         raise HTTPException(status_code=429, detail=str(exc))
     except APIError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
-
-    scene_events = []
-    if last_user is not None:
-        try:
-            save = get_current_save(default_session_id=payload.session_id)
-            if save.session_id != payload.session_id:
-                save.session_id = payload.session_id
-            scene_events = advance_public_scene_in_save(
-                save,
-                session_id=payload.session_id,
-                player_text=last_user.content,
-                gm_summary=reply.content,
-                config=payload.config,
-            )
-            advanced = advance_active_encounter_in_save(save, session_id=payload.session_id, minutes_elapsed=time_spent_min, config=payload.config)
-            if advanced is not None:
-                scene_events.append(
-                    _new_scene_event(
-                        "encounter_background",
-                        advanced.latest_outcome_summary or advanced.scene_summary or advanced.description,
-                        metadata={"encounter_id": advanced.encounter_id},
-                    )
-                )
-            save_current(save)
-        except Exception:
-            pass
-
     token_usage_store.add(payload.session_id, "chat", usage.input_tokens, usage.output_tokens)
+    last_user = next((m for m in reversed(payload.messages) if m.role == "user"), None)
     if last_user is not None:
         add_game_log(
             GameLogAddRequest(
@@ -310,16 +292,6 @@ async def chat(payload: ChatRequest) -> ChatResponse:
             message=reply.content,
         )
     )
-    if last_user is not None:
-        try:
-            apply_team_reactions(
-                payload.session_id,
-                trigger_kind="main_chat",
-                player_text=last_user.content,
-                summary=reply.content,
-            )
-        except Exception:
-            pass
     return ChatResponse(
         session_id=payload.session_id,
         reply=reply,
@@ -327,6 +299,7 @@ async def chat(payload: ChatRequest) -> ChatResponse:
         tool_events=tool_events,
         scene_events=scene_events,
         time_spent_min=time_spent_min,
+        archived_sub_zone_turn_id=archived_sub_zone_turn_id,
     )
 
 
@@ -338,40 +311,20 @@ async def chat_sse(payload: ChatRequest) -> StreamingResponse:
     async def event_gen():
         yield "event: start\ndata: {\"session_id\":\"%s\"}\n\n" % payload.session_id
         last_user = next((m for m in reversed(payload.messages) if m.role == "user"), None)
-        time_spent_min = apply_speech_time(payload.session_id, last_user.content, payload.config) if last_user is not None else 0
-        scene_events = []
         try:
-            reply, usage, tool_events = await chat_once(payload)
-            if last_user is not None:
-                try:
-                    save = get_current_save(default_session_id=payload.session_id)
-                    if save.session_id != payload.session_id:
-                        save.session_id = payload.session_id
-                    scene_events = advance_public_scene_in_save(
-                        save,
-                        session_id=payload.session_id,
-                        player_text=last_user.content,
-                        gm_summary=reply.content,
-                        config=payload.config,
-                    )
-                    advanced = advance_active_encounter_in_save(save, session_id=payload.session_id, minutes_elapsed=time_spent_min, config=payload.config)
-                    if advanced is not None:
-                        scene_events.append(
-                            _new_scene_event(
-                                "encounter_background",
-                                advanced.latest_outcome_summary or advanced.scene_summary or advanced.description,
-                                metadata={"encounter_id": advanced.encounter_id},
-                            )
-                        )
-                    save_current(save)
-                except Exception:
-                    pass
+            reply, usage, tool_events, scene_events, time_spent_min, archived_sub_zone_turn_id = await resolve_main_chat_turn(payload)
             data = json.dumps({"content": reply.content}, ensure_ascii=False)
             yield f"event: delta\ndata: {data}\n\n"
         except MissingAPIKeyError:
             data = json.dumps({"code": 401, "message": "api_key is not configured in config"})
             yield f"event: error\ndata: {data}\n\n"
             return
+        except ValueError as exc:
+            if str(exc) == "PASSIVE_TURN_REQUIRES_ACTIVE_ENCOUNTER":
+                data = json.dumps({"code": 409, "message": str(exc)})
+                yield f"event: error\ndata: {data}\n\n"
+                return
+            raise
         except RateLimitError as exc:
             data = json.dumps({"code": 429, "message": str(exc)})
             yield f"event: error\ndata: {data}\n\n"
@@ -397,22 +350,13 @@ async def chat_sse(payload: ChatRequest) -> StreamingResponse:
                 message=reply.content,
             )
         )
-        if last_user is not None:
-            try:
-                apply_team_reactions(
-                    payload.session_id,
-                    trigger_kind="main_chat",
-                    player_text=last_user.content,
-                    summary=reply.content,
-                )
-            except Exception:
-                pass
         usage_data = json.dumps(
             {
                 "usage": {"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens},
                 "tool_events": [ev.model_dump(mode="json") for ev in tool_events],
                 "scene_events": [ev.model_dump(mode="json") for ev in scene_events],
                 "time_spent_min": time_spent_min,
+                "archived_sub_zone_turn_id": archived_sub_zone_turn_id,
             },
             ensure_ascii=False,
         )
@@ -704,6 +648,34 @@ async def fate_current(session_id: str) -> FateCurrentResponse:
     return get_fate_state(session_id)
 
 
+@router.get("/reputation/current", response_model=ReputationStateResponse)
+async def reputation_current(session_id: str, sub_zone_id: str | None = None) -> ReputationStateResponse:
+    return get_area_reputation(session_id, sub_zone_id=sub_zone_id)
+
+
+@router.get("/role-drives", response_model=RoleDrivesResponse)
+async def role_drives(session_id: str, scope: str = "current_sub_zone", role_id: str | None = None) -> RoleDrivesResponse:
+    save = get_current_save(default_session_id=session_id)
+    if save.session_id != session_id:
+        save.session_id = session_id
+        save_current(save)
+    normalized_scope = scope if scope in {"role", "team", "current_sub_zone"} else "current_sub_zone"
+    return RoleDrivesResponse(
+        session_id=session_id,
+        scope=normalized_scope,  # type: ignore[arg-type]
+        items=build_role_drive_summaries(
+            save,
+            scope=("current_sub_zone" if normalized_scope == "role" and role_id is None else normalized_scope),
+            role_id=role_id,
+        ),
+    )
+
+
+@router.get("/scene/public-state", response_model=PublicSceneStateResponse)
+async def public_scene_state(session_id: str) -> PublicSceneStateResponse:
+    return get_public_scene_state(session_id)
+
+
 @router.post("/fate/debug/generate", response_model=FateGenerateResponse)
 async def fate_debug_generate(payload: FateGenerateRequest) -> FateGenerateResponse:
     try:
@@ -953,6 +925,10 @@ async def npc_chat_run(payload: NpcChatRequest) -> NpcChatResponse:
         return npc_chat(payload)
     except KeyError:
         raise HTTPException(status_code=404, detail="role not found")
+    except NpcChatConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except NpcChatGenerationError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
 
 
 @router.get("/npc/{npc_role_id}/knowledge", response_model=NpcKnowledgeResponse)
@@ -1031,6 +1007,14 @@ async def npc_chat_stream(payload: NpcChatRequest) -> StreamingResponse:
             data = json.dumps({"code": 404, "message": "role not found"}, ensure_ascii=False)
             yield f"event: error\ndata: {data}\n\n"
             return
+        except NpcChatConfigError as exc:
+            data = json.dumps({"code": 400, "message": str(exc)}, ensure_ascii=False)
+            yield f"event: error\ndata: {data}\n\n"
+            return
+        except NpcChatGenerationError as exc:
+            data = json.dumps({"code": 502, "message": str(exc)}, ensure_ascii=False)
+            yield f"event: error\ndata: {data}\n\n"
+            return
         except Exception as exc:
             data = json.dumps({"code": 500, "message": str(exc)}, ensure_ascii=False)
             yield f"event: error\ndata: {data}\n\n"
@@ -1090,6 +1074,14 @@ async def world_area_execute_interaction(payload: AreaExecuteInteractionRequest)
         raise HTTPException(status_code=404, detail="interaction not found")
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/actions/check/plan", response_model=ActionCheckPlanResponse)
+async def action_check_plan_run(payload: ActionCheckPlanRequest) -> ActionCheckPlanResponse:
+    try:
+        return plan_action_check(payload)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="role not found")
 
 
 @router.post("/actions/check", response_model=ActionCheckResponse)

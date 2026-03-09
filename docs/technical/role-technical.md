@@ -1,249 +1,138 @@
-# 角色系统技术设计（Role Technical）
-## 设计来源
-- `docs/design/gamedesign/roledesign.md`
-- `docs/design/gamedesign/actiondesign.md`
-- `docs/design/gamedesign/teamdesign.md`
+# 角色系统技术文档
 
-更新于 `2026-03-08`。
+更新日期：`2026-03-09`
 
-## 1. 目标与边界
-- 使用统一角色底座覆盖玩家、NPC、怪物。
-- 保持玩家与 NPC 的背包、装备、BUFF、法术、技能模型一致。
-- 让 NPC 角色卡不仅服务单聊，也服务关系、队伍、一致性和背包查看。
-- 当前重点是数据模型、运行时计算、对话日志和队伍复用，不做完整角色卡编辑器。
+## 1. 范围
+本文描述当前角色底座、`NpcRoleCard` 扩展字段、欲望/故事状态、公开场景中的角色主动性，以及它们与关系和声望的联动。
 
 ## 2. 统一角色底座
-位置：`backend/app/models/schemas.py`
-
-### 2.1 核心模型
+玩家和 NPC 共享统一的 DND5E 风格角色底座：
 - `PlayerStaticData`
 - `Dnd5eCharacterSheet`
-- `Dnd5eAbilityScores`
-- `Dnd5eAbilityModifiers`
-- `Dnd5eHitPoints`
-- `Dnd5eSpellSlots`
 - `InventoryItem`
 - `InventoryData`
 - `EquipmentSlots`
 - `RoleBuff`
 
-### 2.2 对 roledesign 的映射
-- 等级、经验、升级经验
-- 六维能力值及当前值
-- 六维修正值及当前修正
-- AC / DC
-- 背包、装备槽、BUFF、法术、技能
-- 体力、HP、死亡状态、状态标记
-- 熟练项与特质
-- 关系列表
+派生值仍由 `backend/app/services/world_service.py` 统一重算。
 
-### 2.3 当前字段落点
-- 基础属性：`ability_scores`
-- 当前属性：`current_ability_scores`
-- 基础修正：`ability_modifiers`
-- 当前修正：`current_ability_modifiers`
-- 背包：`backpack`
-- 装备槽：`equipment_slots`
-- BUFF：`buffs`
-- HP：`hit_points`
-- 体力：`stamina_current / stamina_maximum`
-- 法术位：`spell_slots_max / spell_slots_current`
+## 3. `NpcRoleCard` 当前职责
+除基础资料、个性和关系外，`NpcRoleCard` 现在还负责承载：
+- 公开区域中的持久状态
+- 欲望和队友故事种子
+- 对话日志
+- 最近公开轮次记忆
 
-## 3. 派生值计算
-位置：`backend/app/services/world_service.py`
-
-统一通过 `_recompute_player_derived(...)` 计算：
-- 当前属性 = 基础属性 + BUFF 影响
-- 当前修正 = 当前属性按 5E 公式换算
-- AC = 基础 10 + 护甲加值 + 敏捷修正 + BUFF
-- DC = 8 + 熟练加值 + 攻击相关修正 + 武器加值 + BUFF
-- 当前 HP / 当前体力 / 当前法术位会被裁剪到合法范围
-- HP 归零时自动标记 `is_dead=true`
-
-说明：
-- 这是工程化的 5E 映射，不追求完整桌规实现。
-- 玩家与 NPC 共用同一套派生逻辑。
-
-## 4. NPC 角色卡
-### 4.1 `NpcRoleCard`
-除统一角色底座外，还包含：
+当前关键字段：
 - `role_id`
 - `name`
-- `zone_id / sub_zone_id`
-- `source_world_revision / source_map_revision`
-- `knowledge_scope`
+- `zone_id`
+- `sub_zone_id`
 - `state`
 - `personality`
 - `speaking_style`
-- `appearance`
 - `background`
 - `cognition`
-- `alignment`
 - `relations`
-- `cognition_changes`
-- `attitude_changes`
 - `dialogue_logs`
+- `desires`
+- `story_beats`
+- `last_public_turn_at`
 
-### 4.2 关系规则
-- 关系结构：`RoleRelation`
-  - `target_role_id`
-  - `relation_tag`
-  - `note`
-- 预生成 NPC 初始可带 1~2 条 NPC 之间关系。
-- 不在预生成阶段直接写入玩家关系。
-- 玩家关系通过单聊、检定、入队等运行时事件追加或更新。
+## 4. 角色欲望
 
-### 4.3 对话日志规则
-- 使用 `NpcDialogueEntry`
-- 每条记录至少包含：
-  - 世界日期 / 时间文本
-  - 说话方
-  - 文本内容
-- 日志保存在角色卡内部，作为后续单聊、队伍聊天的上下文来源。
+### 4.1 数据结构
+`RoleDesire` 当前字段：
+- `desire_id`
+- `kind`
+- `title`
+- `summary`
+- `intensity`
+- `status`
+- `visibility`
+- `preferred_surface`
+- `target_refs`
+- `linked_quest_id`
+- `cooldown_until`
+- `last_surfaced_at`
 
-## 5. NPC 单聊与知识边界
-位置：`backend/app/services/world_service.py`
+### 4.2 当前规则
+- 新 NPC 自动补齐 `1-2` 个 desire
+- desire 是隐式状态，不要求一创建就向玩家公开
+- desire 可以在 `public_scene / team_chat / area_arrival / encounter_aftermath / private_chat` 浮出
+- 满足条件时可转成普通 quest，并把 `status` 置为 `quest_linked`
 
-### 5.1 问候
-- `npc_greet(req)`
-- 语义：玩家刚靠近 NPC 的第一反应
-- 输出要求：
-  - 短句
-  - 口语
-  - 不要长段旁白
+### 4.3 当前实现位置
+- `backend/app/services/roleplay_service.py`
 
-### 5.2 正式对话
-- `npc_chat(req)`
-- 核心流程：
-  1. 推进玩家发言时间
-  2. 写入玩家发言日志
-  3. 构建历史上下文
-  4. 构建 `NpcKnowledgeSnapshot`
-  5. 若玩家提到越界人物/区域，优先走 guard reply
-  6. 模型输出后再做非法实体名过滤
-  7. 写入 NPC 回应日志
+## 5. 队友故事
 
-## 6. 与队伍系统的结合
-- 队友不另建新角色结构，直接复用 `NpcRoleCard.profile: PlayerStaticData`
-- 因此队友天然拥有：
-  - 统一 DND 角色卡
-  - 背包
-  - 装备槽
-  - BUFF
-  - 法术 / 技能
-  - 关系
-  - 对话日志
+### 5.1 数据结构
+`RoleStoryBeat` 当前字段：
+- `beat_id`
+- `title`
+- `summary`
+- `affinity_required`
+- `min_days_in_team`
+- `status`
+- `preferred_surface`
+- `last_surfaced_at`
+- `completed_at`
 
-### 6.1 队伍聊天
-- 队伍聊天 `team_chat` 会把玩家发言和队友回应分别写入每名队友的 `dialogue_logs`
-- 当前队友回应支持：
-  - `speech` 直接说话
-  - `action` 仅动作反馈
-- 队伍聊天与单聊共用同一份角色卡记忆，而不是额外建一份“队友聊天记忆”
+### 5.2 当前规则
+- 只有队友才会自动补齐 story beats
+- 默认每名队友补齐 2 个 story beat
+- 当前触发门槛：
+  - `affinity >= 60`
+  - 入队至少 2 天
+  - 当前无 active encounter
+  - 同角色当天未触发过 story beat
+- 默认只作为公开事件或队伍聊天话题，不开模态
 
-### 6.2 队友背包查看
-- 前端通过队伍面板查看队友背包详情
-- AI 通过 `get_role_inventory` 结构化读取队友背包
-- 当前阶段只读，不开放直接编辑队友物品
+## 6. 公开场景中的角色主动性
 
-## 7. API 契约影响
-### 7.1 玩家相关
-- `GET /api/v1/player/static`
-- `POST /api/v1/player/static`
-- `GET /api/v1/player/runtime`
-- `POST /api/v1/player/runtime`
+### 6.1 导演器读取角色状态
+公开场景导演器会读取：
+- 当前可见角色
+- desire/story 的浮出状态
+- 最近公开轮次时间
+- 当前遭遇锚点
+- 与玩家输入的直接关联
 
-### 7.2 NPC 与队伍相关
-- `GET /api/v1/role-pool`
-- `GET /api/v1/role-pool/{role_id}`
-- `POST /api/v1/role-pool/{role_id}/relate-player`
-- `POST /api/v1/role-pool/{role_id}/relations`
-- `POST /api/v1/npc/greet`
-- `POST /api/v1/npc/chat`
-- `POST /api/v1/npc/chat/stream`
-- `GET /api/v1/npc/{npc_role_id}/knowledge`
-- `GET /api/v1/team`
-- `POST /api/v1/team/invite`
-- `POST /api/v1/team/leave`
-- `POST /api/v1/team/chat`
+### 6.2 行动结果
+角色行动会产生：
+- `public_actor_resolution`
+- `public_targeted_npc_reply`
+- `public_bystander_reaction`
+- `team_public_reaction`
 
-## 8. 前端联动
-位置：
-- `frontend/src/App.tsx`
-- `frontend/src/components/NpcPoolPanel.tsx`
-- `frontend/src/components/PlayerPanel.tsx`
+角色公开动作还可能带来：
+- 声望变化
+- 关系变化
+- 遭遇局势变化
+
+## 7. 关系与声望偏置
+- 关系基础仍保存在 `NpcRoleCard.relations`
+- 子区块声望高时，正向关系变化会被额外放大
+- 子区块声望低时，负向关系变化会被额外放大
+- 当前偏置实现位于 `backend/app/services/reputation_service.py::apply_reputation_relation_bias(...)`
+
+## 8. 对话与日志
+- NPC 单聊写入 `dialogue_logs`
+- 公开点名和公开反应也会写入对话日志，但带不同 `context_kind`
+- 队伍聊天与公开反应共享同一角色记忆，而不是另建一套“队友聊天历史”
+
+## 9. 前端展示
+- `frontend/src/components/RoleProfileModal.tsx`
 - `frontend/src/components/TeamPanel.tsx`
-- `frontend/src/components/RoleInventoryModal.tsx`
-- `frontend/src/services/api.ts`
-- `frontend/src/types/app.ts`
+- `frontend/src/components/SubZoneContextPanel.tsx`
 
-当前行为：
-- 玩家数据仍可即时保存并刷新生效
-- `NpcPoolPanel` 可查看角色关系、聊天日志、背包摘要
-- `TeamPanel` 可：
-  - 查看队友状态
-  - 发起队伍聊天
-  - 查看队友背包详情
-  - 进入队友单聊
+当前前端已可展示：
+- desire 摘要
+- story beat 摘要
+- 公开事件中的角色动作
 
-## 9. 存档兼容
-- 新字段全部带默认值或 `default_factory`
-- 旧存档读取时自动补齐：
-  - 扩展后的角色卡字段
-  - 对话日志
-  - 关系
-  - `team_state`
-
-## 10. 当前限制
-- 玩家角色面板还不是完整的角色卡编辑器。
-- 队友关系数值仍是轻量实现，没有完整策划表。
-- 队友背包当前没有“使用 / 装备 / 转移”操作入口。
-## 2026-03-08 Addendum
-### Prompt 驱动的完整队友属性
-- 新增共享生成入口：`backend/app/services/team_service.py::generate_team_role_from_prompt(...)`
-- 规则是“AI 决定概念，后端决定合法数值”
-- 结构化字段包括：
-  - `display_name`
-  - `race`
-  - `char_class`
-  - `sheet_background`
-  - `alignment`
-  - `personality`
-  - `speaking_style`
-  - `appearance`
-  - `background`
-  - `cognition`
-  - `secret`
-  - `likes`
-  - `languages`
-  - `tool_proficiencies`
-  - `skills_proficient`
-  - `features_traits`
-  - `spells`
-  - `preferred_weapon`
-  - `preferred_armor`
-  - `inventory_items`
-  - `notes`
-  - `ability_bias`
-- 后端会对 `race`、`char_class`、`ability_bias`、装备偏好、背包物品做枚举/目录清洗，不接受自由文本直接落库为非法装备。
-
-### 新的统一背包协议
-- `InventoryOwnerRef` 抽象了物品归属：
-  - `owner_type=player`
-  - `owner_type=role`
-- 新增后端 schema：
-  - `InventoryEquipRequest`
-  - `InventoryUnequipRequest`
-  - `InventoryMutationResponse`
-  - `InventoryInteractRequest`
-  - `InventoryInteractResponse`
-- 玩家和 NPC/队友现在共用同一套装备、卸下、观察、使用协议，不再各走一套前后端逻辑。
-
-### 队友完整属性查看
-- 前端新增 `RoleProfileModal`
-- 队伍面板支持直接查看队友完整角色卡：
-  - 基础信息
-  - NPC 设定字段
-  - DND5E 数值与资源
-  - 技能/语言/法术/特性
-  - relations / cognition_changes / attitude_changes / dialogue_logs
+## 10. 回归测试
+- `backend/tests/test_role_system.py`
+- `backend/tests/test_npc_chat_routes.py`
+- `backend/tests/test_chat_route_scene_rendering.py`

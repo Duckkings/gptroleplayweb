@@ -32,9 +32,15 @@ export function RoleProfileModal({ open, role, onClose }: Props) {
           <section className="role-profile-section">
             <h4>基础信息</h4>
             <p>状态: {role.state}</p>
-            <p>区域: {role.zone_id ?? '-'} / {role.sub_zone_id ?? '-'}</p>
-            <p>种族/职业: {sheet.race || '-'} / {sheet.char_class || '-'}</p>
-            <p>背景/阵营: {sheet.background || '-'} / {sheet.alignment || '-'}</p>
+            <p>
+              区域: {role.zone_id ?? '-'} / {role.sub_zone_id ?? '-'}
+            </p>
+            <p>
+              种族/职业: {sheet.race || '-'} / {sheet.char_class || '-'}
+            </p>
+            <p>
+              背景/阵营: {sheet.background || '-'} / {sheet.alignment || '-'}
+            </p>
             <p>等级: {sheet.level}</p>
           </section>
 
@@ -83,6 +89,12 @@ export function RoleProfileModal({ open, role, onClose }: Props) {
               法术位: {sheet.spell_slots_current.level_1}/{sheet.spell_slots_max.level_1} | {sheet.spell_slots_current.level_2}/{sheet.spell_slots_max.level_2} | {sheet.spell_slots_current.level_3}/{sheet.spell_slots_max.level_3}
             </p>
             <p>备注: {sheet.notes || '-'}</p>
+          </section>
+
+          <section className="role-profile-section">
+            <h4>欲望与故事</h4>
+            <p>欲望: {role.desires.map((item) => `${item.title}(${item.status})`).join(', ') || '-'}</p>
+            <p>故事节点: {role.story_beats.map((item) => `${item.title}(${item.status})`).join(', ') || '-'}</p>
           </section>
 
           <section className="role-profile-section">

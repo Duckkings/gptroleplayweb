@@ -15,6 +15,8 @@ from app.core.token_usage import token_usage_store
 from app.core.prompt_table import prompt_table
 from app.models.schemas import (
     ActionCheckRequest,
+    ActionCheckPlanRequest,
+    ActionCheckPlanResponse,
     ActionCheckResponse,
     AreaCurrentResponse,
     AreaDiscoverInteractionsRequest,
@@ -83,6 +85,9 @@ from app.models.schemas import (
     RenderSubNode,
     SaveFile,
     SceneEvent,
+    SubZoneChatContext,
+    SubZoneChatTurn,
+    SubZoneChatTurnEvent,
     WorldClock,
     WorldClockInitRequest,
     WorldClockInitResponse,
@@ -105,6 +110,14 @@ class AIRegionGenerationError(RuntimeError):
 
 
 class AIBehaviorError(RuntimeError):
+    pass
+
+
+class NpcChatConfigError(ValueError):
+    pass
+
+
+class NpcChatGenerationError(RuntimeError):
     pass
 
 
@@ -151,6 +164,240 @@ def _new_game_log(session_id: str, kind: str, message: str, payload: dict[str, s
         message=message,
         payload=payload or {},
     )
+
+
+_SUB_ZONE_CHAT_TURN_LIMIT = 20
+_SUB_ZONE_CHAT_EVENT_LIMIT = 5
+_PASSIVE_TURN_DISPLAY_TEXT = "【自动推进】玩家本轮选择观察与等待，不主动行动。"
+
+
+def _current_sub_zone(save: SaveFile) -> AreaSubZone | None:
+    sub_zone_id = save.area_snapshot.current_sub_zone_id
+    if not sub_zone_id:
+        return None
+    return next((item for item in save.area_snapshot.sub_zones if item.sub_zone_id == sub_zone_id), None)
+
+
+def _ensure_sub_zone_chat_context(sub_zone: AreaSubZone | None) -> SubZoneChatContext | None:
+    if sub_zone is None:
+        return None
+    context = getattr(sub_zone, "chat_context", None)
+    if context is None:
+        sub_zone.chat_context = SubZoneChatContext()
+    return sub_zone.chat_context
+
+
+def _scene_event_to_turn_event(event: SceneEvent) -> SubZoneChatTurnEvent:
+    actor_type: str = "system"
+    event_kind = "system_notice"
+    if event.kind in {"public_targeted_npc_reply", "public_bystander_reaction"}:
+        actor_type = "npc"
+        event_kind = "npc_reply"
+    elif event.kind == "team_public_reaction":
+        actor_type = "team"
+        event_kind = "team_reply"
+    elif event.kind == "public_actor_resolution":
+        actor_type = str(event.metadata.get("actor_type") or "system")
+        if actor_type not in {"npc", "team", "system"}:
+            actor_type = "system"
+        event_kind = "public_actor_resolution"
+    elif event.kind == "role_desire_surface":
+        actor_type = str(event.metadata.get("actor_type") or "npc")
+        if actor_type not in {"npc", "team", "system"}:
+            actor_type = "npc"
+        event_kind = "role_desire_surface"
+    elif event.kind == "companion_story_surface":
+        actor_type = "team"
+        event_kind = "companion_story_surface"
+    elif event.kind == "reputation_update":
+        event_kind = "reputation_update"
+    elif event.kind == "encounter_situation_update":
+        event_kind = "encounter_situation_update"
+    elif event.kind == "encounter_progress":
+        event_kind = "encounter_progress"
+    elif event.kind == "encounter_resolution":
+        event_kind = "encounter_resolution"
+    return SubZoneChatTurnEvent(
+        event_kind=event_kind,  # type: ignore[arg-type]
+        actor_type=actor_type,  # type: ignore[arg-type]
+        actor_id=event.actor_role_id or "",
+        actor_name=event.actor_name or "",
+        content=event.content,
+    )
+
+
+def _active_encounter_for_current_sub_zone(save: SaveFile):
+    state = getattr(save, "encounter_state", None)
+    if state is None or not state.active_encounter_id:
+        return None
+    encounter = next((item for item in state.encounters if item.encounter_id == state.active_encounter_id), None)
+    if encounter is None or encounter.status not in {"active", "escaped"}:
+        return None
+    current_sub_zone = save.area_snapshot.current_sub_zone_id
+    if encounter.sub_zone_id and current_sub_zone and encounter.sub_zone_id != current_sub_zone:
+        return None
+    if encounter.zone_id and save.area_snapshot.current_zone_id and encounter.zone_id != save.area_snapshot.current_zone_id:
+        return None
+    return encounter
+
+
+def _serialize_recent_sub_zone_turns(sub_zone: AreaSubZone | None, *, limit: int) -> list[dict[str, object]]:
+    context = _ensure_sub_zone_chat_context(sub_zone)
+    if context is None:
+        return []
+    items: list[dict[str, object]] = []
+    for turn in context.recent_turns[-limit:]:
+        items.append(
+            {
+                "player_mode": turn.player_mode,
+                "world_time_text": turn.world_time_text,
+                "player_action": turn.player_action,
+                "player_speech": turn.player_speech,
+                "gm_narration": turn.gm_narration,
+                "active_encounter_id": turn.active_encounter_id,
+                "active_encounter_title": turn.active_encounter_title,
+                "active_encounter_status": turn.active_encounter_status,
+                "events": [
+                    {
+                        "event_kind": event.event_kind,
+                        "actor_name": event.actor_name,
+                        "content": event.content,
+                    }
+                    for event in turn.events[:_SUB_ZONE_CHAT_EVENT_LIMIT]
+                ],
+            }
+        )
+    return items
+
+
+def _visible_team_roles(save: SaveFile) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    for member in getattr(save.team_state, "members", []):
+        role = next((item for item in save.role_pool if item.role_id == member.role_id), None)
+        if role is None:
+            continue
+        items.append({"role_id": role.role_id, "name": role.name})
+    return items
+
+
+def build_main_turn_context_payload(save: SaveFile, player_message: str, *, recent_turn_count: int = 8) -> dict[str, object]:
+    _ensure_area_snapshot(save)
+    sub_zone = _current_sub_zone(save)
+    zone = next((item for item in save.area_snapshot.zones if item.zone_id == save.area_snapshot.current_zone_id), None)
+    active_encounter = _active_encounter_for_current_sub_zone(save)
+    active_quest = next((item for item in save.quest_state.quests if item.status == "active" and item.is_tracked), None)
+    if active_quest is None:
+        active_quest = next((item for item in save.quest_state.quests if item.status == "active"), None)
+    current_fate = save.fate_state.current_fate
+    intent = _parse_player_intent(player_message)
+    world_time_text, world_time = _world_time_payload(save.area_snapshot.clock)
+    return {
+        "schema_version": "main_turn_context.v1",
+        "current_area": {
+            "zone_id": save.area_snapshot.current_zone_id,
+            "zone_name": zone.name if zone is not None else "",
+            "sub_zone_id": save.area_snapshot.current_sub_zone_id,
+            "sub_zone_name": sub_zone.name if sub_zone is not None else "",
+            "sub_zone_description": sub_zone.description if sub_zone is not None else "",
+        },
+        "world_time": {"world_time_text": world_time_text, **world_time},
+        "player_input": {
+            "action": str(intent["action_text"]),
+            "speech": str(intent["speech_text"]),
+            "display_text": str(intent["display_text"]),
+            "passive_turn": bool(intent.get("passive_turn")),
+            "passive_mode": str(intent.get("passive_mode") or ""),
+            "action_check": intent["action_check"] if isinstance(intent["action_check"], dict) else {},
+        },
+        "active_quest": (
+            {
+                "quest_id": active_quest.quest_id,
+                "title": active_quest.title,
+                "status": active_quest.status,
+            }
+            if active_quest is not None
+            else None
+        ),
+        "active_fate": (
+            {
+                "fate_id": current_fate.fate_id,
+                "title": current_fate.title,
+                "current_phase_id": current_fate.current_phase_id,
+            }
+            if current_fate is not None
+            else None
+        ),
+        "active_encounter": (
+            {
+                "encounter_id": active_encounter.encounter_id,
+                "title": active_encounter.title,
+                "status": active_encounter.status,
+                "npc_role_id": active_encounter.npc_role_id,
+                "scene_summary": active_encounter.scene_summary,
+                "latest_outcome_summary": active_encounter.latest_outcome_summary,
+                "player_presence": active_encounter.player_presence,
+            }
+            if active_encounter is not None
+            else None
+        ),
+        "visible_npcs": [{"role_id": role.role_id, "name": role.name} for role in _visible_public_roles(save)],
+        "team_members": _visible_team_roles(save),
+        "sub_zone_recent_turns": _serialize_recent_sub_zone_turns(sub_zone, limit=recent_turn_count),
+    }
+
+
+def build_main_turn_context_json(save: SaveFile, player_message: str, *, recent_turn_count: int = 8) -> str:
+    return json.dumps(build_main_turn_context_payload(save, player_message, recent_turn_count=recent_turn_count), ensure_ascii=False, indent=2)
+
+
+def _build_scene_context_payload(
+    save: SaveFile,
+    *,
+    player_text: str,
+    gm_narration: str,
+    recent_turn_count: int = 4,
+) -> dict[str, object]:
+    base = build_main_turn_context_payload(save, player_text, recent_turn_count=recent_turn_count)
+    base["gm_narration"] = gm_narration
+    return base
+
+
+def _record_sub_zone_chat_turn(
+    save: SaveFile,
+    *,
+    source: str,
+    player_mode: str,
+    player_action: str,
+    player_speech: str,
+    player_action_check: dict[str, object] | None,
+    gm_narration: str,
+    events: list[SceneEvent],
+) -> str | None:
+    sub_zone = _current_sub_zone(save)
+    context = _ensure_sub_zone_chat_context(sub_zone)
+    if context is None:
+        return None
+    world_time_text, world_time = _world_time_payload(save.area_snapshot.clock)
+    active_encounter = _active_encounter_for_current_sub_zone(save)
+    turn = SubZoneChatTurn(
+        turn_id=f"sturn_{int(datetime.now(timezone.utc).timestamp() * 1000)}_{random.randint(100, 999)}",
+        source=source,  # type: ignore[arg-type]
+        player_mode=player_mode,  # type: ignore[arg-type]
+        world_time_text=world_time_text,
+        world_time=world_time,
+        player_action=player_action,
+        player_speech=player_speech,
+        player_action_check={k: v for k, v in (player_action_check or {}).items() if isinstance(v, (str, int, float, bool))},
+        gm_narration=gm_narration,
+        active_encounter_id=(active_encounter.encounter_id if active_encounter is not None else None),
+        active_encounter_title=(active_encounter.title if active_encounter is not None else ""),
+        active_encounter_status=(active_encounter.status if active_encounter is not None else ""),
+        events=[_scene_event_to_turn_event(event) for event in events[:_SUB_ZONE_CHAT_EVENT_LIMIT]],
+    )
+    context.recent_turns.append(turn)
+    context.recent_turns = context.recent_turns[-_SUB_ZONE_CHAT_TURN_LIMIT:]
+    context.updated_at = _utc_now()
+    return turn.turn_id
 
 
 def _stable_int(seed: str) -> int:
@@ -729,6 +976,14 @@ def _ensure_npc_role_complete(save: SaveFile, role: NpcRoleCard) -> bool:
         sheet.spell_slots_current = template_sheet.spell_slots_current.model_copy(deep=True)
         changed = True
 
+    try:
+        from app.services.roleplay_service import ensure_roleplay_state_for_role
+
+        if ensure_roleplay_state_for_role(save, role):
+            changed = True
+    except Exception:
+        pass
+
     _recompute_player_derived(profile)
     return changed
 
@@ -1088,18 +1343,24 @@ def inventory_interact(payload: InventoryInteractRequest) -> InventoryInteractRe
             raise ValueError("ITEM_USE_UNSUPPORTED_SLOT")
         if item.uses_left is not None and item.uses_left <= 0:
             raise ValueError("ITEM_DEPLETED")
-        action_result = action_check(
-            ActionCheckRequest(
-                session_id=payload.session_id,
-                action_type="item_use",
-                action_prompt=(
-                    f"owner_type={payload.owner.owner_type}; role_id={owner_id}; "
-                    f"item_id={item.item_id}; item_name={item.name}; prompt={payload.prompt.strip() or '-'}"
-                ),
-                actor_role_id=owner_id,
-                config=payload.config,
+        if payload.action_check is not None:
+            action_result = payload.action_check
+            if action_result.actor_role_id != owner_id:
+                raise ValueError("ACTION_CHECK_ACTOR_MISMATCH")
+        else:
+            action_result = action_check(
+                ActionCheckRequest(
+                    session_id=payload.session_id,
+                    action_type="item_use",
+                    action_prompt=(
+                        f"owner_type={payload.owner.owner_type}; role_id={owner_id}; "
+                        f"item_id={item.item_id}; item_name={item.name}; prompt={payload.prompt.strip() or '-'}"
+                    ),
+                    actor_role_id=owner_id,
+                    allow_backend_roll=(payload.owner.owner_type == "role"),
+                    config=payload.config,
+                )
             )
-        )
         time_spent_min = max(1, action_result.time_spent_min)
         save = get_current_save(default_session_id=payload.session_id)
         save.session_id = payload.session_id
@@ -1107,6 +1368,8 @@ def inventory_interact(payload: InventoryInteractRequest) -> InventoryInteractRe
         item = _get_inventory_item_for_owner(profile, payload.item_id)
         if action_result.success and item.uses_left is not None:
             item.uses_left = max(0, item.uses_left - 1)
+        if payload.action_check is not None and save.area_snapshot.clock is not None:
+            save.area_snapshot.clock = _advance_clock(save.area_snapshot.clock, time_spent_min)
     reply = _generate_inventory_interaction_reply(
         payload.session_id,
         payload.config,
@@ -1134,10 +1397,10 @@ def inventory_interact(payload: InventoryInteractRequest) -> InventoryInteractRe
     if payload.owner.owner_type == "player":
         scene_events = advance_public_scene_in_save(
             save,
-            payload.session_id,
-            f"{payload.mode}:{item.name}; {payload.prompt.strip()}".strip(),
-            reply,
-            payload.config,
+            session_id=payload.session_id,
+            player_text=f"{payload.mode}:{item.name}; {payload.prompt.strip()}".strip(),
+            gm_summary=reply,
+            config=payload.config,
         )
         summary = _scene_events_to_summary(scene_events)
         if summary:
@@ -1370,7 +1633,28 @@ def set_game_log_settings(session_id: str, settings: GameLogSettings) -> GameLog
     return GameLogSettingsResponse(session_id=session_id, settings=save.game_log_settings)
 
 
-def _build_region_prompt(center: Position, count: int, world_prompt: str) -> str:
+def _sub_zone_count_range(size: str, config: ChatConfig | None = None) -> tuple[int, int]:
+    debug = config.sub_zone_debug if config is not None else None
+    if size == "small":
+        return (
+            (debug.small_min_count if debug is not None else 3),
+            (debug.small_max_count if debug is not None else 5),
+        )
+    if size == "large":
+        return (
+            (debug.large_min_count if debug is not None else 8),
+            (debug.large_max_count if debug is not None else 15),
+        )
+    return (
+        (debug.medium_min_count if debug is not None else 5),
+        (debug.medium_max_count if debug is not None else 10),
+    )
+
+
+def _build_region_prompt(center: Position, count: int, world_prompt: str, config: ChatConfig | None = None) -> str:
+    small_min, small_max = _sub_zone_count_range("small", config)
+    medium_min, medium_max = _sub_zone_count_range("medium", config)
+    large_min, large_max = _sub_zone_count_range("large", config)
     default_prompt = (
         "根据以下世界设定，生成可探索地图区块。"
         "必须返回严格 JSON，且只返回 JSON。"
@@ -1380,7 +1664,7 @@ def _build_region_prompt(center: Position, count: int, world_prompt: str) -> str
         "x,y 单位是米。为了可视化，请将坐标限制在玩家中心点半径 300 米内。"
         "至少 1 个区块与玩家当前位置相邻（可在 0-80 米内）。"
         "返回的区块名称必须是语义名称，禁止使用‘区域1/区块1’这类流水号。"
-        "子区块数量规则：small=3~5, medium=5~10, large=8~15。"
+        f"子区块数量规则：small={small_min}~{small_max}, medium={medium_min}~{medium_max}, large={large_min}~{large_max}。"
         "区块半径规则：small=60~180, medium=120~300, large=240~500。"
         "区块间不能重叠：任意两区块中心距离必须大于两者 radius_m 之和。"
         "sub_zones 的 offset_* 是相对区块中心坐标偏移（单位米）。"
@@ -1396,15 +1680,6 @@ def _build_region_prompt(center: Position, count: int, world_prompt: str) -> str
         world_prompt=world_prompt,
     )
 
-
-def _sub_zone_count_range(size: str) -> tuple[int, int]:
-    if size == "small":
-        return (3, 5)
-    if size == "large":
-        return (8, 15)
-    return (5, 10)
-
-
 def _zone_radius_range(size: str) -> tuple[int, int]:
     if size == "small":
         return (60, 180)
@@ -1413,8 +1688,8 @@ def _zone_radius_range(size: str) -> tuple[int, int]:
     return (120, 300)
 
 
-def _default_sub_zone_seeds(size: str, zone_name: str) -> list[ZoneSubZoneSeed]:
-    min_count, _ = _sub_zone_count_range(size)
+def _default_sub_zone_seeds(size: str, zone_name: str, config: ChatConfig | None = None) -> list[ZoneSubZoneSeed]:
+    min_count, _ = _sub_zone_count_range(size, config)
     rmin, rmax = _zone_radius_range(size)
     base_r = int((rmin + rmax) / 2)
     seeds: list[ZoneSubZoneSeed] = []
@@ -1486,6 +1761,33 @@ def _extract_json_content(content: str) -> dict:
         if raw.startswith("json"):
             raw = raw[4:].strip()
     return json.loads(raw)
+
+
+def _extract_zone_items(parsed: object) -> list[dict[str, object]]:
+    if isinstance(parsed, list):
+        return [item for item in parsed if isinstance(item, dict)]
+    if not isinstance(parsed, dict):
+        return []
+
+    direct = parsed.get("zones")
+    if isinstance(direct, list):
+        return [item for item in direct if isinstance(item, dict)]
+
+    for key in ("map", "data", "result", "payload"):
+        nested = parsed.get(key)
+        if isinstance(nested, dict):
+            nested_zones = nested.get("zones")
+            if isinstance(nested_zones, list):
+                return [item for item in nested_zones if isinstance(item, dict)]
+
+    for key in ("regions", "items", "zone_list", "areas", "locations"):
+        alt_list = parsed.get(key)
+        if isinstance(alt_list, list):
+            return [item for item in alt_list if isinstance(item, dict)]
+
+    if {"name", "description"} <= set(parsed.keys()) and ("x" in parsed or "center_x" in parsed):
+        return [parsed]
+    return []
 
 
 def _build_discover_prompt(sub_zone: AreaSubZone, intent: str) -> str:
@@ -1583,7 +1885,7 @@ def _ai_generate_zones(session_id: str, center: Position, count: int, world_prom
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": prompt_table.get_text("world.region.system", "你是地图设计器，只输出 JSON。")},
-                {"role": "user", "content": _build_region_prompt(center, count, world_prompt)},
+                {"role": "user", "content": _build_region_prompt(center, count, world_prompt, config)},
             ],
         )
         usage = resp.usage
@@ -1598,13 +1900,14 @@ def _ai_generate_zones(session_id: str, center: Position, count: int, world_prom
             raise AIRegionGenerationError("AI 返回为空")
 
         parsed = _extract_json_content(content)
-        raw_zones = parsed.get("zones") if isinstance(parsed, dict) else None
-        if not isinstance(raw_zones, list) or len(raw_zones) < count:
+        raw_zones = _extract_zone_items(parsed)
+        if not raw_zones:
             raise AIRegionGenerationError("AI 返回结构缺少 zones")
 
         zones: list[Zone] = []
         seen_coords: set[tuple[int, int]] = set()
-        for item in raw_zones[:count]:
+        source_zone_count = min(len(raw_zones), max(count, 1))
+        for item in raw_zones[:source_zone_count]:
             if not isinstance(item, dict):
                 continue
             name = str(item.get("name") or "").strip()
@@ -1648,11 +1951,11 @@ def _ai_generate_zones(session_id: str, center: Position, count: int, world_prom
                             description=str(sub.get("description") or "").strip(),
                         )
                     )
-            min_count, max_count = _sub_zone_count_range(size)
+            min_count, max_count = _sub_zone_count_range(size, config)
             if len(seeds) < min_count or len(seeds) > max_count:
-                seeds = _default_sub_zone_seeds(size, name)
+                seeds = _default_sub_zone_seeds(size, name, config)
             if _is_sub_seed_quality_bad(seeds, radius_m):
-                seeds = _default_sub_zone_seeds(size, name)
+                seeds = _default_sub_zone_seeds(size, name, config)
             normalized_seeds: list[ZoneSubZoneSeed] = []
             for s in seeds:
                 ox, oy = _fit_offset_in_radius(s.offset_x, s.offset_y, radius_m)
@@ -1689,7 +1992,7 @@ def _ai_generate_zones(session_id: str, center: Position, count: int, world_prom
         if not zones:
             raise AIRegionGenerationError("AI 结果解析后无有效区块")
         _enforce_non_overlap(zones)
-        if len(seen_coords) < min(count, 3):
+        if len(seen_coords) < min(source_zone_count, 3):
             raise AIRegionGenerationError("AI 返回的区块坐标过于集中")
         return zones
     except AIRegionGenerationError:
@@ -2315,12 +2618,32 @@ def _build_npc_context(role: NpcRoleCard, recent_count: int = 16) -> str:
     return "\n".join(lines)
 
 
-def _build_npc_prompt_context(role: NpcRoleCard, clock: WorldClock | None, recent_count: int = 12) -> str:
+def _build_npc_prompt_context(role: NpcRoleCard, clock: WorldClock | None, recent_count: int = 12, save: SaveFile | None = None) -> str:
     lines = []
     if clock is not None:
         world_time_text, _ = _world_time_payload(clock)
         lines.append(f"当前世界时间={world_time_text}")
     lines.append(_npc_conversation_state_summary(role))
+    if save is not None:
+        active_encounter = _active_encounter_for_current_sub_zone(save)
+        if active_encounter is not None:
+            lines.append(
+                "当前地区活跃遭遇="
+                + json.dumps(
+                    {
+                        "encounter_id": active_encounter.encounter_id,
+                        "title": active_encounter.title,
+                        "status": active_encounter.status,
+                        "scene_summary": active_encounter.scene_summary,
+                        "latest_outcome_summary": active_encounter.latest_outcome_summary,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        recent_turns = _serialize_recent_sub_zone_turns(_current_sub_zone(save), limit=4)
+        if recent_turns:
+            lines.append("当前地区最近回合:")
+            lines.append(json.dumps(recent_turns, ensure_ascii=False))
     lines.append("最近对话:")
     lines.append(_build_npc_context(role, recent_count=recent_count))
     return "\n".join(lines)
@@ -2365,13 +2688,19 @@ def apply_speech_time(session_id: str, text: str, config: ChatConfig | None) -> 
     if save.area_snapshot.clock is None:
         save.area_snapshot.clock = _default_world_clock()
 
-    token_count, time_spent_min = _speech_time_minutes(text, config)
+    intent = _parse_player_intent(text)
+    if bool(intent.get("passive_turn")):
+        token_count, time_spent_min = 0, 1
+        message = f"玩家本轮旁观消耗时间 {time_spent_min} 分钟"
+    else:
+        token_count, time_spent_min = _speech_time_minutes(text, config)
+        message = f"玩家发言消耗时间 {time_spent_min} 分钟"
     save.area_snapshot.clock = _advance_clock(save.area_snapshot.clock, time_spent_min)
     save.game_logs.append(
         _new_game_log(
             session_id,
             "speech_time",
-            f"玩家发言消耗时间 {time_spent_min} 分钟",
+            message,
             {"token_count": token_count, "time_spent_min": time_spent_min},
         )
     )
@@ -2389,14 +2718,25 @@ def _parse_player_intent(player_message: str) -> dict[str, object]:
             parsed = {}
     action_text = str(parsed.get("action_description") or "").strip()
     speech_text = str(parsed.get("speech_description") or "").strip()
+    passive_turn = bool(parsed.get("passive_turn"))
+    passive_mode_raw = str(parsed.get("passive_mode") or "").strip().lower()
+    passive_mode = "observe" if passive_turn else ""
+    if passive_mode_raw == "observe":
+        passive_mode = "observe"
     action_check = parsed.get("action_check_result") if isinstance(parsed.get("action_check_result"), dict) else None
-    if not action_text and not speech_text:
+    if passive_turn:
+        action_text = ""
+        speech_text = ""
+    elif not action_text and not speech_text:
         speech_text = raw
     display_lines: list[str] = []
-    if action_text:
-        display_lines.append(f"动作：{action_text}")
-    if speech_text:
-        display_lines.append(f"语言：{speech_text}")
+    if passive_turn:
+        display_lines.append(_PASSIVE_TURN_DISPLAY_TEXT)
+    else:
+        if action_text:
+            display_lines.append(f"动作：{action_text}")
+        if speech_text:
+            display_lines.append(f"语言：{speech_text}")
     if isinstance(action_check, dict):
         status = "成功" if bool(action_check.get("success")) else "失败"
         critical = str(action_check.get("critical") or "none")
@@ -2411,6 +2751,8 @@ def _parse_player_intent(player_message: str) -> dict[str, object]:
         "action_text": action_text,
         "speech_text": speech_text,
         "display_text": display_text,
+        "passive_turn": passive_turn,
+        "passive_mode": passive_mode,
         "action_check": action_check,
         "raw_text": raw,
     }
@@ -2607,10 +2949,12 @@ def _update_npc_conversation_state_from_player(
     action_text: str,
     speech_text: str,
     player_text: str,
+    *,
+    scene_mode: str = "private_chat",
 ) -> None:
     state = _ensure_npc_conversation_state(role)
     state.last_player_intent = _trim_npc_text(player_text or speech_text or action_text, 120)
-    state.last_scene_mode = "private_chat"
+    state.last_scene_mode = scene_mode  # type: ignore[assignment]
     follow_up_topic = _npc_follow_up_topic(role, speech_text)
     if follow_up_topic:
         state.current_topic = follow_up_topic
@@ -2631,12 +2975,14 @@ def _update_npc_conversation_state_from_reply(
     role: NpcRoleCard,
     speech_reply: str,
     action_reaction: str,
+    *,
+    scene_mode: str = "private_chat",
 ) -> None:
     state = _ensure_npc_conversation_state(role)
     claim_text = _trim_npc_text(speech_reply or action_reaction, 120)
     if claim_text:
         state.last_npc_claim = claim_text
-    state.last_scene_mode = "private_chat"
+    state.last_scene_mode = scene_mode  # type: ignore[assignment]
     claim_topic = _conversation_claim_topic(speech_reply)
     if claim_topic:
         state.current_topic = claim_topic
@@ -2917,7 +3263,7 @@ def _detect_targeted_visible_npc(save: SaveFile, player_text: str) -> NpcRoleCar
 def _fallback_targeted_public_npc_reply(
     role: NpcRoleCard,
     player_text: str,
-    gm_summary: str,
+    scene_context: dict[str, object] | None,
 ) -> tuple[str, str, str]:
     action = _fallback_npc_action_reaction(role, "", player_text, None)
     speech = _fallback_npc_speech_reply(role, player_text, None)
@@ -2932,10 +3278,12 @@ def _generate_targeted_public_npc_reply(
     save: SaveFile,
     role: NpcRoleCard,
     player_text: str,
-    gm_summary: str,
+    scene_context: dict[str, object] | None,
     config: ChatConfig | None,
 ) -> tuple[str, str, str]:
     knowledge = build_npc_knowledge_snapshot(save, role.role_id)
+    gm_summary = str((scene_context or {}).get("gm_narration") or "").strip()
+    scene_context_json = json.dumps(scene_context or {}, ensure_ascii=False)
     if config is not None:
         api_key = (config.openai_api_key or "").strip()
         model = (config.model or "").strip()
@@ -2952,7 +3300,8 @@ def _generate_targeted_public_npc_reply(
                     conversation_state=_npc_conversation_state_summary(role),
                     knowledge_rules="\n".join(f"- {item}" for item in knowledge.response_rules),
                     player_text=player_text,
-                    context=_build_npc_prompt_context(role, save.area_snapshot.clock, recent_count=8),
+                    context=_build_npc_prompt_context(role, save.area_snapshot.clock, recent_count=8, save=save),
+                    scene_context_json=scene_context_json,
                 )
                 resp = client.chat.completions.create(
                     model=model,
@@ -2983,17 +3332,19 @@ def _generate_targeted_public_npc_reply(
                     return action, speech, relation_tag
             except Exception:
                 pass
-    return _fallback_targeted_public_npc_reply(role, player_text, gm_summary)
+    return _fallback_targeted_public_npc_reply(role, player_text, scene_context)
 
 
 def _generate_bystander_public_reactions(
     save: SaveFile,
     roles: list[NpcRoleCard],
     player_text: str,
-    gm_summary: str,
+    scene_context: dict[str, object] | None,
     config: ChatConfig | None,
 ) -> list[tuple[NpcRoleCard, str, str]]:
     created: list[tuple[NpcRoleCard, str, str]] = []
+    gm_summary = str((scene_context or {}).get("gm_narration") or "").strip()
+    scene_context_json = json.dumps(scene_context or {}, ensure_ascii=False)
     for role in roles[:2]:
         action_reaction = ""
         speech_reply = ""
@@ -3011,6 +3362,7 @@ def _generate_bystander_public_reactions(
                         scene_summary=gm_summary or "公开区域中的即时互动",
                         player_text=player_text,
                         gm_summary=gm_summary,
+                        scene_context_json=scene_context_json,
                     )
                     resp = client.chat.completions.create(
                         model=model,
@@ -3042,140 +3394,20 @@ def advance_public_scene_in_save(
     session_id: str,
     player_text: str,
     gm_summary: str = "",
+    scene_context: dict[str, object] | None = None,
     config: ChatConfig | None = None,
 ) -> list[SceneEvent]:
+    from app.services.public_scene_service import advance_public_scene_in_save as advance_public_scene_director
+
     _ensure_area_snapshot(save)
-    intent = _parse_player_intent(player_text)
-    action_text = str(intent["action_text"])
-    speech_text = str(intent["speech_text"])
-    display_text = str(intent["display_text"])
-    if not _public_behavior_triggered(action_text, speech_text, str(intent["raw_text"])):
-        return []
-
-    visible_roles = _visible_public_roles(save)
-    if not visible_roles:
-        return []
-
-    player_id = save.player_static_data.player_id
-    events: list[SceneEvent] = []
-    targeted_role = _detect_targeted_visible_npc(save, display_text)
-    if targeted_role is not None:
-        action_reaction, speech_reply, relation_tag = _generate_targeted_public_npc_reply(save, targeted_role, display_text, gm_summary, config)
-        _update_npc_conversation_state_from_player(targeted_role, action_text, speech_text, display_text)
-        _append_npc_dialogue(
-            role=targeted_role,
-            speaker="player",
-            speaker_role_id=player_id,
-            speaker_name=save.player_static_data.name,
-            content=display_text,
-            clock=save.area_snapshot.clock,
-            context_kind="public_targeted",
-        )
-        _update_npc_conversation_state_from_reply(targeted_role, speech_reply, action_reaction)
-        targeted_reply = _compose_npc_reply(action_reaction, speech_reply) or action_reaction or speech_reply
-        _append_npc_dialogue(
-            role=targeted_role,
-            speaker="npc",
-            speaker_role_id=targeted_role.role_id,
-            speaker_name=targeted_role.name,
-            content=targeted_reply,
-            clock=save.area_snapshot.clock,
-            context_kind="public_targeted",
-        )
-        _upsert_npc_player_relation(targeted_role, player_id, relation_tag, "公开场景针对性互动")
-        targeted_role.cognition_changes.append(f"{_utc_now()} 公开针对性互动: {display_text[:64]}")
-        targeted_role.cognition_changes = targeted_role.cognition_changes[-50:]
-        targeted_role.attitude_changes.append(f"{_utc_now()} public_targeted->{relation_tag}")
-        targeted_role.attitude_changes = targeted_role.attitude_changes[-50:]
-        events.append(
-            _new_scene_event(
-                "public_targeted_npc_reply",
-                targeted_reply,
-                actor_role_id=targeted_role.role_id,
-                actor_name=targeted_role.name,
-                metadata={"relation_tag": relation_tag},
-            )
-        )
-
-    bystander_roles = [role for role in visible_roles if targeted_role is None or role.role_id != targeted_role.role_id]
-    for role, line, relation_tag in _generate_bystander_public_reactions(save, bystander_roles, display_text, gm_summary, config):
-        _upsert_npc_player_relation(role, player_id, relation_tag, "公开场景行为记忆")
-        role.cognition_changes.append(f"{_utc_now()} 公开记忆: {display_text[:64]}")
-        role.cognition_changes = role.cognition_changes[-50:]
-        role.attitude_changes.append(f"{_utc_now()} public->{relation_tag}")
-        role.attitude_changes = role.attitude_changes[-50:]
-        events.append(
-            _new_scene_event(
-                "public_bystander_reaction",
-                line,
-                actor_role_id=role.role_id,
-                actor_name=role.name,
-                metadata={"relation_tag": relation_tag},
-            )
-        )
-
-    try:
-        from app.services.team_service import generate_team_public_replies_in_save
-
-        for reaction in generate_team_public_replies_in_save(
-            save,
-            session_id=session_id,
-            player_text=display_text,
-            scene_summary=gm_summary,
-            config=config,
-        )[:2]:
-            events.append(
-                _new_scene_event(
-                    "team_public_reaction",
-                    reaction.content,
-                    actor_role_id=reaction.member_role_id,
-                    actor_name=reaction.member_name,
-                    metadata={"trigger_kind": reaction.trigger_kind},
-                )
-            )
-    except Exception:
-        pass
-
-    if events:
-        save.game_logs.append(
-            _new_game_log(
-                session_id,
-                "public_scene_events",
-                f"公开区域产生 {len(events)} 条场景反应",
-                {"count": len(events)},
-            )
-        )
-        if any(event.kind == "public_bystander_reaction" for event in events):
-            save.game_logs.append(
-                _new_game_log(
-                    session_id,
-                    "public_npc_reaction",
-                    "公开区域触发周围NPC反应",
-                    {"count": sum(1 for event in events if event.kind == "public_bystander_reaction")},
-                )
-            )
-
-    if targeted_role is None and any(event.kind == "public_bystander_reaction" for event in events):
-        try:
-            from app.models.schemas import EncounterCheckRequest
-            from app.services.encounter_service import check_for_encounter
-
-            encounter_result = check_for_encounter(EncounterCheckRequest(session_id=session_id, trigger_kind="random_dialog", config=config))
-            if encounter_result.generated and encounter_result.encounter is not None:
-                events.append(
-                    _new_scene_event(
-                        "encounter_started",
-                        f"【遭遇触发】{encounter_result.encounter.title}\n{encounter_result.encounter.description}",
-                        metadata={
-                            "encounter_id": encounter_result.encounter.encounter_id,
-                            "encounter_title": encounter_result.encounter.title,
-                        },
-                    )
-                )
-        except Exception:
-            pass
-
-    return events[:5]
+    return advance_public_scene_director(
+        save,
+        session_id=session_id,
+        player_text=player_text,
+        gm_summary=gm_summary,
+        scene_context=scene_context,
+        config=config,
+    )
 
 
 def _scene_events_to_summary(events: list[SceneEvent]) -> str:
@@ -3207,7 +3439,15 @@ def apply_public_npc_reactions_in_save(
     summary: str = "",
     config: ChatConfig | None = None,
 ) -> str:
-    return _scene_events_to_summary(advance_public_scene_in_save(save, session_id, player_text, summary, config))
+    return _scene_events_to_summary(
+        advance_public_scene_in_save(
+            save,
+            session_id=session_id,
+            player_text=player_text,
+            gm_summary=summary,
+            config=config,
+        )
+    )
 
 
 def npc_greet(req: NpcGreetRequest) -> NpcGreetResponse:
@@ -3313,7 +3553,7 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
     speech_text = str(intent["speech_text"])
     player_text = str(intent["display_text"]).strip()
     action_check = intent["action_check"] if isinstance(intent["action_check"], dict) else None
-    _update_npc_conversation_state_from_player(role, action_text, speech_text, player_text)
+    _update_npc_conversation_state_from_player(role, action_text, speech_text, player_text, scene_mode="private_chat")
     _append_npc_dialogue(
         role=role,
         speaker="player",
@@ -3327,120 +3567,113 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
     action_reaction = ""
     speech_reply = ""
     relation_tag = "met"
-    allow_action_repair = True
-    allow_speech_repair = True
+    allow_action_repair = False
+    allow_speech_repair = False
     scene_events: list[SceneEvent] = []
     knowledge = build_npc_knowledge_snapshot(save, role.role_id)
     if role.talkative_current <= 0:
         action_reaction = f"{role.name} 明显不想继续交谈，只是移开了视线。"
-        allow_action_repair = False
-        allow_speech_repair = False
     elif player_mentions_unknown_npc(save, role.role_id, player_text):
         action_reaction = f"{role.name} 皱起眉，像是在确认你提到的是谁。"
         speech_reply = npc_guard_reply()
-        allow_action_repair = False
-        allow_speech_repair = False
-    elif req.config is not None:
+    else:
+        if req.config is None:
+            raise NpcChatConfigError("npc chat requires config with openai_api_key and model")
         api_key = (req.config.openai_api_key or "").strip()
         model = (req.config.model or "").strip()
-        if api_key and model:
-            try:
-                client = create_sync_client(req.config, client_cls=OpenAI)
-                world_time_text, _ = _world_time_payload(save.area_snapshot.clock)
-                context = _build_npc_prompt_context(role, save.area_snapshot.clock)
-                conversation_state = _npc_conversation_state_summary(role)
-                default_prompt = (
-                    "你要扮演一个NPC与玩家进行单独交互。"
-                    "必须保持人设一致，结合历史对话、当前世界时间、玩家动作与检定结果作答。"
-                    "你只能基于当前合法世界事实回答；若玩家提到不存在、已失效或不在你知识范围内的人物/区域，明确表示不知道或不确认。"
-                    "你只输出JSON，不要输出额外解释。"
-                    "JSON schema: {\"action_reaction\":\"...\",\"speech_reply\":\"...\",\"relation_tag\":\"ally|friendly|met|neutral|wary|hostile\"}。"
-                    "speech_reply 可以为空；NPC允许只做动作不说话。"
-                    "action_reaction 必须始终先写，且至少包含神态+一个可见动作或站位变化，不能只写“显得警惕”“显得冷淡”这种概括。"
-                    "如果玩家语言里包含问题、确认句或询问身份/关系/去向，speech_reply 必须直接回答该问题，不能只说“继续”“我在听”。"
-                    "如果玩家是在追问你上一轮提到的概念、名词或事件，必须先解释那个概念本身，不能切回你自己的静态喜好。"
-                    "\nNPC信息: name=$name, personality=$personality, speaking_style=$speaking_style, "
-                    "appearance=$appearance, background=$background, cognition=$cognition, alignment=$alignment, secret=$secret, likes=$likes"
-                    "\n当前世界时间: $world_time_text"
-                    "\n当前健谈值: $talkative_current / $talkative_maximum"
-                    "\n当前会话状态:\n$conversation_state"
-                    "\n当前知识边界规则:\n$knowledge_rules"
-                    "\n当前可知本地NPC IDs: $known_local_npc_ids"
-                    "\n当前不可编造实体 IDs: $forbidden_entity_ids"
-                    "\n历史对话(按时间顺序):\n$context"
-                    "\n玩家动作: $player_action"
-                    "\n玩家语言: $player_speech"
-                    "\n玩家检定结果: $action_check_result"
-                    "\n玩家刚刚完整输入: $player_text"
-                )
-                prompt = prompt_table.render(
-                    PromptKeys.NPC_CHAT_USER,
-                    default_prompt,
-                    name=role.name,
-                    roleplay_brief=_build_npc_roleplay_brief(role),
-                    personality=role.personality,
-                    speaking_style=role.speaking_style,
-                    appearance=role.appearance,
-                    background=role.background,
-                    cognition=role.cognition,
-                    alignment=role.alignment,
-                    secret=role.secret,
-                    likes=" / ".join(role.likes) or "无特殊偏好",
-                    world_time_text=world_time_text,
-                    talkative_current=role.talkative_current,
-                    talkative_maximum=role.talkative_maximum,
-                    conversation_state=conversation_state,
-                    knowledge_rules="\n".join(f"- {item}" for item in knowledge.response_rules),
-                    known_local_npc_ids=",".join(knowledge.known_local_npc_ids) or "none",
-                    forbidden_entity_ids=",".join(knowledge.forbidden_entity_ids) or "none",
-                    context=context,
-                    player_action=action_text or "无",
-                    player_speech=speech_text or "无",
-                    action_check_result=json.dumps(action_check or {"status": "none"}, ensure_ascii=False),
-                    player_text=player_text,
-                )
-                resp = client.chat.completions.create(
-                    model=model,
-                    **build_completion_options(req.config),
-                    response_format={"type": "json_object"},
-                    messages=[
-                        {"role": "system", "content": req.config.gm_prompt},
-                        {"role": "user", "content": prompt},
-                    ],
-                )
-                parsed = _extract_json_content((resp.choices[0].message.content or "").strip())
-                action_reaction = str(parsed.get("action_reaction") or "").strip()
-                speech_reply = str(parsed.get("speech_reply") or "").strip()
-                tag = str(parsed.get("relation_tag") or "").strip().lower()
-                if tag in {"ally", "friendly", "met", "neutral", "wary", "hostile"}:
-                    relation_tag = tag
-                forbidden_role_names = [
-                    item.name
-                    for item in save.role_pool
-                    if item.role_id not in knowledge.known_local_npc_ids and item.role_id != role.role_id
-                ]
-                generated_reply = _compose_npc_reply(action_reaction, speech_reply)
-                if any(name and name in generated_reply for name in forbidden_role_names):
-                    action_reaction = f"{role.name} 迟疑地眯起眼，显然不打算顺着这个话题说下去。"
-                    speech_reply = npc_guard_reply()
-                    allow_action_repair = False
-                    allow_speech_repair = False
-                else:
-                    allow_action_repair = False
-                    allow_speech_repair = False
-                usage = resp.usage
-                token_usage_store.add(
-                    req.session_id,
-                    "chat",
-                    getattr(usage, "prompt_tokens", 0) or 0,
-                    getattr(usage, "completion_tokens", 0) or 0,
-                )
-            except Exception:
-                action_reaction, speech_reply, relation_tag = _fallback_npc_reply_parts(role, action_text, speech_text, action_check)
-        else:
-            action_reaction, speech_reply, relation_tag = _fallback_npc_reply_parts(role, action_text, speech_text, action_check)
-    else:
-        action_reaction, speech_reply, relation_tag = _fallback_npc_reply_parts(role, action_text, speech_text, action_check)
+        if not api_key or not model:
+            raise NpcChatConfigError("npc chat requires openai_api_key and model")
+        try:
+            client = create_sync_client(req.config, client_cls=OpenAI)
+            world_time_text, _ = _world_time_payload(save.area_snapshot.clock)
+            context = _build_npc_prompt_context(role, save.area_snapshot.clock, save=save)
+            conversation_state = _npc_conversation_state_summary(role)
+            default_prompt = (
+                "你要扮演一个NPC与玩家进行单独交互。"
+                "必须保持人设一致，结合历史对话、当前世界时间、玩家动作与检定结果作答。"
+                "你只能基于当前合法世界事实回答；若玩家提到不存在、已失效或不在你知识范围内的人物/区域，明确表示不知道或不确认。"
+                "你只输出JSON，不要输出额外解释。"
+                "JSON schema: {\"action_reaction\":\"...\",\"speech_reply\":\"...\",\"relation_tag\":\"ally|friendly|met|neutral|wary|hostile\"}。"
+                "speech_reply 可以为空；NPC允许只做动作不说话。"
+                "action_reaction 必须始终先写，且至少包含神态+一个可见动作或站位变化，不能只写“显得警惕”“显得冷淡”这种概括。"
+                "如果玩家语言里包含问题、确认句或询问身份/关系/去向，speech_reply 必须直接回答该问题，不能只说“继续”“我在听”。"
+                "如果玩家是在追问你上一轮提到的概念、名词或事件，必须先解释那个概念本身，不能切回你自己的静态喜好。"
+                "\nNPC信息: name=$name, personality=$personality, speaking_style=$speaking_style, "
+                "appearance=$appearance, background=$background, cognition=$cognition, alignment=$alignment, secret=$secret, likes=$likes"
+                "\n当前世界时间: $world_time_text"
+                "\n当前健谈值: $talkative_current / $talkative_maximum"
+                "\n当前会话状态:\n$conversation_state"
+                "\n当前知识边界规则:\n$knowledge_rules"
+                "\n当前可知本地NPC IDs: $known_local_npc_ids"
+                "\n当前不可编造实体 IDs: $forbidden_entity_ids"
+                "\n历史对话(按时间顺序):\n$context"
+                "\n玩家动作: $player_action"
+                "\n玩家语言: $player_speech"
+                "\n玩家检定结果: $action_check_result"
+                "\n玩家刚刚完整输入: $player_text"
+            )
+            prompt = prompt_table.render(
+                PromptKeys.NPC_CHAT_USER,
+                default_prompt,
+                name=role.name,
+                roleplay_brief=_build_npc_roleplay_brief(role),
+                personality=role.personality,
+                speaking_style=role.speaking_style,
+                appearance=role.appearance,
+                background=role.background,
+                cognition=role.cognition,
+                alignment=role.alignment,
+                secret=role.secret,
+                likes=" / ".join(role.likes) or "无特殊偏好",
+                world_time_text=world_time_text,
+                talkative_current=role.talkative_current,
+                talkative_maximum=role.talkative_maximum,
+                conversation_state=conversation_state,
+                knowledge_rules="\n".join(f"- {item}" for item in knowledge.response_rules),
+                known_local_npc_ids=",".join(knowledge.known_local_npc_ids) or "none",
+                forbidden_entity_ids=",".join(knowledge.forbidden_entity_ids) or "none",
+                context=context,
+                player_action=action_text or "无",
+                player_speech=speech_text or "无",
+                action_check_result=json.dumps(action_check or {"status": "none"}, ensure_ascii=False),
+                player_text=player_text,
+            )
+            resp = client.chat.completions.create(
+                model=model,
+                **build_completion_options(req.config),
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": req.config.gm_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            parsed = _extract_json_content((resp.choices[0].message.content or "").strip())
+            action_reaction = str(parsed.get("action_reaction") or "").strip()
+            speech_reply = str(parsed.get("speech_reply") or "").strip()
+            tag = str(parsed.get("relation_tag") or "").strip().lower()
+            if tag in {"ally", "friendly", "met", "neutral", "wary", "hostile"}:
+                relation_tag = tag
+            forbidden_role_names = [
+                item.name
+                for item in save.role_pool
+                if item.role_id not in knowledge.known_local_npc_ids and item.role_id != role.role_id
+            ]
+            generated_reply = _compose_npc_reply(action_reaction, speech_reply)
+            if any(name and name in generated_reply for name in forbidden_role_names):
+                raise NpcChatGenerationError("npc chat output referenced forbidden entity")
+            usage = resp.usage
+            token_usage_store.add(
+                req.session_id,
+                "chat",
+                getattr(usage, "prompt_tokens", 0) or 0,
+                getattr(usage, "completion_tokens", 0) or 0,
+            )
+        except NpcChatGenerationError:
+            raise
+        except ValueError as exc:
+            raise NpcChatGenerationError(f"npc chat output parse failed: {exc}") from exc
+        except Exception as exc:
+            raise NpcChatGenerationError(f"npc chat generation failed: {exc}") from exc
 
     action_reaction, speech_reply = _normalize_npc_reply_parts(
         role,
@@ -3455,13 +3688,15 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
     action_reaction = _normalize_logged_speaker_content("npc", role.name, action_reaction)
     speech_reply = _normalize_logged_speaker_content("npc", role.name, speech_reply)
     if not action_reaction and not speech_reply:
-        action_reaction, speech_reply, relation_tag = _fallback_npc_reply_parts(role, action_text, speech_text, action_check)
+        raise NpcChatGenerationError("npc chat returned empty action and speech")
 
     talkative_delta = _npc_talkative_delta(role, action_text, speech_text) if role.talkative_current > 0 else 0
     role.talkative_current = max(0, min(role.talkative_maximum, role.talkative_current + talkative_delta))
     role.last_private_chat_at = _world_clock_iso(save.area_snapshot.clock)
-    _update_npc_conversation_state_from_reply(role, speech_reply, action_reaction)
-    reply = _compose_npc_reply(action_reaction, speech_reply) or f"{role.name} 没有给出明确回应。"
+    _update_npc_conversation_state_from_reply(role, speech_reply, action_reaction, scene_mode="private_chat")
+    reply = _compose_npc_reply(action_reaction, speech_reply)
+    if not reply:
+        raise NpcChatGenerationError("npc chat returned empty reply")
 
     _append_npc_dialogue(
         role=role,
@@ -3582,6 +3817,12 @@ def set_role_relation(session_id: str, role_id: str, payload: RoleRelationSetReq
     return role
 
 
+def _actor_kind(save: SaveFile, actor_role_id: str | None) -> str:
+    if not actor_role_id or actor_role_id == save.player_static_data.player_id:
+        return "player"
+    return "npc"
+
+
 def _get_actor_profile(save: SaveFile, actor_role_id: str | None) -> tuple[str, PlayerStaticData]:
     if not actor_role_id or actor_role_id == save.player_static_data.player_id:
         _recompute_player_derived(save.player_static_data)
@@ -3598,6 +3839,64 @@ def _ability_modifier(profile: PlayerStaticData, ability: str) -> int:
     return int((score - 10) // 2)
 
 
+def _humanize_action_prompt(action_prompt: str) -> str:
+    raw = (action_prompt or "").strip()
+    if not raw:
+        return ""
+    parts: list[str] = []
+    for chunk in re.split(r"[;\n]+", raw):
+        text = chunk.strip()
+        if not text:
+            continue
+        if "=" in text:
+            key, value = text.split("=", 1)
+            if key.strip().lower() in {"action", "speech", "prompt", "item", "item_name", "title", "task", "intent"}:
+                clean_value = value.strip()
+                if clean_value and clean_value != "-":
+                    parts.append(clean_value)
+            continue
+        parts.append(text)
+    merged = "；".join(parts).strip()
+    return merged[:120] if merged else raw[:120]
+
+
+def _default_check_task(action_type: str, action_prompt: str) -> str:
+    human_prompt = _humanize_action_prompt(action_prompt)
+    if human_prompt:
+        return human_prompt
+    if action_type == "attack":
+        return "判断这次攻击是否顺利命中并压制目标"
+    if action_type == "item_use":
+        return "判断这次物品使用是否稳定生效"
+    return "判断这次行动是否顺利完成"
+
+
+def _normalize_action_plan(
+    action_type: str,
+    action_prompt: str,
+    raw_plan: dict[str, object] | None,
+) -> dict[str, int | bool | str]:
+    raw_plan = raw_plan or {}
+    ability = str(raw_plan.get("ability_used") or "").strip().lower()
+    if ability not in {"strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"}:
+        ability = "wisdom"
+    dc = int(raw_plan.get("dc") or 12)
+    dc = max(5, min(30, dc))
+    time_spent_min = int(raw_plan.get("time_spent_min") or (3 if action_type == "item_use" else 5))
+    time_spent_min = max(1, min(180, time_spent_min))
+    requires_check = bool(raw_plan.get("requires_check"))
+    if action_type in {"attack", "check"}:
+        requires_check = True
+    check_task = str(raw_plan.get("check_task") or "").strip() or _default_check_task(action_type, action_prompt)
+    return {
+        "ability_used": ability,
+        "dc": dc,
+        "time_spent_min": time_spent_min,
+        "requires_check": requires_check,
+        "check_task": check_task,
+    }
+
+
 def _fallback_action_plan(action_type: str, action_prompt: str) -> dict[str, int | bool | str]:
     text = action_prompt.lower()
     ability = "wisdom"
@@ -3610,40 +3909,57 @@ def _fallback_action_plan(action_type: str, action_prompt: str) -> dict[str, int
     elif any(k in text for k in ["persuade", "deceive", "intimidate", "说服", "威吓"]):
         ability = "charisma"
     requires_check = action_type in {"attack", "check"}
-    return {
-        "ability_used": ability,
-        "dc": 12,
-        "time_spent_min": 5 if action_type != "item_use" else 3,
-        "requires_check": requires_check,
-    }
+    if not requires_check:
+        if any(token in text for token in ["尝试", "试图", "强行", "撬", "逃离", "说服", "威胁", "潜行", "偷", "骗", "拆", "破解"]):
+            requires_check = True
+        elif any(token in text for token in ["观察", "看看", "检查标签", "阅读", "打招呼", "问好", "listen", "look"]):
+            requires_check = False
+    return _normalize_action_plan(
+        action_type,
+        action_prompt,
+        {
+            "ability_used": ability,
+            "dc": 12,
+            "time_spent_min": 5 if action_type != "item_use" else 3,
+            "requires_check": requires_check,
+            "check_task": _default_check_task(action_type, action_prompt),
+        },
+    )
 
 
-def _ai_action_plan(req: ActionCheckRequest) -> dict[str, int | bool | str]:
-    if req.config is None:
-        return _fallback_action_plan(req.action_type, req.action_prompt)
-    api_key = (req.config.openai_api_key or "").strip()
-    model = (req.config.model or "").strip()
+def _ai_action_plan(
+    action_type: str,
+    action_prompt: str,
+    config: ChatConfig | None,
+) -> dict[str, int | bool | str]:
+    if config is None:
+        return _fallback_action_plan(action_type, action_prompt)
+    api_key = (config.openai_api_key or "").strip()
+    model = (config.model or "").strip()
     if not api_key or not model:
-        return _fallback_action_plan(req.action_type, req.action_prompt)
+        return _fallback_action_plan(action_type, action_prompt)
 
     try:
         default_prompt = (
             "你是跑团行动判定助手。基于玩家行动，返回JSON。"
             "字段: ability_used(strength|dexterity|constitution|intelligence|wisdom|charisma),"
-            "dc(5-30),time_spent_min(>=1),requires_check(boolean)。"
+            "dc(5-30),time_spent_min(>=1),requires_check(boolean),check_task(string)。"
+            "规则: 任何结果不明确、存在风险、需要说服/潜行/逃脱/破解/攻击/强行尝试的行为，都应 requires_check=true。"
+            "只有结果明显、无需悬念或风险的简单行为，才允许 requires_check=false。"
+            "check_task 要写清楚这次到底在判定什么。"
             "action_type=attack/check/item_use。"
             "action_type=$action_type, action_prompt=$action_prompt"
         )
         prompt = prompt_table.render(
             "action.plan.user",
             default_prompt,
-            action_type=req.action_type,
-            action_prompt=req.action_prompt,
+            action_type=action_type,
+            action_prompt=action_prompt,
         )
-        client = create_sync_client(req.config, client_cls=OpenAI)
+        client = create_sync_client(config, client_cls=OpenAI)
         resp = client.chat.completions.create(
             model=model,
-            **build_completion_options(req.config),
+            **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": prompt_table.get_text("action.plan.system", "你只输出JSON。")},
@@ -3652,19 +3968,53 @@ def _ai_action_plan(req: ActionCheckRequest) -> dict[str, int | bool | str]:
         )
         content = (resp.choices[0].message.content or "").strip()
         parsed = _extract_json_content(content)
-        ability = str(parsed.get("ability_used") or "").strip().lower()
-        if ability not in {"strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"}:
-            ability = "wisdom"
-        dc = int(parsed.get("dc") or 12)
-        dc = max(5, min(30, dc))
-        time_spent = int(parsed.get("time_spent_min") or 5)
-        time_spent = max(1, min(180, time_spent))
-        requires_check = bool(parsed.get("requires_check"))
-        if req.action_type in {"attack", "check"}:
-            requires_check = True
-        return {"ability_used": ability, "dc": dc, "time_spent_min": time_spent, "requires_check": requires_check}
+        return _normalize_action_plan(action_type, action_prompt, parsed)
     except Exception:
-        return _fallback_action_plan(req.action_type, req.action_prompt)
+        return _fallback_action_plan(action_type, action_prompt)
+
+
+def _planned_action_plan(req: ActionCheckRequest) -> dict[str, int | bool | str] | None:
+    if (
+        req.planned_ability_used is None
+        or req.planned_dc is None
+        or req.planned_time_spent_min is None
+        or req.planned_requires_check is None
+    ):
+        return None
+    return _normalize_action_plan(
+        req.action_type,
+        req.action_prompt,
+        {
+            "ability_used": req.planned_ability_used,
+            "dc": req.planned_dc,
+            "time_spent_min": req.planned_time_spent_min,
+            "requires_check": req.planned_requires_check,
+            "check_task": req.planned_check_task or _default_check_task(req.action_type, req.action_prompt),
+        },
+    )
+
+
+def plan_action_check(req: ActionCheckPlanRequest) -> ActionCheckPlanResponse:
+    save = get_current_save(default_session_id=req.session_id)
+    if save.session_id != req.session_id:
+        save.session_id = req.session_id
+    actor_role_id, profile = _get_actor_profile(save, req.actor_role_id)
+    actor_kind = _actor_kind(save, actor_role_id)
+    plan = _ai_action_plan(req.action_type, req.action_prompt, req.config)
+    ability = str(plan["ability_used"])
+    return ActionCheckPlanResponse(
+        session_id=req.session_id,
+        actor_role_id=actor_role_id,
+        actor_name=profile.name,
+        actor_kind=actor_kind,  # type: ignore[arg-type]
+        action_type=req.action_type,
+        requires_check=bool(plan["requires_check"]),
+        ability_used=ability,  # type: ignore[arg-type]
+        ability_modifier=_ability_modifier(profile, ability),
+        dc=int(plan["dc"]),
+        time_spent_min=int(plan["time_spent_min"]),
+        check_task=str(plan["check_task"]),
+    )
 
 
 def _apply_penalty(profile: PlayerStaticData, rule_key: str, fail_gap: int) -> list[str]:
@@ -3732,6 +4082,139 @@ def _suggest_relation_tag(req: ActionCheckRequest, success: bool, critical: str)
     return "friendly" if success else "wary"
 
 
+def _action_outcome_code(success: bool, critical: str) -> str:
+    if critical == "critical_success":
+        return "critical_success"
+    if critical == "critical_failure":
+        return "critical_failure"
+    return "success" if success else "failure"
+
+
+def _action_outcome_label(success: bool, critical: str) -> str:
+    code = _action_outcome_code(success, critical)
+    if code == "critical_success":
+        return "大成功"
+    if code == "critical_failure":
+        return "大失败"
+    if code == "success":
+        return "成功"
+    return "失败"
+
+
+def _build_action_process_text(
+    *,
+    actor_name: str,
+    check_task: str,
+    ability_used: str,
+    ability_modifier: int,
+    dc: int,
+    requires_check: bool,
+    dice_roll: int | None,
+    total_score: int | None,
+    success: bool,
+    critical: str,
+) -> str:
+    if not requires_check:
+        return f"【检定】{actor_name}的行动无需正式检定，本轮按常理直接推进。"
+    modifier_text = f"{ability_modifier:+d}"
+    detail = f"结果{_action_outcome_label(success, critical)}。"
+    if critical == "critical_success":
+        detail = "掷出天然20，结果大成功。"
+    elif critical == "critical_failure":
+        detail = "掷出天然1，结果大失败。"
+    return (
+        f"【检定】{actor_name}进行“{check_task}”检定，"
+        f"使用 {ability_used} 调整值 {modifier_text}，"
+        f"d20({dice_roll if dice_roll is not None else '-'}) {modifier_text} = {total_score if total_score is not None else '-'}，"
+        f"对抗 DC {dc}。{detail}"
+    )
+
+
+def _fallback_action_resolution_text(
+    *,
+    actor_name: str,
+    action_type: str,
+    check_task: str,
+    success: bool,
+    critical: str,
+    requires_check: bool,
+) -> str:
+    if not requires_check:
+        if action_type == "item_use":
+            return f"{actor_name}按部就班地处理了这次物品操作，过程没有出现明显阻碍。"
+        return f"{actor_name}直接着手处理这件事，局面顺势朝着行动目标推进。"
+    label = _action_outcome_label(success, critical)
+    if action_type == "attack":
+        return f"{actor_name}围绕“{check_task}”展开攻势，现场立刻显出{label}带来的后续变化。"
+    if action_type == "item_use":
+        return f"{actor_name}尝试让“{check_task}”生效，结果是{label}，物品与现场因此出现直接反馈。"
+    return f"{actor_name}围绕“{check_task}”展开尝试，结果是{label}，局势随之给出明确回应。"
+
+
+def _ai_action_resolution_text(
+    req: ActionCheckRequest,
+    *,
+    actor_name: str,
+    actor_kind: str,
+    action_type: str,
+    action_prompt: str,
+    check_task: str,
+    success: bool,
+    critical: str,
+    requires_check: bool,
+) -> str:
+    fallback = _fallback_action_resolution_text(
+        actor_name=actor_name,
+        action_type=action_type,
+        check_task=check_task,
+        success=success,
+        critical=critical,
+        requires_check=requires_check,
+    )
+    if req.config is None:
+        return fallback
+    api_key = (req.config.openai_api_key or "").strip()
+    model = (req.config.model or "").strip()
+    if not api_key or not model:
+        return fallback
+    try:
+        default_prompt = (
+            "你是跑团行动结算叙述助手。只输出JSON，结构为 {\"narrative\":\"...\"}。"
+            "你只能根据给定的行动目标与最终结果等级进行演绎，不能编造骰点、DC、属性值或数值过程。"
+            "结果等级只可能是 success / failure / critical_success / critical_failure。"
+            "若 requires_check=false，表示这次行动无需正式检定。"
+            "请用 1-3 句简体中文描述局势反馈，不要代替其他现场 NPC 或队友发言。"
+            "actor_name=$actor_name; actor_kind=$actor_kind; action_type=$action_type; "
+            "check_task=$check_task; outcome_code=$outcome_code; requires_check=$requires_check; action_prompt=$action_prompt"
+        )
+        prompt = prompt_table.render(
+            "action.resolve.user",
+            default_prompt,
+            actor_name=actor_name,
+            actor_kind=actor_kind,
+            action_type=action_type,
+            check_task=check_task,
+            outcome_code=_action_outcome_code(success, critical),
+            requires_check=requires_check,
+            action_prompt=action_prompt,
+        )
+        client = create_sync_client(req.config, client_cls=OpenAI)
+        resp = client.chat.completions.create(
+            model=model,
+            **build_completion_options(req.config),
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": prompt_table.get_text("action.resolve.system", "你只输出JSON。")},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        parsed = _extract_json_content((resp.choices[0].message.content or "").strip())
+        narrative = str(parsed.get("narrative") or "").strip()
+        return narrative or fallback
+    except Exception:
+        return fallback
+
+
 def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
     save = get_current_save(default_session_id=req.session_id)
     if save.session_id != req.session_id:
@@ -3741,11 +4224,13 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
         save.area_snapshot.clock = _default_world_clock()
 
     actor_role_id, profile = _get_actor_profile(save, req.actor_role_id)
-    plan = _ai_action_plan(req)
+    actor_kind = _actor_kind(save, actor_role_id)
+    plan = _planned_action_plan(req) or _ai_action_plan(req.action_type, req.action_prompt, req.config)
     ability = str(plan["ability_used"])
     dc = int(plan["dc"])
     time_spent_min = int(plan["time_spent_min"])
     requires_check = bool(plan["requires_check"])
+    check_task = str(plan["check_task"])
 
     dice_roll: int | None = None
     total_score: int | None = None
@@ -3755,7 +4240,12 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
     ability_modifier = _ability_modifier(profile, ability)
 
     if requires_check:
-        dice_roll = req.forced_dice_roll if req.forced_dice_roll is not None else random.randint(1, 20)
+        if req.forced_dice_roll is not None:
+            dice_roll = req.forced_dice_roll
+        elif actor_kind == "npc" or req.allow_backend_roll:
+            dice_roll = random.randint(1, 20)
+        else:
+            raise ValueError("PLAYER_DICE_ROLL_REQUIRED")
         total_score = dice_roll + ability_modifier
         if dice_roll == 1:
             critical = "critical_failure"
@@ -3771,32 +4261,31 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
         rule_key = _ACTION_PENALTY_RULES.get(req.action_type, "hit_points.current")
         applied_effects.extend(_apply_penalty(profile, rule_key, fail_gap))
 
-    save.area_snapshot.clock = _advance_clock(save.area_snapshot.clock, time_spent_min)
-    save.game_logs.append(
-        _new_game_log(
-            req.session_id,
-            "action_check",
-            f"行为检定: {req.action_type} | {'成功' if success else '失败'} | 耗时 {time_spent_min} 分钟",
-            {
-                "actor_role_id": actor_role_id,
-                "action_type": req.action_type,
-                "dc": dc,
-                "time_spent_min": time_spent_min,
-                "success": success,
-            },
-        )
+    process_text = _build_action_process_text(
+        actor_name=profile.name,
+        check_task=check_task,
+        ability_used=ability,
+        ability_modifier=ability_modifier,
+        dc=dc,
+        requires_check=requires_check,
+        dice_roll=dice_roll,
+        total_score=total_score,
+        success=success,
+        critical=critical,
     )
-    save_current(save)
-
-    narrative = (
-        f"{profile.name} 执行了行动，耗时 {time_spent_min} 分钟。"
-        f"{'检定成功。' if success else '检定失败，出现负面后果。'}"
+    resolution_text = _ai_action_resolution_text(
+        req,
+        actor_name=profile.name,
+        actor_kind=actor_kind,
+        action_type=req.action_type,
+        action_prompt=req.action_prompt,
+        check_task=check_task,
+        success=success,
+        critical=critical,
+        requires_check=requires_check,
     )
+    narrative = process_text if process_text == resolution_text else f"{process_text}\n{resolution_text}".strip()
     scene_events: list[SceneEvent] = []
-    if critical == "critical_success":
-        narrative = f"{profile.name} 掷出天然20，行动大成功！耗时 {time_spent_min} 分钟。"
-    elif critical == "critical_failure":
-        narrative = f"{profile.name} 掷出天然1，行动大失败。耗时 {time_spent_min} 分钟。"
 
     relation_tag = _suggest_relation_tag(req, success, critical)
     if relation_tag is not None and "npc_id=" in req.action_prompt:
@@ -3811,51 +4300,72 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
                         role.attitude_changes = role.attitude_changes[-50:]
         except Exception:
             pass
-    try:
-        from app.services.team_service import apply_team_reactions_in_save
 
-        apply_team_reactions_in_save(
-            save,
-            session_id=req.session_id,
-            trigger_kind="action_check",
-            player_text=req.action_prompt,
-            summary=narrative,
-            exclude_role_ids=({actor_role_id} if actor_role_id != save.player_static_data.player_id else None),
-        )
-    except Exception:
-        pass
-    if actor_role_id == save.player_static_data.player_id:
-        scene_events = advance_public_scene_in_save(
-            save,
-            req.session_id,
-            req.action_prompt,
-            narrative,
-            req.config,
-        )
-    try:
-        from app.services.encounter_service import advance_active_encounter_in_save
-
-        advanced = advance_active_encounter_in_save(save, session_id=req.session_id, minutes_elapsed=time_spent_min, config=req.config)
-        if advanced is not None:
-            scene_events.append(
-                _new_scene_event(
-                    "encounter_background",
-                    advanced.latest_outcome_summary or advanced.scene_summary or advanced.description,
-                    metadata={"encounter_id": advanced.encounter_id},
-                )
+    if req.resolution_context == "standalone":
+        save.area_snapshot.clock = _advance_clock(save.area_snapshot.clock, time_spent_min)
+        save.game_logs.append(
+            _new_game_log(
+                req.session_id,
+                "action_check",
+                f"行为检定: {req.action_type} | {_action_outcome_label(success, critical)} | 耗时 {time_spent_min} 分钟",
+                {
+                    "actor_role_id": actor_role_id,
+                    "action_type": req.action_type,
+                    "dc": dc,
+                    "time_spent_min": time_spent_min,
+                    "success": success,
+                    "requires_check": requires_check,
+                },
             )
-    except Exception:
-        pass
+        )
+        try:
+            from app.services.team_service import apply_team_reactions_in_save
+
+            apply_team_reactions_in_save(
+                save,
+                session_id=req.session_id,
+                trigger_kind="action_check",
+                player_text=req.action_prompt,
+                summary=resolution_text,
+                exclude_role_ids=({actor_role_id} if actor_role_id != save.player_static_data.player_id else None),
+            )
+        except Exception:
+            pass
+        if actor_role_id == save.player_static_data.player_id:
+            scene_events = advance_public_scene_in_save(
+                save,
+                session_id=req.session_id,
+                player_text=req.action_prompt,
+                gm_summary=resolution_text,
+                config=req.config,
+            )
+        try:
+            from app.services.encounter_service import advance_active_encounter_in_save
+
+            advanced = advance_active_encounter_in_save(save, session_id=req.session_id, minutes_elapsed=time_spent_min, config=req.config)
+            if advanced is not None:
+                scene_events.append(
+                    _new_scene_event(
+                        "encounter_background",
+                        advanced.latest_outcome_summary or advanced.scene_summary or advanced.description,
+                        metadata={"encounter_id": advanced.encounter_id},
+                    )
+                )
+        except Exception:
+            pass
     save_current(save)
 
     return ActionCheckResponse(
         session_id=req.session_id,
         actor_role_id=actor_role_id,
+        actor_name=profile.name,
+        actor_kind=actor_kind,  # type: ignore[arg-type]
         action_type=req.action_type,
         requires_check=requires_check,
         ability_used=ability,  # type: ignore[arg-type]
         ability_modifier=ability_modifier,
         dc=dc,
+        check_task=check_task,
         dice_roll=dice_roll,
         total_score=total_score,
         success=success,
@@ -4027,6 +4537,7 @@ def discover_interactions(req: AreaDiscoverInteractionsRequest) -> AreaDiscoverI
     if target is None:
         raise KeyError("AREA_SUB_ZONE_NOT_FOUND")
 
+    interaction_limit = req.config.sub_zone_debug.discover_interaction_limit if req.config is not None else 3
     generated_raw: list[dict[str, str]]
     if req.config is not None:
         try:
@@ -4058,7 +4569,7 @@ def discover_interactions(req: AreaDiscoverInteractionsRequest) -> AreaDiscoverI
         deduped.append(interaction)
         existing_ids.add(candidate_id)
         existing_names.add(name_key)
-        if len(deduped) >= 3:
+        if len(deduped) >= interaction_limit:
             break
 
     if not deduped:

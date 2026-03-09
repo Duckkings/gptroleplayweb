@@ -10,6 +10,28 @@ class UIConfig(BaseModel):
     theme: str = Field(default="dark")
 
 
+class SubZoneDebugConfig(BaseModel):
+    small_min_count: int = Field(default=3, ge=1, le=20)
+    small_max_count: int = Field(default=5, ge=1, le=20)
+    medium_min_count: int = Field(default=5, ge=1, le=30)
+    medium_max_count: int = Field(default=10, ge=1, le=30)
+    large_min_count: int = Field(default=8, ge=1, le=40)
+    large_max_count: int = Field(default=15, ge=1, le=40)
+    discover_interaction_limit: int = Field(default=3, ge=1, le=10)
+
+    @model_validator(mode="after")
+    def _validate_ranges(self) -> "SubZoneDebugConfig":
+        pairs = (
+            ("small", self.small_min_count, self.small_max_count),
+            ("medium", self.medium_min_count, self.medium_max_count),
+            ("large", self.large_min_count, self.large_max_count),
+        )
+        for label, minimum, maximum in pairs:
+            if minimum > maximum:
+                raise ValueError(f"{label}_min_count must be <= {label}_max_count")
+        return self
+
+
 class ChatRuntimeConfig(BaseModel):
     temperature: float | None = Field(default=None, ge=0, le=2)
     max_tokens: int | None = Field(default=None, gt=0)
@@ -26,6 +48,7 @@ class ChatConfig(BaseModel):
     runtime: ChatRuntimeConfig = Field(default_factory=ChatRuntimeConfig)
     gm_prompt: str = Field(..., min_length=1)
     speech_time_per_50_tokens_min: int = Field(default=1, ge=1, le=30)
+    sub_zone_debug: SubZoneDebugConfig = Field(default_factory=SubZoneDebugConfig)
     ui: UIConfig | None = None
 
     @model_validator(mode="before")
@@ -141,9 +164,15 @@ class SceneEvent(BaseModel):
         "public_targeted_npc_reply",
         "public_bystander_reaction",
         "team_public_reaction",
+        "public_actor_resolution",
+        "role_desire_surface",
+        "companion_story_surface",
+        "reputation_update",
         "encounter_started",
         "encounter_progress",
+        "encounter_resolution",
         "encounter_background",
+        "encounter_situation_update",
     ]
     actor_role_id: str = Field(default="", min_length=0)
     actor_name: str = Field(default="", min_length=0)
@@ -159,6 +188,7 @@ class ChatResponse(BaseModel):
     tool_events: list[ToolEvent] = Field(default_factory=list)
     scene_events: list[SceneEvent] = Field(default_factory=list)
     time_spent_min: int = 0
+    archived_sub_zone_turn_id: str | None = None
 
 
 class HealthResponse(BaseModel):
@@ -246,6 +276,48 @@ class SubZoneState(BaseModel):
     flags: list[str] = Field(default_factory=lambda: ["normal"])
 
 
+class SubZoneChatTurnEvent(BaseModel):
+    event_kind: Literal[
+        "encounter_progress",
+        "encounter_resolution",
+        "npc_reply",
+        "team_reply",
+        "system_notice",
+        "public_actor_resolution",
+        "role_desire_surface",
+        "companion_story_surface",
+        "reputation_update",
+        "encounter_situation_update",
+    ] = "system_notice"
+    actor_type: Literal["npc", "team", "system"] = "system"
+    actor_id: str = Field(default="", min_length=0)
+    actor_name: str = Field(default="", min_length=0)
+    content: str = Field(..., min_length=1)
+
+
+class SubZoneChatTurn(BaseModel):
+    turn_id: str = Field(..., min_length=1)
+    source: Literal["main_chat", "encounter", "system"] = "main_chat"
+    player_mode: Literal["active", "passive"] = "active"
+    world_time_text: str = Field(default="", min_length=0)
+    world_time: dict[str, str | int] = Field(default_factory=dict)
+    player_action: str = Field(default="", min_length=0)
+    player_speech: str = Field(default="", min_length=0)
+    player_action_check: dict[str, str | int | float | bool] = Field(default_factory=dict)
+    gm_narration: str = Field(default="", min_length=0)
+    active_encounter_id: str | None = None
+    active_encounter_title: str = Field(default="", min_length=0)
+    active_encounter_status: str = Field(default="", min_length=0)
+    events: list[SubZoneChatTurnEvent] = Field(default_factory=list)
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class SubZoneChatContext(BaseModel):
+    version: str = Field(default="0.1.0")
+    recent_turns: list[SubZoneChatTurn] = Field(default_factory=list)
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
 class AreaSubZone(BaseModel):
     sub_zone_id: str = Field(..., min_length=1)
     zone_id: str = Field(..., min_length=1)
@@ -257,6 +329,7 @@ class AreaSubZone(BaseModel):
     key_interactions: list[AreaInteraction] = Field(default_factory=list)
     npcs: list[AreaNpc] = Field(default_factory=list)
     state: SubZoneState = Field(default_factory=SubZoneState)
+    chat_context: SubZoneChatContext = Field(default_factory=SubZoneChatContext)
 
 
 class AreaZone(BaseModel):
@@ -469,6 +542,33 @@ class NpcConversationState(BaseModel):
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
+class RoleDesire(BaseModel):
+    desire_id: str = Field(..., min_length=1)
+    kind: Literal["item", "place", "info", "bond", "secret", "help"] = "info"
+    title: str = Field(..., min_length=1)
+    summary: str = Field(default="", min_length=0)
+    intensity: int = Field(default=50, ge=0, le=100)
+    status: Literal["latent", "active", "surfaced", "quest_linked", "resolved", "expired"] = "latent"
+    visibility: Literal["hidden", "hinted", "explicit"] = "hidden"
+    preferred_surface: Literal["public_scene", "team_chat", "area_arrival", "encounter_aftermath", "private_chat"] = "public_scene"
+    target_refs: list["EntityRef"] = Field(default_factory=list)
+    linked_quest_id: str | None = None
+    cooldown_until: str | None = None
+    last_surfaced_at: str | None = None
+
+
+class RoleStoryBeat(BaseModel):
+    beat_id: str = Field(..., min_length=1)
+    title: str = Field(..., min_length=1)
+    summary: str = Field(default="", min_length=0)
+    affinity_required: int = Field(default=60, ge=0, le=100)
+    min_days_in_team: int = Field(default=2, ge=0, le=3650)
+    status: Literal["locked", "ready", "surfaced", "completed", "cooldown"] = "locked"
+    preferred_surface: Literal["team_chat", "area_arrival", "passive_turn", "encounter_aftermath"] = "team_chat"
+    last_surfaced_at: str | None = None
+    completed_at: str | None = None
+
+
 class NpcRoleCard(BaseModel):
     role_id: str = Field(..., min_length=1)
     name: str = Field(..., min_length=1)
@@ -486,9 +586,12 @@ class NpcRoleCard(BaseModel):
     alignment: str = Field(default="", min_length=0)
     secret: str = Field(default="", min_length=0)
     likes: list[str] = Field(default_factory=list)
+    desires: list[RoleDesire] = Field(default_factory=list)
+    story_beats: list[RoleStoryBeat] = Field(default_factory=list)
     talkative_current: int = Field(default=100, ge=0, le=100)
     talkative_maximum: int = Field(default=100, ge=1, le=100)
     last_private_chat_at: str | None = None
+    last_public_turn_at: str | None = None
     profile: PlayerStaticData = Field(default_factory=lambda: PlayerStaticData(role_type="npc"))
     relations: list[RoleRelation] = Field(default_factory=list)
     cognition_changes: list[str] = Field(default_factory=list)
@@ -529,6 +632,37 @@ class StoryNpcSummary(BaseModel):
     zone_id: str | None = None
     sub_zone_id: str | None = None
     relation_tag: str | None = None
+
+
+class RoleDriveSummary(BaseModel):
+    role_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    desires: list[RoleDesire] = Field(default_factory=list)
+    story_beats: list[RoleStoryBeat] = Field(default_factory=list)
+
+
+class PublicSceneActorCandidate(BaseModel):
+    role_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    actor_type: Literal["npc", "team"] = "npc"
+    priority_reason: str = Field(default="", min_length=0)
+    surfaced_desire_ids: list[str] = Field(default_factory=list)
+    surfaced_story_beat_ids: list[str] = Field(default_factory=list)
+
+
+class SubZoneReputationEntry(BaseModel):
+    sub_zone_id: str = Field(..., min_length=1)
+    zone_id: str | None = None
+    score: int = Field(default=50, ge=0, le=100)
+    band: Literal["hostile", "cold", "neutral", "trusted", "favored"] = "neutral"
+    recent_reasons: list[str] = Field(default_factory=list)
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class ReputationState(BaseModel):
+    version: str = Field(default="0.1.0")
+    entries: list[SubZoneReputationEntry] = Field(default_factory=list)
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 class StoryQuestSummary(BaseModel):
@@ -576,6 +710,35 @@ class GlobalStorySnapshot(BaseModel):
     current_fate_phase_id: str | None = None
     recent_encounter_ids: list[str] = Field(default_factory=list)
     recent_game_log_refs: list[str] = Field(default_factory=list)
+
+
+class EncounterOutcomeChange(BaseModel):
+    target_id: str = Field(..., min_length=1)
+    delta: int = 0
+    summary: str = Field(default="", min_length=0)
+
+
+class EncounterOutcomePackage(BaseModel):
+    result: Literal["success", "failure"] = "success"
+    reputation_delta: int = 0
+    npc_relation_deltas: list[EncounterOutcomeChange] = Field(default_factory=list)
+    team_deltas: list[EncounterOutcomeChange] = Field(default_factory=list)
+    item_rewards: list[InventoryItem] = Field(default_factory=list)
+    buff_rewards: list[RoleBuff] = Field(default_factory=list)
+    resource_deltas: list[str] = Field(default_factory=list)
+    narrative_summary: str = Field(default="", min_length=0)
+
+
+class PublicSceneState(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    current_zone_id: str | None = None
+    current_sub_zone_id: str | None = None
+    current_reputation: SubZoneReputationEntry | None = None
+    visible_npcs: list[StoryNpcSummary] = Field(default_factory=list)
+    team_members: list[StoryNpcSummary] = Field(default_factory=list)
+    candidate_actors: list[PublicSceneActorCandidate] = Field(default_factory=list)
+    surfaced_drives: list[RoleDriveSummary] = Field(default_factory=list)
+    active_encounter: "EncounterEntry | None" = None
 
 
 class NpcKnowledgeSnapshot(BaseModel):
@@ -631,7 +794,7 @@ class TeamState(BaseModel):
 
 
 class SaveFile(BaseModel):
-    version: str = Field(default="1.2.0")
+    version: str = Field(default="1.4.0")
     session_id: str = Field(..., min_length=1)
     world_state: WorldState = Field(default_factory=WorldState)
     map_snapshot: MapSnapshot = Field(default_factory=MapSnapshot)
@@ -642,6 +805,7 @@ class SaveFile(BaseModel):
     player_runtime_data: PlayerRuntimeData = Field(default_factory=PlayerRuntimeData)
     role_pool: list[NpcRoleCard] = Field(default_factory=list)
     team_state: TeamState = Field(default_factory=TeamState)
+    reputation_state: ReputationState = Field(default_factory=ReputationState)
     quest_state: QuestState = Field(default_factory=lambda: QuestState())
     encounter_state: EncounterState = Field(default_factory=lambda: EncounterState())
     fate_state: FateState = Field(default_factory=lambda: FateState())
@@ -852,12 +1016,17 @@ class EncounterEntry(BaseModel):
     player_presence: Literal["engaged", "away"] = "engaged"
     related_quest_ids: list[str] = Field(default_factory=list)
     related_fate_phase_ids: list[str] = Field(default_factory=list)
+    participant_role_ids: list[str] = Field(default_factory=list)
     generated_prompt_tags: list[str] = Field(default_factory=list)
     allow_player_prompt: bool = True
     termination_conditions: list["EncounterTerminationCondition"] = Field(default_factory=list)
     steps: list["EncounterStepEntry"] = Field(default_factory=list)
     scene_summary: str = Field(default="", min_length=0)
     latest_outcome_summary: str = Field(default="", min_length=0)
+    situation_start_value: int = Field(default=50, ge=0, le=100)
+    situation_value: int = Field(default=50, ge=0, le=100)
+    situation_trend: Literal["improving", "stable", "worsening"] = "stable"
+    last_outcome_package: "EncounterOutcomePackage | None" = None
     background_tick_count: int = Field(default=0, ge=0)
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     presented_at: str | None = None
@@ -889,6 +1058,10 @@ class EncounterResolution(BaseModel):
     reply: str = Field(..., min_length=1)
     time_spent_min: int = Field(default=1, ge=1)
     quest_updates: list[str] = Field(default_factory=list)
+    situation_delta: int = 0
+    situation_value_after: int = Field(default=50, ge=0, le=100)
+    reputation_delta: int = 0
+    applied_outcome_summaries: list[str] = Field(default_factory=list)
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -1091,18 +1264,51 @@ class ActionCheckRequest(BaseModel):
     action_prompt: str = Field(..., min_length=1)
     actor_role_id: str | None = None
     forced_dice_roll: int | None = Field(default=None, ge=1, le=20)
+    allow_backend_roll: bool = False
+    resolution_context: Literal["standalone", "embedded"] = "standalone"
+    planned_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
+    planned_dc: int | None = Field(default=None, ge=5, le=30)
+    planned_time_spent_min: int | None = Field(default=None, ge=1, le=180)
+    planned_requires_check: bool | None = None
+    planned_check_task: str | None = None
     config: ChatConfig | None = None
+
+
+class ActionCheckPlanRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    action_type: Literal["attack", "check", "item_use"] = "check"
+    action_prompt: str = Field(..., min_length=1)
+    actor_role_id: str | None = None
+    config: ChatConfig | None = None
+
+
+class ActionCheckPlanResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    actor_role_id: str
+    actor_name: str
+    actor_kind: Literal["player", "npc"] = "player"
+    action_type: Literal["attack", "check", "item_use"]
+    requires_check: bool
+    ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"]
+    ability_modifier: int
+    dc: int
+    time_spent_min: int = Field(ge=1)
+    check_task: str = Field(default="", min_length=0)
 
 
 class ActionCheckResponse(BaseModel):
     ok: bool = True
     session_id: str
     actor_role_id: str
+    actor_name: str
+    actor_kind: Literal["player", "npc"] = "player"
     action_type: Literal["attack", "check", "item_use"]
     requires_check: bool
     ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"]
     ability_modifier: int
     dc: int
+    check_task: str = Field(default="", min_length=0)
     dice_roll: int | None = None
     total_score: int | None = None
     success: bool
@@ -1321,6 +1527,26 @@ class StorySnapshotResponse(BaseModel):
     snapshot: GlobalStorySnapshot
 
 
+class ReputationStateResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    reputation_state: ReputationState
+    current_entry: SubZoneReputationEntry | None = None
+
+
+class RoleDrivesResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    scope: Literal["role", "team", "current_sub_zone"] = "current_sub_zone"
+    items: list[RoleDriveSummary] = Field(default_factory=list)
+
+
+class PublicSceneStateResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    public_scene_state: PublicSceneState
+
+
 class NpcKnowledgeResponse(BaseModel):
     ok: bool = True
     session_id: str
@@ -1469,6 +1695,7 @@ class InventoryInteractRequest(BaseModel):
     item_id: str = Field(..., min_length=1)
     mode: Literal["inspect", "use"] = "inspect"
     prompt: str = Field(default="", min_length=0)
+    action_check: ActionCheckResponse | None = None
     config: ChatConfig | None = None
 
 
@@ -1529,4 +1756,6 @@ class PlayerStaminaAdjustRequest(BaseModel):
     amount: int = Field(default=1, ge=1)
 
 
+RoleDesire.model_rebuild()
+PublicSceneState.model_rebuild()
 EncounterEntry.model_rebuild()

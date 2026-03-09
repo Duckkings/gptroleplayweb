@@ -1,223 +1,152 @@
-# 核心玩法技术文档（Gameplay Core Technical）
-## 设计来源
-- `docs/design/gamedesign/gamedesign.md`
-- `docs/design/gamedesign/worldmapdesign.md`
-- `docs/design/gamedesign/roledesign.md`
-- `docs/design/gamedesign/teamdesign.md`
-- `docs/design/gamedesign/savedesign.md`
-- `docs/design/gamedesign/debugdesign.md`
-- `docs/design/gamedesign/actiondesign.md`
+# 核心玩法技术文档
 
-更新于 `2026-03-08`。
+更新日期：`2026-03-09`
 
-## 1. 核心术语
-- `Zone`：世界地图区块
-- `AreaSnapshot`：区域层状态快照
-- `MapSnapshot`：地图层状态快照
-- `PlayerStaticData`：玩家长期静态数据
-- `PlayerRuntimeData`：玩家运行时数据
-- `NpcRoleCard`：NPC 角色卡
-- `TeamState`：当前队伍状态
-- `SaveFile`：统一持久化对象
+## 1. 范围
+本文描述当前版本的主聊天、公开场景、遭遇、任务/命运阻塞规则，以及前后端之间的主流程约束。
 
-## 2. 坐标与耗时
-- 坐标单位：
-  - `x / y` 为米
-  - `z` 为扩展字段
-- 统一耗时：
-  - `distance_m = distance((x1,y1,z1),(x2,y2,z2))`
-  - `duration_h = distance_m / move_speed_mph`
-  - `duration_min = ceil(duration_h * 60)`
+核心目标只有一条：玩家在主聊天中做出的明确玩法行为，必须由后端真实落地，而不是只由 AI 写成一段看似发生过的文本。
 
-## 3. API 归类（`/api/v1`）
-### 3.1 地图
-- `POST /world-map/regions/generate`
-- `POST /world-map/render`
-- `POST /world-map/move`
+## 2. 当前核心流程
 
-### 3.2 区域与交互
-- `POST /world/clock/init`
-- `GET /world/area/current`
-- `POST /world/area/move-sub-zone`
-- `POST /world/area/interactions/discover`
-- `POST /world/area/interactions/execute`
+### 2.1 主聊天回合
+`POST /api/v1/chat` 与 `POST /api/v1/chat/stream` 都走同一条主链路：
+1. 读取当前 `SaveFile`
+2. 解析最后一条玩家输入
+3. 调用 `route_main_turn_intent(...)`
+4. 若命中确定性玩法动作，则先执行后端真实逻辑
+5. 若未命中，进入模型主聊天与工具调用
+6. 推进公开场景导演器
+7. 推进活跃遭遇或后台遭遇
+8. 写入 `tool_events`、`scene_events`、`game_logs`
+9. 返回 `reply.content`
 
-### 3.3 聊天与角色
-- `POST /chat`
-- `POST /chat/stream`
-- `POST /npc/greet`
-- `POST /npc/chat`
-- `POST /npc/chat/stream`
-- `GET /role-pool`
-- `GET /role-pool/{role_id}`
-- `POST /role-pool/{role_id}/relate-player`
-- `POST /role-pool/{role_id}/relations`
+### 2.2 后端路由优先原则
+`backend/app/services/chat_service.py::route_main_turn_intent(...)` 当前优先处理：
+- `move_to_zone`
+- `move_to_sub_zone`
+- `inventory_mutate`
+- `inventory_interact`
+- `team_invite_npc`
+- `team_remove_npc`
+- `encounter_escape`
+- `encounter_rejoin`
+- `encounter_act`
+- 当前可见 NPC 的公开点名
+- `passive_turn`
 
-### 3.4 队伍
-- `GET /team`
-- `POST /team/invite`
-- `POST /team/leave`
-- `POST /team/chat`
-- `POST /team/debug/generate`
+命中条件固定为：
+- 有明确动词
+- 有合法实体匹配
+- 当前状态允许执行
 
-### 3.5 玩家与检定
-- `GET /player/static`
-- `POST /player/static`
-- `GET /player/runtime`
-- `POST /player/runtime`
-- `POST /actions/check`
+否则回落给模型自由叙事或工具决策。
 
-### 3.6 叙事系统
-- `GET /quests`
-- `POST /quests/publish`
-- `POST /quests/{quest_id}/accept`
-- `POST /quests/{quest_id}/reject`
-- `POST /quests/{quest_id}/track`
-- `POST /quests/{quest_id}/evaluate`
-- `POST /quests/evaluate-all`
-- `GET /encounters/pending`
-- `POST /encounters/check`
-- `POST /encounters/{encounter_id}/present`
-- `POST /encounters/{encounter_id}/act`
-- `GET /fate/current`
-- `POST /fate/debug/generate`
-- `POST /fate/debug/regenerate`
-- `POST /fate/evaluate`
+## 3. 公开场景导演器
 
-### 3.7 一致性与存档
-- `GET /story/snapshot`
-- `GET /story/entity-index`
-- `GET /consistency/status`
-- `POST /consistency/run`
-- `GET /storage/config/path`
-- `POST /storage/config/path`
-- `GET /saves/current`
-- `POST /saves/import`
-- `POST /saves/clear`
+### 3.1 服务位置
+- `backend/app/services/public_scene_service.py`
+- `backend/app/services/world_service.py::advance_public_scene_in_save(...)` 只是兼容入口，实际逻辑已转发到导演器服务
 
-## 4. 状态机
-### 4.1 地图
-- `closed -> loading -> ready -> (moving | error)`
+### 3.2 固定顺序
+每个主聊天回合的公开区域推进顺序固定为：
+1. 玩家动作
+2. GM 直接反馈
+3. 导演器选择最多 4 名非玩家行动体逐个行动
+4. 其余角色合并为 crowd summary
 
-### 4.2 存档
-- `idle -> (saving | loading | clearing) -> (idle | error)`
+### 3.3 行动体优先级
+- 被玩家点名的当前可见 NPC
+- 当前活跃遭遇锚点角色
+- 本轮刚浮出 desire/story 的队友
+- 与玩家动作直接相关的队友或 NPC
+- 其余旁观者
 
-### 4.3 玩家面板
-- `idle -> editing -> saving -> (idle | error)`
+### 3.4 输出约束
+- AI 的行动意图只允许输出结构化 actor intent JSON
+- 检定结果由后端完成
+- 公开动作只能写入 `scene_events`、`SubZoneChatTurn.events`、`game_logs`
+- 不允许直接拼进 `reply.content`
 
-### 4.4 主聊天 / 单聊
-- 主聊天：`idle -> (sending | streaming) -> (idle | error)`
-- NPC 单聊：`idle -> waiting_greet(blocking) -> (sending | streaming) -> (idle | error)`
+### 3.5 当前 scene event
+当前主聊天会把以下公开事件送到前端：
+- `public_actor_resolution`
+- `role_desire_surface`
+- `companion_story_surface`
+- `reputation_update`
+- `encounter_situation_update`
+- `encounter_started`
+- `encounter_progress`
+- `encounter_resolution`
 
-### 4.5 队伍
-- 队伍面板：`closed -> loading -> ready -> closed`
-- 招募流程：`idle -> inviting -> (accepted | rejected | error)`
-- 队友离队：`active -> leaving -> (closed | error)`
-- 队伍聊天：`idle -> sending -> (ready | error)`
-- 调试队友生成：`idle -> generating -> (ready | error)`
-- 队友背包详情：`closed -> ready -> closed`
+同时仍保留兼容用事件：
+- `public_targeted_npc_reply`
+- `public_bystander_reaction`
+- `team_public_reaction`
 
-### 4.6 行为检定
-- 检定表单：`idle -> submitting -> idle`
-- 投骰模态：`closed -> ready(blocking) -> rolling(blocking) -> resolving(blocking) -> (resolved | error) -> closed`
+## 4. 阻塞规则
 
-## 5. 队伍相关核心交互
-### 5.1 自动反馈
-以下行为后会触发队友反馈：
-- 主聊天
-- NPC 单聊
-- 大区块移动
-- 子区块移动
-- 行为检定
+### 4.1 模态优先级
+固定为：
+1. `Quest/Fate`
+2. `Encounter`
+3. 主聊天
 
-### 5.2 队伍聊天
-- 玩家从队伍面板发送一句话
-- 后端推进世界时间
-- 每个当前队友返回一次短回应
-- 回应写入：
-  - 角色卡 `dialogue_logs`
-  - `team_state.reactions(trigger_kind=team_chat)`
-  - `game_logs(kind=team_chat)`
+### 4.2 不变规则
+- 所有模态都会阻塞聊天输入
+- Fate quest 仍是 accept-only
+- 普通 quest 仍允许 accept/reject，但走模态
+- `quest accept/reject` 仍不开放给主聊天自由文本直接完成
 
-### 5.3 队友背包查看
-- 前端队伍面板通过 `RoleInventoryModal` 展示队友背包
-- 数据来自 `NpcRoleCard.profile.dnd5e_sheet`
-- 当前阶段只读
+## 5. 主聊天与遭遇的联动
 
-## 6. 行为检定协议
-### 6.1 前端阶段
-1. 记录待执行检定 payload
-2. 打开 `ActionCheckRollModal`
-3. 玩家点击空白区域，本地生成 `1..20` 的 `d20`
-4. 将 `forced_dice_roll` 一并发给后端
-5. 后端返回结算结果
-6. 前端展示比较并等待继续
+### 5.1 活跃遭遇存在时
+- 主聊天回合可能被路由为 `encounter_act`
+- 公开场景中的 NPC/队友行动也可以修改当前 `situation_value`
+- 主聊天结束后仍会检查活跃遭遇是否需要继续推进或结算
 
-### 6.2 后端阶段
-- 接口：`POST /actions/check`
-- 当 `forced_dice_roll` 存在时，服务端必须使用该点数
-- 当前目的：保证前端动画与后端真实结算一致
+### 5.2 被遭遇打断时
+- NPC 单聊会被强制切回主聊天
+- 遭遇结果通过 scene events 和 encounter lane 展示
+- 结算后不会自动回到之前的 NPC 单聊上下文
 
-## 7. 前端实现落点
-- 主状态：`frontend/src/App.tsx`
-- 队伍面板：`frontend/src/components/TeamPanel.tsx`
-- 队友背包模态：`frontend/src/components/RoleInventoryModal.tsx`
-- NPC 池：`frontend/src/components/NpcPoolPanel.tsx`
-- 投骰模态：`frontend/src/components/ActionCheckRollModal.tsx`
-- API 层：`frontend/src/services/api.ts`
-- 类型层：`frontend/src/types/app.ts`
+## 6. API 总览
 
-## 8. 错误处理
-- 若招募失败或被拒绝：
-  - 不阻断主会话
-  - 只更新配置提示或反馈文案
-  - 不污染当前队伍状态
-- 若队伍聊天失败：
-  - 队伍面板保持打开
-  - 不清空现有队伍状态
-  - 不写入伪响应
-- 若检定请求失败：
-  - 投骰模态进入 `error(blocking)`
-  - 允许玩家显式退出
+### 6.1 主链路
+- `POST /api/v1/chat`
+- `POST /api/v1/chat/stream`
 
-## 9. 错误码约定
-- `400` 参数错误
-- `404` 资源不存在
-- `409` 状态冲突
-- `422` schema 校验失败
-- `429` 上游限流
-- `502` 上游模型错误
+### 6.2 公开状态读取
+- `GET /api/v1/scene/public-state`
+- `GET /api/v1/reputation/current`
+- `GET /api/v1/role-drives`
 
-## 10. 结构说明
-- JSON 数据结构统一维护在：
-  - `backend/app/models/schemas.py`
-  - `frontend/src/types/app.ts`
-- 详细协议变化需要同步更新：
-  - `team-technical.md`
-  - `role-technical.md`
-  - `ai-tool-protocol.md`
-## 2026-03-08 Addendum
-### 新增 Inventory API
-- `POST /api/v1/inventory/equip`
-- `POST /api/v1/inventory/unequip`
-- `POST /api/v1/inventory/interact`
+### 6.3 遭遇
+- `GET /api/v1/encounters/pending`
+- `GET /api/v1/encounters/history`
+- `POST /api/v1/encounters/check`
+- `POST /api/v1/encounters/{encounter_id}/present`
+- `POST /api/v1/encounters/{encounter_id}/act`
+- `POST /api/v1/encounters/{encounter_id}/escape`
+- `POST /api/v1/encounters/{encounter_id}/rejoin`
+- `GET /api/v1/encounters/debug/overview`
 
-### Inventory 统一规则
-- `player` 与 `role` 共用 `InventoryOwnerRef`
-- `weapon/armor` 走 `equip/unequip`
-- `misc` 物品支持 `inspect/use`
-- `inspect` 不走检定
-- `use` 只对 `misc` 开放，必要时会进入 `action_check`
-- 物品 `uses_left` 仅在成功 `use` 时扣减
+## 7. 前端联动点
+- `frontend/src/App.tsx` 负责主聊天、scene events、encounter lane 和模态优先级
+- `frontend/src/components/SubZoneContextPanel.tsx` 渲染公开事件
+- `frontend/src/components/EncounterLane.tsx` 与 `frontend/src/components/EncounterModal.tsx` 渲染局势值、趋势和结果摘要
+- `frontend/src/components/PlayerPanel.tsx` 渲染当前子区块声望
+- `frontend/src/components/TeamPanel.tsx` 与 `frontend/src/components/RoleProfileModal.tsx` 渲染欲望与故事
 
-### 遭遇模态状态机
-- `pendingEncounter` 已进入统一阻塞条件
-- 单聊状态下触发遭遇时，前端会先切回主聊天，再展示遭遇模态
-- 遭遇结算后的后续输入目标始终是主聊天
+## 8. 当前限制
+- 公开场景导演器是叙事轮值器，不是完整战斗先攻系统
+- `crowd_summary` 目前只做摘要，不单独拥有检定和关系结算
+- 队友故事默认只是公开话题或队伍聊天入口，不强制升级成任务
 
-### 队友/玩家物品交互前端链路
-- 新增共享组件：
-  - `CharacterInventoryModal`
-  - `ItemInteractionModal`
-  - `RoleProfileModal`
-- 玩家背包与队友背包现在都走共享 UI 和共享后端协议
+## 9. 回归测试
+- `backend/tests/test_chat_route_scene_rendering.py`
+- `backend/tests/test_action_check_routes.py`
+- `backend/tests/test_npc_chat_routes.py`
+- `backend/tests/test_role_system.py`
+- `backend/tests/test_encounter_service.py`
+

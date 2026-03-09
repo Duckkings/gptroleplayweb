@@ -1,4 +1,5 @@
 ﻿import type {
+  ActionCheckPlan,
   ActionCheckResult,
   AreaMoveResult,
   AreaSnapshot,
@@ -36,7 +37,10 @@
   PathStatus,
   PlayerRuntimeData,
   PlayerStaticData,
+  PublicSceneStateResponse,
+  ReputationStateResponse,
   RenderResult,
+  RoleDrivesResponse,
   SaveFile,
   SceneEvent,
   StorySnapshotResponse,
@@ -151,7 +155,7 @@ export async function streamChat(
   handlers: {
     onDelta: (delta: string) => void;
     onError: (message: string) => void;
-    onEnd: () => void;
+    onEnd: (payload: { archived_sub_zone_turn_id?: string | null }) => void;
     onUsage: (usage: Usage) => void;
     onTimeSpent: (minutes: number) => void;
     onToolEvents: (events: ToolEvent[]) => void;
@@ -182,11 +186,11 @@ export async function streamChat(
 
   const decoder = new TextDecoder();
   let buffer = '';
+  let terminalEventReceived = false;
 
   while (true) {
     const { value, done } = await reader.read();
     if (done) {
-      handlers.onEnd();
       break;
     }
 
@@ -207,22 +211,29 @@ export async function streamChat(
           tool_events?: ToolEvent[];
           scene_events?: SceneEvent[];
           time_spent_min?: number;
+          archived_sub_zone_turn_id?: string | null;
         };
         if (event === 'delta') {
           handlers.onDelta(data.content ?? '');
         } else if (event === 'error') {
+          terminalEventReceived = true;
           handlers.onError(data.message ?? '未知错误');
         } else if (event === 'end') {
+          terminalEventReceived = true;
           handlers.onUsage(data.usage ?? { input_tokens: 0, output_tokens: 0 });
           handlers.onTimeSpent(data.time_spent_min ?? 0);
           handlers.onToolEvents(data.tool_events ?? []);
           handlers.onSceneEvents(data.scene_events ?? []);
-          handlers.onEnd();
+          handlers.onEnd({ archived_sub_zone_turn_id: data.archived_sub_zone_turn_id ?? null });
         }
       } catch {
         handlers.onError('流消息解析失败');
       }
     }
+  }
+
+  if (!terminalEventReceived) {
+    handlers.onEnd({ archived_sub_zone_turn_id: null });
   }
 }
 
@@ -605,6 +616,34 @@ export async function getFateState(sessionId: string, report?: DebugReporter): P
   return requestJson(`/fate/current?session_id=${encodeURIComponent(sessionId)}`, { method: 'GET' }, report);
 }
 
+export async function getAreaReputation(
+  sessionId: string,
+  payload?: { sub_zone_id?: string | null },
+  report?: DebugReporter,
+): Promise<ReputationStateResponse> {
+  const suffix = payload?.sub_zone_id ? `&sub_zone_id=${encodeURIComponent(payload.sub_zone_id)}` : '';
+  return requestJson(`/reputation/current?session_id=${encodeURIComponent(sessionId)}${suffix}`, { method: 'GET' }, report);
+}
+
+export async function getRoleDrives(
+  sessionId: string,
+  payload?: { scope?: 'role' | 'team' | 'current_sub_zone'; role_id?: string | null },
+  report?: DebugReporter,
+): Promise<RoleDrivesResponse> {
+  const params = new URLSearchParams({ session_id: sessionId });
+  if (payload?.scope) {
+    params.set('scope', payload.scope);
+  }
+  if (payload?.role_id) {
+    params.set('role_id', payload.role_id);
+  }
+  return requestJson(`/role-drives?${params.toString()}`, { method: 'GET' }, report);
+}
+
+export async function getPublicSceneState(sessionId: string, report?: DebugReporter): Promise<PublicSceneStateResponse> {
+  return requestJson(`/scene/public-state?session_id=${encodeURIComponent(sessionId)}`, { method: 'GET' }, report);
+}
+
 export async function generateFate(
   payload: { session_id: string; config?: AppConfig },
   report?: DebugReporter,
@@ -828,6 +867,7 @@ export async function interactInventoryItem(
     item_id: string;
     mode: 'inspect' | 'use';
     prompt: string;
+    action_check?: ActionCheckResult | null;
     config?: AppConfig;
   },
   report?: DebugReporter,
@@ -1189,6 +1229,28 @@ export async function executeAreaInteraction(
 }
 
 
+export async function planActionCheck(
+  payload: {
+    session_id: string;
+    action_type: 'attack' | 'check' | 'item_use';
+    action_prompt: string;
+    actor_role_id?: string;
+    config?: AppConfig;
+  },
+  report?: DebugReporter,
+): Promise<ActionCheckPlan> {
+  return requestJson(
+    '/actions/check/plan',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+
 export async function runActionCheck(
   payload: {
     session_id: string;
@@ -1196,6 +1258,13 @@ export async function runActionCheck(
     action_prompt: string;
     actor_role_id?: string;
     forced_dice_roll?: number;
+    allow_backend_roll?: boolean;
+    resolution_context?: 'standalone' | 'embedded';
+    planned_ability_used?: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
+    planned_dc?: number;
+    planned_time_spent_min?: number;
+    planned_requires_check?: boolean;
+    planned_check_task?: string;
     config?: AppConfig;
   },
   report?: DebugReporter,

@@ -42,7 +42,7 @@ export function TeamPanel({
       <header className="chat-header">
         <div>
           <h2>当前队伍</h2>
-          <p>成员 {state.members.length}，可发起队伍聊天，查看队友完整属性或背包，并进入单聊。</p>
+          <p>成员 {state.members.length}，可发起队伍聊天、查看队友属性与背包，并进入单聊。</p>
         </div>
         <div className="actions">
           <button onClick={onRefresh}>刷新</button>
@@ -127,9 +127,13 @@ export function TeamPanel({
                     <p>状态: {role.state}</p>
                     <p>性格: {role.personality || '-'}</p>
                     <p>说话方式: {role.speaking_style || '-'}</p>
-                    <p>种族/职业: {role.profile.dnd5e_sheet.race || '-'} / {role.profile.dnd5e_sheet.char_class || '-'}</p>
+                    <p>
+                      种族/职业: {role.profile.dnd5e_sheet.race || '-'} / {role.profile.dnd5e_sheet.char_class || '-'}
+                    </p>
                     <p>背包金币: {inventory?.gold ?? 0}</p>
                     <p>背包物品: {(inventory?.items ?? []).map((item) => item.name).join(', ') || '无'}</p>
+                    <p>欲望: {role.desires.map((item) => `${item.title}(${item.status})`).join(' / ') || '暂无'}</p>
+                    <p>故事节点: {role.story_beats.map((item) => `${item.title}(${item.status})`).join(' / ') || '暂无'}</p>
                   </>
                 )}
               </article>
