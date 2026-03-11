@@ -109,13 +109,74 @@ export type ToolEvent = {
   payload: Record<string, string | number | boolean>;
 };
 
+export type JsonPrimitive = string | number | boolean | null;
+export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+
+export type PublicActorActionMetadata = {
+  response_mode?: 'respond' | 'ignore' | 'none';
+  incoming_from_actor_id?: string;
+  incoming_from_actor_name?: string;
+  incoming_summary?: string;
+  incoming_reaction_narration?: string;
+  incoming_reaction_speech?: string;
+  ignore_reason?: string;
+  external_action_narration?: string;
+  speech_line?: string;
+  visible_intent?: string;
+  private_goal?: string;
+  private_reason?: string;
+  expression_cues?: string;
+  body_language?: string;
+  risk_source?: string;
+  risk_object?: string;
+  risk_location?: string;
+  specific_threat?: string;
+  target_label?: string;
+  needs_check?: boolean;
+  action_type?: 'check' | 'attack' | 'item_use';
+  situation_delta_hint?: number;
+  actor_type?: 'npc' | 'team' | 'encounter_temp_npc' | 'system';
+};
+
+export type PublicRoundResolutionRow = {
+  actor_id: string;
+  actor_name: string;
+  result: string;
+  affected_object: string;
+  concrete_effect: string;
+  opened_opportunity: string;
+  new_pressure: string;
+};
+
+export type PublicRoundResolutionMetadata = {
+  situation_value_before?: number;
+  situation_value_after?: number;
+  direction?: 'stabilize' | 'hold' | 'worsen';
+  trend?: 'improving' | 'stable' | 'worsening';
+  result_rows?: PublicRoundResolutionRow[];
+  actor_type?: 'system';
+};
+
+export type EncounterSituationMetadata = {
+  encounter_id?: string;
+  encounter_title?: string;
+  situation_value?: number;
+  situation_delta?: number;
+  direction?: 'stabilize' | 'hold' | 'worsen';
+  trend?: 'improving' | 'stable' | 'worsening';
+  summary_basis?: 'numeric' | 'fallback';
+  actor_type?: 'npc' | 'team' | 'encounter_temp_npc' | 'system';
+};
+
 export type SceneEvent = {
   event_id: string;
   kind:
     | 'public_targeted_npc_reply'
     | 'public_bystander_reaction'
     | 'team_public_reaction'
+    | 'public_actor_action'
     | 'public_actor_resolution'
+    | 'public_round_resolution'
     | 'role_desire_surface'
     | 'companion_story_surface'
     | 'reputation_update'
@@ -127,7 +188,7 @@ export type SceneEvent = {
   actor_role_id: string | null;
   actor_name: string;
   content: string;
-  metadata: Record<string, string | number | boolean>;
+  metadata: Record<string, JsonValue>;
   created_at: string;
 };
 
@@ -323,6 +384,7 @@ export type EncounterEntry = {
   related_quest_ids: string[];
   related_fate_phase_ids: string[];
   participant_role_ids: string[];
+  temporary_npcs: EncounterTemporaryNpc[];
   generated_prompt_tags: string[];
   allow_player_prompt: boolean;
   termination_conditions: EncounterTerminationCondition[];
@@ -350,12 +412,23 @@ export type EncounterTerminationCondition = {
 
 export type EncounterStepEntry = {
   step_id: string;
-  kind: 'announcement' | 'player_action' | 'gm_update' | 'npc_reaction' | 'team_reaction' | 'escape_attempt' | 'background_tick' | 'resolution';
-  actor_type: 'player' | 'npc' | 'team' | 'system';
+  kind: 'announcement' | 'player_action' | 'gm_update' | 'npc_reaction' | 'team_reaction' | 'temp_npc_action' | 'escape_attempt' | 'background_tick' | 'resolution';
+  actor_type: 'player' | 'npc' | 'team' | 'encounter_temp_npc' | 'system';
   actor_id: string;
   actor_name: string;
   content: string;
   created_at: string;
+};
+
+export type EncounterTemporaryNpc = {
+  encounter_npc_id: string;
+  name: string;
+  title: string;
+  description: string;
+  speaking_style: string;
+  agenda: string;
+  state: string;
+  introduced_at: string;
 };
 
 export type EncounterResolution = {
@@ -564,15 +637,18 @@ export type SubZoneChatTurnEvent = {
     | 'npc_reply'
     | 'team_reply'
     | 'system_notice'
+    | 'public_actor_action'
     | 'public_actor_resolution'
+    | 'public_round_resolution'
     | 'role_desire_surface'
     | 'companion_story_surface'
     | 'reputation_update'
     | 'encounter_situation_update';
-  actor_type: 'npc' | 'team' | 'system';
+  actor_type: 'npc' | 'team' | 'encounter_temp_npc' | 'system';
   actor_id: string;
   actor_name: string;
   content: string;
+  metadata?: Record<string, JsonValue>;
 };
 
 export type SubZoneChatTurn = {
@@ -1035,7 +1111,7 @@ export type RoleDriveSummary = {
 export type PublicSceneActorCandidate = {
   role_id: string;
   name: string;
-  actor_type: 'npc' | 'team';
+  actor_type: 'npc' | 'team' | 'encounter_temp_npc';
   priority_reason: string;
   surfaced_desire_ids: string[];
   surfaced_story_beat_ids: string[];

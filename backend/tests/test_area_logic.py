@@ -19,6 +19,7 @@ from app.models.schemas import (
     PlayerStaticData,
     Position,
     RegionGenerateRequest,
+    MoveRequest,
     WorldClock,
     WorldClockInitRequest,
     Zone,
@@ -35,7 +36,9 @@ from app.services.world_service import (
     get_current_save,
     generate_regions,
     init_world_clock,
+    move_to_zone,
     move_to_sub_zone,
+    save_current,
 )
 from app.models.schemas import AreaMoveSubZoneRequest
 
@@ -246,6 +249,8 @@ class AreaLogicTests(unittest.TestCase):
         updated = get_current_save(session_id)
         self.assertEqual([z.zone_id for z in updated.map_snapshot.zones], ['zone_new'])
         self.assertEqual(sorted({z.zone_id for z in updated.area_snapshot.zones}), ['zone_new'])
+        self.assertEqual(updated.area_snapshot.current_zone_id, 'zone_new')
+        self.assertEqual(updated.area_snapshot.current_sub_zone_id, 'sub_zone_new_1')
         self.assertNotIn('npc_old', [r.role_id for r in updated.role_pool])
         self.assertTrue(all((r.zone_id == 'zone_new') for r in updated.role_pool))
 
@@ -303,6 +308,110 @@ class AreaLogicTests(unittest.TestCase):
         self.assertEqual(len(zones), 1)
         self.assertEqual(zones[0].name, '港埠区')
         self.assertEqual(zones[0].zone_type, 'coast')
+
+    def test_generate_regions_selects_sub_zone_closest_to_zone_center(self) -> None:
+        session_id = 'sess_generate_current_sub_zone'
+        clear_current_save(session_id)
+        generated_zone = Zone(
+            zone_id='zone_center_pick',
+            name='新城区',
+            x=120,
+            y=60,
+            z=0,
+            description='new',
+            tags=['new'],
+            sub_zones=[
+                ZoneSubZoneSeed(name='远街', offset_x=90, offset_y=0, offset_z=0, description='far'),
+                ZoneSubZoneSeed(name='中心广场', offset_x=5, offset_y=5, offset_z=0, description='near'),
+                ZoneSubZoneSeed(name='另一端', offset_x=-80, offset_y=-20, offset_z=0, description='far2'),
+            ],
+        )
+
+        with patch('app.services.world_service._ai_generate_zones', return_value=[generated_zone]):
+            generate_regions(
+                RegionGenerateRequest(
+                    session_id=session_id,
+                    config=ChatConfig(
+                        version='1.0.0',
+                        openai_api_key='sk-test',
+                        model='gpt-4.1-mini',
+                        stream=False,
+                        temperature=0.8,
+                        max_tokens=256,
+                        gm_prompt='test',
+                    ),
+                    player_position=Position(x=120, y=60, z=0, zone_id='zone_center_pick'),
+                    desired_count=1,
+                    max_count=1,
+                    world_prompt='test',
+                    force_regenerate=True,
+                )
+            )
+
+        updated = get_current_save(session_id)
+        self.assertEqual(updated.area_snapshot.current_zone_id, 'zone_center_pick')
+        self.assertEqual(updated.area_snapshot.current_sub_zone_id, 'sub_zone_center_pick_2')
+
+    def test_get_area_current_backfills_missing_current_sub_zone(self) -> None:
+        session_id = 'sess_backfill_current_sub_zone'
+        self._seed_area(session_id)
+        save = get_current_save(session_id)
+        save.area_snapshot.current_sub_zone_id = None
+        save_current(save)
+
+        response = get_area_current(session_id)
+
+        self.assertEqual(response.area_snapshot.current_zone_id, 'zone_a')
+        self.assertEqual(response.area_snapshot.current_sub_zone_id, 'sub_a_1')
+
+    def test_move_to_zone_selects_default_current_sub_zone(self) -> None:
+        session_id = 'sess_move_zone_current_sub_zone'
+        save = clear_current_save(session_id)
+        save.session_id = session_id
+        save.map_snapshot.player_position = Position(x=0, y=0, z=0, zone_id='zone_from')
+        save.player_runtime_data.current_position = Position(x=0, y=0, z=0, zone_id='zone_from')
+        save.map_snapshot.zones = [
+            Zone(
+                zone_id='zone_from',
+                name='出发地',
+                x=0,
+                y=0,
+                z=0,
+                description='from',
+                tags=['from'],
+                sub_zones=[ZoneSubZoneSeed(name='起点', offset_x=0, offset_y=0, offset_z=0, description='start')],
+            ),
+            Zone(
+                zone_id='zone_to',
+                name='目的地',
+                x=300,
+                y=0,
+                z=0,
+                description='to',
+                tags=['to'],
+                sub_zones=[
+                    ZoneSubZoneSeed(name='远侧', offset_x=120, offset_y=0, offset_z=0, description='far'),
+                    ZoneSubZoneSeed(name='中心口', offset_x=8, offset_y=0, offset_z=0, description='near'),
+                ],
+            ),
+        ]
+        from app.services.world_service import save_current
+
+        save_current(save)
+
+        response = move_to_zone(
+            MoveRequest(
+                session_id=session_id,
+                from_zone_id='zone_from',
+                to_zone_id='zone_to',
+                player_name='Player',
+            )
+        )
+
+        self.assertEqual(response.new_position.zone_id, 'zone_to')
+        updated = get_current_save(session_id)
+        self.assertEqual(updated.area_snapshot.current_zone_id, 'zone_to')
+        self.assertEqual(updated.area_snapshot.current_sub_zone_id, 'sub_zone_to_2')
 
 
 if __name__ == '__main__':

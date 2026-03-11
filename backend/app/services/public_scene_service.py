@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
-from typing import Any
 
 from openai import OpenAI
 
@@ -12,6 +11,7 @@ from app.models.schemas import (
     ActionCheckRequest,
     ActionCheckResponse,
     ChatConfig,
+    EncounterTemporaryNpc,
     NpcRoleCard,
     PublicSceneActorCandidate,
     PublicSceneState,
@@ -26,7 +26,6 @@ from app.services.reputation_service import (
     apply_sub_zone_reputation_delta,
     get_current_sub_zone_reputation,
 )
-from app.services.roleplay_service import build_role_drive_summaries, surface_role_drives_for_scene
 from app.services.world_service import (
     _active_encounter_for_current_sub_zone,
     _append_npc_dialogue,
@@ -51,6 +50,10 @@ def _clamp(value: int, lower: int, upper: int) -> int:
     return max(lower, min(upper, int(value)))
 
 
+def _scene_context_json(scene_context: dict[str, object] | None) -> str:
+    return json.dumps(scene_context or {}, ensure_ascii=False, indent=2)
+
+
 def _team_role_map(save: SaveFile) -> dict[str, NpcRoleCard]:
     member_ids = {item.role_id for item in getattr(save.team_state, "members", [])}
     return {
@@ -64,8 +67,91 @@ def _team_member_by_role_id(save: SaveFile, role_id: str):
     return next((item for item in getattr(save.team_state, "members", []) if item.role_id == role_id), None)
 
 
-def _scene_context_json(scene_context: dict[str, object] | None) -> str:
-    return json.dumps(scene_context or {}, ensure_ascii=False, indent=2)
+def _encounter_temp_npcs(save: SaveFile) -> list[EncounterTemporaryNpc]:
+    active_encounter = _active_encounter_for_current_sub_zone(save)
+    if active_encounter is None or active_encounter.status != "active":
+        return []
+    return list(getattr(active_encounter, "temporary_npcs", []) or [])
+
+
+def _find_actor_name_match(name: str, text: str) -> bool:
+    clean_name = (name or "").strip()
+    clean_text = (text or "").strip()
+    return bool(clean_name and clean_text and clean_name in clean_text)
+
+
+def _scene_focus_label(save: SaveFile, player_text: str, gm_summary: str) -> str:
+    active_encounter = _active_encounter_for_current_sub_zone(save)
+    if active_encounter is not None:
+        for candidate in [
+            active_encounter.scene_summary,
+            active_encounter.title,
+            active_encounter.description,
+            gm_summary,
+            player_text,
+        ]:
+            clean = " ".join(str(candidate or "").split()).strip()
+            if clean:
+                return clean[:48]
+    for candidate in [gm_summary, player_text]:
+        clean = " ".join(str(candidate or "").split()).strip()
+        if clean:
+            return clean[:48]
+    return "当前场面"
+
+
+def _contains_concrete_marker(text: str) -> bool:
+    concrete_tokens = [
+        "书架",
+        "书页",
+        "桌面",
+        "地板",
+        "窗",
+        "门",
+        "锁",
+        "楼梯",
+        "墙",
+        "符文",
+        "影子",
+        "管理员",
+        "火",
+        "灯",
+        "绳",
+        "木板",
+        "脚步",
+        "柜",
+        "台阶",
+        "走廊",
+        "巷",
+        "血",
+        "石",
+        "箱",
+        "架",
+    ]
+    return any(token in (text or "") for token in concrete_tokens)
+
+
+def _looks_too_vague(text: str) -> bool:
+    clean = " ".join((text or "").split()).strip()
+    if not clean:
+        return True
+    vague_tokens = [
+        "危险",
+        "异常",
+        "变化",
+        "局势",
+        "紧张",
+        "不安",
+        "某种",
+        "似乎",
+        "仿佛",
+        "威胁",
+        "压力",
+        "进展",
+    ]
+    if any(token in clean for token in vague_tokens) and not _contains_concrete_marker(clean):
+        return True
+    return False
 
 
 def _relation_tag_after_delta(role: NpcRoleCard, player_id: str, delta: int) -> str:
@@ -83,65 +169,135 @@ def _relation_tag_after_delta(role: NpcRoleCard, player_id: str, delta: int) -> 
     return ladder[_clamp(index + shift, 0, len(ladder) - 1)]
 
 
-def _fallback_actor_intent(
-    role: NpcRoleCard,
+def _actor_check(
+    save: SaveFile,
+    actor_id: str,
     *,
-    actor_type: str,
+    action_type: str,
+    action_prompt: str,
+    config: ChatConfig | None,
+) -> ActionCheckResponse | None:
+    try:
+        return action_check(
+            ActionCheckRequest(
+                session_id=save.session_id,
+                actor_role_id=actor_id,
+                action_type=action_type,  # type: ignore[arg-type]
+                action_prompt=action_prompt,
+                allow_backend_roll=True,
+                resolution_context="embedded",
+                config=config,
+            )
+        )
+    except Exception:
+        return None
+
+
+def _check_bonus(action_result: ActionCheckResponse | None) -> int:
+    if action_result is None:
+        return 0
+    if action_result.critical == "critical_success":
+        return 8
+    if action_result.critical == "critical_failure":
+        return -8
+    return 4 if action_result.success else -4
+
+
+def _apply_actor_relation_delta(save: SaveFile, role: NpcRoleCard, actor_type: str, relation_delta: int, reputation_score: int) -> int:
+    applied = apply_reputation_relation_bias(reputation_score, relation_delta)
+    if applied == 0:
+        return 0
+    if actor_type == "team":
+        member = _team_member_by_role_id(save, role.role_id)
+        if member is not None:
+            member.affinity = _clamp(member.affinity + applied * 3, 0, 100)
+            member.trust = _clamp(member.trust + applied * 2, 0, 100)
+        return applied
+    next_tag = _relation_tag_after_delta(role, save.player_static_data.player_id, applied)
+    _upsert_npc_player_relation(role, save.player_static_data.player_id, next_tag, "公开场景轮次结算")
+    return applied
+
+
+def _actor_roleplay_brief(actor: dict[str, object]) -> str:
+    role = actor.get("role")
+    if isinstance(role, NpcRoleCard):
+        return _build_npc_roleplay_brief(role)
+    temp_npc = actor.get("temp_npc")
+    if isinstance(temp_npc, EncounterTemporaryNpc):
+        parts = [
+            f"姓名={temp_npc.name}",
+            f"头衔={temp_npc.title}",
+            f"描述={temp_npc.description}",
+            f"说话风格={temp_npc.speaking_style}",
+            f"当前意图={temp_npc.agenda}",
+        ]
+        return "；".join(part for part in parts if part and not part.endswith("="))
+    return str(actor.get("name") or "在场角色")
+
+
+def _fallback_actor_action(
+    save: SaveFile,
+    actor: dict[str, object],
+    *,
     player_text: str,
     gm_summary: str,
     priority_reason: str,
-    has_surfaced_drive: bool,
-    in_encounter: bool,
 ) -> dict[str, object]:
-    merged = f"{player_text}\n{gm_summary}".strip()
-    mentions_role = bool(role.name and role.name in merged)
-    positive = any(token in merged for token in ["谢谢", "帮", "合作", "一起", "线索", "冷静", "别怕"])
-    negative = any(token in merged for token in ["威胁", "攻击", "滚开", "抢", "打", "杀", "闭嘴"])
-    if actor_type == "team":
-        action = f"{role.name} 先靠近半步，保持和你同一条线。"
-        speech = "我跟上，你先别乱。" if in_encounter else "我在听，先把眼前局面稳住。"
-        if has_surfaced_drive:
-            speech = f"{speech} 另外，关于“{role.story_beats[0].title if role.story_beats else role.desires[0].title if role.desires else '那件事'}”，我之后想和你单独说。"
-    else:
-        if mentions_role:
-            action = f"{role.name} 明显把注意力转到了你这边。"
-            speech = "你先把话说清楚。" if not positive else "我听见了，继续。"
+    name = str(actor.get("name") or "在场角色")
+    actor_type = str(actor.get("actor_type") or "npc")
+    active_encounter = _active_encounter_for_current_sub_zone(save)
+    focus = _scene_focus_label(save, player_text, gm_summary)
+    if active_encounter is not None:
+        target_label = active_encounter.title or focus
+        specific_threat = active_encounter.scene_summary or active_encounter.description or focus
+        stakes = f"不让{target_label}继续恶化"
+        if actor_type == "team":
+            action_summary = f"立刻贴近{target_label}的核心位置，先去稳住最容易失控的那一处。"
+            speech_summary = f"提醒大家先盯住{target_label}里最危险的部分。"
+            situation_delta_hint = 3
+        elif actor_type == "encounter_temp_npc":
+            agenda = str(getattr(actor.get("temp_npc"), "agenda", "") or "").strip()
+            action_summary = f"直接把注意力转向{target_label}，试图按自己熟悉的方式处理现场。"
+            speech_summary = agenda[:80]
+            situation_delta_hint = 2
         else:
-            action = f"{role.name} 侧过身观察局势，没有立刻离开。"
-            speech = ""
-    if negative:
-        action = f"{role.name} 下意识绷紧了肩背，动作明显带上戒备。"
-        speech = "别把事情闹得更大。"
-    situation_delta = 0
-    if in_encounter:
-        situation_delta = 2 if positive or actor_type == "team" else (-2 if negative else 0)
-    reputation_delta = 1 if positive and actor_type == "team" else (-1 if negative else 0)
-    relation_delta = 1 if positive or mentions_role else (-1 if negative else 0)
-    needs_check = in_encounter and (actor_type == "team" or negative or has_surfaced_drive)
+            action_summary = f"快步靠向{target_label}，试着先确认造成混乱的具体源头。"
+            speech_summary = "示意周围人别碰最危险的位置。"
+            situation_delta_hint = 2
+        needs_check = True
+    else:
+        target_label = focus
+        specific_threat = f"{focus}里最容易被忽略的异常点"
+        stakes = f"把{focus}说明白"
+        if priority_reason.startswith("player_targeted"):
+            action_summary = "把注意力转向你，准备先回应你点出的那件事。"
+            speech_summary = "让你直接说清楚最关键的那部分。"
+        else:
+            action_summary = f"停下手里的事，转头确认{focus}到底出了什么问题。"
+            speech_summary = ""
+        situation_delta_hint = 0
+        needs_check = False
     return {
-        "action_summary": action[:160],
-        "speech_summary": speech[:120],
+        "action_summary": action_summary[:160],
+        "speech_summary": speech_summary[:120],
         "needs_check": needs_check,
         "action_type": "check",
-        "action_prompt": f"{role.name} 在公开场景中{priority_reason or '作出即时反应'}",
-        "situation_delta_hint": _clamp(situation_delta, -8, 8),
-        "reputation_delta_hint": _clamp(reputation_delta, -2, 2),
-        "relation_delta_hint": _clamp(relation_delta, -2, 2),
+        "action_prompt": f"actor={name}; target={target_label}; stakes={stakes}; threat={specific_threat}",
+        "target_label": target_label[:80],
+        "stakes": stakes[:120],
+        "specific_threat": specific_threat[:120],
+        "situation_delta_hint": _clamp(situation_delta_hint, -8, 8),
     }
 
 
-def _ai_actor_intent(
-    role: NpcRoleCard,
+def _ai_actor_action(
+    actor: dict[str, object],
     *,
-    actor_type: str,
     player_text: str,
     gm_summary: str,
     priority_reason: str,
     scene_context: dict[str, object] | None,
-    reputation_score: int,
     config: ChatConfig | None,
-    surfaced_desire_titles: list[str],
-    surfaced_story_titles: list[str],
 ) -> dict[str, object] | None:
     if config is None:
         return None
@@ -154,29 +310,26 @@ def _ai_actor_intent(
     except Exception:
         world_time_text = ""
     prompt = prompt_table.render(
-        PromptKeys.SCENE_ACTOR_INTENT_USER,
+        PromptKeys.SCENE_ACTOR_ACTION_USER,
         (
-            "你要为公开区域里的一个行动体生成结构化行动意图，只输出 JSON。\n"
+            "你要为公开场景中的一个非玩家行动体生成本轮动作声明，只输出 JSON。"
             "Schema={\"action_summary\":\"\",\"speech_summary\":\"\",\"needs_check\":true,"
-            "\"action_type\":\"check|attack|item_use\",\"action_prompt\":\"\","
-            "\"situation_delta_hint\":0,\"reputation_delta_hint\":0,\"relation_delta_hint\":0}。\n"
-            "数值限制：situation_delta_hint -8..8，reputation_delta_hint -2..2，relation_delta_hint -2..2。"
+            "\"action_type\":\"check|attack|item_use\",\"action_prompt\":\"\",\"target_label\":\"\","
+            "\"stakes\":\"\",\"specific_threat\":\"\",\"situation_delta_hint\":0}。"
+            "动作声明必须具体到对象、目标和风险，不允许只说发现危险、局势变化或情况恶化。"
         ),
-        role_name=role.name,
-        actor_type=actor_type,
-        roleplay_brief=_build_npc_roleplay_brief(role),
+        role_name=str(actor.get("name") or ""),
+        actor_type=str(actor.get("actor_type") or "npc"),
+        roleplay_brief=_actor_roleplay_brief(actor),
         player_text=player_text,
         gm_summary=gm_summary,
         world_time_text=world_time_text,
         priority_reason=priority_reason,
-        reputation_score=reputation_score,
         scene_context_json=_scene_context_json(scene_context),
-        surfaced_desires=" / ".join(surfaced_desire_titles) or "none",
-        surfaced_story_beats=" / ".join(surfaced_story_titles) or "none",
     )
     try:
         client = create_sync_client(config, client_cls=OpenAI)
-        resp = client.chat.completions.create(
+        response = client.chat.completions.create(
             model=model,
             **build_completion_options(config),
             response_format={"type": "json_object"},
@@ -185,73 +338,151 @@ def _ai_actor_intent(
                 {"role": "user", "content": prompt},
             ],
         )
-        parsed = _extract_json_content((resp.choices[0].message.content or "").strip())
-        action_summary = str(parsed.get("action_summary") or "").strip()[:160]
-        speech_summary = str(parsed.get("speech_summary") or "").strip()[:120]
-        action_type = str(parsed.get("action_type") or "check").strip().lower()
-        if action_type not in {"check", "attack", "item_use"}:
-            action_type = "check"
-        action_prompt = str(parsed.get("action_prompt") or "").strip()[:160]
-        if not action_summary and not speech_summary:
-            return None
-        return {
-            "action_summary": action_summary,
-            "speech_summary": speech_summary,
-            "needs_check": bool(parsed.get("needs_check")),
-            "action_type": action_type,
-            "action_prompt": action_prompt or f"{role.name} 在公开场景中采取行动",
-            "situation_delta_hint": _clamp(int(parsed.get("situation_delta_hint") or 0), -8, 8),
-            "reputation_delta_hint": _clamp(int(parsed.get("reputation_delta_hint") or 0), -2, 2),
-            "relation_delta_hint": _clamp(int(parsed.get("relation_delta_hint") or 0), -2, 2),
-        }
+        parsed = _extract_json_content((response.choices[0].message.content or "").strip())
     except Exception:
         return None
+    action_summary = str(parsed.get("action_summary") or "").strip()[:160]
+    speech_summary = str(parsed.get("speech_summary") or "").strip()[:120]
+    action_type = str(parsed.get("action_type") or "check").strip().lower()
+    if action_type not in {"check", "attack", "item_use"}:
+        action_type = "check"
+    action_prompt = str(parsed.get("action_prompt") or "").strip()[:160]
+    target_label = str(parsed.get("target_label") or "").strip()[:80]
+    stakes = str(parsed.get("stakes") or "").strip()[:120]
+    specific_threat = str(parsed.get("specific_threat") or "").strip()[:120]
+    if not action_summary or not target_label or not stakes or not specific_threat:
+        return None
+    if _looks_too_vague(action_summary) or _looks_too_vague(specific_threat):
+        return None
+    return {
+        "action_summary": action_summary,
+        "speech_summary": speech_summary,
+        "needs_check": bool(parsed.get("needs_check")),
+        "action_type": action_type,
+        "action_prompt": action_prompt or f"actor={actor.get('name')}; target={target_label}; stakes={stakes}; threat={specific_threat}",
+        "target_label": target_label,
+        "stakes": stakes,
+        "specific_threat": specific_threat,
+        "situation_delta_hint": _clamp(int(parsed.get("situation_delta_hint") or 0), -8, 8),
+    }
+
+
+def _compose_actor_action_line(actor: dict[str, object], payload: dict[str, object]) -> str:
+    name = str(actor.get("name") or "在场角色")
+    action_summary = str(payload.get("action_summary") or "").strip()
+    speech_summary = str(payload.get("speech_summary") or "").strip()
+    target_label = str(payload.get("target_label") or "").strip()
+    stakes = str(payload.get("stakes") or "").strip()
+    specific_threat = str(payload.get("specific_threat") or "").strip()
+    parts = [f"{name}{action_summary}"]
+    if target_label:
+        parts.append(f"目标是：{target_label}")
+    if stakes:
+        parts.append(f"意图是：{stakes}")
+    if specific_threat:
+        parts.append(f"眼前风险是：{specific_threat}")
+    if speech_summary:
+        parts.append(f"{name}同时出声提醒：{speech_summary}")
+    line = " ".join(part for part in parts if part.strip()).strip()
+    return line[:320]
 
 
 def _candidate_rows(
     save: SaveFile,
     *,
     player_text: str,
-    surfaced_desires: dict[str, list[str]],
-    surfaced_stories: dict[str, list[str]],
-) -> list[tuple[NpcRoleCard, str, str]]:
+    addressed_role_name: str = "",
+) -> list[dict[str, object]]:
     visible_npcs = _visible_public_roles(save)
     team_roles = list(_team_role_map(save).values())
     active_encounter = _active_encounter_for_current_sub_zone(save)
-    visible_map = {role.role_id: role for role in [*team_roles, *visible_npcs]}
-    targeted_role = next((role for role in visible_npcs if role.name and role.name in player_text), None)
-    rows: list[tuple[int, NpcRoleCard, str, str]] = []
-    mentioned_ids = {role_id for role_id, role in visible_map.items() if role.name and role.name in player_text}
+    temp_npcs = _encounter_temp_npcs(save)
+    visible_rows: list[dict[str, object]] = [
+        {"actor_id": role.role_id, "name": role.name, "actor_type": "npc", "priority_reason": "", "role": role}
+        for role in visible_npcs
+    ]
+    visible_rows.extend(
+        {"actor_id": role.role_id, "name": role.name, "actor_type": "team", "priority_reason": "", "role": role}
+        for role in team_roles
+    )
+    visible_rows.extend(
+        {
+            "actor_id": temp.encounter_npc_id,
+            "name": temp.name,
+            "actor_type": "encounter_temp_npc",
+            "priority_reason": "",
+            "temp_npc": temp,
+        }
+        for temp in temp_npcs
+    )
+    rows: list[tuple[int, dict[str, object]]] = []
+    seen_ids: set[str] = set()
 
-    def add(role: NpcRoleCard, actor_type: str, priority: int, reason: str) -> None:
-        rows.append((priority, role, actor_type, reason))
+    def add(candidate: dict[str, object], priority: int, reason: str) -> None:
+        actor_id = str(candidate.get("actor_id") or "")
+        if not actor_id:
+            return
+        copy = dict(candidate)
+        copy["priority_reason"] = reason
+        rows.append((priority, copy))
 
-    if targeted_role is not None:
-        add(targeted_role, "npc", 0, "player_targeted_visible_npc")
+    targeted = next(
+        (
+            candidate
+            for candidate in visible_rows
+            if addressed_role_name and _find_actor_name_match(str(candidate.get("name") or ""), addressed_role_name)
+        ),
+        None,
+    )
+    if targeted is None:
+        targeted = next(
+            (
+                candidate
+                for candidate in visible_rows
+                if _find_actor_name_match(str(candidate.get("name") or ""), player_text)
+            ),
+            None,
+        )
+    if targeted is not None:
+        add(targeted, 0, "player_targeted_visible_npc")
+
+    for temp in temp_npcs:
+        candidate = next((item for item in visible_rows if item.get("actor_id") == temp.encounter_npc_id), None)
+        if candidate is not None:
+            add(candidate, 1, "active_encounter_temp_npc")
+
     if active_encounter is not None and active_encounter.npc_role_id:
-        encounter_role = visible_map.get(active_encounter.npc_role_id)
-        if encounter_role is not None:
-            add(encounter_role, "npc" if encounter_role.role_id not in _team_role_map(save) else "team", 1, "active_encounter_anchor")
-    for role in team_roles:
-        if role.role_id in surfaced_desires or role.role_id in surfaced_stories:
-            add(role, "team", 2, "surfaced_drive")
-    for role_id in mentioned_ids:
-        role = visible_map.get(role_id)
-        if role is not None:
-            add(role, "team" if role_id in _team_role_map(save) else "npc", 3, "direct_player_reference")
-    for role in visible_npcs:
-        add(role, "npc", 5, "bystander")
-    for role in team_roles:
-        add(role, "team", 4, "team_presence")
+        candidate = next((item for item in visible_rows if item.get("actor_id") == active_encounter.npc_role_id), None)
+        if candidate is not None:
+            add(candidate, 2, "active_encounter_anchor")
 
-    deduped: list[tuple[NpcRoleCard, str, str]] = []
-    seen: set[str] = set()
-    for _, role, actor_type, reason in sorted(rows, key=lambda item: (item[0], item[1].name, item[1].role_id)):
-        if role.role_id in seen:
+    for candidate in visible_rows:
+        if candidate is targeted:
             continue
-        seen.add(role.role_id)
-        deduped.append((role, actor_type, reason))
-    return deduped
+        if _find_actor_name_match(str(candidate.get("name") or ""), player_text):
+            add(candidate, 3, "direct_player_reference")
+
+    if active_encounter is not None and active_encounter.status == "active":
+        for role in team_roles:
+            candidate = next((item for item in visible_rows if item.get("actor_id") == role.role_id), None)
+            if candidate is not None:
+                add(candidate, 4, "active_team_presence")
+    elif not rows and visible_npcs:
+        add(
+            {"actor_id": visible_npcs[0].role_id, "name": visible_npcs[0].name, "actor_type": "npc", "role": visible_npcs[0]},
+            6,
+            "scene_fallback_observer",
+        )
+
+    deduped: list[dict[str, object]] = []
+    for _, candidate in sorted(rows, key=lambda item: (item[0], str(item[1].get("name") or ""), str(item[1].get("actor_id") or ""))):
+        actor_id = str(candidate.get("actor_id") or "")
+        if actor_id in seen_ids:
+            continue
+        seen_ids.add(actor_id)
+        deduped.append(candidate)
+    limit = 4 if active_encounter is not None and active_encounter.status == "active" else 2
+    return deduped[:limit]
 
 
 def build_public_scene_state(
@@ -259,18 +490,15 @@ def build_public_scene_state(
     *,
     session_id: str,
     player_text: str = "",
-    surfaced_desires: dict[str, list[str]] | None = None,
-    surfaced_stories: dict[str, list[str]] | None = None,
 ) -> PublicSceneState:
-    surfaced_desires = surfaced_desires or {}
-    surfaced_stories = surfaced_stories or {}
+    intent = _parse_player_intent(player_text)
+    addressed_role_name = str(intent.get("addressed_role_name") or "").strip()
     rep = get_current_sub_zone_reputation(save, create=True)
     team_roles = _team_role_map(save)
     candidates = _candidate_rows(
         save,
-        player_text=player_text,
-        surfaced_desires=surfaced_desires,
-        surfaced_stories=surfaced_stories,
+        player_text=str(intent.get("display_text") or player_text).strip(),
+        addressed_role_name=addressed_role_name,
     )
     return PublicSceneState(
         session_id=session_id,
@@ -297,16 +525,16 @@ def build_public_scene_state(
         ],
         candidate_actors=[
             PublicSceneActorCandidate(
-                role_id=role.role_id,
-                name=role.name,
-                actor_type=actor_type,  # type: ignore[arg-type]
-                priority_reason=reason,
-                surfaced_desire_ids=surfaced_desires.get(role.role_id, []),
-                surfaced_story_beat_ids=surfaced_stories.get(role.role_id, []),
+                role_id=str(candidate.get("actor_id") or ""),
+                name=str(candidate.get("name") or ""),
+                actor_type=str(candidate.get("actor_type") or "npc"),  # type: ignore[arg-type]
+                priority_reason=str(candidate.get("priority_reason") or ""),
+                surfaced_desire_ids=[],
+                surfaced_story_beat_ids=[],
             )
-            for role, actor_type, reason in candidates[:6]
+            for candidate in candidates
         ],
-        surfaced_drives=build_role_drive_summaries(save, scope="current_sub_zone"),
+        surfaced_drives=[],
         active_encounter=_active_encounter_for_current_sub_zone(save),
     )
 
@@ -324,65 +552,155 @@ def get_public_scene_state(session_id: str) -> PublicSceneStateResponse:
     )
 
 
-def _check_bonus(action_result: ActionCheckResponse | None) -> int:
-    if action_result is None:
+def _resolution_relation_delta(actor_type: str, action_result: ActionCheckResponse | None, situation_delta: int) -> int:
+    if actor_type == "encounter_temp_npc":
         return 0
-    if action_result.critical == "critical_success":
-        return 8
-    if action_result.critical == "critical_failure":
-        return -8
-    return 4 if action_result.success else -4
+    if action_result is not None:
+        if action_result.critical == "critical_success":
+            return 2
+        if action_result.critical == "critical_failure":
+            return -2
+        if action_result.success:
+            return 1
+        return -1
+    if situation_delta > 2:
+        return 1
+    if situation_delta < -2:
+        return -1
+    return 0
 
 
-def _apply_actor_relation_delta(save: SaveFile, role: NpcRoleCard, actor_type: str, relation_delta: int, reputation_score: int) -> int:
-    applied = apply_reputation_relation_bias(reputation_score, relation_delta)
-    if applied == 0:
+def _resolution_reputation_delta(actor_type: str, situation_delta: int) -> int:
+    if actor_type not in {"npc", "team", "encounter_temp_npc"}:
         return 0
-    if actor_type == "team":
-        member = _team_member_by_role_id(save, role.role_id)
-        if member is not None:
-            member.affinity = _clamp(member.affinity + applied * 3, 0, 100)
-            member.trust = _clamp(member.trust + applied * 2, 0, 100)
-    else:
-        next_tag = _relation_tag_after_delta(role, save.player_static_data.player_id, applied)
-        _upsert_npc_player_relation(role, save.player_static_data.player_id, next_tag, "公开场景导演器关系变化")
-    return applied
+    if situation_delta >= 4:
+        return 1
+    if situation_delta <= -4:
+        return -1
+    return 0
 
 
-def _actor_check(
-    save: SaveFile,
-    role: NpcRoleCard,
+def _predict_situation_value(save: SaveFile, situation_delta_total: int) -> int:
+    active_encounter = _active_encounter_for_current_sub_zone(save)
+    if active_encounter is None:
+        return 0
+    return _clamp(active_encounter.situation_value + situation_delta_total, 0, 100)
+
+
+def _fallback_round_resolution(records: list[dict[str, object]], *, predicted_situation_value: int) -> str:
+    if not records:
+        return ""
+    lines: list[str] = []
+    for record in records:
+        name = str(record.get("name") or "在场角色")
+        target_label = str(record.get("target_label") or "眼前局面")
+        stakes = str(record.get("stakes") or "先把事情稳住")
+        threat = str(record.get("specific_threat") or "最危险的部分")
+        action_result = record.get("action_result")
+        if isinstance(action_result, ActionCheckResponse):
+            if action_result.critical == "critical_success":
+                outcome = "大成功"
+            elif action_result.critical == "critical_failure":
+                outcome = "大失败"
+            else:
+                outcome = "成功" if action_result.success else "失败"
+            detail = (action_result.narrative or "").strip()
+            if not detail:
+                if action_result.success:
+                    detail = f"{name}把{target_label}里最关键的风险压住了，{stakes}。"
+                else:
+                    detail = f"{name}没能处理好{target_label}，{threat}反而压得更近。"
+            lines.append(f"{name}处理{target_label}时检定{outcome}，{detail}")
+        else:
+            lines.append(f"{name}已经把动作落到了{target_label}上，意图是{stakes}，现场最危险的是{threat}。")
+    if predicted_situation_value:
+        lines.append(f"GM随后把这一轮的结果汇总起来，局势值来到 {predicted_situation_value}/100，下一轮的压力和机会都已经摆在明处。")
+    return "\n".join(lines)[:640]
+
+
+def _ai_round_resolution(
+    records: list[dict[str, object]],
     *,
-    action_type: str,
-    action_prompt: str,
+    player_text: str,
+    gm_summary: str,
+    scene_context: dict[str, object] | None,
+    predicted_situation_value: int,
     config: ChatConfig | None,
-) -> ActionCheckResponse | None:
+) -> str | None:
+    if config is None or not records:
+        return None
+    api_key = (config.openai_api_key or "").strip()
+    model = (config.model or "").strip()
+    if not api_key or not model:
+        return None
+    prompt = prompt_table.render(
+        PromptKeys.SCENE_ROUND_RESOLVE_USER,
+        (
+            "你要把一轮公开场景的行动统一结算成一段 GM 反馈，只输出 JSON。"
+            "Schema={\"resolution_text\":\"...\"}。"
+            "必须逐条说清谁成功或失败、影响了什么对象、什么风险被推进或暴露、给下一轮留下什么机会或压力。"
+            "不允许只说局势恶化、发现危险、出现异常。"
+        ),
+        player_text=player_text,
+        gm_summary=gm_summary,
+        predicted_situation_value=predicted_situation_value,
+        scene_context_json=_scene_context_json(scene_context),
+        action_rows_json=json.dumps(records, ensure_ascii=False),
+    )
     try:
-        return action_check(
-            ActionCheckRequest(
-                session_id=save.session_id,
-                actor_role_id=role.role_id,
-                action_type=action_type,  # type: ignore[arg-type]
-                action_prompt=action_prompt,
-                allow_backend_roll=True,
-                resolution_context="embedded",
-                config=config,
-            )
+        client = create_sync_client(config, client_cls=OpenAI)
+        response = client.chat.completions.create(
+            model=model,
+            **build_completion_options(config),
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": config.gm_prompt},
+                {"role": "user", "content": prompt},
+            ],
         )
+        parsed = _extract_json_content((response.choices[0].message.content or "").strip())
+        text = str(parsed.get("resolution_text") or "").strip()[:640]
+        if not text or _looks_too_vague(text):
+            return None
+        return text
     except Exception:
         return None
 
 
-def _compose_actor_resolution(role: NpcRoleCard, action_summary: str, speech_summary: str, action_result: ActionCheckResponse | None) -> str:
-    parts = [item.strip() for item in [action_summary, speech_summary] if item.strip()]
-    if action_result is not None:
-        outcome = "成功" if action_result.success else "失败"
-        if action_result.critical == "critical_success":
-            outcome = "大成功"
-        elif action_result.critical == "critical_failure":
-            outcome = "大失败"
-        parts.append(f"检定结果：{outcome}。{action_result.narrative}")
-    return "\n".join(parts).strip()[:320]
+def _append_actor_memory(
+    save: SaveFile,
+    actor: dict[str, object],
+    *,
+    display_text: str,
+    action_line: str,
+    priority_reason: str,
+) -> None:
+    role = actor.get("role")
+    if not isinstance(role, NpcRoleCard):
+        return
+    role.last_public_turn_at = _utc_now()
+    role.cognition_changes.append(f"{role.last_public_turn_at} 公开记忆: {display_text[:64]}")
+    role.cognition_changes = role.cognition_changes[-50:]
+    context_kind = "public_targeted" if priority_reason == "player_targeted_visible_npc" else ("encounter" if _active_encounter_for_current_sub_zone(save) is not None else "public_reaction")
+    if priority_reason == "player_targeted_visible_npc":
+        _append_npc_dialogue(
+            role=role,
+            speaker="player",
+            speaker_role_id=save.player_static_data.player_id,
+            speaker_name=save.player_static_data.name,
+            content=display_text,
+            clock=save.area_snapshot.clock,
+            context_kind="public_targeted",
+        )
+    _append_npc_dialogue(
+        role=role,
+        speaker="npc",
+        speaker_role_id=role.role_id,
+        speaker_name=role.name,
+        content=action_line,
+        clock=save.area_snapshot.clock,
+        context_kind=context_kind,  # type: ignore[arg-type]
+    )
 
 
 def advance_public_scene_in_save(
@@ -395,6 +713,7 @@ def advance_public_scene_in_save(
 ) -> list[SceneEvent]:
     intent = _parse_player_intent(player_text)
     display_text = str(intent.get("display_text") or player_text).strip()
+    addressed_role_name = str(intent.get("addressed_role_name") or "").strip()
     passive_turn = bool(intent.get("passive_turn"))
     if not passive_turn and not _public_behavior_triggered(str(intent.get("action_text") or ""), str(intent.get("speech_text") or ""), str(intent.get("raw_text") or "")):
         return []
@@ -409,198 +728,130 @@ def advance_public_scene_in_save(
         )
 
     active_encounter = _active_encounter_for_current_sub_zone(save)
-    drive_events, surfaced_desires, surfaced_stories = surface_role_drives_for_scene(
-        save,
-        session_id=session_id,
-        player_text=display_text,
-        scene_mode=("public_scene" if not passive_turn else "team_chat"),
-        active_encounter=active_encounter is not None and active_encounter.status == "active",
-    )
     reputation_entry = get_current_sub_zone_reputation(save, create=True)
     reputation_score = reputation_entry.score if reputation_entry is not None else 50
     candidates = _candidate_rows(
         save,
         player_text=display_text,
-        surfaced_desires=surfaced_desires,
-        surfaced_stories=surfaced_stories,
+        addressed_role_name=addressed_role_name,
     )
-    if not candidates and not drive_events:
+    if not candidates:
         return []
 
-    scene_events: list[SceneEvent] = [*drive_events]
-    reacted_role_ids: list[str] = []
+    scene_events: list[SceneEvent] = []
+    round_records: list[dict[str, object]] = []
     reputation_delta_total = 0
 
-    for role, actor_type, priority_reason in candidates[:4]:
-        reacted_role_ids.append(role.role_id)
-        surfaced_desire_titles = [
-            item.title
-            for item in role.desires
-            if item.desire_id in surfaced_desires.get(role.role_id, [])
-        ]
-        surfaced_story_titles = [
-            item.title
-            for item in role.story_beats
-            if item.beat_id in surfaced_stories.get(role.role_id, [])
-        ]
-        intent_payload = _ai_actor_intent(
-            role,
-            actor_type=actor_type,
+    for actor in candidates:
+        priority_reason = str(actor.get("priority_reason") or "")
+        payload = _ai_actor_action(
+            actor,
             player_text=display_text,
             gm_summary=gm_summary,
             priority_reason=priority_reason,
             scene_context=scene_context,
-            reputation_score=reputation_score,
             config=config,
-            surfaced_desire_titles=surfaced_desire_titles,
-            surfaced_story_titles=surfaced_story_titles,
-        ) or _fallback_actor_intent(
-            role,
-            actor_type=actor_type,
+        ) or _fallback_actor_action(
+            save,
+            actor,
             player_text=display_text,
             gm_summary=gm_summary,
             priority_reason=priority_reason,
-            has_surfaced_drive=bool(surfaced_desires.get(role.role_id) or surfaced_stories.get(role.role_id)),
-            in_encounter=active_encounter is not None and active_encounter.status == "active",
         )
-
-        action_result = None
-        if bool(intent_payload.get("needs_check")):
-            action_result = _actor_check(
-                save,
-                role,
-                action_type=str(intent_payload.get("action_type") or "check"),
-                action_prompt=str(intent_payload.get("action_prompt") or role.name),
-                config=config,
-            )
-
-        relation_delta = _apply_actor_relation_delta(
-            save,
-            role,
-            actor_type,
-            int(intent_payload.get("relation_delta_hint") or 0),
-            reputation_score,
-        )
-        reputation_delta = int(intent_payload.get("reputation_delta_hint") or 0)
-        reputation_delta_total += reputation_delta
-        situation_delta = _clamp(int(intent_payload.get("situation_delta_hint") or 0) + _check_bonus(action_result), -20, 20)
-        line = _compose_actor_resolution(
-            role,
-            str(intent_payload.get("action_summary") or ""),
-            str(intent_payload.get("speech_summary") or ""),
-            action_result,
-        )
-        if not line:
+        action_line = _compose_actor_action_line(actor, payload)
+        if not action_line:
             continue
-
-        role.last_public_turn_at = _utc_now()
-        role.cognition_changes.append(f"{role.last_public_turn_at} 公开记忆: {display_text[:64]}")
-        role.cognition_changes = role.cognition_changes[-50:]
-        role.attitude_changes.append(f"{role.last_public_turn_at} public_director relation={relation_delta:+d} reputation={reputation_delta:+d}")
-        role.attitude_changes = role.attitude_changes[-50:]
-        if actor_type == "npc":
-            context_kind = "public_targeted" if priority_reason == "player_targeted_visible_npc" else ("encounter" if active_encounter is not None else "public_reaction")
-            if priority_reason == "player_targeted_visible_npc":
-                _append_npc_dialogue(
-                    role=role,
-                    speaker="player",
-                    speaker_role_id=save.player_static_data.player_id,
-                    speaker_name=save.player_static_data.name,
-                    content=display_text,
-                    clock=save.area_snapshot.clock,
-                    context_kind="public_targeted",
-                )
-            _append_npc_dialogue(
-                role=role,
-                speaker="npc",
-                speaker_role_id=role.role_id,
-                speaker_name=role.name,
-                content=line,
-                clock=save.area_snapshot.clock,
-                context_kind=context_kind,  # type: ignore[arg-type]
-            )
-        elif actor_type == "team":
-            _append_npc_dialogue(
-                role=role,
-                speaker="npc",
-                speaker_role_id=role.role_id,
-                speaker_name=role.name,
-                content=line,
-                clock=save.area_snapshot.clock,
-                context_kind=("encounter" if active_encounter is not None else "team_chat"),
-            )
         scene_events.append(
             _new_scene_event(
-                "public_actor_resolution",
-                line,
-                actor_role_id=role.role_id,
-                actor_name=role.name,
+                "public_actor_action",
+                action_line,
+                actor_role_id=str(actor.get("actor_id") or ""),
+                actor_name=str(actor.get("name") or ""),
                 metadata={
-                    "actor_type": actor_type,
-                    "needs_check": bool(action_result is not None),
-                    "situation_delta": situation_delta,
-                    "reputation_delta": reputation_delta,
-                    "relation_delta": relation_delta,
+                    "actor_type": str(actor.get("actor_type") or "npc"),
+                    "needs_check": bool(payload.get("needs_check")),
                 },
             )
         )
-        if priority_reason == "player_targeted_visible_npc" and actor_type == "npc":
-            scene_events.append(
-                _new_scene_event(
-                    "public_targeted_npc_reply",
-                    line,
-                    actor_role_id=role.role_id,
-                    actor_name=role.name,
-                    metadata={"relation_delta": relation_delta},
-                )
+        _append_actor_memory(
+            save,
+            actor,
+            display_text=display_text,
+            action_line=action_line,
+            priority_reason=priority_reason,
+        )
+        action_result = None
+        if bool(payload.get("needs_check")):
+            action_result = _actor_check(
+                save,
+                str(actor.get("actor_id") or ""),
+                action_type=str(payload.get("action_type") or "check"),
+                action_prompt=str(payload.get("action_prompt") or action_line),
+                config=config,
             )
-        elif actor_type == "npc":
-            scene_events.append(
-                _new_scene_event(
-                    "public_bystander_reaction",
-                    line,
-                    actor_role_id=role.role_id,
-                    actor_name=role.name,
-                    metadata={"relation_delta": relation_delta},
-                )
+        situation_delta = _clamp(int(payload.get("situation_delta_hint") or 0) + _check_bonus(action_result), -20, 20)
+        relation_delta = _resolution_relation_delta(str(actor.get("actor_type") or "npc"), action_result, situation_delta)
+        reputation_delta = _resolution_reputation_delta(str(actor.get("actor_type") or "npc"), situation_delta)
+        role = actor.get("role")
+        if isinstance(role, NpcRoleCard) and relation_delta != 0:
+            applied = _apply_actor_relation_delta(
+                save,
+                role,
+                str(actor.get("actor_type") or "npc"),
+                relation_delta,
+                reputation_score,
             )
-        elif actor_type == "team":
-            scene_events.append(
-                _new_scene_event(
-                    "team_public_reaction",
-                    line,
-                    actor_role_id=role.role_id,
-                    actor_name=role.name,
-                    metadata={"relation_delta": relation_delta},
-                )
-            )
-        if active_encounter is not None and situation_delta != 0:
-            try:
-                from app.services.encounter_service import apply_active_encounter_situation_delta_in_save
+        else:
+            applied = 0
+        reputation_delta_total += reputation_delta
+        round_records.append(
+            {
+                "actor_id": str(actor.get("actor_id") or ""),
+                "name": str(actor.get("name") or ""),
+                "actor_type": str(actor.get("actor_type") or "npc"),
+                "target_label": str(payload.get("target_label") or ""),
+                "stakes": str(payload.get("stakes") or ""),
+                "specific_threat": str(payload.get("specific_threat") or ""),
+                "action_line": action_line,
+                "action_result": (action_result.model_dump() if action_result is not None else None),
+                "situation_delta": situation_delta,
+                "reputation_delta": reputation_delta,
+                "relation_delta": applied,
+            }
+        )
 
-                update_events = apply_active_encounter_situation_delta_in_save(
+    if not round_records:
+        return []
+
+    total_situation_delta = sum(int(item.get("situation_delta") or 0) for item in round_records)
+    predicted_situation_value = _predict_situation_value(save, total_situation_delta)
+    resolution_text = _ai_round_resolution(
+        round_records,
+        player_text=display_text,
+        gm_summary=gm_summary,
+        scene_context=scene_context,
+        predicted_situation_value=predicted_situation_value,
+        config=config,
+    ) or _fallback_round_resolution(
+        round_records,
+        predicted_situation_value=predicted_situation_value,
+    )
+
+    if active_encounter is not None:
+        try:
+            from app.services.encounter_service import apply_active_encounter_situation_delta_in_save
+
+            scene_events.extend(
+                apply_active_encounter_situation_delta_in_save(
                     save,
                     session_id=session_id,
-                    delta=situation_delta,
-                    summary=f"{role.name} 的公开行动改变了局势。",
-                    actor_role_id=role.role_id,
-                    actor_name=role.name,
+                    delta=total_situation_delta,
+                    summary=resolution_text,
+                    actor_name="公开轮次",
                 )
-                scene_events.extend(update_events)
-            except Exception:
-                pass
-
-    overflow = [role for role, _, _ in candidates[4:] if role.role_id not in reacted_role_ids]
-    if overflow:
-        crowd_names = "、".join(item.name for item in overflow[:4])
-        scene_events.append(
-            _new_scene_event(
-                "public_actor_resolution",
-                f"其余在场者没有单独插话，只是把注意力集中在局势上：{crowd_names}。",
-                actor_name="周围人群",
-                metadata={"actor_type": "system", "crowd_summary": True},
             )
-        )
+        except Exception:
+            pass
 
     rep_entry, rep_event = apply_sub_zone_reputation_delta(
         save,
@@ -615,31 +866,32 @@ def advance_public_scene_in_save(
         scene_events.append(rep_event)
         reputation_score = rep_entry.score if rep_entry is not None else reputation_score
 
-    if scene_events:
-        save.game_logs.append(
-            _new_game_log(
-                session_id,
-                "public_scene_director",
-                f"公开场景导演器推进了 {sum(1 for item in scene_events if item.kind == 'public_actor_resolution')} 个行动体回合",
-                {
-                    "candidate_count": len(candidates),
-                    "resolved_count": sum(1 for item in scene_events if item.kind == "public_actor_resolution"),
-                    "reputation_score": reputation_score,
-                },
-            )
+    scene_events.append(
+        _new_scene_event(
+            "public_round_resolution",
+            resolution_text,
+            actor_name="GM",
+            metadata={
+                "actor_type": "system",
+                "candidate_count": len(round_records),
+                "reputation_score": reputation_score,
+                "predicted_situation_value": predicted_situation_value,
+            },
         )
-        bystander_count = sum(1 for item in scene_events if item.kind == "public_bystander_reaction")
-        if bystander_count > 0:
-            save.game_logs.append(
-                _new_game_log(
-                    session_id,
-                    "public_npc_reaction",
-                    "公开区域触发周围 NPC 反应",
-                    {"count": bystander_count},
-                )
-            )
+    )
+    save.game_logs.append(
+        _new_game_log(
+            session_id,
+            "public_scene_director",
+            f"公开场景推进了 {len(round_records)} 个行动声明，并统一完成轮次结算",
+            {
+                "candidate_count": len(round_records),
+                "reputation_score": reputation_score,
+            },
+        )
+    )
 
-    if active_encounter is None and any(item.kind == "public_actor_resolution" for item in scene_events):
+    if active_encounter is None and any(item.kind == "public_actor_action" for item in scene_events):
         try:
             from app.models.schemas import EncounterCheckRequest
             from app.services.encounter_service import check_for_encounter
@@ -665,4 +917,35 @@ def advance_public_scene_in_save(
         except Exception:
             pass
 
-    return scene_events[:8]
+    return scene_events[:10]
+
+
+def build_public_scene_state(
+    save: SaveFile,
+    *,
+    session_id: str,
+    player_text: str = "",
+) -> PublicSceneState:
+    from app.services.public_scene_runtime_v2 import build_public_scene_state as runtime_v2
+
+    return runtime_v2(save, session_id=session_id, player_text=player_text)
+
+
+def advance_public_scene_in_save(
+    save: SaveFile,
+    session_id: str,
+    player_text: str,
+    gm_summary: str = "",
+    scene_context: dict[str, object] | None = None,
+    config: ChatConfig | None = None,
+) -> list[SceneEvent]:
+    from app.services.public_scene_runtime_v2 import advance_public_scene_in_save as runtime_v2
+
+    return runtime_v2(
+        save,
+        session_id=session_id,
+        player_text=player_text,
+        gm_summary=gm_summary,
+        scene_context=scene_context,
+        config=config,
+    )

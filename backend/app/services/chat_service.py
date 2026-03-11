@@ -232,6 +232,22 @@ def _find_named_role(save, text: str, *, team_only: bool = False, visible_only: 
     return None
 
 
+def _find_addressed_scene_actor(save, addressed_role_name: str):
+    clean = (addressed_role_name or "").strip()
+    if not clean:
+        return None
+    for role in [*_visible_public_roles(save), *[item for item in save.role_pool if item.role_id in {member.role_id for member in save.team_state.members}]]:
+        if role.name and clean in role.name:
+            return {"actor_id": role.role_id, "name": role.name, "actor_type": ("team" if role.role_id in {member.role_id for member in save.team_state.members} else "npc")}
+    active_encounter = _active_encounter_for_current_sub_zone(save)
+    if active_encounter is None:
+        return None
+    for temp_npc in getattr(active_encounter, "temporary_npcs", []) or []:
+        if temp_npc.name and clean in temp_npc.name:
+            return {"actor_id": temp_npc.encounter_npc_id, "name": temp_npc.name, "actor_type": "encounter_temp_npc"}
+    return None
+
+
 def _find_inventory_item(items: list[InventoryItem], text: str):
     clean = (text or "").strip()
     if not clean:
@@ -280,6 +296,7 @@ def route_main_turn_intent(session_id: str, parsed_intent: dict[str, object], co
     action_text = str(parsed_intent.get("action_text") or "").strip()
     speech_text = str(parsed_intent.get("speech_text") or "").strip()
     display_text = str(parsed_intent.get("display_text") or "").strip()
+    addressed_role_name = str(parsed_intent.get("addressed_role_name") or "").strip()
     merged = "\n".join(part for part in [action_text, speech_text, display_text] if part).strip()
     active_encounter = _active_encounter_for_current_sub_zone(save)
     tool_events: list[ToolEvent] = []
@@ -459,9 +476,19 @@ def route_main_turn_intent(session_id: str, parsed_intent: dict[str, object], co
                 "skip_encounter_main_chat_advance": False,
             }
 
-    visible_role = _find_named_role(save, merged, visible_only=True)
-    if visible_role is not None:
-        tool_events.append(ToolEvent(tool_name="route_main_turn_target_npc", ok=True, summary=f"public scene target={visible_role.role_id}"))
+    addressed_actor = _find_addressed_scene_actor(save, addressed_role_name)
+    if addressed_actor is not None:
+        tool_events.append(
+            ToolEvent(
+                tool_name="route_main_turn_target_npc",
+                ok=True,
+                summary=f"public scene target={addressed_actor['actor_id']}",
+            )
+        )
+    else:
+        visible_role = _find_named_role(save, merged, visible_only=True)
+        if visible_role is not None:
+            tool_events.append(ToolEvent(tool_name="route_main_turn_target_npc", ok=True, summary=f"public scene target={visible_role.role_id}"))
     return {
         "handled": False,
         "reply": None,

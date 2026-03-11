@@ -164,7 +164,9 @@ class SceneEvent(BaseModel):
         "public_targeted_npc_reply",
         "public_bystander_reaction",
         "team_public_reaction",
+        "public_actor_action",
         "public_actor_resolution",
+        "public_round_resolution",
         "role_desire_surface",
         "companion_story_surface",
         "reputation_update",
@@ -177,7 +179,7 @@ class SceneEvent(BaseModel):
     actor_role_id: str = Field(default="", min_length=0)
     actor_name: str = Field(default="", min_length=0)
     content: str = Field(..., min_length=1)
-    metadata: dict[str, str | int | float | bool] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -283,16 +285,19 @@ class SubZoneChatTurnEvent(BaseModel):
         "npc_reply",
         "team_reply",
         "system_notice",
+        "public_actor_action",
         "public_actor_resolution",
+        "public_round_resolution",
         "role_desire_surface",
         "companion_story_surface",
         "reputation_update",
         "encounter_situation_update",
     ] = "system_notice"
-    actor_type: Literal["npc", "team", "system"] = "system"
+    actor_type: Literal["npc", "team", "encounter_temp_npc", "system"] = "system"
     actor_id: str = Field(default="", min_length=0)
     actor_name: str = Field(default="", min_length=0)
     content: str = Field(..., min_length=1)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class SubZoneChatTurn(BaseModel):
@@ -644,7 +649,7 @@ class RoleDriveSummary(BaseModel):
 class PublicSceneActorCandidate(BaseModel):
     role_id: str = Field(..., min_length=1)
     name: str = Field(..., min_length=1)
-    actor_type: Literal["npc", "team"] = "npc"
+    actor_type: Literal["npc", "team", "encounter_temp_npc"] = "npc"
     priority_reason: str = Field(default="", min_length=0)
     surfaced_desire_ids: list[str] = Field(default_factory=list)
     surfaced_story_beat_ids: list[str] = Field(default_factory=list)
@@ -1017,6 +1022,7 @@ class EncounterEntry(BaseModel):
     related_quest_ids: list[str] = Field(default_factory=list)
     related_fate_phase_ids: list[str] = Field(default_factory=list)
     participant_role_ids: list[str] = Field(default_factory=list)
+    temporary_npcs: list["EncounterTemporaryNpc"] = Field(default_factory=list)
     generated_prompt_tags: list[str] = Field(default_factory=list)
     allow_player_prompt: bool = True
     termination_conditions: list["EncounterTerminationCondition"] = Field(default_factory=list)
@@ -1034,6 +1040,17 @@ class EncounterEntry(BaseModel):
     last_advanced_at: str | None = None
 
 
+class EncounterTemporaryNpc(BaseModel):
+    encounter_npc_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    title: str = Field(default="", min_length=0)
+    description: str = Field(default="", min_length=0)
+    speaking_style: str = Field(default="", min_length=0)
+    agenda: str = Field(default="", min_length=0)
+    state: str = Field(default="active", min_length=1)
+    introduced_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
 class EncounterTerminationCondition(BaseModel):
     condition_id: str = Field(..., min_length=1)
     kind: Literal["npc_leaves", "player_escapes", "target_resolved", "time_elapsed", "manual_custom"] = "manual_custom"
@@ -1044,8 +1061,8 @@ class EncounterTerminationCondition(BaseModel):
 
 class EncounterStepEntry(BaseModel):
     step_id: str = Field(..., min_length=1)
-    kind: Literal["announcement", "player_action", "gm_update", "npc_reaction", "team_reaction", "escape_attempt", "background_tick", "resolution"] = "gm_update"
-    actor_type: Literal["player", "npc", "team", "system"] = "system"
+    kind: Literal["announcement", "player_action", "gm_update", "npc_reaction", "team_reaction", "temp_npc_action", "escape_attempt", "background_tick", "resolution"] = "gm_update"
+    actor_type: Literal["player", "npc", "team", "encounter_temp_npc", "system"] = "system"
     actor_id: str = Field(default="", min_length=0)
     actor_name: str = Field(default="", min_length=0)
     content: str = Field(..., min_length=1)

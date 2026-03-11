@@ -196,14 +196,22 @@ def _scene_event_to_turn_event(event: SceneEvent) -> SubZoneChatTurnEvent:
     elif event.kind == "team_public_reaction":
         actor_type = "team"
         event_kind = "team_reply"
+    elif event.kind == "public_actor_action":
+        actor_type = str(event.metadata.get("actor_type") or "system")
+        if actor_type not in {"npc", "team", "encounter_temp_npc", "system"}:
+            actor_type = "system"
+        event_kind = "public_actor_action"
     elif event.kind == "public_actor_resolution":
         actor_type = str(event.metadata.get("actor_type") or "system")
-        if actor_type not in {"npc", "team", "system"}:
+        if actor_type not in {"npc", "team", "encounter_temp_npc", "system"}:
             actor_type = "system"
         event_kind = "public_actor_resolution"
+    elif event.kind == "public_round_resolution":
+        actor_type = "system"
+        event_kind = "public_round_resolution"
     elif event.kind == "role_desire_surface":
         actor_type = str(event.metadata.get("actor_type") or "npc")
-        if actor_type not in {"npc", "team", "system"}:
+        if actor_type not in {"npc", "team", "encounter_temp_npc", "system"}:
             actor_type = "npc"
         event_kind = "role_desire_surface"
     elif event.kind == "companion_story_surface":
@@ -223,6 +231,7 @@ def _scene_event_to_turn_event(event: SceneEvent) -> SubZoneChatTurnEvent:
         actor_id=event.actor_role_id or "",
         actor_name=event.actor_name or "",
         content=event.content,
+        metadata=dict(event.metadata or {}),
     )
 
 
@@ -262,6 +271,7 @@ def _serialize_recent_sub_zone_turns(sub_zone: AreaSubZone | None, *, limit: int
                         "event_kind": event.event_kind,
                         "actor_name": event.actor_name,
                         "content": event.content,
+                        "metadata": dict(event.metadata or {}),
                     }
                     for event in turn.events[:_SUB_ZONE_CHAT_EVENT_LIMIT]
                 ],
@@ -1086,12 +1096,29 @@ def get_current_save(default_session_id: str = "sess_default") -> SaveFile:
         save.player_runtime_data.session_id = save.session_id
     _recompute_player_derived(save.player_static_data)
     changed = False
+    role_count_before = len(save.role_pool)
+    area_markers_before = (
+        len(save.area_snapshot.zones),
+        len(save.area_snapshot.sub_zones),
+        save.area_snapshot.current_zone_id,
+        save.area_snapshot.current_sub_zone_id,
+        save.area_snapshot.clock is None,
+    )
+    _ensure_area_snapshot(save)
+    if area_markers_before != (
+        len(save.area_snapshot.zones),
+        len(save.area_snapshot.sub_zones),
+        save.area_snapshot.current_zone_id,
+        save.area_snapshot.current_sub_zone_id,
+        save.area_snapshot.clock is None,
+    ):
+        changed = True
+    if len(save.role_pool) != role_count_before:
+        changed = True
     for role in save.role_pool:
         _recompute_player_derived(role.profile)
         if _ensure_npc_role_complete(save, role):
             changed = True
-    if _ensure_role_pool_from_area(save):
-        changed = True
     _, reconciled = reconcile_consistency(save, session_id=save.session_id or default_session_id, reason="load")
     if changed or reconciled:
         save_current(save)
@@ -2019,13 +2046,14 @@ def generate_regions(req: RegionGenerateRequest) -> RegionGenerateResponse:
         save.area_snapshot = AreaSnapshot(clock=save.area_snapshot.clock)
         save.map_snapshot.zones = []
     save.map_snapshot.player_position = req.player_position
+    save.player_runtime_data.session_id = req.session_id
+    save.player_runtime_data.current_position = req.player_position
     save.map_snapshot.zones = zones
-    save.area_snapshot = _area_snapshot_from_map(save)
+    save.area_snapshot = _area_snapshot_from_map(save, preferred_zone_id=req.player_position.zone_id)
+    _ensure_current_area_selection(save, preferred_zone_id=req.player_position.zone_id)
     _ensure_role_pool_from_area(save)
     if req.force_regenerate:
         reconcile_consistency(save, session_id=req.session_id, reason="map_force_regenerate")
-    save.player_runtime_data.session_id = req.session_id
-    save.player_runtime_data.current_position = req.player_position
     save.game_logs.append(
         _new_game_log(
             req.session_id,
@@ -2222,7 +2250,7 @@ def move_to_zone(req: MoveRequest) -> MoveResponse:
     _ensure_area_snapshot(save)
     _ensure_zone_subzone_placeholders(save, to_zone.zone_id)
     save.area_snapshot.current_zone_id = to_zone.zone_id
-    save.area_snapshot.current_sub_zone_id = None
+    _ensure_current_area_selection(save, preferred_zone_id=to_zone.zone_id)
     if save.area_snapshot.clock is not None:
         save.area_snapshot.clock = _advance_clock(save.area_snapshot.clock, duration_min)
 
@@ -2350,7 +2378,62 @@ def _infer_zone_type(tags: list[str]) -> str:
     return "unknown"
 
 
-def _area_snapshot_from_map(save: SaveFile) -> AreaSnapshot:
+def _select_default_sub_zone_id_for_zone(save: SaveFile, zone_id: str) -> str | None:
+    zone = next((item for item in save.area_snapshot.zones if item.zone_id == zone_id), None)
+    if zone is None:
+        return None
+    candidates = [item for item in save.area_snapshot.sub_zones if item.zone_id == zone_id]
+    if not candidates:
+        return None
+    ranked = sorted(
+        candidates,
+        key=lambda item: (
+            ((item.coord.x - zone.center.x) ** 2) + ((item.coord.y - zone.center.y) ** 2),
+            item.sub_zone_id,
+        ),
+    )
+    return ranked[0].sub_zone_id
+
+
+def _ensure_current_area_selection(save: SaveFile, preferred_zone_id: str | None = None) -> None:
+    snap = save.area_snapshot
+    if not snap.zones:
+        snap.current_zone_id = None
+        snap.current_sub_zone_id = None
+        return
+
+    zone_ids = [item.zone_id for item in snap.zones]
+    candidate_zone_ids: list[str] = []
+    for candidate in [
+        preferred_zone_id,
+        snap.current_zone_id,
+        (save.player_runtime_data.current_position.zone_id if save.player_runtime_data.current_position else None),
+        (save.map_snapshot.player_position.zone_id if save.map_snapshot.player_position else None),
+    ]:
+        normalized = (candidate or "").strip()
+        if normalized and normalized not in candidate_zone_ids:
+            candidate_zone_ids.append(normalized)
+
+    resolved_zone_id = next((item for item in candidate_zone_ids if item in zone_ids), None) or zone_ids[0]
+    snap.current_zone_id = resolved_zone_id
+
+    if not any(item.zone_id == resolved_zone_id for item in snap.sub_zones):
+        _ensure_zone_subzone_placeholders(save, resolved_zone_id)
+
+    valid_sub_zone = next(
+        (
+            item
+            for item in snap.sub_zones
+            if item.sub_zone_id == snap.current_sub_zone_id and item.zone_id == resolved_zone_id
+        ),
+        None,
+    )
+    if valid_sub_zone is not None:
+        return
+    snap.current_sub_zone_id = _select_default_sub_zone_id_for_zone(save, resolved_zone_id)
+
+
+def _area_snapshot_from_map(save: SaveFile, preferred_zone_id: str | None = None) -> AreaSnapshot:
     zones: list[AreaZone] = []
     sub_zones: list[AreaSubZone] = []
     for idx, zone in enumerate(save.map_snapshot.zones):
@@ -2396,19 +2479,21 @@ def _area_snapshot_from_map(save: SaveFile) -> AreaSnapshot:
         if idx > 40:
             break
 
-    current_zone_id = save.player_runtime_data.current_position.zone_id if save.player_runtime_data.current_position else None
-    current_sub_zone_id = None
-    if not current_zone_id and zones:
-        current_zone_id = zones[0].zone_id
-        current_sub_zone_id = None
-
-    return AreaSnapshot(
+    snapshot = AreaSnapshot(
         zones=zones,
         sub_zones=sub_zones,
-        current_zone_id=current_zone_id,
-        current_sub_zone_id=current_sub_zone_id,
-        clock=_default_world_clock(),
+        current_zone_id=preferred_zone_id or save.area_snapshot.current_zone_id,
+        current_sub_zone_id=save.area_snapshot.current_sub_zone_id,
+        clock=save.area_snapshot.clock or _default_world_clock(),
     )
+    previous_snapshot = save.area_snapshot
+    try:
+        save.area_snapshot = snapshot
+        _ensure_current_area_selection(save, preferred_zone_id=preferred_zone_id)
+        snapshot = save.area_snapshot
+    finally:
+        save.area_snapshot = previous_snapshot
+    return snapshot
 
 
 def _ensure_area_snapshot(save: SaveFile) -> None:
@@ -2417,6 +2502,7 @@ def _ensure_area_snapshot(save: SaveFile) -> None:
         save.area_snapshot = _area_snapshot_from_map(save)
     if save.area_snapshot.clock is None:
         save.area_snapshot.clock = _default_world_clock()
+    _ensure_current_area_selection(save)
     _ensure_role_pool_from_area(save)
 
 
@@ -2708,6 +2794,50 @@ def apply_speech_time(session_id: str, text: str, config: ChatConfig | None) -> 
     return time_spent_min
 
 
+def _normalize_player_speech_target(text: str) -> tuple[str, str]:
+    clean = (text or "").strip()
+    if not clean:
+        return "", ""
+    bracket_match = re.match(r"^\[(?P<name>[^\]]{1,40})\]\s*(?P<body>.+)$", clean)
+    if bracket_match is not None:
+        name = str(bracket_match.group("name") or "").strip()
+        body = str(bracket_match.group("body") or "").strip()
+        if name and body:
+            return name, body
+    prefix_match = re.match(r"^(?P<name>[^：:\n]{1,40})[：:]\s*(?P<body>.+)$", clean)
+    if prefix_match is not None:
+        name = str(prefix_match.group("name") or "").strip().strip("“”\"'")
+        body = str(prefix_match.group("body") or "").strip()
+        if name and body:
+            return name, body
+    return "", clean
+
+
+def _extract_referenced_role_names(*texts: str) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+
+    def add(name: str) -> None:
+        clean = str(name or "").strip().strip("“”\"'[]")
+        if not clean or len(clean) > 40 or clean in seen:
+            return
+        seen.add(clean)
+        names.append(clean)
+
+    for text in texts:
+        clean = str(text or "").strip()
+        if not clean:
+            continue
+        for match in re.finditer(r"对(?P<name>[^，。！？：:\n]{1,20})说", clean):
+            add(str(match.group("name") or ""))
+        for match in re.finditer(r"\[(?P<name>[^\]]{1,20})\]", clean):
+            add(str(match.group("name") or ""))
+        prefix_match = re.match(r"^(?P<name>[^：:\n]{1,40})[：:]\s*(?P<body>.+)$", clean)
+        if prefix_match is not None:
+            add(str(prefix_match.group("name") or ""))
+    return names
+
+
 def _parse_player_intent(player_message: str) -> dict[str, object]:
     raw = (player_message or "").strip()
     parsed: dict[str, object] = {}
@@ -2724,11 +2854,17 @@ def _parse_player_intent(player_message: str) -> dict[str, object]:
     if passive_mode_raw == "observe":
         passive_mode = "observe"
     action_check = parsed.get("action_check_result") if isinstance(parsed.get("action_check_result"), dict) else None
+    addressed_role_name = ""
     if passive_turn:
         action_text = ""
         speech_text = ""
     elif not action_text and not speech_text:
         speech_text = raw
+    if speech_text:
+        addressed_role_name, speech_text = _normalize_player_speech_target(speech_text)
+    referenced_role_names = _extract_referenced_role_names(action_text, speech_text)
+    if addressed_role_name and addressed_role_name not in referenced_role_names:
+        referenced_role_names.insert(0, addressed_role_name)
     display_lines: list[str] = []
     if passive_turn:
         display_lines.append(_PASSIVE_TURN_DISPLAY_TEXT)
@@ -2736,7 +2872,10 @@ def _parse_player_intent(player_message: str) -> dict[str, object]:
         if action_text:
             display_lines.append(f"动作：{action_text}")
         if speech_text:
-            display_lines.append(f"语言：{speech_text}")
+            if addressed_role_name:
+                display_lines.append(f"语言：对{addressed_role_name}说：{speech_text}")
+            else:
+                display_lines.append(f"语言：{speech_text}")
     if isinstance(action_check, dict):
         status = "成功" if bool(action_check.get("success")) else "失败"
         critical = str(action_check.get("critical") or "none")
@@ -2751,6 +2890,9 @@ def _parse_player_intent(player_message: str) -> dict[str, object]:
         "action_text": action_text,
         "speech_text": speech_text,
         "display_text": display_text,
+        "addressed_role_name": addressed_role_name,
+        "referenced_role_names": referenced_role_names,
+        "incoming_target_candidates": list(referenced_role_names),
         "passive_turn": passive_turn,
         "passive_mode": passive_mode,
         "action_check": action_check,
@@ -3216,7 +3358,7 @@ def _new_scene_event(
     *,
     actor_role_id: str = "",
     actor_name: str = "",
-    metadata: dict[str, str | int | float | bool] | None = None,
+    metadata: dict[str, object] | None = None,
 ) -> SceneEvent:
     return SceneEvent(
         event_id=f"scene_{int(datetime.now(timezone.utc).timestamp() * 1000)}_{random.randint(100, 999)}",
@@ -3817,9 +3959,23 @@ def set_role_relation(session_id: str, role_id: str, payload: RoleRelationSetReq
     return role
 
 
+def _find_active_encounter_temp_npc(save: SaveFile, actor_role_id: str | None):
+    if not actor_role_id:
+        return None
+    state = getattr(save, "encounter_state", None)
+    if state is None or not getattr(state, "active_encounter_id", None):
+        return None
+    encounter = next((item for item in getattr(state, "encounters", []) if item.encounter_id == state.active_encounter_id), None)
+    if encounter is None or encounter.status not in {"active", "escaped"}:
+        return None
+    return next((item for item in getattr(encounter, "temporary_npcs", []) if item.encounter_npc_id == actor_role_id), None)
+
+
 def _actor_kind(save: SaveFile, actor_role_id: str | None) -> str:
     if not actor_role_id or actor_role_id == save.player_static_data.player_id:
         return "player"
+    if _find_active_encounter_temp_npc(save, actor_role_id) is not None:
+        return "npc"
     return "npc"
 
 
@@ -3827,6 +3983,11 @@ def _get_actor_profile(save: SaveFile, actor_role_id: str | None) -> tuple[str, 
     if not actor_role_id or actor_role_id == save.player_static_data.player_id:
         _recompute_player_derived(save.player_static_data)
         return save.player_static_data.player_id, save.player_static_data
+    temp_npc = _find_active_encounter_temp_npc(save, actor_role_id)
+    if temp_npc is not None:
+        profile = PlayerStaticData(role_type="npc", name=temp_npc.name or "遭遇角色")
+        _recompute_player_derived(profile)
+        return temp_npc.encounter_npc_id, profile
     role = next((r for r in save.role_pool if r.role_id == actor_role_id), None)
     if role is None:
         raise KeyError("ROLE_NOT_FOUND")

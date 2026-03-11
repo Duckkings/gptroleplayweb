@@ -1,24 +1,12 @@
 import { useEffect, useRef } from 'react';
 import type { AreaSubZone, SubZoneChatTurnEvent } from '../types/app';
+import { SceneEventCard } from './SceneEventCard';
 
 type Props = {
   subZone: AreaSubZone | null;
 };
 
 const HIDDEN_EVENT_KINDS = new Set<SubZoneChatTurnEvent['event_kind']>(['encounter_progress', 'encounter_resolution']);
-
-const EVENT_LABEL: Record<SubZoneChatTurnEvent['event_kind'], string> = {
-  encounter_progress: '遭遇推进',
-  encounter_resolution: '遭遇结算',
-  npc_reply: 'NPC',
-  team_reply: '队友',
-  system_notice: '系统',
-  public_actor_resolution: '公开轮次',
-  role_desire_surface: '角色欲望',
-  companion_story_surface: '队友故事',
-  reputation_update: '区域声望',
-  encounter_situation_update: '局势值',
-};
 
 export function SubZoneContextPanel({ subZone }: Props) {
   const turns = subZone?.chat_context?.recent_turns ?? [];
@@ -87,7 +75,7 @@ export function SubZoneContextPanel({ subZone }: Props) {
                 {passiveTurn ? (
                   <p>
                     <strong>玩家:</strong>
-                    本轮选择观察与等待（自动推进）
+                    本轮选择观察与等待，由系统自动推进。
                   </p>
                 ) : (
                   <>
@@ -113,17 +101,20 @@ export function SubZoneContextPanel({ subZone }: Props) {
                 )}
               </div>
               {visibleEvents.length > 0 && (
-                <ul className="subzone-context-events">
+                <div className="subzone-context-events">
                   {visibleEvents.map((event, index) => (
-                    <li key={`${turn.turn_id}_${event.actor_id || event.actor_name}_${index}`} className="subzone-context-event">
-                      <strong>
-                        {EVENT_LABEL[event.event_kind]}
-                        {event.actor_name ? ` / ${event.actor_name}` : ''}
-                      </strong>
-                      <span>{event.content}</span>
-                    </li>
+                    <SceneEventCard
+                      key={`${turn.turn_id}_${event.actor_id || event.actor_name}_${index}`}
+                      event={{
+                        event_kind: event.event_kind,
+                        actor_name: event.actor_name,
+                        content: event.content,
+                        metadata: event.metadata,
+                      }}
+                      compact
+                    />
                   ))}
-                </ul>
+                </div>
               )}
             </article>
           );

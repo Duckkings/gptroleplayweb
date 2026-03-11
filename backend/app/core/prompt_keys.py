@@ -12,14 +12,16 @@ class PromptKeys:
     TEAM_CHAT_USER = "team.chat.user.v1"
     TEAM_PUBLIC_REACTION_USER = "team.public.reaction.user.v2"
     SCENE_ACTOR_INTENT_USER = "scene.actor.intent.user.v1"
+    SCENE_ACTOR_ACTION_USER = "scene.actor.action.user.v2"
+    SCENE_ROUND_RESOLVE_USER = "scene.round.resolve.user.v2"
     ROLE_DESIRE_SEED_USER = "role.desire.seed.user.v1"
     ROLE_DESIRE_SURFACE_USER = "role.desire.surface.user.v1"
     COMPANION_STORY_SEED_USER = "companion.story.seed.user.v1"
     COMPANION_STORY_SURFACE_USER = "companion.story.surface.user.v1"
     REPUTATION_BEHAVIOR_USER = "reputation.behavior.user.v1"
     ENCOUNTER_GENERATE_USER = "encounter.generate.user.v2"
-    ENCOUNTER_STEP_USER = "encounter.step.user.v2"
-    ENCOUNTER_BACKGROUND_TICK_USER = "encounter.background.tick.user.v1"
+    ENCOUNTER_STEP_USER = "encounter.step.user.v3"
+    ENCOUNTER_BACKGROUND_TICK_USER = "encounter.background.tick.user.v2"
     ENCOUNTER_ESCAPE_USER = "encounter.escape.user.v1"
     ENCOUNTER_REJOIN_USER = "encounter.rejoin.user.v1"
     ENCOUNTER_DEBUG_SUMMARY_USER = "encounter.debug.summary.user.v1"
@@ -37,6 +39,8 @@ REQUIRED_PROMPT_KEYS: tuple[str, ...] = (
     PromptKeys.TEAM_CHAT_USER,
     PromptKeys.TEAM_PUBLIC_REACTION_USER,
     PromptKeys.SCENE_ACTOR_INTENT_USER,
+    PromptKeys.SCENE_ACTOR_ACTION_USER,
+    PromptKeys.SCENE_ROUND_RESOLVE_USER,
     PromptKeys.ROLE_DESIRE_SEED_USER,
     PromptKeys.ROLE_DESIRE_SURFACE_USER,
     PromptKeys.COMPANION_STORY_SEED_USER,

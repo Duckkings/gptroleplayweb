@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from math import ceil
@@ -35,6 +36,7 @@ from app.models.schemas import (
     EncounterResolution,
     EncounterState,
     EncounterStepEntry,
+    EncounterTemporaryNpc,
     EncounterTerminationCondition,
     GameLogEntry,
     InventoryItem,
@@ -111,6 +113,185 @@ def _clamp(value: int, lower: int, upper: int) -> int:
     return max(lower, min(upper, int(value)))
 
 
+@dataclass(frozen=True)
+class SituationAssessment:
+    before_value: int
+    delta: int
+    after_value: int
+    direction: str
+    trend: str
+    allowed_lexicon: tuple[str, ...]
+    forbidden_lexicon: tuple[str, ...]
+
+
+def _assess_situation_change(before_value: int, delta: int, after_value: int) -> SituationAssessment:
+    before = _clamp(before_value, 0, 100)
+    applied = int(delta)
+    after = _clamp(after_value, 0, 100)
+    if applied > 0:
+        return SituationAssessment(
+            before_value=before,
+            delta=applied,
+            after_value=after,
+            direction="stabilize",
+            trend="improving",
+            allowed_lexicon=("稳住", "压住", "争取到空间", "局势更稳", "险情被控制"),
+            forbidden_lexicon=("恶化", "更糟", "失控扩大", "逼近失控", "压力扩大", "险情扩散"),
+        )
+    if applied < 0:
+        return SituationAssessment(
+            before_value=before,
+            delta=applied,
+            after_value=after,
+            direction="worsen",
+            trend="worsening",
+            allowed_lexicon=("恶化", "逼近失控", "压力扩大", "险情扩散"),
+            forbidden_lexicon=("稳住", "压住", "局势更稳", "险情被控制", "争取到空间"),
+        )
+    return SituationAssessment(
+        before_value=before,
+        delta=0,
+        after_value=after,
+        direction="hold",
+        trend="stable",
+        allowed_lexicon=("暂时维持", "僵持", "未继续恶化", "未取得突破"),
+        forbidden_lexicon=("恶化", "更糟", "失控扩大", "稳住", "压住", "局势更稳"),
+    )
+
+
+def _assessment_line(assessment: SituationAssessment) -> str:
+    if assessment.direction == "stabilize":
+        return f"局势值变为 {assessment.after_value}/100，本轮更稳，险情被压住。"
+    if assessment.direction == "worsen":
+        return f"局势值变为 {assessment.after_value}/100，局面正在恶化，压力继续扩大。"
+    return f"局势值变为 {assessment.after_value}/100，现场暂时维持僵持，没有继续恶化，但也未取得突破。"
+
+
+def _text_conflicts_with_assessment(text: str, assessment: SituationAssessment) -> bool:
+    clean = " ".join((text or "").split()).strip()
+    if not clean:
+        return True
+    return any(token in clean for token in assessment.forbidden_lexicon)
+
+
+def _enforce_assessment_text(text: str, assessment: SituationAssessment, *, fallback_reason: str) -> str:
+    clean = " ".join((text or "").split()).strip()
+    if clean and not _text_conflicts_with_assessment(clean, assessment):
+        return clean[:240]
+    basis = fallback_reason.strip() or "现场局势发生了新的变化。"
+    if assessment.direction == "stabilize":
+        rebuilt = f"{basis} 这一步替现场争取到了更稳的空间，最危险的部分暂时被压住。"
+    elif assessment.direction == "worsen":
+        rebuilt = f"{basis} 这一步没能压住最直接的风险，现场压力继续扩大，局面朝更糟的方向滑去。"
+    else:
+        rebuilt = f"{basis} 现场暂时维持僵持，没有继续恶化，但也还没出现真正的突破口。"
+    return rebuilt[:240]
+
+
+def _encounter_actor_label(save, encounter: EncounterEntry, actor_role_id: str = "", actor_name: str = "") -> str:
+    if actor_name:
+        return actor_name
+    if actor_role_id:
+        role = next((item for item in save.role_pool if item.role_id == actor_role_id), None)
+        if role is not None and role.name:
+            return role.name
+        temp_npc = next((item for item in getattr(encounter, "temporary_npcs", []) or [] if item.encounter_npc_id == actor_role_id), None)
+        if temp_npc is not None and temp_npc.name:
+            return temp_npc.name
+    if encounter.npc_role_id:
+        role = next((item for item in save.role_pool if item.role_id == encounter.npc_role_id), None)
+        if role is not None and role.name:
+            return role.name
+    first_temp = next((item for item in getattr(encounter, "temporary_npcs", []) or [] if item.name), None)
+    if first_temp is not None:
+        return first_temp.name
+    return "现场局势"
+
+def _contains_concrete_marker(text: str) -> bool:
+    concrete_tokens = [
+        "书架",
+        "书页",
+        "管理员",
+        "地板",
+        "门",
+        "窗",
+        "符文",
+        "影子",
+        "楼梯",
+        "桌",
+        "柜",
+        "走廊",
+        "巷",
+        "脚步",
+        "木板",
+        "锁",
+        "火",
+        "绳",
+        "血",
+        "石",
+        "箱",
+    ]
+    return any(token in (text or "") for token in concrete_tokens)
+
+
+def _text_is_too_vague(text: str) -> bool:
+    clean = " ".join((text or "").split()).strip()
+    if not clean:
+        return True
+    vague_tokens = ["危险", "异常", "变化", "局势", "紧张", "不安", "某种", "似乎", "仿佛", "威胁", "压力", "进展"]
+    if any(token in clean for token in vague_tokens) and not _contains_concrete_marker(clean):
+        return True
+    return False
+
+
+def _visible_participant_text(save, encounter: EncounterEntry) -> tuple[str, str]:
+    team_members = [member.name for member in getattr(save.team_state, "members", []) if member.status == "active"]
+    npc_names: list[str] = []
+    if encounter.npc_role_id:
+        role = next((item for item in save.role_pool if item.role_id == encounter.npc_role_id), None)
+        if role is not None:
+            npc_names.append(role.name)
+    npc_names.extend(temp.name for temp in getattr(encounter, "temporary_npcs", []) or [] if temp.name)
+    return (" / ".join(team_members) or "none", " / ".join(npc_names) or "none")
+
+
+def _build_encounter_temp_npc(raw: dict[str, object], index: int) -> EncounterTemporaryNpc | None:
+    name = _force_chinese_text(raw.get("name"), "", limit=24)
+    if not name:
+        return None
+    title = _force_chinese_text(raw.get("title"), "", limit=40)
+    description = _force_chinese_text(raw.get("description"), f"{name}卷入了眼前的遭遇。", limit=120)
+    speaking_style = _force_chinese_text(raw.get("speaking_style"), "", limit=60)
+    agenda = _force_chinese_text(raw.get("agenda"), f"{name}正试图处理眼前最危险的部分。", limit=80)
+    return EncounterTemporaryNpc(
+        encounter_npc_id=f"encnpc_{index + 1}_{int(datetime.now(timezone.utc).timestamp() * 1000)}",
+        name=name,
+        title=title,
+        description=description,
+        speaking_style=speaking_style,
+        agenda=agenda,
+        state="active",
+    )
+
+
+def _sanitize_temporary_npcs(raw_list: object) -> list[EncounterTemporaryNpc]:
+    if not isinstance(raw_list, list):
+        return []
+    items: list[EncounterTemporaryNpc] = []
+    seen_names: set[str] = set()
+    for index, raw in enumerate(raw_list):
+        if len(items) >= 2:
+            break
+        if not isinstance(raw, dict):
+            continue
+        built = _build_encounter_temp_npc(raw, index)
+        if built is None or built.name in seen_names:
+            continue
+        seen_names.add(built.name)
+        items.append(built)
+    return items
+
+
 def _check_bonus_from_result(action_result: ActionCheckResponse | None) -> int:
     if action_result is None:
         return 0
@@ -169,6 +350,9 @@ def _refresh_participants(save, encounter: EncounterEntry) -> None:
     participant_ids = [member.role_id for member in getattr(save.team_state, "members", [])]
     if encounter.npc_role_id and encounter.npc_role_id not in participant_ids:
         participant_ids.append(encounter.npc_role_id)
+    for temp_npc in getattr(encounter, "temporary_npcs", []) or []:
+        if temp_npc.encounter_npc_id not in participant_ids:
+            participant_ids.append(temp_npc.encounter_npc_id)
     encounter.participant_role_ids = participant_ids
 
 
@@ -702,8 +886,9 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
     default_prompt = (
         "你要设计一个持续型跑团遭遇，且只能返回 JSON。\n"
         "所有可见文本字段都必须使用简体中文，不允许输出英文标题、英文描述或英文叙事。\n"
-        "Schema: {\"type\":\"npc|event|anomaly\",\"title\":\"\",\"description\":\"\",\"npc_role_id\":\"optional\",\"scene_summary\":\"\",\"termination_conditions\":[{\"kind\":\"npc_leaves|player_escapes|target_resolved|time_elapsed|manual_custom\",\"description\":\"\"}],\"tags\":[\"\"]}。\n"
+        "Schema: {\"type\":\"npc|event|anomaly\",\"title\":\"\",\"description\":\"\",\"npc_role_id\":\"optional\",\"temporary_npcs\":[{\"name\":\"\",\"title\":\"\",\"description\":\"\",\"speaking_style\":\"\",\"agenda\":\"\"}],\"scene_summary\":\"\",\"termination_conditions\":[{\"kind\":\"npc_leaves|player_escapes|target_resolved|time_elapsed|manual_custom\",\"description\":\"\"}],\"tags\":[\"\"]}。\n"
         "若 type=npc，则 npc_role_id 必填，且只能从允许列表中选择。\n"
+        "temporary_npcs 用于遭遇现场临时出现的 NPC，只在这次遭遇中存在，最多 2 名。\n"
         "禁止编造 npc id、zone id、sub-zone id、quest id 或 fate phase id。\n"
         "遭遇需要有立刻发生的现场感，title、description、scene_summary 和 termination_conditions.description 都必须是简体中文。"
     )
@@ -753,6 +938,7 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
 
         entity_refs: list[EntityRef] = []
         npc_role_id = _sanitize_allowed_id(parsed.get("npc_role_id"), allowed_npc_ids)
+        temporary_npcs = _sanitize_temporary_npcs(parsed.get("temporary_npcs"))
         termination_conditions_raw = parsed.get("termination_conditions") if isinstance(parsed.get("termination_conditions"), list) else []
         termination_conditions: list[EncounterTerminationCondition] = []
         for raw in termination_conditions_raw[:5]:
@@ -789,6 +975,7 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
             zone_id=zone_id,
             sub_zone_id=sub_zone_id,
             npc_role_id=npc_role_id or None,
+            temporary_npcs=temporary_npcs,
             related_quest_ids=[item.quest_id for item in active_quests[:2]],
             related_fate_phase_ids=([phase.phase_id] if phase is not None else []),
             generated_prompt_tags=clean_tags,
@@ -940,7 +1127,7 @@ def present_encounter(encounter_id: str, req: EncounterPresentRequest) -> Encoun
     )
 
 
-def _resolve_fallback_reply(encounter: EncounterEntry, player_prompt: str) -> tuple[str, int]:
+def _legacy_unused_resolve_fallback_reply_v0(encounter: EncounterEntry, player_prompt: str) -> tuple[str, int]:
     minutes = max(1, min(15, ceil(len(player_prompt.strip()) / 30)))
     if encounter.type == "npc":
         return (f"对方先打量了你一眼，然后低声回应了你的试探，显然不想在公开场合多说。", minutes)
@@ -949,7 +1136,7 @@ def _resolve_fallback_reply(encounter: EncounterEntry, player_prompt: str) -> tu
     return (f"你的举动让这场遭遇有了明确进展，现场留下的细节足够你继续推进调查。", minutes)
 
 
-def _ai_resolve_encounter(encounter: EncounterEntry, req: EncounterActRequest) -> dict[str, object] | None:
+def _legacy_unused_ai_resolve_encounter_v0(encounter: EncounterEntry, req: EncounterActRequest) -> dict[str, object] | None:
     config = req.config
     if config is None:
         return None
@@ -1018,7 +1205,7 @@ def _ai_resolve_encounter(encounter: EncounterEntry, req: EncounterActRequest) -
         return None
 
 
-def _fallback_step_updates(encounter: EncounterEntry, player_prompt: str) -> tuple[str, list[dict[str, object]], str]:
+def _legacy_unused_fallback_step_updates_v0(encounter: EncounterEntry, player_prompt: str) -> tuple[str, list[dict[str, object]], str]:
     clean = (player_prompt or "").strip()
     updates: list[dict[str, object]] = []
     step_kind = "gm_update"
@@ -1033,6 +1220,157 @@ def _fallback_step_updates(encounter: EncounterEntry, player_prompt: str) -> tup
             if condition.kind == "npc_leaves":
                 updates.append({"condition_index": index, "satisfied": True})
                 break
+    return scene_summary, updates, step_kind
+
+
+def _encounter_specific_defaults(encounter: EncounterEntry, player_prompt: str) -> tuple[str, str, str, str]:
+    clean_prompt = " ".join((player_prompt or "").split()).strip() or "本轮行动"
+    focus_title = encounter.title or "当前遭遇"
+    scene_summary = " ".join((encounter.scene_summary or encounter.description or focus_title).split()).strip()
+    first_temp = next((item for item in getattr(encounter, "temporary_npcs", []) or [] if item.name), None)
+    focus_actor = first_temp.name if first_temp is not None else ("现场 NPC" if encounter.npc_role_id else "现场")
+    termination_text = next((item.description for item in encounter.termination_conditions if item.description), "")
+    specific_change = f"你刚做出“{clean_prompt[:36]}”后，{focus_actor}立刻围绕“{focus_title}”采取了动作，现场变化变得明确：{scene_summary}"
+    specific_threat = termination_text or f"{focus_title}里最直接的阻碍仍然是：{scene_summary}"
+    opened_opportunity = f"你下一轮可以直接介入“{focus_title}”，优先处理“{specific_threat[:48]}”"
+    return scene_summary, specific_change[:180], specific_threat[:180], opened_opportunity[:180]
+
+
+def _legacy_unused_concretize_encounter_reply_v1(
+    encounter: EncounterEntry,
+    player_prompt: str,
+    *,
+    reply: str,
+    scene_summary: str,
+    specific_change: str = "",
+    specific_threat: str = "",
+    opened_opportunity: str = "",
+) -> tuple[str, str]:
+    fallback_scene, fallback_change, fallback_threat, fallback_opportunity = _encounter_specific_defaults(encounter, player_prompt)
+    change_text = _force_chinese_text(specific_change, fallback_change, limit=180)
+    threat_text = _force_chinese_text(specific_threat, fallback_threat, limit=180)
+    opportunity_text = _force_chinese_text(opened_opportunity, fallback_opportunity, limit=180)
+    summary_text = _force_chinese_text(scene_summary, fallback_scene, limit=240)
+    if _text_is_too_vague(summary_text):
+        summary_text = f"{change_text} 当前最直接的风险是：{threat_text}。"
+    reply_text = _force_chinese_text(reply, "", limit=240)
+    if _text_is_too_vague(reply_text):
+        reply_text = f"{change_text} 当前最直接的风险是：{threat_text}。这给你留下的明确机会是：{opportunity_text}。"
+    return reply_text[:240], summary_text[:240]
+
+
+def _legacy_unused_resolve_fallback_reply_v1(encounter: EncounterEntry, player_prompt: str) -> tuple[str, int]:
+    minutes = max(1, min(15, ceil(len(player_prompt.strip()) / 30)))
+    reply, _ = _concretize_encounter_reply(
+        encounter,
+        player_prompt,
+        reply="",
+        scene_summary=encounter.scene_summary or encounter.description or encounter.title,
+    )
+    return reply, minutes
+
+
+def _legacy_unused_ai_resolve_encounter_v1(encounter: EncounterEntry, req: EncounterActRequest) -> dict[str, object] | None:
+    config = req.config
+    if config is None:
+        return None
+    api_key = (config.openai_api_key or "").strip()
+    model = (config.model or "").strip()
+    if not api_key or not model:
+        return None
+    fallback_reply, fallback_minutes = _resolve_fallback_reply(encounter, req.player_prompt)
+    save = get_current_save(default_session_id=req.session_id)
+    team_members, visible_npcs = _visible_participant_text(save, encounter)
+    default_prompt = (
+        "你要推进一个跑团遭遇步骤，只能返回 JSON。\n"
+        "reply、scene_summary、specific_change、specific_threat、opened_opportunity 都必须使用简体中文。\n"
+        "不能写模糊句。禁止只写“发现危险”“情况恶化”“似乎有异常”“有某种力量”这类没有来源、对象、位置和后果的描述。\n"
+        "必须明确写出：谁对什么做了什么，现场哪一处发生了什么变化，直接危险或障碍是什么，给玩家留下了什么机会或压力。\n"
+        "你只能描述环境、事物、局势、目标反馈和系统性变化，不允许代替现场 NPC 或队友发言。\n"
+        "若玩家本轮选择旁观与等待，就把这一轮视为局势自行推进，不要编造玩家主动动作。\n"
+        "JSON schema: "
+        "{\"reply\":\"...\",\"time_spent_min\":1,\"scene_summary\":\"...\","
+        "\"specific_change\":\"...\",\"specific_threat\":\"...\",\"opened_opportunity\":\"...\","
+        "\"situation_delta_hint\":0,"
+        "\"step_kind\":\"gm_update|resolution\","
+        "\"termination_updates\":[{\"condition_index\":0,\"satisfied\":true}]}"
+    )
+    prompt = prompt_table.render(
+        PromptKeys.ENCOUNTER_STEP_USER,
+        default_prompt,
+        title=encounter.title,
+        description=encounter.description,
+        encounter_mode=encounter.encounter_mode,
+        player_presence=encounter.player_presence,
+        scene_summary=encounter.scene_summary or encounter.description,
+        termination_conditions=_termination_conditions_text(encounter),
+        recent_steps=_recent_steps_text(encounter),
+        player_prompt=req.player_prompt,
+        team_members=team_members,
+        visible_npcs=visible_npcs,
+    )
+    try:
+        client = create_sync_client(config, client_cls=OpenAI)
+        resp = client.chat.completions.create(
+            model=model,
+            **build_completion_options(config),
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": prompt_table.get_text("encounter.resolve.system", "你只输出 JSON。所有文本字段使用简体中文。")},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        parsed = _extract_json_content((resp.choices[0].message.content or "").strip())
+        minutes = max(1, min(30, int(parsed.get("time_spent_min") or fallback_minutes or 1)))
+        step_kind = str(parsed.get("step_kind") or "gm_update").strip().lower()
+        if step_kind not in {"gm_update", "resolution"}:
+            step_kind = "gm_update"
+        reply, scene_summary = _concretize_encounter_reply(
+            encounter,
+            req.player_prompt,
+            reply=str(parsed.get("reply") or fallback_reply),
+            scene_summary=str(parsed.get("scene_summary") or encounter.scene_summary or encounter.description),
+            specific_change=str(parsed.get("specific_change") or ""),
+            specific_threat=str(parsed.get("specific_threat") or ""),
+            opened_opportunity=str(parsed.get("opened_opportunity") or ""),
+        )
+        if not reply:
+            return None
+        termination_updates = parsed.get("termination_updates")
+        if not isinstance(termination_updates, list):
+            termination_updates = []
+        return {
+            "reply": reply,
+            "time_spent_min": minutes,
+            "scene_summary": scene_summary,
+            "specific_change": _force_chinese_text(parsed.get("specific_change"), "", limit=180),
+            "specific_threat": _force_chinese_text(parsed.get("specific_threat"), "", limit=180),
+            "opened_opportunity": _force_chinese_text(parsed.get("opened_opportunity"), "", limit=180),
+            "situation_delta_hint": _clamp(int(parsed.get("situation_delta_hint") or 0), -8, 8),
+            "step_kind": step_kind,
+            "termination_updates": termination_updates,
+        }
+    except Exception:
+        return None
+
+
+def _legacy_unused_fallback_step_updates_v1(encounter: EncounterEntry, player_prompt: str) -> tuple[str, list[dict[str, object]], str]:
+    clean = (player_prompt or "").strip()
+    updates: list[dict[str, object]] = []
+    scene_summary, _, _, _ = _encounter_specific_defaults(encounter, player_prompt)
+    step_kind = "gm_update"
+    if any(token in clean for token in ["搞清", "确认", "解决", "谈妥", "处理完", "拿到"]):
+        for index, condition in enumerate(encounter.termination_conditions):
+            if condition.kind == "target_resolved":
+                updates.append({"condition_index": index, "satisfied": True})
+                break
+    if encounter.type == "npc" and any(token in clean for token in ["散了", "离开", "不聊", "闭嘴"]):
+        for index, condition in enumerate(encounter.termination_conditions):
+            if condition.kind == "npc_leaves":
+                updates.append({"condition_index": index, "satisfied": True})
+                break
+    if updates:
+        step_kind = "resolution"
     return scene_summary, updates, step_kind
 
 
@@ -1167,7 +1505,7 @@ def act_on_encounter(encounter_id: str, req: EncounterActRequest) -> EncounterAc
     )
 
 
-def advance_active_encounter_from_main_chat_in_save(
+def _legacy_unused_advance_active_encounter_from_main_chat_in_save_v1(
     save,
     *,
     session_id: str,
@@ -1312,7 +1650,7 @@ def advance_active_encounter_from_main_chat_in_save(
     return events
 
 
-def advance_active_encounter_in_save(save, *, session_id: str, minutes_elapsed: int, config: ChatConfig | None = None) -> EncounterEntry | None:
+def _legacy_unused_advance_active_encounter_in_save_v1(save, *, session_id: str, minutes_elapsed: int, config: ChatConfig | None = None) -> EncounterEntry | None:
     state = _state(save)
     encounter = _current_active_encounter(state)
     if encounter is None or encounter.player_presence != "away" or encounter.status not in {"active", "escaped"}:
@@ -1383,7 +1721,7 @@ def advance_active_encounter_in_save(save, *, session_id: str, minutes_elapsed: 
     return encounter
 
 
-def apply_active_encounter_situation_delta_in_save(
+def _legacy_unused_apply_active_encounter_situation_delta_in_save_v1(
     save,
     *,
     session_id: str,
@@ -1541,7 +1879,7 @@ def rejoin_encounter(encounter_id: str, req: EncounterRejoinRequest) -> Encounte
     )
 
 
-def get_encounter_debug_overview(session_id: str) -> EncounterDebugOverviewResponse:
+def _legacy_unused_get_encounter_debug_overview_v1(session_id: str) -> EncounterDebugOverviewResponse:
     save = get_current_save(default_session_id=session_id)
     if save.session_id != session_id:
         save.session_id = session_id
@@ -1562,7 +1900,413 @@ def get_encounter_debug_overview(session_id: str) -> EncounterDebugOverviewRespo
     )
 
 
-def escape_encounter(encounter_id: str, req: EncounterEscapeRequest) -> EncounterEscapeResponse:
+def _concretize_encounter_reply(
+    encounter: EncounterEntry,
+    player_prompt: str,
+    *,
+    reply: str,
+    scene_summary: str,
+    specific_change: str = "",
+    specific_threat: str = "",
+    opened_opportunity: str = "",
+) -> tuple[str, str]:
+    from app.services.encounter_runtime_v2 import concretize_encounter_reply
+
+    save = get_current_save(default_session_id=getattr(encounter, "encounter_id", "") or "encounter_runtime")
+    return concretize_encounter_reply(
+        save,
+        encounter,
+        player_prompt,
+        reply=reply,
+        scene_summary=scene_summary,
+        specific_change=specific_change,
+        specific_threat=specific_threat,
+        opened_opportunity=opened_opportunity,
+    )
+
+
+def _resolve_fallback_reply(encounter: EncounterEntry, player_prompt: str) -> tuple[str, int]:
+    from app.services.encounter_runtime_v2 import resolve_fallback_reply
+
+    save = get_current_save(default_session_id=getattr(encounter, "encounter_id", "") or "encounter_runtime")
+    return resolve_fallback_reply(save, encounter, player_prompt)
+
+
+def _ai_resolve_encounter(encounter: EncounterEntry, req: EncounterActRequest) -> dict[str, object] | None:
+    from app.services.encounter_runtime_v2 import ai_resolve_encounter
+
+    return ai_resolve_encounter(encounter, req)
+
+
+def _fallback_step_updates(encounter: EncounterEntry, player_prompt: str) -> tuple[str, list[dict[str, object]], str]:
+    from app.services.encounter_runtime_v2 import fallback_step_updates
+
+    return fallback_step_updates(encounter, player_prompt)
+
+
+def advance_active_encounter_in_save(save, *, session_id: str, minutes_elapsed: int, config: ChatConfig | None = None) -> EncounterEntry | None:
+    from app.services.encounter_runtime_v2 import advance_active_encounter_in_save as runtime_v2
+
+    return runtime_v2(save, session_id=session_id, minutes_elapsed=minutes_elapsed, config=config)
+
+
+def apply_active_encounter_situation_delta_in_save(
+    save,
+    *,
+    session_id: str,
+    delta: int,
+    summary: str,
+    actor_role_id: str = "",
+    actor_name: str = "",
+) -> list:
+    from app.services.encounter_runtime_v2 import apply_active_encounter_situation_delta_in_save as runtime_v2
+
+    return runtime_v2(
+        save,
+        session_id=session_id,
+        delta=delta,
+        summary=summary,
+        actor_role_id=actor_role_id,
+        actor_name=actor_name,
+    )
+
+
+def advance_active_encounter_from_main_chat_in_save(
+    save,
+    *,
+    session_id: str,
+    player_text: str,
+    gm_narration: str,
+    time_spent_min: int,
+    config: ChatConfig | None = None,
+) -> list:
+    from app.services.encounter_runtime_v2 import advance_active_encounter_from_main_chat_in_save as runtime_v2
+
+    return runtime_v2(
+        save,
+        session_id=session_id,
+        player_text=player_text,
+        gm_narration=gm_narration,
+        time_spent_min=time_spent_min,
+        config=config,
+    )
+
+
+def get_encounter_debug_overview(session_id: str) -> EncounterDebugOverviewResponse:
+    from app.services.encounter_runtime_v2 import get_encounter_debug_overview as runtime_v2
+
+    return runtime_v2(session_id)
+
+
+def _legacy_unused_advance_active_encounter_in_save_v2(save, *, session_id: str, minutes_elapsed: int, config: ChatConfig | None = None) -> EncounterEntry | None:
+    state = _state(save)
+    encounter = _current_active_encounter(state)
+    if encounter is None or encounter.player_presence != "away" or encounter.status not in {"active", "escaped"}:
+        return None
+    if minutes_elapsed <= 0:
+        return None
+    if encounter.presented_at is None:
+        _initialize_encounter_state(save, encounter)
+
+    team_members, visible_npcs = _visible_participant_text(save, encounter)
+    raw_reply = f"你离开现场后，《{encounter.title}》仍在后台推进。"
+    raw_scene_summary = encounter.scene_summary or encounter.description
+    if config is not None:
+        api_key = (config.openai_api_key or "").strip()
+        model = (config.model or "").strip()
+        if api_key and model:
+            try:
+                client = create_sync_client(config, client_cls=OpenAI)
+                prompt = prompt_table.render(
+                    PromptKeys.ENCOUNTER_BACKGROUND_TICK_USER,
+                    "你要在后台推进一个遭遇，只能返回 JSON。reply 和 scene_summary 必须具体说明现场哪一处发生了什么变化、风险是什么、接下来会压向哪里。",
+                    title=encounter.title,
+                    description=encounter.description,
+                    scene_summary=encounter.scene_summary or encounter.description,
+                    termination_conditions=_termination_conditions_text(encounter),
+                    recent_steps=_recent_steps_text(encounter),
+                    minutes_elapsed=minutes_elapsed,
+                    team_members=team_members,
+                    visible_npcs=visible_npcs,
+                )
+                resp = client.chat.completions.create(
+                    model=model,
+                    **build_completion_options(config),
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": prompt_table.get_text("encounter.generate.system", "你只输出 JSON。所有文本字段使用简体中文。")},
+                        {"role": "user", "content": prompt},
+                    ],
+                )
+                parsed = _extract_json_content((resp.choices[0].message.content or "").strip())
+                raw_reply = str(parsed.get("reply") or raw_reply)
+                raw_scene_summary = str(parsed.get("scene_summary") or raw_scene_summary)
+                _apply_termination_updates(encounter, parsed.get("termination_updates"))
+            except Exception:
+                pass
+
+    reply, next_scene_summary = _concretize_encounter_reply(
+        encounter,
+        f"后台推进 {minutes_elapsed} 分钟",
+        reply=raw_reply,
+        scene_summary=raw_scene_summary,
+    )
+    encounter.scene_summary = next_scene_summary
+    encounter.background_tick_count += 1
+    background_delta = -_clamp(max(1, minutes_elapsed // 10), 1, 6)
+    encounter.situation_value = _clamp(encounter.situation_value + background_delta, 0, 100)
+    encounter.situation_trend = "worsening" if background_delta < 0 else "stable"
+    encounter.latest_outcome_summary = reply
+    encounter.last_advanced_at = _utc_now()
+    _append_step(encounter, kind="background_tick", content=reply)
+    _finalize_encounter_if_needed(save, state, encounter, session_id=session_id)
+    _append_game_log(
+        save,
+        session_id,
+        "encounter_background_tick",
+        reply,
+        {
+            "encounter_id": encounter.encounter_id,
+            "minutes_elapsed": minutes_elapsed,
+            "situation_value": encounter.situation_value,
+            "situation_delta": background_delta,
+        },
+    )
+    _touch_state(state)
+    return encounter
+
+
+def _legacy_unused_apply_active_encounter_situation_delta_in_save_v2(
+    save,
+    *,
+    session_id: str,
+    delta: int,
+    summary: str,
+    actor_role_id: str = "",
+    actor_name: str = "",
+) -> list:
+    state = _state(save)
+    encounter = _current_active_encounter(state)
+    if encounter is None or encounter.status not in {"active", "escaped"}:
+        return []
+    if encounter.presented_at is None:
+        _initialize_encounter_state(save, encounter)
+    applied = _clamp(delta, -20, 20)
+    if applied == 0:
+        return []
+
+    team_member = next((item for item in getattr(save.team_state, "members", []) if item.role_id == actor_role_id), None)
+    temp_npc = next((item for item in getattr(encounter, "temporary_npcs", []) or [] if item.encounter_npc_id == actor_role_id), None)
+    if team_member is not None:
+        step_kind = "team_reaction"
+        actor_type = "team"
+    elif temp_npc is not None:
+        step_kind = "temp_npc_action"
+        actor_type = "encounter_temp_npc"
+        actor_name = actor_name or temp_npc.name
+    elif actor_role_id:
+        step_kind = "npc_reaction"
+        actor_type = "npc"
+    else:
+        step_kind = "background_tick"
+        actor_type = "system"
+
+    encounter.situation_value = _clamp(encounter.situation_value + applied, 0, 100)
+    encounter.situation_trend = "improving" if applied > 0 else "worsening"
+    concrete_summary, next_scene_summary = _concretize_encounter_reply(
+        encounter,
+        summary or "局势推进",
+        reply=summary or encounter.latest_outcome_summary or encounter.scene_summary or encounter.description,
+        scene_summary=encounter.scene_summary or encounter.description,
+    )
+    encounter.scene_summary = next_scene_summary
+    encounter.latest_outcome_summary = concrete_summary
+    encounter.last_advanced_at = _utc_now()
+    _append_step(
+        encounter,
+        kind=step_kind,
+        actor_type=actor_type,
+        actor_id=actor_role_id,
+        actor_name=actor_name,
+        content=concrete_summary,
+    )
+    outcome_package, _ = _finalize_encounter_if_needed(save, state, encounter, session_id=session_id)
+    _append_game_log(
+        save,
+        session_id,
+        "encounter_situation_update",
+        concrete_summary,
+        {
+            "encounter_id": encounter.encounter_id,
+            "situation_value": encounter.situation_value,
+            "situation_delta": applied,
+        },
+    )
+    events = [
+        _new_scene_event(
+            "encounter_situation_update",
+            f"局势值变为 {encounter.situation_value}/100，趋势为 {encounter.situation_trend}。{concrete_summary}",
+            actor_role_id=actor_role_id,
+            actor_name=actor_name,
+            metadata={
+                "encounter_id": encounter.encounter_id,
+                "encounter_title": encounter.title,
+                "situation_value": encounter.situation_value,
+                "situation_delta": applied,
+                "actor_type": actor_type,
+            },
+        )
+    ]
+    if outcome_package is not None:
+        events.append(
+            _new_scene_event(
+                "encounter_resolution",
+                outcome_package.narrative_summary or concrete_summary,
+                metadata={
+                    "encounter_id": encounter.encounter_id,
+                    "encounter_title": encounter.title,
+                    "status": encounter.status,
+                },
+            )
+        )
+    return events
+
+
+def _legacy_unused_advance_active_encounter_from_main_chat_in_save_v2(
+    save,
+    *,
+    session_id: str,
+    player_text: str,
+    gm_narration: str,
+    time_spent_min: int,
+    config: ChatConfig | None = None,
+) -> list:
+    state = _state(save)
+    encounter = _current_active_encounter(state)
+    if encounter is None or encounter.status != "active" or encounter.player_presence != "engaged":
+        return []
+    if encounter.zone_id and save.area_snapshot.current_zone_id and encounter.zone_id != save.area_snapshot.current_zone_id:
+        return []
+    if encounter.sub_zone_id and save.area_snapshot.current_sub_zone_id and encounter.sub_zone_id != save.area_snapshot.current_sub_zone_id:
+        return []
+    if encounter.presented_at is None:
+        _initialize_encounter_state(save, encounter)
+
+    parsed_intent = _parse_player_intent(player_text)
+    passive_turn = bool(parsed_intent.get("passive_turn"))
+    passive_text = "【玩家旁观】玩家本轮选择观察与等待，不主动行动。"
+    display_text = passive_text if passive_turn else str(parsed_intent.get("display_text") or player_text).strip()
+    if any(token in display_text for token in ["离开", "逃离", "脱身", "撤退", "先撤", "转身跑", "脱离遭遇"]):
+        reply = f"你暂时从《{encounter.title}》里抽身离开，但现场问题仍在继续发展。"
+        encounter.status = "escaped"
+        encounter.player_presence = "away"
+        encounter.latest_outcome_summary = reply
+        encounter.last_advanced_at = _utc_now()
+        _append_step(encounter, kind="escape_attempt", content=reply)
+        for index, condition in enumerate(encounter.termination_conditions):
+            if condition.kind == "player_escapes":
+                _apply_termination_updates(encounter, [{"condition_index": index, "satisfied": True}])
+                break
+        state.active_encounter_id = encounter.encounter_id
+        _append_game_log(save, session_id, "encounter_escape", reply, {"encounter_id": encounter.encounter_id, "from_main_chat": True})
+        _touch_state(state)
+        return [
+            _new_scene_event(
+                "encounter_progress",
+                reply,
+                metadata={"encounter_id": encounter.encounter_id, "encounter_title": encounter.title, "status": encounter.status},
+            )
+        ]
+
+    _append_step(
+        encounter,
+        kind="player_action",
+        actor_type="player",
+        actor_id=save.player_static_data.player_id,
+        actor_name=save.player_static_data.name,
+        content=display_text or gm_narration or "玩家继续应对当前遭遇。",
+    )
+    resolved = _ai_resolve_encounter(
+        encounter,
+        EncounterActRequest(
+            session_id=session_id,
+            encounter_id=encounter.encounter_id,
+            player_prompt=f"{display_text}\nGM叙事：{gm_narration}".strip(),
+            config=config,
+        ),
+    )
+    if resolved is None:
+        reply, _ = _resolve_fallback_reply(encounter, display_text or gm_narration)
+        next_scene_summary, termination_updates, step_kind = _fallback_step_updates(encounter, display_text or gm_narration)
+        situation_delta_hint = _fallback_situation_delta(encounter, display_text or gm_narration)
+    else:
+        reply = str(resolved.get("reply") or "").strip()
+        next_scene_summary = str(resolved.get("scene_summary") or "").strip() or encounter.scene_summary or encounter.description
+        termination_updates = resolved.get("termination_updates") if isinstance(resolved.get("termination_updates"), list) else []
+        step_kind = str(resolved.get("step_kind") or "gm_update")
+        situation_delta_hint = _clamp(int(resolved.get("situation_delta_hint") or 0), -8, 8)
+
+    encounter.scene_summary = next_scene_summary
+    encounter.latest_outcome_summary = reply
+    encounter.last_advanced_at = _utc_now()
+    _append_step(encounter, kind=step_kind, content=reply)
+    _apply_termination_updates(encounter, termination_updates)
+    situation_delta = _clamp(situation_delta_hint + _check_bonus_from_player_prompt(player_text), -20, 20)
+    if situation_delta != 0:
+        encounter.situation_value = _clamp(encounter.situation_value + situation_delta, 0, 100)
+        encounter.situation_trend = "improving" if situation_delta > 0 else "worsening"
+    else:
+        encounter.situation_trend = "stable"
+    event_kind = "encounter_progress"
+    outcome_package, applied_outcome_summaries = _finalize_encounter_if_needed(save, state, encounter, session_id=session_id)
+    if outcome_package is not None:
+        event_kind = "encounter_resolution"
+    else:
+        encounter.status = "active"
+        state.active_encounter_id = encounter.encounter_id
+    state.history.append(
+        EncounterResolution(
+            encounter_id=encounter.encounter_id,
+            player_prompt=display_text or player_text,
+            reply=reply,
+            time_spent_min=max(0, time_spent_min),
+            quest_updates=[f"{quest_id}:progress" for quest_id in encounter.related_quest_ids],
+            situation_delta=situation_delta,
+            situation_value_after=encounter.situation_value,
+            reputation_delta=(outcome_package.reputation_delta if outcome_package is not None else 0),
+            applied_outcome_summaries=applied_outcome_summaries,
+        )
+    )
+    state.history = state.history[-80:]
+    _append_game_log(
+        save,
+        session_id,
+        ("encounter_resolved" if event_kind == "encounter_resolution" else "encounter_progress"),
+        reply,
+        {"encounter_id": encounter.encounter_id, "from_main_chat": True, "time_spent_min": time_spent_min},
+    )
+    _touch_state(state)
+    events = [
+        _new_scene_event(
+            "encounter_situation_update",
+            f"局势值变为 {encounter.situation_value}/100，趋势为 {encounter.situation_trend}。{reply}",
+            metadata={
+                "encounter_id": encounter.encounter_id,
+                "encounter_title": encounter.title,
+                "situation_value": encounter.situation_value,
+                "situation_delta": situation_delta,
+            },
+        ),
+        _new_scene_event(
+            event_kind,
+            reply,
+            metadata={"encounter_id": encounter.encounter_id, "encounter_title": encounter.title, "status": encounter.status},
+        ),
+    ]
+    return events
+
+
+def _legacy_unused_escape_encounter_v1(encounter_id: str, req: EncounterEscapeRequest) -> EncounterEscapeResponse:
     save = get_current_save(default_session_id=req.session_id)
     save.session_id = req.session_id
     state = _state(save)
@@ -1630,7 +2374,7 @@ def escape_encounter(encounter_id: str, req: EncounterEscapeRequest) -> Encounte
     )
 
 
-def rejoin_encounter(encounter_id: str, req: EncounterRejoinRequest) -> EncounterRejoinResponse:
+def _legacy_unused_rejoin_encounter_v1(encounter_id: str, req: EncounterRejoinRequest) -> EncounterRejoinResponse:
     save = get_current_save(default_session_id=req.session_id)
     save.session_id = req.session_id
     state = _state(save)
@@ -1663,7 +2407,7 @@ def rejoin_encounter(encounter_id: str, req: EncounterRejoinRequest) -> Encounte
     )
 
 
-def get_encounter_debug_overview(session_id: str) -> EncounterDebugOverviewResponse:
+def _legacy_unused_get_encounter_debug_overview_v2(session_id: str) -> EncounterDebugOverviewResponse:
     save = get_current_save(default_session_id=session_id)
     if save.session_id != session_id:
         save.session_id = session_id

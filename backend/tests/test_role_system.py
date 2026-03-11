@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from app.core.prompt_keys import PromptKeys
 from app.core.prompt_table import prompt_table
 from app.core.storage import storage_state
 from app.models.schemas import (
@@ -18,6 +19,7 @@ from app.models.schemas import (
     Coord3D,
     EncounterCheckResponse,
     EncounterEntry,
+    EncounterTemporaryNpc,
     EncounterTerminationCondition,
     InventoryItem,
     NpcChatRequest,
@@ -35,6 +37,8 @@ from app.models.schemas import (
     SubZoneChatTurn,
     TeamMember,
 )
+from app.services.public_scene_service import get_public_scene_state
+from app.services.chat_service import route_main_turn_intent
 from app.services.team_service import ensure_team_state
 from app.services.world_service import (
     _parse_player_intent,
@@ -362,13 +366,14 @@ class RoleSystemTests(unittest.TestCase):
         )
         save_current(loaded)
 
-        self.assertIn("NPC", summary)
+        self.assertIn("【场景反应】", summary)
+        self.assertIn("Square Watcher", summary)
         updated = get_current_save(sid)
         role = updated.role_pool[0]
         self.assertTrue(any("公开记忆" in item for item in role.cognition_changes))
-        self.assertTrue(any(item.kind == "public_npc_reaction" for item in updated.game_logs))
+        self.assertTrue(any(item.kind == "public_scene_director" for item in updated.game_logs))
 
-    def test_public_targeted_reply_stays_public_context(self) -> None:
+    def test_public_scene_targeted_actor_uses_action_then_round_resolution(self) -> None:
         sid = "sess_public_targeted_reply"
         self._seed_public_scene_roles(sid)
         save = get_current_save(sid)
@@ -376,21 +381,37 @@ class RoleSystemTests(unittest.TestCase):
         events = advance_public_scene_in_save(
             save,
             session_id=sid,
-            player_text='{"input_type":"player_intent_v1","speech_description":"Luna, what do you think?"}',
+            player_text='{"input_type":"player_intent_v1","speech_description":"Luna：你好，请告诉我发生了什么。"}',
             gm_summary="GM summary",
             config=None,
         )
         save_current(save)
 
-        targeted = next(event for event in events if event.kind == "public_targeted_npc_reply")
-        self.assertEqual(targeted.actor_role_id, "npc_luna")
-        self.assertTrue(targeted.content)
+        self.assertTrue(any(event.kind == "public_actor_action" and event.actor_role_id == "npc_luna" for event in events))
+        self.assertTrue(any(event.kind == "public_round_resolution" for event in events))
+        self.assertFalse(any(event.kind in {"role_desire_surface", "companion_story_surface"} for event in events))
         updated = get_current_save(sid)
         luna = next(item for item in updated.role_pool if item.role_id == "npc_luna")
-        self.assertEqual(luna.dialogue_logs[-1].context_kind, "public_targeted")
-        self.assertEqual(luna.dialogue_logs[-2].context_kind, "public_targeted")
+        self.assertTrue(any(item.context_kind == "public_targeted" for item in luna.dialogue_logs[-2:]))
 
-    def test_public_bystander_reaction_is_written_with_public_reaction_context(self) -> None:
+    def test_main_chat_named_visible_npc_stays_in_public_route(self) -> None:
+        sid = "sess_public_named_visible_npc"
+        self._seed_public_scene_roles(sid)
+
+        parsed = _parse_player_intent('{"input_type":"player_intent_v1","speech_description":"Luna：你怎么看？"}')
+        routed = route_main_turn_intent(sid, parsed, None)
+
+        self.assertFalse(routed["handled"])
+        self.assertTrue(any(event.tool_name == "route_main_turn_target_npc" for event in routed["tool_events"]))
+        self.assertEqual(parsed["addressed_role_name"], "Luna")
+
+    def test_parse_player_speech_prefix_keeps_player_as_speaker(self) -> None:
+        parsed = _parse_player_intent('{"input_type":"player_intent_v1","speech_description":"Luna：你好，请告诉我发生了什么。"}')
+        self.assertEqual(parsed["addressed_role_name"], "Luna")
+        self.assertEqual(parsed["speech_text"], "你好，请告诉我发生了什么。")
+        self.assertIn("语言：对Luna说：你好，请告诉我发生了什么。", parsed["display_text"])
+
+    def test_public_scene_emits_action_and_round_resolution_without_drive_events(self) -> None:
         sid = "sess_public_bystander_memory"
         self._seed_public_scene_roles(sid)
         save = get_current_save(sid)
@@ -404,15 +425,26 @@ class RoleSystemTests(unittest.TestCase):
         )
         save_current(save)
 
-        self.assertTrue(any(event.kind == "public_bystander_reaction" for event in events))
+        self.assertTrue(any(event.kind == "public_actor_action" for event in events))
+        self.assertTrue(any(event.kind == "public_round_resolution" for event in events))
+        self.assertFalse(any(event.kind in {"role_desire_surface", "companion_story_surface"} for event in events))
         updated = get_current_save(sid)
-        bram = next(item for item in updated.role_pool if item.role_id == "npc_bram")
-        self.assertEqual(bram.dialogue_logs[-1].context_kind, "public_reaction")
+        self.assertTrue(any(role.dialogue_logs for role in updated.role_pool))
 
-    def test_encounter_scene_bystander_reaction_is_written_with_encounter_context(self) -> None:
+    def test_encounter_temp_npc_participates_in_public_scene_candidates(self) -> None:
         sid = "sess_encounter_bystander_memory"
         self._seed_scene_context_with_team_and_encounter(sid)
         save = get_current_save(sid)
+        save.encounter_state.encounters[0].temporary_npcs = [
+            EncounterTemporaryNpc(
+                encounter_npc_id="encnpc_1",
+                name="管理员",
+                title="图书馆管理员",
+                description="她守在倒下的书架旁。",
+                speaking_style="急促",
+                agenda="先把散落的禁书收拢起来",
+            )
+        ]
 
         events = advance_public_scene_in_save(
             save,
@@ -423,10 +455,17 @@ class RoleSystemTests(unittest.TestCase):
         )
         save_current(save)
 
-        self.assertTrue(any(event.actor_role_id == "npc_bram" and event.kind in {"team_public_reaction", "public_actor_resolution"} for event in events))
-        updated = get_current_save(sid)
-        bram = next(item for item in updated.role_pool if item.role_id == "npc_bram")
-        self.assertEqual(bram.dialogue_logs[-1].context_kind, "encounter")
+        self.assertTrue(
+            any(
+                event.kind == "public_actor_action"
+                and event.actor_role_id == "encnpc_1"
+                and event.metadata.get("actor_type") == "encounter_temp_npc"
+                for event in events
+            )
+        )
+        state = get_public_scene_state(sid).public_scene_state
+        self.assertTrue(any(item.actor_type == "encounter_temp_npc" and item.role_id == "encnpc_1" for item in state.candidate_actors))
+        self.assertFalse(any(item.name == "管理员" for item in state.visible_npcs))
 
     def test_action_check_narrative_does_not_inline_public_scene_summary(self) -> None:
         sid = "sess_action_check_no_inline_scene"
@@ -443,7 +482,7 @@ class RoleSystemTests(unittest.TestCase):
         )
 
         self.assertNotIn("场景反应", result.narrative)
-        self.assertTrue(any(event.kind == "public_targeted_npc_reply" for event in result.scene_events))
+        self.assertTrue(any(event.kind in {"public_actor_action", "public_round_resolution"} for event in result.scene_events))
 
     def test_plan_action_check_returns_check_task_and_modifier(self) -> None:
         sid = "sess_action_check_plan"
@@ -569,29 +608,59 @@ class RoleSystemTests(unittest.TestCase):
         self._seed_scene_context_with_team_and_encounter(sid)
         save = get_current_save(sid)
         config = self._chat_config()
-        npc_client = self._fake_openai_client('{"action_reaction":"He glances over.","speech_reply":"I heard it too.","relation_tag":"friendly"}')
-        team_client = self._fake_openai_client('{"action_reaction":"He squares his shoulders.","speech_reply":"I am with you.","affinity_delta":1,"trust_delta":1}')
-
-        with patch("app.services.world_service.create_sync_client", return_value=npc_client):
-            with patch("app.services.team_service.create_sync_client", return_value=team_client):
-                with patch("app.core.prompt_table.prompt_table.render", wraps=prompt_table.render) as mocked_render:
-                    advance_public_scene_in_save(
-                        save,
-                        session_id=sid,
-                        player_text='{"input_type":"player_intent_v1","action_description":"I move toward the disturbance","speech_description":"Luna, what do you see?"}',
-                        gm_summary="The encounter is unfolding in the square.",
-                        config=config,
+        responses = [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content='{"action_summary":"快步靠近书架并扶住摇晃的上层木板","speech_summary":"先别碰最左边那排书","needs_check":true,"action_type":"check","action_prompt":"actor=Luna; target=左侧书架; stakes=稳住书架防止砸伤人; threat=左侧书架已经开始倾斜","target_label":"左侧书架","stakes":"稳住书架防止砸伤人","specific_threat":"左侧书架已经开始倾斜","situation_delta_hint":3}'
+                        )
                     )
+                ],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content='{"action_summary":"压低身体守在过道口，盯住正在扩散的阴影","speech_summary":"别让阴影贴近楼梯","needs_check":true,"action_type":"check","action_prompt":"actor=Bram; target=楼梯口阴影; stakes=堵住阴影继续外扩; threat=阴影正朝楼梯口蔓延","target_label":"楼梯口阴影","stakes":"堵住阴影继续外扩","specific_threat":"阴影正朝楼梯口蔓延","situation_delta_hint":2}'
+                        )
+                    )
+                ],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content='{"resolution_text":"露娜先稳住了左侧书架，避免最上层木板继续下砸；布莱姆则压住楼梯口的阴影扩散，让它没能再贴近出口。局势因此暂时被按住，但书架深处的异动还在继续，玩家下一轮可以直接检查书架背后的空隙。"}'
+                        )
+                    )
+                ],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+            ),
+        ]
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_: responses.pop(0))))
+
+        with patch("app.services.public_scene_service.create_sync_client", return_value=fake_client):
+            with patch("app.core.prompt_table.prompt_table.render", wraps=prompt_table.render) as mocked_render:
+                advance_public_scene_in_save(
+                    save,
+                    session_id=sid,
+                    player_text='{"input_type":"player_intent_v1","action_description":"I move toward the disturbance","speech_description":"Luna, what do you see?"}',
+                    gm_summary="The encounter is unfolding in the square.",
+                    config=config,
+                )
 
         captured: dict[str, dict[str, object]] = {}
         for call in mocked_render.call_args_list:
             if not call.args:
                 continue
             key = call.args[0]
-            if key == "scene.actor.intent.user.v1":
+            if key in {PromptKeys.SCENE_ACTOR_ACTION_USER, PromptKeys.SCENE_ROUND_RESOLVE_USER}:
                 captured[key] = call.kwargs
 
-        for key in ("scene.actor.intent.user.v1",):
+        for key in (PromptKeys.SCENE_ACTOR_ACTION_USER, PromptKeys.SCENE_ROUND_RESOLVE_USER):
             self.assertIn(key, captured)
             scene_context = json.loads(str(captured[key]["scene_context_json"]))
             self.assertEqual(scene_context["active_encounter"]["encounter_id"], "enc_square")

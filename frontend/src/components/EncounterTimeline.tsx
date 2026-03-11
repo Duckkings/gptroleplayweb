@@ -11,6 +11,7 @@ const STEP_LABELS: Record<EncounterStepEntry['kind'], string> = {
   gm_update: '局势推进',
   npc_reaction: 'NPC反应',
   team_reaction: '队友反应',
+  temp_npc_action: '遭遇NPC行动',
   escape_attempt: '逃离尝试',
   background_tick: '后台推进',
   resolution: '遭遇结束',
@@ -25,7 +26,8 @@ export function EncounterTimeline({ steps, maxItems = 8 }: Props) {
       {items.map((step) => (
         <article key={step.step_id} className="encounter-step">
           <strong>
-            {STEP_LABELS[step.kind]}{step.actor_name ? ` / ${step.actor_name}` : ''}
+            {STEP_LABELS[step.kind]}
+            {step.actor_name ? ` / ${step.actor_name}` : ''}
           </strong>
           <p>{step.content}</p>
           <p className="hint">{step.created_at}</p>

@@ -16,6 +16,7 @@ import { QuestInspectModal } from './components/QuestInspectModal';
 import { QuestModal } from './components/QuestModal';
 import { RoleInventoryModal } from './components/RoleInventoryModal';
 import { RoleProfileModal } from './components/RoleProfileModal';
+import { SceneEventCard } from './components/SceneEventCard';
 import { SubZoneContextPanel } from './components/SubZoneContextPanel';
 import { TeamPanel } from './components/TeamPanel';
 import { ActionCheckPanel } from './components/ActionCheckPanel';
@@ -173,47 +174,16 @@ const MODEL_PARAM_LABELS: Record<'temperature' | 'max_tokens' | 'max_completion_
   max_completion_tokens: 'Max Completion Tokens',
 };
 const MAIN_OUTPUT_SCENE_EVENT_KINDS = new Set<SceneEvent['kind']>([
-  'public_targeted_npc_reply',
-  'public_bystander_reaction',
-  'team_public_reaction',
+  'public_actor_action',
   'public_actor_resolution',
-  'role_desire_surface',
-  'companion_story_surface',
+  'public_round_resolution',
   'reputation_update',
   'encounter_started',
   'encounter_background',
   'encounter_situation_update',
+  'encounter_progress',
+  'encounter_resolution',
 ]);
-
-function sceneEventEncounterTitle(event: SceneEvent): string {
-  const fromMetadata = typeof event.metadata?.encounter_title === 'string' ? event.metadata.encounter_title.trim() : '';
-  if (fromMetadata) return fromMetadata;
-  const firstLine = (event.content ?? '').split('\n')[0]?.trim() ?? '';
-  if (!firstLine) return '未知遭遇';
-  return firstLine.replace(/^【遭遇触发】/, '').trim() || '未知遭遇';
-}
-
-function sceneEventToMessage(event: SceneEvent): ChatMessage {
-  if (event.kind === 'encounter_started') {
-    return { role: 'assistant', content: `【遭遇触发】${sceneEventEncounterTitle(event)}，详见右侧并行遭遇栏。` };
-  }
-  const labelMap: Record<SceneEvent['kind'], string> = {
-    public_targeted_npc_reply: '公开目标回复',
-    public_bystander_reaction: '旁观反应',
-    team_public_reaction: '队友反应',
-    public_actor_resolution: '公开轮次',
-    role_desire_surface: '角色欲望',
-    companion_story_surface: '队友故事',
-    reputation_update: '区域声望',
-    encounter_started: '遭遇触发',
-    encounter_progress: '遭遇推进',
-    encounter_resolution: '遭遇结算',
-    encounter_background: '遭遇后台',
-    encounter_situation_update: '局势值',
-  };
-  const header = event.actor_name ? `【${labelMap[event.kind]} / ${event.actor_name}】` : `【${labelMap[event.kind]}】`;
-  return { role: 'assistant', content: `${header}\n${event.content}` };
-}
 
 function selectCurrentReputation(save: SaveFile): SubZoneReputationEntry | null {
   const subZoneId = save.area_snapshot?.current_sub_zone_id ?? null;
@@ -516,15 +486,6 @@ function App() {
     }
     setMainOutput('system_output', text);
   };
-  const mainOutputMessages = useMemo(() => {
-    if (!currentMainOutput) return [];
-    const nextMessages: ChatMessage[] = [];
-    if (currentMainOutput.reply_text.trim()) {
-      nextMessages.push({ role: 'assistant', content: currentMainOutput.reply_text });
-    }
-    nextMessages.push(...currentMainOutput.scene_events.map(sceneEventToMessage));
-    return nextMessages;
-  }, [currentMainOutput]);
   const forceReturnToMainChat = (reason: 'encounter_interrupt' | 'manual' | 'narrative_switch') => {
     void reason;
     setChatMode('main');
@@ -2843,12 +2804,17 @@ function App() {
                   <h3>当前轮输出</h3>
                   <p>{currentMainOutput?.source_kind === 'system_output' ? '系统反馈' : '临时输出，归档后会自动收起'}</p>
                 </header>
-                {mainOutputMessages.length === 0 && <p className="hint">主聊天历史已经收进上方地区上下文，这里只显示当前轮输出或系统反馈。</p>}
-                {mainOutputMessages.map((m, index) => (
-                  <article key={`${m.role}_${index}`} className={`msg ${m.role}`}>
-                    <strong>{m.role === 'user' ? '你' : m.role === 'assistant' ? 'GM' : 'System'}</strong>
-                    <p>{m.content}</p>
+                {!currentMainOutput?.reply_text.trim() && (currentMainOutput?.scene_events.length ?? 0) === 0 && (
+                  <p className="hint">主聊天历史已经收进上方地区上下文，这里只显示当前轮输出或系统反馈。</p>
+                )}
+                {currentMainOutput?.reply_text.trim() && (
+                  <article className="msg assistant">
+                    <strong>GM</strong>
+                    <p>{currentMainOutput.reply_text}</p>
                   </article>
+                )}
+                {(currentMainOutput?.scene_events ?? []).map((event) => (
+                  <SceneEventCard key={event.event_id} event={event} />
                 ))}
               </section>
             ) : (
@@ -2974,6 +2940,7 @@ function App() {
           <EncounterLane
             encounter={activeEncounter}
             queuedEncounters={queuedEncounters}
+            roleCards={npcPoolItems}
             busy={encounterModalBusy}
             canRejoin={canRejoinActiveEncounter}
           />
@@ -3158,7 +3125,12 @@ function App() {
         onReject={(questId) => void onRejectQuest(questId)}
       />
 
-      <EncounterModal encounter={pendingQuest ? null : encounterModalEncounter} busy={encounterModalBusy} onContinue={onCloseEncounterModal} />
+      <EncounterModal
+        encounter={pendingQuest ? null : encounterModalEncounter}
+        roleCards={npcPoolItems}
+        busy={encounterModalBusy}
+        onContinue={onCloseEncounterModal}
+      />
 
       <QuestInspectModal quest={questInspectOpen ? currentQuest : null} onClose={() => setQuestInspectOpen(false)} />
 

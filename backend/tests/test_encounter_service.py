@@ -16,9 +16,12 @@ from app.models.schemas import (
     EncounterEntry,
     EncounterEscapeRequest,
     EncounterRejoinRequest,
+    EncounterTemporaryNpc,
     EncounterTerminationCondition,
 )
 from app.services.encounter_service import (
+    _sanitize_temporary_npcs,
+    _text_is_too_vague,
     act_on_encounter,
     advance_active_encounter_from_main_chat_in_save,
     advance_active_encounter_in_save,
@@ -138,6 +141,16 @@ class EncounterServiceTests(unittest.TestCase):
         sid = "sess_encounter_rejoin"
         self._seed_context(sid)
         save = get_current_save(sid)
+        save.area_snapshot.zones[0].sub_zone_ids.append("sub_other")
+        save.area_snapshot.sub_zones.append(
+            AreaSubZone(
+                sub_zone_id="sub_other",
+                zone_id="zone_town",
+                name="Alley",
+                coord=Coord3D(x=5, y=0, z=0),
+                description="Back alley",
+            )
+        )
         encounter = EncounterEntry(
             encounter_id="enc_rejoin",
             type="event",
@@ -396,6 +409,65 @@ class EncounterServiceTests(unittest.TestCase):
         self.assertEqual(save.encounter_state.encounters[0].steps[-2].content, "【玩家旁观】玩家本轮选择观察与等待，不主动行动。")
         self.assertEqual(save.encounter_state.history[-1].player_prompt, "【玩家旁观】玩家本轮选择观察与等待，不主动行动。")
 
+
+    def test_sanitize_temporary_npcs_limits_and_deduplicates(self) -> None:
+        items = _sanitize_temporary_npcs(
+            [
+                {"name": "管理员", "title": "图书馆管理员", "description": "守在倒下的书架旁", "speaking_style": "急促", "agenda": "收拢禁书"},
+                {"name": "管理员", "title": "重复角色", "description": "重复", "speaking_style": "短促", "agenda": "重复"},
+                {"name": "学徒", "title": "抄写学徒", "description": "躲在楼梯口后面", "speaking_style": "发抖", "agenda": "护住账本"},
+            ]
+        )
+        self.assertEqual(len(items), 2)
+        self.assertTrue(all(item.encounter_npc_id.startswith("encnpc_") for item in items))
+        self.assertEqual(items[0].name, "管理员")
+        self.assertEqual(items[1].name, "学徒")
+
+    def test_text_is_too_vague_rejects_abstract_reply(self) -> None:
+        self.assertTrue(_text_is_too_vague("NPC 发现了危险。"))
+        self.assertFalse(_text_is_too_vague("管理员发现左侧书架的上层木板已经松动，正朝楼梯口砸下来。"))
+
+    def test_generated_encounter_can_include_temporary_npcs(self) -> None:
+        sid = "sess_encounter_generate_temp_npc"
+        self._seed_context(sid)
+        save = get_current_save(sid)
+        save.encounter_state.debug_force_trigger = True
+        save_current(save)
+        config = ChatConfig(openai_api_key="test-key", model="test-model", stream=False, gm_prompt="gm")
+
+        class _FakeResponse:
+            def __init__(self) -> None:
+                self.choices = [
+                    type(
+                        "Choice",
+                        (),
+                        {
+                            "message": type(
+                                "Message",
+                                (),
+                                {
+                                    "content": '{"type":"event","title":"图书馆异动","description":"旧书架后面传出纸页摩擦声。","temporary_npcs":[{"name":"管理员","title":"图书馆管理员","description":"她正护住掉落的账册。","speaking_style":"急促","agenda":"先把散页收回柜台后方"}],"scene_summary":"管理员正拦在倾斜的书架前。","termination_conditions":[{"kind":"target_resolved","description":"稳住书架并找出异动来源。"}],"tags":["library"]}'
+                                },
+                            )()
+                        },
+                    )
+                ]
+
+        fake_client = type(
+            "Client",
+            (),
+            {"chat": type("Chat", (), {"completions": type("Completions", (), {"create": lambda *args, **kwargs: _FakeResponse()})()})()},
+        )()
+
+        with patch("app.services.encounter_service.OpenAI", return_value=fake_client):
+            response = check_for_encounter(EncounterCheckRequest(session_id=sid, trigger_kind="debug_forced", config=config))
+
+        self.assertTrue(response.generated)
+        self.assertIsNotNone(response.encounter)
+        assert response.encounter is not None
+        self.assertEqual(len(response.encounter.temporary_npcs), 1)
+        self.assertEqual(response.encounter.temporary_npcs[0].name, "管理员")
+        self.assertFalse(any(role.name == "管理员" for role in get_current_save(sid).role_pool))
 
 if __name__ == "__main__":
     unittest.main()
