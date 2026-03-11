@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
+import tempfile
 from typing import Any
 
 from app.models.schemas import PathStatusResponse
@@ -17,11 +18,15 @@ class StoragePaths:
 
 class StorageState:
     def __init__(self) -> None:
-        self._app_root = Path(__file__).resolve().parents[2]
-        self._data_dir = self._app_root / "data"
+        this_file = Path(__file__).resolve()
+        self._backend_root = this_file.parents[2]
+        self._repo_root = this_file.parents[3]
+        self._data_dir = self._repo_root / "data"
         self._state_path = self._data_dir / "storage" / "paths.json"
-        self._default_config = self._data_dir / "config" / "config.json"
-        self._default_save = self._data_dir / "saves" / "current-save.json"
+        self._legacy_data_dir = self._backend_root / "data"
+        self._legacy_state_path = self._legacy_data_dir / "storage" / "paths.json"
+        self._default_config = self._data_dir / "config.json"
+        self._default_save = self._data_dir / "current-save.json"
         self._paths = self._load_or_init()
 
     def _load_or_init(self) -> StoragePaths:
@@ -29,13 +34,33 @@ class StorageState:
         self._default_config.parent.mkdir(parents=True, exist_ok=True)
         self._default_save.parent.mkdir(parents=True, exist_ok=True)
 
-        if not self._state_path.exists():
+        source_path = self._state_path if self._state_path.exists() else self._legacy_state_path
+        if not source_path.exists():
             paths = StoragePaths(config_path=self._default_config, save_path=self._default_save)
             self._persist(paths)
             return paths
 
-        data = json.loads(self._state_path.read_text(encoding="utf-8"))
-        return StoragePaths(config_path=Path(data["config_path"]), save_path=Path(data["save_path"]))
+        data = json.loads(source_path.read_text(encoding="utf-8"))
+        paths = StoragePaths(config_path=Path(data["config_path"]), save_path=Path(data["save_path"]))
+        changed = False
+        if self._should_reset_to_default(paths.config_path):
+            paths.config_path = self._default_config
+            changed = True
+        if self._should_reset_to_default(paths.save_path):
+            paths.save_path = self._default_save
+            changed = True
+        if changed or source_path != self._state_path:
+            self._persist(paths)
+        return paths
+
+    @staticmethod
+    def _should_reset_to_default(path: Path) -> bool:
+        try:
+            temp_root = Path(tempfile.gettempdir()).resolve()
+            resolved = path.expanduser().resolve()
+        except OSError:
+            return False
+        return not resolved.exists() and temp_root in resolved.parents
 
     def _persist(self, paths: StoragePaths) -> None:
         self._state_path.write_text(

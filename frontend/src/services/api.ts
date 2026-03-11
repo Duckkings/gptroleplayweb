@@ -275,6 +275,10 @@ export async function saveConfig(config: AppConfig, report?: DebugReporter): Pro
   );
 }
 
+export async function getStoredConfig(report?: DebugReporter): Promise<AppConfig> {
+  return requestJson('/storage/config', { method: 'GET' }, report);
+}
+
 export async function getSavePath(report?: DebugReporter): Promise<PathStatus> {
   return requestJson('/saves/path', { method: 'GET' }, report);
 }

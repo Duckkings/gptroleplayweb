@@ -40,6 +40,7 @@ import {
   getGameLogSettings,
   getConfigPath,
   getConfigModelProfile,
+  getStoredConfig,
   getCurrentArea,
   getCurrentSave,
   getFateState,
@@ -248,6 +249,7 @@ function App() {
   const [sessionId, setSessionId] = useState(() => `sess_${Date.now()}`);
   const [configPath, setCfgPath] = useState<PathStatus | null>(null);
   const [configDraft, setConfigDraft] = useState<AppConfig>(defaultConfig);
+  const [hasStoredConfig, setHasStoredConfig] = useState(false);
   const [configModels, setConfigModels] = useState<ModelCapabilityInfo[]>([]);
   const [configProfile, setConfigProfile] = useState<ModelCapabilityInfo | null>(null);
   const [configModelsLoading, setConfigModelsLoading] = useState(false);
@@ -732,12 +734,48 @@ function App() {
     }
   }, []);
 
+  const loadStoredConfig = async (pathStatus: PathStatus | null): Promise<'loaded' | 'missing' | 'error'> => {
+    if (!pathStatus?.exists) {
+      setHasStoredConfig(false);
+      return 'missing';
+    }
+    try {
+      const stored = await getStoredConfig(report);
+      setConfig(stored);
+      setConfigDraft(stored);
+      setHasStoredConfig(true);
+      return 'loaded';
+    } catch {
+      setHasStoredConfig(false);
+      return 'error';
+    }
+  };
+
   useEffect(() => {
     void (async () => {
+      const [cfgPathResult, svPathResult, saveResult] = await Promise.allSettled([
+        getConfigPath(report),
+        getSavePath(report),
+        getCurrentSave(report),
+      ]);
+
+      if (cfgPathResult.status === 'fulfilled') {
+        setCfgPath(cfgPathResult.value);
+        await loadStoredConfig(cfgPathResult.value);
+      } else {
+        setHasStoredConfig(false);
+      }
+
+      if (svPathResult.status === 'fulfilled') {
+        setSvPath(svPathResult.value);
+      }
+
+      if (saveResult.status !== 'fulfilled') {
+        return;
+      }
+
       try {
-        const [cfgPath, svPath, save] = await Promise.all([getConfigPath(report), getSavePath(report), getCurrentSave(report)]);
-        setCfgPath(cfgPath);
-        setSvPath(svPath);
+        const save = saveResult.value;
         setMapSnapshot(toMapSnapshot(save));
         setAreaSnapshot(save.area_snapshot ?? null);
         setCurrentReputation(selectCurrentReputation(save));
@@ -869,7 +907,7 @@ function App() {
 
   const onNewConfig = () => {
     setConfigReturnView('boot');
-    setConfigDraft(defaultConfig);
+    setConfigDraft(hasStoredConfig ? config : defaultConfig);
     setConfigModels([]);
     setConfigProfile(null);
     setManualModelMode(true);
@@ -918,7 +956,14 @@ function App() {
     try {
       const path = await pickConfigPath(report);
       setCfgPath(path);
-      setConfigHint(`配置路径已更新: ${path.path}`);
+      const loadResult = await loadStoredConfig(path);
+      if (loadResult === 'loaded') {
+        setConfigHint(`配置路径已更新，并已加载已有配置: ${path.path}`);
+      } else if (loadResult === 'missing') {
+        setConfigHint(`配置路径已更新，新路径下暂未发现配置文件: ${path.path}`);
+      } else {
+        setConfigHint(`配置路径已更新，但读取已有配置失败，请检查配置文件内容: ${path.path}`);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : '配置文件夹选择失败');
     }
@@ -1010,8 +1055,11 @@ function App() {
       }
       const normalized = result.normalized_config ?? configDraft;
       await saveConfig(normalized, report);
+      const latestPath = await getConfigPath(report);
+      setCfgPath(latestPath);
       setConfig(normalized);
       setConfigDraft(normalized);
+      setHasStoredConfig(true);
       setView('chat');
       setChatState('idle');
       setConfigHint('配置已保存到后端路径。');
@@ -2434,6 +2482,7 @@ function App() {
         <section className="card">
           <h1>Roleplay Web</h1>
           <p>选择读取已有配置，或先编辑一个新配置。</p>
+          {hasStoredConfig && configPath && <p className="hint">已检测到本地配置: {configPath.path}</p>}
           <div className="actions">
             <button onClick={() => configFileInputRef.current?.click()}>读取本地配置</button>
             <input
