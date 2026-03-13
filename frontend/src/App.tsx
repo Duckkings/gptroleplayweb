@@ -114,6 +114,8 @@ import {
   type PlayerStaticData,
   type NpcRoleCard,
   type Position,
+  type ProviderConfigMap,
+  type ProviderScopedConfig,
   type QuestState,
   type RenderResult,
   type SaveFile,
@@ -192,9 +194,94 @@ function selectCurrentReputation(save: SaveFile): SubZoneReputationEntry | null 
   return save.reputation_state?.entries?.find((item) => item.sub_zone_id === subZoneId) ?? null;
 }
 
+function cloneRuntimeConfig(runtime?: AppConfig['runtime']): AppConfig['runtime'] {
+  return { ...(runtime ?? {}) };
+}
+
+function cloneProviderConfig(providerConfig: ProviderScopedConfig): ProviderScopedConfig {
+  return {
+    api_key: providerConfig.api_key ?? '',
+    base_url_override: providerConfig.base_url_override ?? '',
+    model: providerConfig.model ?? '',
+    runtime: cloneRuntimeConfig(providerConfig.runtime),
+  };
+}
+
+function getDefaultProviderConfig(provider: AppConfig['provider']): ProviderScopedConfig {
+  return cloneProviderConfig(defaultConfig.provider_configs[provider]);
+}
+
+function buildProviderConfigMap(config: AppConfig): ProviderConfigMap {
+  const currentProvider = config.provider ?? defaultConfig.provider;
+  const rawConfigs = config.provider_configs;
+  const providerConfigs: ProviderConfigMap = {
+    openai: cloneProviderConfig(rawConfigs?.openai ?? getDefaultProviderConfig('openai')),
+    deepseek: cloneProviderConfig(rawConfigs?.deepseek ?? getDefaultProviderConfig('deepseek')),
+    gemini: cloneProviderConfig(rawConfigs?.gemini ?? getDefaultProviderConfig('gemini')),
+  };
+
+  providerConfigs[currentProvider] = {
+    ...providerConfigs[currentProvider],
+    api_key: config.api_key ?? providerConfigs[currentProvider].api_key,
+    base_url_override: config.base_url_override ?? providerConfigs[currentProvider].base_url_override ?? '',
+    model: config.model ?? providerConfigs[currentProvider].model,
+    runtime: cloneRuntimeConfig(config.runtime),
+  };
+  return providerConfigs;
+}
+
+function normalizeConfig(config: AppConfig): AppConfig {
+  const providerConfigs = buildProviderConfigMap(config);
+  const currentProviderConfig = providerConfigs[config.provider];
+  return {
+    ...config,
+    provider: config.provider,
+    api_key: currentProviderConfig.api_key,
+    base_url_override: currentProviderConfig.base_url_override ?? '',
+    model: currentProviderConfig.model,
+    runtime: cloneRuntimeConfig(currentProviderConfig.runtime),
+    provider_configs: providerConfigs,
+  };
+}
+
+function updateCurrentProviderConfig(config: AppConfig, updates: Partial<ProviderScopedConfig>): AppConfig {
+  const currentProvider = config.provider;
+  const providerConfigs = buildProviderConfigMap(config);
+  const currentProviderConfig: ProviderScopedConfig = {
+    ...providerConfigs[currentProvider],
+    api_key: updates.api_key ?? config.api_key,
+    base_url_override: updates.base_url_override ?? config.base_url_override ?? '',
+    model: updates.model ?? config.model,
+    runtime: cloneRuntimeConfig(updates.runtime ?? config.runtime),
+  };
+  providerConfigs[currentProvider] = cloneProviderConfig(currentProviderConfig);
+  return {
+    ...config,
+    api_key: currentProviderConfig.api_key,
+    base_url_override: currentProviderConfig.base_url_override ?? '',
+    model: currentProviderConfig.model,
+    runtime: cloneRuntimeConfig(currentProviderConfig.runtime),
+    provider_configs: providerConfigs,
+  };
+}
+
+function selectProviderConfig(config: AppConfig, provider: AppConfig['provider']): AppConfig {
+  const providerConfigs = buildProviderConfigMap(config);
+  const nextProviderConfig = providerConfigs[provider];
+  return {
+    ...config,
+    provider,
+    api_key: nextProviderConfig.api_key,
+    base_url_override: nextProviderConfig.base_url_override ?? '',
+    model: nextProviderConfig.model,
+    runtime: cloneRuntimeConfig(nextProviderConfig.runtime),
+    provider_configs: providerConfigs,
+  };
+}
+
 function applyModelProfile(config: AppConfig, profile: ModelCapabilityInfo | null): AppConfig {
   if (!profile) {
-    return { ...config, runtime: {} };
+    return updateCurrentProviderConfig(config, { runtime: {} });
   }
   const runtime: AppConfig['runtime'] = {};
   for (const key of profile.supported_params) {
@@ -208,16 +295,7 @@ function applyModelProfile(config: AppConfig, profile: ModelCapabilityInfo | nul
       runtime[key] = fallback;
     }
   }
-  return { ...config, runtime };
-}
-
-function resetProviderSelection(config: AppConfig, updates: Partial<AppConfig>): AppConfig {
-  return {
-    ...config,
-    ...updates,
-    model: '',
-    runtime: {},
-  };
+  return updateCurrentProviderConfig(config, { runtime });
 }
 const DEFAULT_ACTION_CHECK_ROLL_STATE: ActionCheckRollState = {
   open: false,
@@ -740,7 +818,7 @@ function App() {
       return 'missing';
     }
     try {
-      const stored = await getStoredConfig(report);
+      const stored = normalizeConfig(await getStoredConfig(report));
       setConfig(stored);
       setConfigDraft(stored);
       setHasStoredConfig(true);
@@ -907,7 +985,7 @@ function App() {
 
   const onNewConfig = () => {
     setConfigReturnView('boot');
-    setConfigDraft(hasStoredConfig ? config : defaultConfig);
+    setConfigDraft(normalizeConfig(hasStoredConfig ? config : defaultConfig));
     setConfigModels([]);
     setConfigProfile(null);
     setManualModelMode(true);
@@ -918,7 +996,7 @@ function App() {
 
   const onOpenConfigFromChat = () => {
     setConfigReturnView('chat');
-    setConfigDraft(config);
+    setConfigDraft(normalizeConfig(config));
     setConfigModels([]);
     setConfigProfile(null);
     setManualModelMode(true);
@@ -939,7 +1017,7 @@ function App() {
         setView('config');
         return;
       }
-      const normalized = result.normalized_config ?? defaultConfig;
+      const normalized = normalizeConfig(result.normalized_config ?? defaultConfig);
       setConfigDraft(normalized);
       setConfigModels([]);
       setConfigProfile(null);
@@ -970,47 +1048,47 @@ function App() {
   };
 
   const onConfigProviderChange = (provider: AppConfig['provider']) => {
-    setConfigDraft((prev) => resetProviderSelection(prev, { provider }));
+    setConfigDraft((prev) => selectProviderConfig(prev, provider));
     setConfigModels([]);
     setConfigProfile(null);
-    setManualModelMode(false);
+    setManualModelMode(true);
     setError('');
     setConfigHint('');
   };
 
   const onConfigApiKeyChange = (api_key: string) => {
-    setConfigDraft((prev) => resetProviderSelection(prev, { api_key }));
+    setConfigDraft((prev) => updateCurrentProviderConfig(prev, { api_key }));
     setConfigModels([]);
     setConfigProfile(null);
-    setManualModelMode(false);
+    setManualModelMode(true);
     setError('');
     setConfigHint('');
   };
 
   const onConfigBaseUrlChange = (base_url_override: string) => {
-    setConfigDraft((prev) => resetProviderSelection(prev, { base_url_override }));
+    setConfigDraft((prev) => updateCurrentProviderConfig(prev, { base_url_override }));
     setConfigModels([]);
     setConfigProfile(null);
-    setManualModelMode(false);
+    setManualModelMode(true);
     setError('');
     setConfigHint('');
   };
 
   const onConfigModelChange = (model: string) => {
-    setConfigDraft((prev) => ({ ...prev, model }));
+    setConfigDraft((prev) => updateCurrentProviderConfig(prev, { model }));
     setError('');
     setConfigHint('');
   };
 
   const onConfigRuntimeChange = (key: keyof AppConfig['runtime'], rawValue: string) => {
     const value = rawValue.trim();
-    setConfigDraft((prev) => ({
-      ...prev,
-      runtime: {
+    setConfigDraft((prev) => {
+      const runtime = {
         ...prev.runtime,
         [key]: value ? Number(value) : undefined,
-      },
-    }));
+      };
+      return updateCurrentProviderConfig(prev, { runtime });
+    });
   };
 
   const onFetchConfigModels = async () => {
@@ -1053,7 +1131,7 @@ function App() {
         setError(`配置校验失败: ${formatValidateErrors(result.errors)}`);
         return;
       }
-      const normalized = result.normalized_config ?? configDraft;
+      const normalized = normalizeConfig(result.normalized_config ?? configDraft);
       await saveConfig(normalized, report);
       const latestPath = await getConfigPath(report);
       setCfgPath(latestPath);
@@ -2517,6 +2595,7 @@ function App() {
                 <select value={configDraft.provider} onChange={(e) => onConfigProviderChange(e.target.value as AppConfig['provider'])}>
                   <option value="openai">OpenAI</option>
                   <option value="deepseek">DeepSeek</option>
+                  <option value="gemini">Gemini</option>
                 </select>
               </label>
               <label>
@@ -2534,7 +2613,13 @@ function App() {
                   type="text"
                   value={configDraft.base_url_override ?? ''}
                   onChange={(e) => onConfigBaseUrlChange(e.target.value)}
-                  placeholder={configDraft.provider === 'deepseek' ? '默认 https://api.deepseek.com' : '留空使用官方地址'}
+                  placeholder={
+                    configDraft.provider === 'deepseek'
+                      ? '默认 https://api.deepseek.com'
+                      : configDraft.provider === 'gemini'
+                        ? '默认 Gemini OpenAI 兼容地址'
+                        : '留空使用官方地址'
+                  }
                 />
               </label>
               <div className="actions">
@@ -2568,7 +2653,7 @@ function App() {
                     type="text"
                     value={configDraft.model}
                     onChange={(e) => onConfigModelChange(e.target.value)}
-                    placeholder="例如 gpt-5 / deepseek-chat"
+                    placeholder="例如 gpt-5 / deepseek-chat / gemini-2.5-flash"
                   />
                 </label>
               )}
@@ -2584,7 +2669,7 @@ function App() {
 
             <div className="config-section">
               <h2>参数</h2>
-              {configProfile ? (
+              {configProfile && configProfile.supported_params.length > 0 ? (
                 <div className="config-fields">
                   {configProfile.supported_params.map((paramKey) => (
                     <label key={paramKey}>
@@ -2598,6 +2683,8 @@ function App() {
                     </label>
                   ))}
                 </div>
+              ) : configProfile ? (
+                <p className="hint">当前模型能力档位不需要额外运行参数，聊天请求将仅发送基础字段。</p>
               ) : (
                 <p className="hint">当前模型尚未解析，参数区暂不可用。</p>
               )}

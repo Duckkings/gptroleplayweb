@@ -2,7 +2,7 @@ export type UIConfig = {
   theme: string;
 };
 
-export type AIProvider = 'openai' | 'deepseek';
+export type AIProvider = 'openai' | 'deepseek' | 'gemini';
 
 export type AppRuntimeConfig = {
   temperature?: number;
@@ -20,6 +20,15 @@ export type SubZoneDebugConfig = {
   discover_interaction_limit: number;
 };
 
+export type ProviderScopedConfig = {
+  api_key: string;
+  base_url_override?: string | null;
+  model: string;
+  runtime: AppRuntimeConfig;
+};
+
+export type ProviderConfigMap = Record<AIProvider, ProviderScopedConfig>;
+
 export type AppConfig = {
   version: string;
   provider: AIProvider;
@@ -28,6 +37,7 @@ export type AppConfig = {
   model: string;
   stream: boolean;
   runtime: AppRuntimeConfig;
+  provider_configs: ProviderConfigMap;
   gm_prompt: string;
   speech_time_per_50_tokens_min: number;
   sub_zone_debug: SubZoneDebugConfig;
@@ -39,6 +49,7 @@ export type ModelCapabilityProfile =
   | 'openai_standard'
   | 'deepseek_chat'
   | 'deepseek_reasoner'
+  | 'gemini_openai_compatible'
   | 'generic_compatible';
 
 export type ModelCapabilityInfo = {
@@ -1505,6 +1516,32 @@ export const defaultConfig: AppConfig = {
     large_min_count: 8,
     large_max_count: 15,
     discover_interaction_limit: 3,
+  },
+  provider_configs: {
+    openai: {
+      api_key: 'sk-xxxx',
+      base_url_override: '',
+      model: 'gpt-5',
+      runtime: {
+        temperature: 0.8,
+        max_completion_tokens: 1200,
+      },
+    },
+    deepseek: {
+      api_key: '',
+      base_url_override: '',
+      model: 'deepseek-chat',
+      runtime: {
+        temperature: 0.8,
+        max_tokens: 1200,
+      },
+    },
+    gemini: {
+      api_key: '',
+      base_url_override: '',
+      model: 'gemini-2.5-flash',
+      runtime: {},
+    },
   },
   ui: {
     theme: 'dark',

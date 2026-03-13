@@ -10,7 +10,7 @@
     },
     "provider": {
       "type": "string",
-      "enum": ["openai", "deepseek"]
+      "enum": ["openai", "deepseek", "gemini"]
     },
     "api_key": {
       "type": "string",
@@ -45,6 +45,15 @@
       },
       "additionalProperties": false
     },
+    "provider_configs": {
+      "type": "object",
+      "properties": {
+        "openai": { "$ref": "#/$defs/providerConfig" },
+        "deepseek": { "$ref": "#/$defs/providerConfig" },
+        "gemini": { "$ref": "#/$defs/providerConfig" }
+      },
+      "additionalProperties": false
+    },
     "gm_prompt": {
       "type": "string",
       "minLength": 1
@@ -65,5 +74,41 @@
       "additionalProperties": false
     }
   },
-  "additionalProperties": false
+  "additionalProperties": false,
+  "$defs": {
+    "providerConfig": {
+      "type": "object",
+      "properties": {
+        "api_key": {
+          "type": "string"
+        },
+        "base_url_override": {
+          "type": ["string", "null"]
+        },
+        "model": {
+          "type": "string"
+        },
+        "runtime": {
+          "type": "object",
+          "properties": {
+            "temperature": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 2
+            },
+            "max_tokens": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_completion_tokens": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  }
 }

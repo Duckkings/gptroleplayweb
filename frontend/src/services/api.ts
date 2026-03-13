@@ -98,7 +98,7 @@ export async function validateConfig(
 }
 
 export async function discoverConfigModels(
-  payload: { provider: 'openai' | 'deepseek'; api_key: string; base_url_override?: string | null },
+  payload: { provider: AppConfig['provider']; api_key: string; base_url_override?: string | null },
   report?: DebugReporter,
 ): Promise<ModelDiscoverResponse> {
   return requestJson(
@@ -113,7 +113,7 @@ export async function discoverConfigModels(
 }
 
 export async function getConfigModelProfile(
-  payload: { provider: 'openai' | 'deepseek'; model: string; api_key?: string; base_url_override?: string | null },
+  payload: { provider: AppConfig['provider']; model: string; api_key?: string; base_url_override?: string | null },
   report?: DebugReporter,
 ): Promise<ModelProfileResponse> {
   return requestJson(

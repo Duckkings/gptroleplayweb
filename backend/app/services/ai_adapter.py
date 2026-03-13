@@ -10,6 +10,7 @@ from app.models.schemas import ChatConfig, ModelCapabilityInfo
 DEFAULT_BASE_URLS = {
     "openai": None,
     "deepseek": "https://api.deepseek.com",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
 }
 
 PROFILE_DEFAULTS: dict[str, dict[str, int | float | bool | str]] = {
@@ -17,6 +18,7 @@ PROFILE_DEFAULTS: dict[str, dict[str, int | float | bool | str]] = {
     "openai_standard": {"temperature": 0.8, "max_tokens": 1200},
     "deepseek_chat": {"temperature": 0.8, "max_tokens": 1200},
     "deepseek_reasoner": {"max_tokens": 1200},
+    "gemini_openai_compatible": {},
     "generic_compatible": {"temperature": 0.8, "max_tokens": 1200},
 }
 
@@ -25,6 +27,7 @@ PROFILE_PARAMS: dict[str, list[str]] = {
     "openai_standard": ["temperature", "max_tokens"],
     "deepseek_chat": ["temperature", "max_tokens"],
     "deepseek_reasoner": ["max_tokens"],
+    "gemini_openai_compatible": [],
     "generic_compatible": ["temperature", "max_tokens"],
 }
 
@@ -70,6 +73,8 @@ def resolve_capability_profile(provider: str, model: str) -> str:
         if "deepseek" in model_id:
             return "deepseek_chat"
         return "generic_compatible"
+    if provider == "gemini":
+        return "gemini_openai_compatible"
     return "generic_compatible"
 
 
@@ -79,6 +84,8 @@ def resolve_model_profile(provider: str, model: str) -> ResolvedModelProfile:
     warning = None
     if profile == "generic_compatible":
         warning = "Unrecognized model; using generic-compatible parameters."
+    elif profile == "gemini_openai_compatible":
+        warning = "Gemini uses the OpenAI-compatible endpoint; runtime params are omitted for compatibility."
     return ResolvedModelProfile(
         model_id=model_id,
         label=model_id,

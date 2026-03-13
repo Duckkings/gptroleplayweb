@@ -38,14 +38,80 @@ class ChatRuntimeConfig(BaseModel):
     max_completion_tokens: int | None = Field(default=None, gt=0)
 
 
+AIProvider = Literal["openai", "deepseek", "gemini"]
+AI_PROVIDERS: tuple[str, ...] = ("openai", "deepseek", "gemini")
+
+
+def _normalize_runtime_payload(raw: Any) -> dict[str, Any]:
+    runtime = dict(raw) if isinstance(raw, dict) else {}
+    if "temperature" in runtime and runtime["temperature"] in ("", None):
+        runtime.pop("temperature", None)
+    if "max_tokens" in runtime and runtime["max_tokens"] in ("", None):
+        runtime.pop("max_tokens", None)
+    if "max_completion_tokens" in runtime and runtime["max_completion_tokens"] in ("", None):
+        runtime.pop("max_completion_tokens", None)
+    return runtime
+
+
+def _normalize_provider_payload(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+
+    data = dict(raw)
+    runtime = _normalize_runtime_payload(data.get("runtime"))
+    if "temperature" in data and "temperature" not in runtime:
+        runtime["temperature"] = data.pop("temperature")
+    if "max_tokens" in data and "max_tokens" not in runtime:
+        runtime["max_tokens"] = data.pop("max_tokens")
+    if "max_completion_tokens" in data and "max_completion_tokens" not in runtime:
+        runtime["max_completion_tokens"] = data.pop("max_completion_tokens")
+    if "openai_api_key" in data and "api_key" not in data:
+        data["api_key"] = data.pop("openai_api_key")
+
+    normalized: dict[str, Any] = {"runtime": runtime}
+    if "api_key" in data:
+        normalized["api_key"] = data.get("api_key")
+    if "base_url_override" in data:
+        normalized["base_url_override"] = data.get("base_url_override")
+    if "model" in data:
+        normalized["model"] = data.get("model")
+    return normalized
+
+
+def _empty_provider_config() -> dict[str, Any]:
+    return {
+        "api_key": "",
+        "base_url_override": None,
+        "model": "",
+        "runtime": {},
+    }
+
+
+class ProviderChatConfig(BaseModel):
+    api_key: str = Field(default="", min_length=0)
+    base_url_override: str | None = None
+    model: str = Field(default="", min_length=0)
+    runtime: ChatRuntimeConfig = Field(default_factory=ChatRuntimeConfig)
+
+
+class ProviderConfigMap(BaseModel):
+    openai: ProviderChatConfig = Field(default_factory=ProviderChatConfig)
+    deepseek: ProviderChatConfig = Field(default_factory=ProviderChatConfig)
+    gemini: ProviderChatConfig = Field(default_factory=ProviderChatConfig)
+
+    def for_provider(self, provider: AIProvider) -> ProviderChatConfig:
+        return getattr(self, provider)
+
+
 class ChatConfig(BaseModel):
     version: str = Field(default="2.0.0")
-    provider: Literal["openai", "deepseek"] = "openai"
+    provider: AIProvider = "openai"
     api_key: str = Field(..., min_length=1)
     base_url_override: str | None = None
     model: str = Field(..., min_length=1)
     stream: bool
     runtime: ChatRuntimeConfig = Field(default_factory=ChatRuntimeConfig)
+    provider_configs: ProviderConfigMap = Field(default_factory=ProviderConfigMap)
     gm_prompt: str = Field(..., min_length=1)
     speech_time_per_50_tokens_min: int = Field(default=1, ge=1, le=30)
     sub_zone_debug: SubZoneDebugConfig = Field(default_factory=SubZoneDebugConfig)
@@ -57,20 +123,42 @@ class ChatConfig(BaseModel):
         if not isinstance(raw, dict):
             return raw
         data = dict(raw)
-        runtime_raw = data.get("runtime")
-        runtime = dict(runtime_raw) if isinstance(runtime_raw, dict) else {}
+        runtime = _normalize_runtime_payload(data.get("runtime"))
 
+        if "provider" not in data or data.get("provider") not in AI_PROVIDERS:
+            data["provider"] = "openai"
+        provider = data["provider"]
         if "openai_api_key" in data and "api_key" not in data:
             data["api_key"] = data.pop("openai_api_key")
-        if "provider" not in data:
-            data["provider"] = "openai"
         if "temperature" in data and "temperature" not in runtime:
             runtime["temperature"] = data.pop("temperature")
         if "max_tokens" in data and "max_tokens" not in runtime:
             runtime["max_tokens"] = data.pop("max_tokens")
         if "max_completion_tokens" in data and "max_completion_tokens" not in runtime:
             runtime["max_completion_tokens"] = data.pop("max_completion_tokens")
-        data["runtime"] = runtime
+
+        provider_configs = {
+            name: _empty_provider_config()
+            for name in AI_PROVIDERS
+        }
+        raw_provider_configs = data.get("provider_configs")
+        if isinstance(raw_provider_configs, dict):
+            for name in AI_PROVIDERS:
+                if name not in raw_provider_configs:
+                    continue
+                provider_configs[name].update(_normalize_provider_payload(raw_provider_configs[name]))
+
+        current_config = dict(provider_configs[provider])
+        current_config.update(_normalize_provider_payload(data))
+        current_config["runtime"] = runtime if runtime else current_config.get("runtime", {})
+        provider_configs[provider] = current_config
+
+        selected = provider_configs[provider]
+        data["provider_configs"] = provider_configs
+        data["api_key"] = selected.get("api_key", "")
+        data["base_url_override"] = selected.get("base_url_override")
+        data["model"] = selected.get("model", "")
+        data["runtime"] = selected.get("runtime", {})
         return data
 
     @property
@@ -106,7 +194,7 @@ class ValidateConfigResponse(BaseModel):
 
 
 class ModelProfileRequest(BaseModel):
-    provider: Literal["openai", "deepseek"]
+    provider: AIProvider
     api_key: str = Field(default="", min_length=0)
     model: str = Field(default="", min_length=0)
     base_url_override: str | None = None
@@ -120,6 +208,7 @@ class ModelCapabilityInfo(BaseModel):
         "openai_standard",
         "deepseek_chat",
         "deepseek_reasoner",
+        "gemini_openai_compatible",
         "generic_compatible",
     ]
     supported_params: list[Literal["temperature", "max_tokens", "max_completion_tokens"]] = Field(default_factory=list)

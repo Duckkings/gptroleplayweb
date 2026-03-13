@@ -37,6 +37,50 @@ class ConfigModelsApiTests(unittest.TestCase):
         self.assertEqual(normalized['runtime']['temperature'], 0.7)
         self.assertEqual(normalized['runtime']['max_tokens'], 512)
 
+    def test_validate_config_preserves_provider_specific_configs(self) -> None:
+        response = self.client.post(
+            '/api/v1/config/validate',
+            json={
+                'version': '2.0.0',
+                'provider': 'gemini',
+                'api_key': 'gemini-key',
+                'base_url_override': '',
+                'model': 'gemini-2.5-flash',
+                'stream': True,
+                'runtime': {},
+                'provider_configs': {
+                    'openai': {
+                        'api_key': 'openai-key',
+                        'base_url_override': '',
+                        'model': 'gpt-5',
+                        'runtime': {'temperature': 0.8, 'max_completion_tokens': 1200},
+                    },
+                    'deepseek': {
+                        'api_key': 'deepseek-key',
+                        'base_url_override': '',
+                        'model': 'deepseek-chat',
+                        'runtime': {'temperature': 0.7, 'max_tokens': 900},
+                    },
+                    'gemini': {
+                        'api_key': 'gemini-key',
+                        'base_url_override': '',
+                        'model': 'gemini-2.5-flash',
+                        'runtime': {},
+                    },
+                },
+                'gm_prompt': 'gm',
+                'speech_time_per_50_tokens_min': 1,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload['valid'])
+        normalized = payload['normalized_config']
+        self.assertEqual(normalized['provider'], 'gemini')
+        self.assertEqual(normalized['api_key'], 'gemini-key')
+        self.assertEqual(normalized['provider_configs']['openai']['api_key'], 'openai-key')
+        self.assertEqual(normalized['provider_configs']['deepseek']['model'], 'deepseek-chat')
+
     def test_model_profile_gpt5_prefers_max_completion_tokens(self) -> None:
         response = self.client.post(
             '/api/v1/config/models/profile',
@@ -47,6 +91,16 @@ class ConfigModelsApiTests(unittest.TestCase):
         self.assertEqual(payload['capability_profile'], 'openai_gpt5')
         self.assertIn('max_completion_tokens', payload['supported_params'])
         self.assertNotIn('max_tokens', payload['supported_params'])
+
+    def test_model_profile_gemini_uses_compat_profile(self) -> None:
+        response = self.client.post(
+            '/api/v1/config/models/profile',
+            json={'provider': 'gemini', 'model': 'gemini-2.5-flash'},
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()['model']
+        self.assertEqual(payload['capability_profile'], 'gemini_openai_compatible')
+        self.assertEqual(payload['supported_params'], [])
 
     def test_model_discover_returns_normalized_profiles(self) -> None:
         fake_models = [SimpleNamespace(id='gpt-5'), SimpleNamespace(id='deepseek-chat')]
@@ -105,6 +159,18 @@ class ChatConfigAdapterTests(unittest.IsolatedAsyncioTestCase):
         options = build_completion_options(config)
         self.assertEqual(options['max_tokens'], 320)
         self.assertNotIn('temperature', options)
+
+    def test_build_completion_options_omits_runtime_params_for_gemini(self) -> None:
+        config = ChatConfig(
+            provider='gemini',
+            api_key='gemini-key',
+            model='gemini-2.5-flash',
+            stream=False,
+            runtime={'temperature': 0.9, 'max_tokens': 320},
+            gm_prompt='gm',
+        )
+        options = build_completion_options(config)
+        self.assertEqual(options, {})
 
 
 if __name__ == '__main__':
