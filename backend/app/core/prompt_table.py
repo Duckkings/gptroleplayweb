@@ -10,7 +10,10 @@ class _PromptTable:
         this_file = Path(__file__).resolve()
         self._backend_root = this_file.parents[2]
         self._repo_root = this_file.parents[3]
+        # NOTE: repo-root /data is ignored by git (runtime data). Prompts should live in a tracked folder.
+        # We still support legacy locations for local setups.
         self._paths = [
+            self._repo_root / "prompts" / "ai-prompts.csv",
             self._repo_root / "data" / "ai-prompts.csv",
             self._backend_root / "data" / "ai-prompts.csv",
         ]
