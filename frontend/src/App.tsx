@@ -63,7 +63,6 @@ import {
   moveToZone,
   npcChat,
   sendTeamChat,
-  pickConfigPath,
   pickSavePath,
   planActionCheck,
   presentEncounter,
@@ -89,6 +88,8 @@ import {
   authMe,
   authLogin,
   authRegister,
+  authLogout,
+  authResetPassword,
 } from './services/api';
 import {
   defaultPlayerStaticData,
@@ -313,8 +314,9 @@ const DEFAULT_ACTION_CHECK_ROLL_STATE: ActionCheckRollState = {
 
 function App() {
   const [authState, setAuthState] = useState<'checking' | 'authed' | 'guest'>('checking');
-  const [authUser, setAuthUser] = useState<string>('');
   const [authError, setAuthError] = useState<string>('');
+  const [authNotice, setAuthNotice] = useState<string>('');
+  const [accountConfigReady, setAccountConfigReady] = useState(false);
 
   const [view, setView] = useState<View>('boot');
   const [configReturnView, setConfigReturnView] = useState<View>('boot');
@@ -408,7 +410,6 @@ function App() {
   const [encounterModalEncounterId, setEncounterModalEncounterId] = useState<string | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
-  const configFileInputRef = useRef<HTMLInputElement | null>(null);
   const announcedEncounterIdsRef = useRef<Set<string>>(new Set());
   const autoRejoinEncounterIdRef = useRef<string | null>(null);
   const pendingActionCheckRef = useRef<ActionCheckPayload | null>(null);
@@ -422,12 +423,25 @@ function App() {
     return '就绪';
   }, [chatState, error]);
 
+  const report = (entry: { endpoint: string; status: number; ok: boolean; detail?: string; usage?: { input_tokens: number; output_tokens: number } }) => {
+    setDebugEntries((prev) => [
+      {
+        endpoint: entry.endpoint,
+        status: entry.status,
+        ok: entry.ok,
+        detail: entry.detail,
+        usage: entry.usage,
+        at: new Date().toLocaleTimeString(),
+      },
+      ...prev,
+    ].slice(0, 20));
+  };
+
   useEffect(() => {
     void (async () => {
       try {
         const me = await authMe(report);
         if (me?.ok) {
-          setAuthUser(me.username);
           setAuthState('authed');
           return;
         }
@@ -440,9 +454,9 @@ function App() {
 
   const onDoLogin = async (payload: { username: string; password: string }) => {
     setAuthError('');
+    setAuthNotice('');
     try {
-      const result = await authLogin(payload, report);
-      setAuthUser(result.username);
+      await authLogin(payload, report);
       setAuthState('authed');
     } catch (e) {
       setAuthError(e instanceof Error ? e.message : String(e));
@@ -451,6 +465,7 @@ function App() {
 
   const onDoRegister = async (payload: { username: string; password: string }) => {
     setAuthError('');
+    setAuthNotice('');
     try {
       await authRegister(payload, report);
       await onDoLogin(payload);
@@ -459,17 +474,35 @@ function App() {
     }
   };
 
-  if (authState !== 'authed') {
-    return (
-      <main className="app-shell" style={{ minHeight: '100vh' }}>
-        {authState === 'checking' ? (
-          <div style={{ color: 'rgba(255,255,255,0.72)', textAlign: 'center', marginTop: '12vh' }}>正在检查登录状态...</div>
-        ) : (
-          <AuthPanel onLogin={onDoLogin} onRegister={onDoRegister} error={authError} />
-        )}
-      </main>
-    );
-  }
+  const onDoResetPassword = async (payload: { username: string; current_password: string; new_password: string }) => {
+    setAuthError('');
+    setAuthNotice('');
+    try {
+      await authResetPassword(payload, report);
+      setAuthNotice('密码已重置，请使用新密码登录。');
+    } catch (e) {
+      setAuthError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const onDoLogout = async () => {
+    setAuthError('');
+    setAuthNotice('');
+    try {
+      await authLogout(report);
+    } catch {
+      // Ignore logout failure and still clear local auth state.
+    } finally {
+      setAuthState('guest');
+      setAccountConfigReady(false);
+      setHasStoredConfig(false);
+      setView('boot');
+      setConfig(defaultConfig);
+      setConfigDraft(defaultConfig);
+      setConfigHint('');
+      setError('');
+    }
+  };
 
   useEffect(() => {
     if (authState !== 'authed') return;
@@ -722,20 +755,6 @@ function App() {
     setCurrentMainOutput(null);
   }, [currentMainOutput, currentSubZone]);
 
-  const report = (entry: { endpoint: string; status: number; ok: boolean; detail?: string; usage?: { input_tokens: number; output_tokens: number } }) => {
-    setDebugEntries((prev) => [
-      {
-        endpoint: entry.endpoint,
-        status: entry.status,
-        ok: entry.ok,
-        detail: entry.detail,
-        usage: entry.usage,
-        at: new Date().toLocaleTimeString(),
-      },
-      ...prev,
-    ].slice(0, 20));
-  };
-
   const refreshTokenUsage = async (sid: string = sessionId) => {
     try {
       const usage = await getTokenUsage(sid, report);
@@ -869,7 +888,7 @@ function App() {
     } catch {
       // Ignore localStorage failures.
     }
-  }, []);
+  }, [authState]);
 
   const loadStoredConfig = async (pathStatus: PathStatus | null): Promise<'loaded' | 'missing' | 'error'> => {
     if (!pathStatus?.exists) {
@@ -889,7 +908,12 @@ function App() {
   };
 
   useEffect(() => {
-    if (authState !== 'authed') return;
+    if (authState !== 'authed') {
+      setAccountConfigReady(false);
+      return;
+    }
+    let cancelled = false;
+    setAccountConfigReady(false);
     void (async () => {
       const [cfgPathResult, svPathResult, saveResult] = await Promise.allSettled([
         getConfigPath(report),
@@ -898,22 +922,38 @@ function App() {
       ]);
 
       if (cfgPathResult.status === 'fulfilled') {
+        if (cancelled) return;
         setCfgPath(cfgPathResult.value);
-        await loadStoredConfig(cfgPathResult.value);
+        const loadResult = await loadStoredConfig(cfgPathResult.value);
+        if (cancelled) return;
+        if (loadResult !== 'loaded') {
+          setConfig(normalizeConfig(defaultConfig));
+          setConfigDraft(normalizeConfig(defaultConfig));
+          setConfigModels([]);
+          setConfigProfile(null);
+          setManualModelMode(true);
+          setConfigReturnView('boot');
+          setConfigHint('当前账号还没有配置，请先新建并保存。');
+          setView('config');
+        }
       } else {
+        if (cancelled) return;
         setHasStoredConfig(false);
       }
 
       if (svPathResult.status === 'fulfilled') {
+        if (cancelled) return;
         setSvPath(svPathResult.value);
       }
 
       if (saveResult.status !== 'fulfilled') {
+        if (!cancelled) setAccountConfigReady(true);
         return;
       }
 
       try {
         const save = saveResult.value;
+        if (cancelled) return;
         setMapSnapshot(toMapSnapshot(save));
         setAreaSnapshot(save.area_snapshot ?? null);
         setCurrentReputation(selectCurrentReputation(save));
@@ -943,11 +983,13 @@ function App() {
         );
 
         const [remoteStatic, remoteRuntime] = await Promise.all([getPlayerStatic(sid, report), getPlayerRuntime(sid, report)]);
+        if (cancelled) return;
         setPlayerStaticState(remoteStatic);
         setPlayerRuntimeState(remoteRuntime);
         if (!(save.area_snapshot?.sub_zones?.length ?? 0)) {
           try {
             const area = await getCurrentArea(sid, report);
+            if (cancelled) return;
             setAreaSnapshot(area.area_snapshot);
           } catch {
             // Ignore area load failures.
@@ -959,15 +1001,21 @@ function App() {
           getFateState(sid, report),
           getTokenUsage(sid, report),
         ]);
+        if (cancelled) return;
         setQuestState(questResponse.quest_state ?? defaultQuestState);
         setEncounterState(encounterResponse.encounter_state ?? defaultEncounterState);
         setFateState(fateResponse.fate_state ?? defaultFateState);
         setTokenUsage(usage);
       } catch {
         // Ignore boot-time failures; user can continue with manual setup.
+      } finally {
+        if (!cancelled) setAccountConfigReady(true);
       }
     })();
-  }, []);
+    return () => {
+      cancelled = true;
+    };
+  }, [authState]);
 
   useEffect(() => {
     announcedEncounterIdsRef.current = new Set();
@@ -1065,48 +1113,6 @@ function App() {
     setView('config');
   };
 
-  const onLoadConfigFile = async (file: File) => {
-    const text = await file.text();
-    setError('');
-    setConfigHint('');
-    try {
-      const parsed = JSON.parse(text) as unknown;
-      const result = await validateConfig(parsed, report);
-      if (!result.valid) {
-        setError(`配置校验失败: ${formatValidateErrors(result.errors)}`);
-        setView('config');
-        return;
-      }
-      const normalized = normalizeConfig(result.normalized_config ?? defaultConfig);
-      setConfigDraft(normalized);
-      setConfigModels([]);
-      setConfigProfile(null);
-      setManualModelMode(true);
-      setConfigHint('本地配置校验通过，请确认后点击“校验并进入聊天”。');
-      setView('config');
-    } catch (e) {
-      setError(`JSON 格式错误: ${e instanceof Error ? e.message : '读取配置失败'}`);
-      setView('config');
-    }
-  };
-
-  const onPickConfigPath = async () => {
-    try {
-      const path = await pickConfigPath(report);
-      setCfgPath(path);
-      const loadResult = await loadStoredConfig(path);
-      if (loadResult === 'loaded') {
-        setConfigHint(`配置路径已更新，并已加载已有配置: ${path.path}`);
-      } else if (loadResult === 'missing') {
-        setConfigHint(`配置路径已更新，新路径下暂未发现配置文件: ${path.path}`);
-      } else {
-        setConfigHint(`配置路径已更新，但读取已有配置失败，请检查配置文件内容: ${path.path}`);
-      }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : '配置文件夹选择失败');
-    }
-  };
-
   const onConfigProviderChange = (provider: AppConfig['provider']) => {
     setConfigDraft((prev) => selectProviderConfig(prev, provider));
     setConfigModels([]);
@@ -1200,7 +1206,7 @@ function App() {
       setHasStoredConfig(true);
       setView('chat');
       setChatState('idle');
-      setConfigHint('配置已保存到后端路径。');
+      setConfigHint('配置已保存到当前账号目录。');
     } catch (e) {
       setError(e instanceof Error ? e.message : '配置保存失败');
     }
@@ -2614,27 +2620,39 @@ function App() {
     }
   };
 
+  if (authState !== 'authed') {
+    return (
+      <main className="app-shell" style={{ minHeight: '100vh' }}>
+        {authState === 'checking' ? (
+          <div style={{ color: 'rgba(255,255,255,0.72)', textAlign: 'center', marginTop: '12vh' }}>正在检查登录状态...</div>
+        ) : (
+          <AuthPanel onLogin={onDoLogin} onRegister={onDoRegister} onResetPassword={onDoResetPassword} error={authError} notice={authNotice} />
+        )}
+      </main>
+    );
+  }
+
+  if (!accountConfigReady) {
+    return (
+      <main className="app-shell" style={{ minHeight: '100vh' }}>
+        <div style={{ color: 'rgba(255,255,255,0.72)', textAlign: 'center', marginTop: '12vh' }}>正在加载当前账号配置...</div>
+      </main>
+    );
+  }
+
   if (view === 'boot') {
     return (
       <main className="app-shell">
         <section className="card">
-          <h1>Roleplay Web</h1>
-          <p>选择读取已有配置，或先编辑一个新配置。</p>
-          {hasStoredConfig && configPath && <p className="hint">已检测到本地配置: {configPath.path}</p>}
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+            <h1 style={{ margin: 0 }}>{hasStoredConfig ? '账号配置已就绪' : '创建账号配置'}</h1>
+            <button onClick={() => void onDoLogout()}>退出登录</button>
+          </div>
+          <p>{hasStoredConfig ? '检测到当前账号已有配置。你可以直接进入聊天，或先编辑账号配置。' : '当前账号还没有配置，请先新建并保存。'}</p>
+          {configPath && <p className="hint">账号配置路径: {configPath.path}</p>}
           <div className="actions">
-            <button onClick={() => configFileInputRef.current?.click()}>读取本地配置</button>
-            <input
-              ref={configFileInputRef}
-              className="hidden-file-input"
-              type="file"
-              accept="application/json"
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                if (file) void onLoadConfigFile(file);
-                e.currentTarget.value = '';
-              }}
-            />
-            <button onClick={onNewConfig}>新建/编辑配置</button>
+            {hasStoredConfig && <button onClick={() => setView('chat')}>使用已有配置</button>}
+            <button onClick={onNewConfig}>{hasStoredConfig ? '编辑账号配置' : '新建账号配置'}</button>
           </div>
         </section>
       </main>
@@ -2645,7 +2663,10 @@ function App() {
     return (
       <main className="app-shell">
         <section className="card config-card">
-          <h1>配置编辑</h1>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+            <h1 style={{ margin: 0 }}>配置编辑</h1>
+            <button onClick={() => void onDoLogout()}>退出登录</button>
+          </div>
           <p>选择服务商、填写 API Key、拉取模型，再按模型能力配置参数。</p>
           <div className="config-grid">
             <div className="config-section">
@@ -2917,11 +2938,9 @@ function App() {
             </div>
 
             <div className="config-section">
-              <h2>存储</h2>
-              <div className="actions">
-                <button onClick={() => void onPickConfigPath()}>选择配置文件夹</button>
-              </div>
-              {configPath && <p className="hint">当前配置路径: {configPath.path}</p>}
+              <h2>账号存储</h2>
+              <p className="hint">多用户模式下，配置文件会自动保存到当前账号目录，不支持选择本地目录。</p>
+              {configPath && <p className="hint">当前账号配置路径: {configPath.path}</p>}
             </div>
           </div>
           <div className="actions">

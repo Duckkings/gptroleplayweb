@@ -1,9 +1,13 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Response, Request
+import logging
 
-from app.core.auth import SESSION_COOKIE, register_user, verify_user, sign_session, load_session, validate_username
+from fastapi import APIRouter, HTTPException, Request, Response
 
+from app.core.auth import SESSION_COOKIE, load_session, register_user, reset_user_password, sign_session, validate_username, verify_user
+
+
+logger = logging.getLogger("roleplay.api.auth")
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
 
@@ -14,7 +18,10 @@ async def auth_register(payload: dict) -> dict:
     try:
         register_user(username, password)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("auth register failed for %r", username)
+        raise HTTPException(status_code=500, detail="auth register failed") from exc
     return {"ok": True}
 
 
@@ -25,10 +32,16 @@ async def auth_login(payload: dict, response: Response) -> dict:
     try:
         username = validate_username(username)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    if not verify_user(username, password):
-        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    try:
+        verified = verify_user(username, password)
+    except Exception as exc:
+        logger.exception("auth login failed during verification for %r", username)
+        raise HTTPException(status_code=500, detail="auth login failed") from exc
+
+    if not verified:
+        raise HTTPException(status_code=401, detail="invalid username or password")
 
     token = sign_session(username)
     response.set_cookie(
@@ -36,7 +49,7 @@ async def auth_login(payload: dict, response: Response) -> dict:
         value=token,
         httponly=True,
         samesite="lax",
-        secure=False,  # set true when behind https
+        secure=False,
         max_age=60 * 60 * 24 * 30,
     )
     return {"ok": True, "username": username}
@@ -48,10 +61,27 @@ async def auth_logout(response: Response) -> dict:
     return {"ok": True}
 
 
+@router.post("/reset-password")
+async def auth_reset_password(payload: dict) -> dict:
+    username = str(payload.get("username") or "")
+    current_password = str(payload.get("current_password") or "")
+    new_password = str(payload.get("new_password") or "")
+    try:
+        reset_user_password(username, current_password, new_password)
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 401 if detail == "invalid username or current password" else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+    except Exception as exc:
+        logger.exception("auth reset password failed for %r", username)
+        raise HTTPException(status_code=500, detail="auth reset password failed") from exc
+    return {"ok": True}
+
+
 @router.get("/me")
 async def auth_me(request: Request) -> dict:
     token = request.cookies.get(SESSION_COOKIE, "")
     sess = load_session(token)
     if not sess:
-        raise HTTPException(status_code=401, detail="未登录")
+        raise HTTPException(status_code=401, detail="not logged in")
     return {"ok": True, "username": sess.username}

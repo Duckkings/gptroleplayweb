@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app/backend
 
-# System deps (bcrypt wheels usually ok, but keep build tools minimal)
+# Keep system deps minimal; auth uses stdlib PBKDF2.
 RUN apt-get update \
   && apt-get install -y --no-install-recommends curl \
   && rm -rf /var/lib/apt/lists/*

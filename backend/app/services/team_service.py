@@ -568,7 +568,7 @@ def _compose_fallback_team_background(
     if likes:
         parts.append(f"平时会对{'、'.join(likes[:2])}这类线索格外上心，也因此更容易被相关话题打动。")
     elif prompt_text:
-        parts.append(f"从你的描述来看，他/她身上最鲜明的特征与"{_limit_text(prompt_text, 24)}"有关。")
+        parts.append(f'从你的描述来看，他/她身上最鲜明的特征与“{_limit_text(prompt_text, 24)}”有关。')
     return _limit_text("".join(parts), 280)
 
 

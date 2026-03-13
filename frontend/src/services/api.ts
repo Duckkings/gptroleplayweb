@@ -76,6 +76,17 @@ export async function authRegister(payload: { username: string; password: string
   }, report);
 }
 
+export async function authResetPassword(
+  payload: { username: string; current_password: string; new_password: string },
+  report?: DebugReporter,
+): Promise<{ ok: boolean }> {
+  return requestJson('/auth/reset-password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  }, report);
+}
+
 export async function authLogout(report?: DebugReporter): Promise<{ ok: boolean }> {
   return requestJson('/auth/logout', { method: 'POST' }, report);
 }
