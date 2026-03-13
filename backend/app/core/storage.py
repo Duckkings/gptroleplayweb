@@ -8,6 +8,7 @@ import tempfile
 from typing import Any
 
 from app.models.schemas import PathStatusResponse
+from app.core.user_context import get_current_user
 
 
 @dataclass
@@ -75,12 +76,24 @@ class StorageState:
             encoding="utf-8",
         )
 
+    def _user_root(self, username: str) -> Path:
+        # per-user data is always stored under repo/data/users/<username>
+        root = self._data_dir / "users" / username
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
     @property
     def config_path(self) -> Path:
+        user = get_current_user()
+        if user:
+            return self._user_root(user) / "config.json"
         return self._paths.config_path
 
     @property
     def save_path(self) -> Path:
+        user = get_current_user()
+        if user:
+            return self._user_root(user) / "current-save.json"
         return self._paths.save_path
 
     def set_config_path(self, raw_path: str) -> Path:

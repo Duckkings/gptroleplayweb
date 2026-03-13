@@ -21,6 +21,7 @@ import { SubZoneContextPanel } from './components/SubZoneContextPanel';
 import { TeamPanel } from './components/TeamPanel';
 import { ActionCheckPanel } from './components/ActionCheckPanel';
 import { ActionCheckRollModal } from './components/ActionCheckRollModal';
+import { AuthPanel } from './components/AuthPanel';
 import {
   acceptQuest,
   checkEncounters,
@@ -85,6 +86,9 @@ import {
   toMapSnapshot,
   unequipInventoryItem,
   validateConfig,
+  authMe,
+  authLogin,
+  authRegister,
 } from './services/api';
 import {
   defaultPlayerStaticData,
@@ -308,6 +312,10 @@ const DEFAULT_ACTION_CHECK_ROLL_STATE: ActionCheckRollState = {
 };
 
 function App() {
+  const [authState, setAuthState] = useState<'checking' | 'authed' | 'guest'>('checking');
+  const [authUser, setAuthUser] = useState<string>('');
+  const [authError, setAuthError] = useState<string>('');
+
   const [view, setView] = useState<View>('boot');
   const [configReturnView, setConfigReturnView] = useState<View>('boot');
   const [config, setConfig] = useState<AppConfig>(defaultConfig);
@@ -415,6 +423,56 @@ function App() {
   }, [chatState, error]);
 
   useEffect(() => {
+    void (async () => {
+      try {
+        const me = await authMe(report);
+        if (me?.ok) {
+          setAuthUser(me.username);
+          setAuthState('authed');
+          return;
+        }
+      } catch {
+        // ignore
+      }
+      setAuthState('guest');
+    })();
+  }, []);
+
+  const onDoLogin = async (payload: { username: string; password: string }) => {
+    setAuthError('');
+    try {
+      const result = await authLogin(payload, report);
+      setAuthUser(result.username);
+      setAuthState('authed');
+    } catch (e) {
+      setAuthError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const onDoRegister = async (payload: { username: string; password: string }) => {
+    setAuthError('');
+    try {
+      await authRegister(payload, report);
+      await onDoLogin(payload);
+    } catch (e) {
+      setAuthError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  if (authState !== 'authed') {
+    return (
+      <main className="app-shell" style={{ minHeight: '100vh' }}>
+        {authState === 'checking' ? (
+          <div style={{ color: 'rgba(255,255,255,0.72)', textAlign: 'center', marginTop: '12vh' }}>正在检查登录状态...</div>
+        ) : (
+          <AuthPanel onLogin={onDoLogin} onRegister={onDoRegister} error={authError} />
+        )}
+      </main>
+    );
+  }
+
+  useEffect(() => {
+    if (authState !== 'authed') return;
     if (view !== 'config') return;
     const model = configDraft.model.trim();
     if (!model) {
@@ -801,6 +859,7 @@ function App() {
   };
 
   useEffect(() => {
+    if (authState !== 'authed') return;
     try {
       const cachedPrompt = window.localStorage.getItem(MAP_PROMPT_STORAGE_KEY) ?? '';
       if (cachedPrompt) {
@@ -830,6 +889,7 @@ function App() {
   };
 
   useEffect(() => {
+    if (authState !== 'authed') return;
     void (async () => {
       const [cfgPathResult, svPathResult, saveResult] = await Promise.allSettled([
         getConfigPath(report),

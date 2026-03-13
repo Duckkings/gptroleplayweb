@@ -56,10 +56,35 @@
 
 const API_BASE = '/api/v1';
 
+export async function authMe(report?: DebugReporter): Promise<{ ok: boolean; username: string }> {
+  return requestJson('/auth/me', { method: 'GET' }, report);
+}
+
+export async function authLogin(payload: { username: string; password: string }, report?: DebugReporter): Promise<{ ok: boolean; username: string }> {
+  return requestJson('/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  }, report);
+}
+
+export async function authRegister(payload: { username: string; password: string }, report?: DebugReporter): Promise<{ ok: boolean }> {
+  return requestJson('/auth/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  }, report);
+}
+
+export async function authLogout(report?: DebugReporter): Promise<{ ok: boolean }> {
+  return requestJson('/auth/logout', { method: 'POST' }, report);
+}
+
+
 type DebugReporter = (payload: { endpoint: string; status: number; ok: boolean; usage?: Usage; detail?: string }) => void;
 
 async function requestJson<T>(endpoint: string, init: RequestInit, report?: DebugReporter): Promise<T> {
-  const response = await fetch(`${API_BASE}${endpoint}`, init);
+  const response = await fetch(`${API_BASE}${endpoint}`, { credentials: 'include', ...init });
   const text = await response.text();
   let parsed: unknown = {};
   if (text) {
@@ -170,6 +195,7 @@ export async function streamChat(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
     signal,
+    credentials: 'include',
   });
 
   report?.({ endpoint, status: response.status, ok: response.ok });
@@ -1112,6 +1138,7 @@ export async function streamNpcChat(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
     signal,
+    credentials: 'include',
   });
   report?.({ endpoint, status: response.status, ok: response.ok });
   if (!response.ok) {

@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from app.core.dialogs import pick_directory
 from app.core.storage import read_json, storage_state, write_json_atomic
 from app.core.token_usage import token_usage_store
+from app.core.user_context import get_current_user
 from app.models.schemas import (
     AreaCurrentResponse,
     AreaDiscoverInteractionsRequest,
@@ -365,29 +366,34 @@ async def chat_sse(payload: ChatRequest) -> StreamingResponse:
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 
+def _require_user() -> str:
+    user = get_current_user()
+    if not user:
+        raise HTTPException(status_code=401, detail="未登录")
+    return user
+
+
 @router.get("/storage/config/path", response_model=PathStatusResponse)
 async def get_config_path() -> PathStatusResponse:
+    _require_user()
     return storage_state.path_status(storage_state.config_path)
 
 
 @router.post("/storage/config/path", response_model=PathStatusResponse)
 async def set_config_path(payload: PathConfig) -> PathStatusResponse:
-    path = storage_state.set_config_path(payload.path)
-    return storage_state.path_status(path)
+    _require_user()
+    raise HTTPException(status_code=403, detail="多用户模式下禁止自定义配置路径")
 
 
 @router.post("/storage/config/path/pick", response_model=PathStatusResponse)
 async def pick_config_path() -> PathStatusResponse:
-    directory = pick_directory("选择配置文件夹")
-    if directory is None:
-        raise HTTPException(status_code=400, detail="未选择目录或系统不支持目录选择窗口")
-
-    path = storage_state.set_config_path(str(directory / "config.json"))
-    return storage_state.path_status(path)
+    _require_user()
+    raise HTTPException(status_code=403, detail="多用户模式下禁止选择本地目录")
 
 
 @router.get("/storage/config")
 async def get_config_data() -> dict:
+    _require_user()
     path = storage_state.config_path
     if not path.exists():
         raise HTTPException(status_code=404, detail="config file not found")
@@ -400,6 +406,7 @@ async def get_config_data() -> dict:
 
 @router.post("/storage/config")
 async def set_config_data(payload: dict) -> dict:
+    _require_user()
     try:
         cfg = ChatConfig.model_validate(payload)
     except ValidationError as exc:
@@ -411,32 +418,31 @@ async def set_config_data(payload: dict) -> dict:
 
 @router.get("/saves/path", response_model=PathStatusResponse)
 async def get_save_path() -> PathStatusResponse:
+    _require_user()
     return storage_state.path_status(storage_state.save_path)
 
 
 @router.post("/saves/path", response_model=PathStatusResponse)
 async def set_save_path(payload: PathConfig) -> PathStatusResponse:
-    path = storage_state.set_save_path(payload.path)
-    return storage_state.path_status(path)
+    _require_user()
+    raise HTTPException(status_code=403, detail="多用户模式下禁止自定义存档路径")
 
 
 @router.post("/saves/path/pick", response_model=PathStatusResponse)
 async def pick_save_path() -> PathStatusResponse:
-    directory = pick_directory("选择存档文件夹")
-    if directory is None:
-        raise HTTPException(status_code=400, detail="未选择目录或系统不支持目录选择窗口")
-
-    path = storage_state.set_save_path(str(directory / "current-save.json"))
-    return storage_state.path_status(path)
+    _require_user()
+    raise HTTPException(status_code=403, detail="多用户模式下禁止选择本地目录")
 
 
 @router.get("/saves/current", response_model=SaveFile)
 async def get_save_current() -> SaveFile:
+    _require_user()
     return get_current_save()
 
 
 @router.post("/saves/current", response_model=SaveFile)
 async def set_save_current(payload: SaveSetRequest) -> SaveFile:
+    _require_user()
     save = SaveFile.model_validate(payload.save_data)
     save_current(save)
     return save
@@ -444,12 +450,14 @@ async def set_save_current(payload: SaveSetRequest) -> SaveFile:
 
 @router.post("/saves/import", response_model=SaveFile)
 async def import_save_file(payload: SaveImportRequest) -> SaveFile:
+    _require_user()
     save = SaveFile.model_validate(payload.save_data)
     return import_save(save)
 
 
 @router.post("/saves/clear", response_model=SaveFile)
 async def clear_save(payload: SaveClearRequest) -> SaveFile:
+    _require_user()
     return clear_current_save(payload.session_id)
 
 
