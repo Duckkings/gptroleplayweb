@@ -173,20 +173,30 @@ def _build_invite_decision(save, role: NpcRoleCard, req: TeamInviteRequest) -> t
             try:
                 client = create_sync_client(config, client_cls=OpenAI)
                 zone_name, sub_name = _current_player_area_names(save)
-                prompt_text = (
+                prompt_text = prompt_table.render(
+                    "team.invite_decider.user",
                     "You decide whether one NPC should join the player's party. Return JSON only.\n"
                     "Schema: {\"accept\":true,\"reason\":\"\",\"affinity\":50,\"trust\":40}.\n"
                     "Consider personality, relation tag, trust, and whether interests align.\n"
-                    f"NPC={role.name}, personality={role.personality}, background={role.background}, cognition={role.cognition}, alignment={role.alignment}.\n"
-                    f"CurrentArea={zone_name}/{sub_name}. RelationTag={relation_tag}. PlayerRequest={prompt or 'none'}.\n"
-                    "affinity/trust must be integers between 0 and 100."
+                    "NPC=$npc_name, personality=$personality, background=$background, cognition=$cognition, alignment=$alignment.\n"
+                    "CurrentArea=$zone_name/$sub_name. RelationTag=$relation_tag. PlayerRequest=$player_request.\n"
+                    "affinity/trust must be integers between 0 and 100.",
+                    npc_name=role.name,
+                    personality=role.personality,
+                    background=role.background,
+                    cognition=role.cognition,
+                    alignment=role.alignment,
+                    zone_name=zone_name,
+                    sub_name=sub_name,
+                    relation_tag=relation_tag,
+                    player_request=(prompt or "none"),
                 )
                 resp = client.chat.completions.create(
                     model=model,
                     **build_completion_options(config),
                     response_format={"type": "json_object"},
                     messages=[
-                        {"role": "system", "content": "Return JSON only."},
+                        {"role": "system", "content": prompt_table.get_text("team.json_only.system", "Return JSON only.")},
                         {"role": "user", "content": prompt_text},
                     ],
                 )
@@ -558,7 +568,7 @@ def _compose_fallback_team_background(
     if likes:
         parts.append(f"平时会对{'、'.join(likes[:2])}这类线索格外上心，也因此更容易被相关话题打动。")
     elif prompt_text:
-        parts.append(f"从你的描述来看，他/她身上最鲜明的特征与“{_limit_text(prompt_text, 24)}”有关。")
+        parts.append(f"从你的描述来看，他/她身上最鲜明的特征与"{_limit_text(prompt_text, 24)}"有关。")
     return _limit_text("".join(parts), 280)
 
 
@@ -709,20 +719,26 @@ def _ai_team_role_spec(save, prompt: str, config, source: str) -> dict[str, Any]
     if not api_key or not model:
         return None
     zone_name, sub_name = _current_player_area_names(save)
-    prompt_text = (
+    prompt_text = prompt_table.render(
+        "team.teammate_concept.user",
         "You generate one teammate concept for a fantasy RPG. Return JSON only.\n"
         "Use this exact schema keys only: "
-        "{\"display_name\":\"\",\"race\":\"\",\"char_class\":\"\",\"sheet_background\":\"\",\"alignment\":\"\","
-        "\"personality\":\"\",\"speaking_style\":\"\",\"appearance\":\"\",\"background\":\"\",\"cognition\":\"\","
-        "\"secret\":\"\",\"likes\":[],\"languages\":[],\"tool_proficiencies\":[],\"skills_proficient\":[],"
-        "\"features_traits\":[],\"spells\":[],\"preferred_weapon\":\"\",\"preferred_armor\":\"\","
+        "{\"display_name\":\"\",\"race\":\"\",\"char_class\":\"\",\"sheet_background\":\"\",\"alignment\":\"\"," 
+        "\"personality\":\"\",\"speaking_style\":\"\",\"appearance\":\"\",\"background\":\"\",\"cognition\":\"\"," 
+        "\"secret\":\"\",\"likes\":[],\"languages\":[],\"tool_proficiencies\":[],\"skills_proficient\":[]," 
+        "\"features_traits\":[],\"spells\":[],\"preferred_weapon\":\"\",\"preferred_armor\":\"\"," 
         "\"inventory_items\":[],\"notes\":\"\",\"ability_bias\":\"\"}.\n"
-        f"Allowed race={_ALLOWED_TEAM_RACES}. Allowed char_class={_ALLOWED_TEAM_CLASSES}. "
-        f"Allowed alignment={_ALLOWED_TEAM_ALIGNMENTS}. Allowed ability_bias="
-        "[strength,dexterity,constitution,intelligence,wisdom,charisma].\n"
+        "Allowed race=$allowed_race. Allowed char_class=$allowed_class. Allowed alignment=$allowed_alignment. Allowed ability_bias=[strength,dexterity,constitution,intelligence,wisdom,charisma].\n"
         "Keep array items short. Use Chinese strings. Do not output markdown.\n"
         "background should be 2-3 full Chinese sentences, not a fragment. cognition/secret/appearance should also be complete phrases.\n"
-        f"Current area={zone_name}/{sub_name}. Source={source}. Player prompt={prompt}."
+        "Current area=$zone_name/$sub_name. Source=$source. Player prompt=$player_prompt.",
+        allowed_race=_ALLOWED_TEAM_RACES,
+        allowed_class=_ALLOWED_TEAM_CLASSES,
+        allowed_alignment=_ALLOWED_TEAM_ALIGNMENTS,
+        zone_name=zone_name,
+        sub_name=sub_name,
+        source=source,
+        player_prompt=prompt,
     )
     try:
         client = create_sync_client(config, client_cls=OpenAI)
@@ -731,7 +747,7 @@ def _ai_team_role_spec(save, prompt: str, config, source: str) -> dict[str, Any]
             **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
-                {"role": "system", "content": "Return JSON only."},
+                {"role": "system", "content": prompt_table.get_text("team.json_only.system", "Return JSON only.")},
                 {"role": "user", "content": prompt_text},
             ],
         )

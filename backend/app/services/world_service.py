@@ -1293,7 +1293,7 @@ def _generate_inventory_interaction_reply(
                     model=model,
                     **build_completion_options(config),
                     messages=[
-                        {"role": "system", "content": "Return plain Chinese text only."},
+                        {"role": "system", "content": prompt_table.get_text("world.plain_zh.system", "Return plain Chinese text only.")},
                         {
                             "role": "user",
                             "content": _build_item_interaction_prompt(owner_type, owner_name, item, mode, prompt, action_check_result),
