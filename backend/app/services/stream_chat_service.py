@@ -182,19 +182,71 @@ class StreamingTurnParser:
         return [piece for piece in emitted if piece]
 
     def require_bundle(self) -> dict[str, Any]:
+        # First check if we have a complete bundle
         if not self.bundle_complete:
+            # Try to find if there's JSON content collected even without closing tag
+            text = self.bundle_buffer.strip()
+            if text:
+                logger.warning(
+                    "%s missing closing tag but has %d chars of content. "
+                    "Attempting to parse anyway...",
+                    self.bundle_tag,
+                    len(text),
+                )
+                # Try to parse what we have
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict):
+                        logger.warning("%s parsed successfully despite missing closing tag", self.bundle_tag)
+                        return parsed
+                except json.JSONDecodeError:
+                    pass
+                # Try raw_decode to extract partial JSON
+                try:
+                    parsed, end = json.JSONDecoder().raw_decode(text)
+                    if isinstance(parsed, dict):
+                        logger.warning(
+                            "%s extracted partial JSON (pos %d of %d chars) despite missing closing tag",
+                            self.bundle_tag,
+                            end,
+                            len(text),
+                        )
+                        return parsed
+                except json.JSONDecodeError:
+                    pass
             raise StreamProtocolError(f"{self.bundle_tag} missing closing tag")
         text = self.bundle_buffer.strip()
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError as exc:
+            # Log detailed error info for debugging
+            logger.error(
+                "%s JSON parse failed at pos %d (char %d): %s. Raw content (first 1000 chars): %r",
+                self.bundle_tag,
+                exc.lineno,
+                exc.colno,
+                exc.msg,
+                text[:1000],
+            )
             try:
                 parsed, end = json.JSONDecoder().raw_decode(text)
             except json.JSONDecodeError:
-                raise StreamProtocolError(f"{self.bundle_tag} json parse failed: {exc}") from exc
+                # Include raw content preview in exception for debugging
+                preview = text[:500] if len(text) <= 500 else f"{text[:500]}...<truncated {len(text)-500}>"
+                raise StreamProtocolError(
+                    f"{self.bundle_tag} json parse failed: {exc}. Raw content preview: {preview!r}"
+                ) from exc
             trailing = text[end:].strip()
-            if trailing and not re.fullmatch(r"""["'`]+""", trailing):
-                raise StreamProtocolError(f"{self.bundle_tag} json parse failed: {exc}") from exc
+            if trailing:
+                # Log warning for trailing content but accept the first valid JSON
+                logger.warning(
+                    "%s has trailing content after valid JSON (pos %d of %d chars). "
+                    "Accepting first JSON object. Trailing preview: %r",
+                    self.bundle_tag,
+                    end,
+                    len(text),
+                    trailing[:200],
+                )
         if not isinstance(parsed, dict):
             raise StreamProtocolError(f"{self.bundle_tag} must decode to object")
         return parsed

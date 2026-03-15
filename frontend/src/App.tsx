@@ -105,6 +105,9 @@ import {
   authRegister,
   authLogout,
   authResetPassword,
+  retainNpc,
+  getRetainedNpcs,
+  generateFromRetained,
 } from './services/api';
 import {
   defaultPlayerStaticData,
@@ -2748,21 +2751,73 @@ function App() {
   };
 
   const onGenerateDebugTeamMember = async () => {
-    const prompt = window.prompt('输入用于生成调试队友的描述');
-    if (!prompt || !prompt.trim()) return;
-    setAiWaitingText('正在生成调试队友...');
-    setAiWaiting(true);
-    try {
-      const response = await generateDebugTeammate({ session_id: sessionId, prompt: prompt.trim(), config }, report);
-      setTeamState(response.team_state ?? defaultTeamState);
-      setTeamChatReplies([]);
-      await refreshNpcPool(npcPoolSearch);
-      setTeamOpen(true);
-      setConfigHint(response.chat_feedback || '调试队友已加入队伍。');
-    } catch (e) {
-      setError(e instanceof Error ? e.message : '生成调试队友失败');
-    } finally {
-      setAiWaiting(false);
+    // 首先询问用户是选择保留的角色还是生成新角色
+    const choice = window.confirm(
+      '生成调试队友：\n\n点击"确定"：使用已保留的角色\n点击"取消"：生成新角色'
+    );
+
+    if (choice) {
+      // 使用保留的角色
+      try {
+        const retainedResponse = await getRetainedNpcs(report);
+        const npcs = retainedResponse.npcs || [];
+
+        if (npcs.length === 0) {
+          window.alert('没有保留的角色，请先生成并保留一个角色。');
+          return;
+        }
+
+        // 构建选择列表
+        const options = npcs.map((npc, index) => `${index + 1}. ${npc.name}${npc.notes ? ` (${npc.notes})` : ''}`).join('\n');
+        const input = window.prompt(`选择要使用的保留角色（输入编号）：\n\n${options}`);
+
+        if (!input || !input.trim()) return;
+
+        const selectedIndex = parseInt(input.trim(), 10) - 1;
+        if (isNaN(selectedIndex) || selectedIndex < 0 || selectedIndex >= npcs.length) {
+          window.alert('无效的选择');
+          return;
+        }
+
+        const selectedNpc = npcs[selectedIndex];
+
+        setAiWaitingText('正在从保留角色生成队友...');
+        setAiWaiting(true);
+
+        const response = await generateFromRetained(
+          selectedNpc.retained_id,
+          { session_id: sessionId },
+          report
+        );
+
+        setTeamState(response.team_state ?? defaultTeamState);
+        setTeamChatReplies([]);
+        await refreshNpcPool(npcPoolSearch);
+        setTeamOpen(true);
+        setConfigHint(response.chat_feedback || `保留角色 ${selectedNpc.name} 已加入队伍。`);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : '从保留角色生成队友失败');
+      } finally {
+        setAiWaiting(false);
+      }
+    } else {
+      // 生成新角色
+      const prompt = window.prompt('输入用于生成调试队友的描述');
+      if (!prompt || !prompt.trim()) return;
+      setAiWaitingText('正在生成调试队友...');
+      setAiWaiting(true);
+      try {
+        const response = await generateDebugTeammate({ session_id: sessionId, prompt: prompt.trim(), config }, report);
+        setTeamState(response.team_state ?? defaultTeamState);
+        setTeamChatReplies([]);
+        await refreshNpcPool(npcPoolSearch);
+        setTeamOpen(true);
+        setConfigHint(response.chat_feedback || '调试队友已加入队伍。');
+      } catch (e) {
+        setError(e instanceof Error ? e.message : '生成调试队友失败');
+      } finally {
+        setAiWaiting(false);
+      }
     }
   };
 
@@ -2786,7 +2841,7 @@ function App() {
         setTeamOpen(true);
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : '邀请 NPC 入队失败');
+      setError(e instanceof Error ? e.message : '邀请NPC入队失败');
     }
   };
 
@@ -2802,17 +2857,26 @@ function App() {
     }
   };
 
+  const onRetainTeamMember = async (roleId: string, npcName: string) => {
+    try {
+      const notes = window.prompt(`为 ${npcName} 添加保留备注（可选）`) ?? '';
+      const response = await retainNpc({ session_id: sessionId, role_id: roleId, notes }, report);
+      setConfigHint(response.message || `${npcName} 已保留到账户中。`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '保留队友失败');
+    }
+  };
+
   const onTeamChat = async (playerMessage: string) => {
     try {
       setTeamChatBusy(true);
       const response = await sendTeamChat({ session_id: sessionId, player_message: playerMessage, config }, report);
       setTeamState(response.team_state ?? defaultTeamState);
       setTeamChatReplies(response.replies ?? []);
+      setConfigHint('队伍聊天已发送。');
       pushTimeNotice(response.time_spent_min, '队伍聊天');
-      await refreshNpcPool(npcPoolSearch);
-      await runNarrativeChecks('random_dialog');
     } catch (e) {
-      setError(e instanceof Error ? e.message : '队伍聊天失败');
+      setError(e instanceof Error ? e.message : '队伍聊天发送失败');
     } finally {
       setTeamChatBusy(false);
     }
@@ -4271,6 +4335,7 @@ function App() {
         onInspectProfile={(npcId) => void onInspectTeamProfile(npcId)}
         onInspectInventory={(npcId) => void onInspectTeamInventory(npcId)}
         onLeave={(npcId) => void onLeaveTeamMember(npcId)}
+        onRetain={(npcId, npcName) => void onRetainTeamMember(npcId, npcName)}
         onClose={() => setTeamOpen(false)}
       />
 

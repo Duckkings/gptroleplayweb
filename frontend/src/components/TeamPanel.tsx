@@ -15,6 +15,7 @@ type Props = {
   onInspectProfile: (npcId: string) => void;
   onInspectInventory: (npcId: string) => void;
   onLeave: (npcId: string) => void;
+  onRetain: (npcId: string, npcName: string) => void;
   onClose: () => void;
 };
 
@@ -32,6 +33,7 @@ export function TeamPanel({
   onInspectProfile,
   onInspectInventory,
   onLeave,
+  onRetain,
   onClose,
 }: Props) {
   const [teamChatInput, setTeamChatInput] = useState('');
@@ -120,6 +122,7 @@ export function TeamPanel({
                     <button onClick={() => onInspectInventory(member.role_id)} disabled={!role}>
                       背包
                     </button>
+                    <button onClick={() => onRetain(member.role_id, member.name)}>保留</button>
                     <button onClick={() => onLeave(member.role_id)}>离队</button>
                   </div>
                 </div>

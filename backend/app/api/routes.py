@@ -263,6 +263,8 @@ from app.services.team_service import (
     team_chat,
 )
 
+from app.services.retained_npc_service import retained_npc_service
+
 router = APIRouter(prefix="/api/v1", tags=["api"])
 
 
@@ -1243,6 +1245,113 @@ async def team_chat_run(payload: TeamChatRequest) -> TeamChatResponse:
         return team_chat(payload)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+# Retained NPC endpoints
+@router.get("/team/retained")
+async def team_retained_list() -> dict:
+    """Get all retained NPCs for the current user."""
+    _require_user()
+    npcs = retained_npc_service.get_all()
+    return {
+        "npcs": [
+            {
+                "retained_id": npc.retained_id,
+                "name": npc.name,
+                "retained_at": npc.retained_at,
+                "notes": npc.notes,
+            }
+            for npc in npcs
+        ]
+    }
+
+
+@router.post("/team/retain")
+async def team_retain_npc(payload: dict) -> dict:
+    """Retain an NPC from the current team."""
+    _require_user()
+    role_id = payload.get("role_id")
+    notes = payload.get("notes", "")
+    session_id = payload.get("session_id")
+    
+    if not role_id or not session_id:
+        raise HTTPException(status_code=400, detail="role_id and session_id are required")
+    
+    # Get the role from the save
+    save = get_current_save(default_session_id=session_id)
+    role = next((r for r in save.role_pool if r.role_id == role_id), None)
+    if not role:
+        raise HTTPException(status_code=404, detail="role not found in current save")
+    
+    retained = retained_npc_service.retain_npc(role, notes)
+    return {
+        "ok": True,
+        "retained_id": retained.retained_id,
+        "name": retained.name,
+        "message": f"{retained.name} 已被保留到账户中。",
+    }
+
+
+@router.post("/team/retained/{retained_id}/generate")
+async def team_generate_from_retained(retained_id: str, payload: dict) -> TeamMutationResponse:
+    """Generate a teammate from a retained NPC."""
+    _require_user()
+    session_id = payload.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+    
+    retained = retained_npc_service.get_by_id(retained_id)
+    if not retained:
+        raise HTTPException(status_code=404, detail="retained NPC not found")
+    
+    # Import the function to generate from spec
+    from app.services.team_service import generate_team_role_from_prompt, ensure_team_state, sync_team_members_with_player_in_save, save_current
+    from app.models.schemas import TeamMember
+    
+    save = get_current_save(default_session_id=session_id)
+    save.session_id = session_id
+    state = ensure_team_state(save)
+    
+    # Create role from retained data
+    role_data = retained.role_data.copy()
+    role_data["role_id"] = f"debug_team_{int(__import__('time').time() * 1000)}"
+    role = NpcRoleCard.model_validate(role_data)
+    save.role_pool.append(role)
+    
+    member = TeamMember(
+        role_id=role.role_id,
+        name=role.name,
+        origin_zone_id=None,
+        origin_sub_zone_id=None,
+        affinity=85,
+        trust=75,
+        join_source="debug",
+        join_reason=f"从保留的队友生成 (原: {retained.name})",
+        is_debug=True,
+        debug_prompt=f"retained:{retained.retained_id}",
+    )
+    state.members.append(member)
+    sync_team_members_with_player_in_save(save)
+    save_current(save)
+    
+    return TeamMutationResponse(
+        session_id=session_id,
+        team_state=state,
+        member=member,
+        role=role,
+        accepted=True,
+        chat_feedback=f"{role.name} 已从保留的队友生成并加入队伍。",
+    )
+
+
+@router.delete("/team/retained/{retained_id}")
+async def team_delete_retained(retained_id: str) -> dict:
+    """Delete a retained NPC."""
+    _require_user()
+    deleted = retained_npc_service.delete_retained(retained_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="retained NPC not found")
+    return {"ok": True, "message": "保留的队友已删除。"}
 
 
 @router.post("/npc/chat/stream")

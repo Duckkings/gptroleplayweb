@@ -1150,6 +1150,55 @@ export async function sendTeamChat(
   );
 }
 
+// Retained NPC API functions
+export async function getRetainedNpcs(
+  report?: DebugReporter,
+): Promise<{ npcs: Array<{ retained_id: string; name: string; retained_at: string; notes: string }> }> {
+  return requestJson('/team/retained', { method: 'GET' }, report);
+}
+
+export async function retainNpc(
+  payload: { session_id: string; role_id: string; notes?: string },
+  report?: DebugReporter,
+): Promise<{ ok: boolean; retained_id: string; name: string; message: string }> {
+  return requestJson(
+    '/team/retain',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function generateFromRetained(
+  retainedId: string,
+  payload: { session_id: string },
+  report?: DebugReporter,
+): Promise<TeamMutationResponse> {
+  return requestJson(
+    `/team/retained/${encodeURIComponent(retainedId)}/generate`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function deleteRetainedNpc(
+  retainedId: string,
+  report?: DebugReporter,
+): Promise<{ ok: boolean; message: string }> {
+  return requestJson(
+    `/team/retained/${encodeURIComponent(retainedId)}`,
+    { method: 'DELETE' },
+    report,
+  );
+}
+
 export async function getPlayerStatic(sessionId: string, report?: DebugReporter): Promise<PlayerStaticData> {
   return requestJson(`/player/static?session_id=${encodeURIComponent(sessionId)}`, { method: 'GET' }, report);
 }
