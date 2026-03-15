@@ -26,6 +26,12 @@ class PromptKeys:
     ENCOUNTER_REJOIN_USER = "encounter.rejoin.user.v1"
     ENCOUNTER_DEBUG_SUMMARY_USER = "encounter.debug.summary.user.v1"
     ENCOUNTER_OUTCOME_PACKAGE_USER = "encounter.outcome.package.user.v1"
+    
+    # Death system prompts
+    DEATH_DYING_NARRATIVE = "death.dying.narrative.v1"
+    DEATH_SAVE_NARRATIVE = "death.save.narrative.v1"
+    DEATH_DECLARATION_NARRATIVE = "death.declaration.narrative.v1"
+    DEATH_REVIVAL_NARRATIVE = "death.revival.narrative.v1"
 
 
 REQUIRED_PROMPT_KEYS: tuple[str, ...] = (
@@ -53,4 +59,9 @@ REQUIRED_PROMPT_KEYS: tuple[str, ...] = (
     PromptKeys.ENCOUNTER_REJOIN_USER,
     PromptKeys.ENCOUNTER_DEBUG_SUMMARY_USER,
     PromptKeys.ENCOUNTER_OUTCOME_PACKAGE_USER,
+    # Death system prompts (optional for now)
+    PromptKeys.DEATH_DYING_NARRATIVE,
+    PromptKeys.DEATH_SAVE_NARRATIVE,
+    PromptKeys.DEATH_DECLARATION_NARRATIVE,
+    PromptKeys.DEATH_REVIVAL_NARRATIVE,
 )

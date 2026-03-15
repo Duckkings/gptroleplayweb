@@ -13,6 +13,7 @@ from app.models.schemas import (
     BattleStepEntry,
     CombatantState,
 )
+from app.services.death_service import death_service
 
 
 _BAND_ORDER = ["engaged", "near", "far", "remote"]
@@ -219,6 +220,17 @@ def _advance_to_next_turn(state: BattleSandboxState) -> None:
 
 
 def _apply_damage(state: BattleSandboxState, target: CombatantState, amount: int, *, actor: CombatantState | None = None, damage_type: str = "") -> int:
+    # 对玩家使用死亡服务进行伤害处理
+    if target.source_kind == "player":
+        result = death_service.check_and_apply_damage(
+            state, target, amount, damage_type=damage_type, actor=actor
+        )
+        if result["triggered_death_check"]:
+            _recompute_momentum(state)
+            _sync_snapshots(state)
+            return result["damage_applied"]
+    
+    # 原有的伤害处理逻辑（用于非玩家或死亡服务未触发的情况）
     remaining = max(0, int(amount))
     if target.temp_hp > 0:
         absorbed = min(target.temp_hp, remaining)
@@ -486,6 +498,67 @@ def resolve_pending_roll(state: BattleSandboxState, forced_dice_roll: int) -> Ba
     elif prompt.roll_kind == "item_use":
         state.pending_roll = None
         summary = f"{actor.display_name} 使用物品完成检定。"
+        _advance_to_next_turn(state)
+    elif prompt.roll_kind == "death_save":
+        # 死亡豁免处理
+        roll_result = BattleRollResolution(
+            prompt_id=prompt.prompt_id,
+            actor_combatant_id=actor.combatant_id,
+            actor_name=actor.display_name,
+            roll_kind=prompt.roll_kind,
+            ability_used=prompt.ability_used,
+            ability_modifier=prompt.ability_modifier,
+            dc=prompt.dc,
+            dice_roll=roll,
+            total_score=total,
+            success=success,
+            critical=critical,  # type: ignore[arg-type]
+            summary="",
+        )
+        outcome = death_service.resolve_death_save(state, actor, roll_result)
+        
+        if outcome == "died":
+            summary = f"{actor.display_name} 的死亡豁免失败，已经死亡。"
+            # 战斗结束处理已在 declare_death 中完成
+        elif outcome == "revived":
+            summary = f"{actor.display_name} 奇迹般地从濒死中恢复！"
+            _advance_to_next_turn(state)
+        elif outcome == "stabilized":
+            summary = f"{actor.display_name} 的伤势稳定了下来。"
+            _advance_to_next_turn(state)
+        else:  # continues
+            summary = f"{actor.display_name} 仍在濒死状态，需要继续检定。"
+        
+        resolution = BattleRollResolution(
+            prompt_id=prompt.prompt_id,
+            actor_combatant_id=actor.combatant_id,
+            actor_name=actor.display_name,
+            roll_kind=prompt.roll_kind,
+            ability_used=prompt.ability_used,
+            ability_modifier=prompt.ability_modifier,
+            dc=prompt.dc,
+            dice_roll=roll,
+            total_score=total,
+            success=success,
+            critical=critical,  # type: ignore[arg-type]
+            summary=summary,
+        )
+        state.last_roll_result = resolution
+        _normalize_battle(state)
+        return resolution
+    elif prompt.roll_kind == "stabilize":
+        # 稳定检定处理（队友救援）
+        state.pending_roll = None
+        target_id = str(prompt.metadata.get("target_id") or "")
+        target = _find_combatant(state, target_id)
+        
+        if target and "dying" in target.conditions:
+            result = death_service.stabilize(state, target, stabilizer=actor, method="medicine")
+            stabilized = result.get("stabilized", False)
+            summary = f"{actor.display_name} 尝试稳定 {target.display_name}：" + ("成功" if stabilized else "失败")
+        else:
+            summary = f"{actor.display_name} 的稳定检定完成。"
+        
         _advance_to_next_turn(state)
     else:
         raise ValueError("BATTLE_ROLL_KIND_UNSUPPORTED")

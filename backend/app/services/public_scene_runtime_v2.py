@@ -262,7 +262,8 @@ def candidate_rows(
         deduped.append(candidate)
     limit = _candidate_limit(active_encounter, config)
     if not deduped and visible_rows:
-        actor_priority = {"npc": 0, "team": 1, "encounter_temp_npc": 2}
+        # Priority: team members first, then encounter temp NPCs, then regular NPCs
+        actor_priority = {"team": 0, "encounter_temp_npc": 1, "npc": 2}
         ordered = sorted(
             visible_rows,
             key=lambda item: (

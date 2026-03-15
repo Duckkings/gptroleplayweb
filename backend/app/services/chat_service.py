@@ -97,6 +97,7 @@ from app.services.consistency_service import (
     reconcile_consistency,
 )
 from app.services.team_service import generate_debug_teammate, get_team_state, invite_npc_to_team, leave_npc_from_team, team_chat
+from app.services.death_service import death_service
 
 logger = logging.getLogger("roleplay.tools")
 
@@ -1154,6 +1155,108 @@ def _tools_schema() -> list[dict[str, Any]]:
                         "value": {"type": "string"},
                     },
                     "required": ["kind", "value"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_player_death_state",
+                "description": "Get player death/dying state including death save progress, death count, and revival weakness status.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "stabilize_player",
+                "description": "Attempt to stabilize a dying player using medicine check or healing item. Can be used by teammates.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "medic_role_id": {"type": "string", "description": "Role ID of the character attempting to stabilize. If omitted, assumes player is using an item."},
+                        "method": {"type": "string", "enum": ["medicine_check", "healing_kit", "spell"], "default": "medicine_check"},
+                        "item_instance_id": {"type": "string", "description": "Item to use if method is healing_kit"},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "player_revive",
+                "description": "Revive a dead player at shrine, by item, or by teammate. Applies death penalties and revival weakness buff.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "method": {"type": "string", "enum": ["shrine", "item", "teammate"], "default": "shrine"},
+                        "shrine_zone_id": {"type": "string", "description": "Zone ID of shrine for shrine revival"},
+                        "item_instance_id": {"type": "string", "description": "Revival item ID for item revival"},
+                        "teammate_role_id": {"type": "string", "description": "Teammate role ID for teammate revival"},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "spawn_encounter_npc",
+                "description": "Spawn a temporary NPC into an active encounter mid-way. Use when narrative introduces a new character that should be tracked as an encounter participant. This will add the NPC to encounter.temporary_npcs and participant_role_ids.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "encounter_id": {
+                            "type": "string",
+                            "description": "ID of the active encounter",
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "NPC name",
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "NPC title or role (e.g., 'Mysterious Stranger')",
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Brief description of the NPC",
+                        },
+                        "speaking_style": {
+                            "type": "string",
+                            "description": "How the NPC speaks (e.g., 'gruff', 'eloquent')",
+                        },
+                        "agenda": {
+                            "type": "string",
+                            "description": "NPC's current goal or motivation in this scene",
+                        },
+                        "role_type": {
+                            "type": "string",
+                            "enum": ["neutral", "hostile", "friendly"],
+                            "description": "NPC's attitude toward the player",
+                        },
+                    },
+                    "required": ["encounter_id", "name"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_encounter_participants",
+                "description": "Get current encounter participant list including temporary NPCs. Use to check which NPCs are already instantiated in the encounter.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "encounter_id": {
+                            "type": "string",
+                            "description": "ID of the encounter",
+                        },
+                    },
+                    "required": ["encounter_id"],
                     "additionalProperties": False,
                 },
             },
@@ -2462,6 +2565,472 @@ async def _handle_tool_call(payload: ChatRequest, tool_call: Any) -> tuple[dict[
         except Exception as exc:
             result = {"ok": False, "error": str(exc)}
             event = ToolEvent(tool_name="player_set_trait", ok=False, summary=f"trait failed: {exc}")
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "get_player_death_state":
+        save = get_current_save(default_session_id=payload.session_id)
+        player = save.player_static_data
+        death_state = player.dnd5e_sheet.death_state
+        
+        # 检查虚弱是否过期
+        death_service.check_weakness_expired(player.dnd5e_sheet)
+        
+        result = {
+            "ok": True,
+            "life_status": death_state.life_status,
+            "death_save_progress": {
+                "successes": death_state.death_save_successes,
+                "failures": death_state.death_save_failures,
+            },
+            "death_count": death_state.death_count,
+            "death_streak_count": death_state.death_streak_count,
+            "can_be_stabilized": death_state.life_status == "dying",
+            "revival_weakness_active": any(
+                b.name == "复活虚弱" for b in player.dnd5e_sheet.buffs
+            ),
+            "last_death_cause": death_state.last_death_cause,
+        }
+        event = ToolEvent(
+            tool_name="get_player_death_state",
+            ok=True,
+            summary=f"death state: {death_state.life_status}",
+            payload={"life_status": death_state.life_status},
+        )
+        logger.info("tool_call get_player_death_state ok: status=%s", death_state.life_status)
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "stabilize_player":
+        try:
+            args = json.loads(arg_text)
+        except Exception:
+            event = ToolEvent(tool_name="stabilize_player", ok=False, summary="invalid json args")
+            logger.info("tool_call stabilize_player failed: invalid_json_args")
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "invalid_json_args"}, ensure_ascii=False)},
+                event,
+            )
+        
+        save = get_current_save(default_session_id=payload.session_id)
+        player = save.player_static_data
+        
+        if player.dnd5e_sheet.death_state.life_status != "dying":
+            result = {"ok": False, "error": "player_not_dying"}
+            event = ToolEvent(tool_name="stabilize_player", ok=False, summary="player not in dying state")
+        else:
+            from app.models.schemas import CombatantState
+            player_combatant = CombatantState(
+                combatant_id="player_001",
+                source_kind="player",
+                display_name=player.name,
+                side="player_side",
+                max_hp=player.dnd5e_sheet.hit_points.maximum,
+                current_hp=player.dnd5e_sheet.hit_points.current,
+                death_state=player.dnd5e_sheet.death_state,
+                conditions=["dying", "unconscious", "prone"],
+            )
+            
+            result_stabilize = death_service.stabilize(
+                save,
+                player_combatant,
+                stabilizer=None,
+                method="medicine" if args.get("method") == "medicine_check" else "item",
+            )
+            
+            # 同步状态回玩家数据
+            player.dnd5e_sheet.death_state = player_combatant.death_state
+            if result_stabilize.get("stabilized"):
+                player.dnd5e_sheet.status_flags = ["stable", "unconscious"]
+            save_current(save)
+            
+            result = {
+                "ok": True,
+                "stabilized": result_stabilize.get("stabilized", False),
+                "narrative": result_stabilize.get("narrative", ""),
+            }
+            event = ToolEvent(
+                tool_name="stabilize_player",
+                ok=True,
+                summary="stabilize " + ("ok" if result["stabilized"] else "failed"),
+                payload={"stabilized": result["stabilized"]},
+            )
+            logger.info("tool_call stabilize_player ok: stabilized=%s", result["stabilized"])
+        
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "player_revive":
+        try:
+            args = json.loads(arg_text)
+        except Exception:
+            event = ToolEvent(tool_name="player_revive", ok=False, summary="invalid json args")
+            logger.info("tool_call player_revive failed: invalid_json_args")
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "invalid_json_args"}, ensure_ascii=False)},
+                event,
+            )
+        
+        save = get_current_save(default_session_id=payload.session_id)
+        player = save.player_static_data
+        
+        if player.dnd5e_sheet.death_state.life_status != "dead":
+            result = {"ok": False, "error": "player_not_dead"}
+            event = ToolEvent(tool_name="player_revive", ok=False, summary="player not dead")
+        else:
+            method = args.get("method", "shrine")
+            
+            if method == "shrine":
+                revive_result = death_service.revive_at_shrine(save, shrine_zone_id=args.get("shrine_zone_id"))
+            elif method == "item":
+                # 查找复活道具
+                item_id = args.get("item_instance_id")
+                item = next((i for i in player.dnd5e_sheet.backpack.items if i.item_id == item_id), None)
+                if item:
+                    revive_result = death_service.revive_by_item(save, item)
+                else:
+                    revive_result = {"success": False, "error": "item_not_found"}
+            else:
+                # 队友复活（简化处理，使用神庙复活的逻辑但减少惩罚）
+                revive_result = death_service.revive_at_shrine(save)
+                revive_result["method"] = "teammate"
+                revive_result["narrative"] = "队友的急救让你重新苏醒。"
+            
+            if revive_result.get("success"):
+                save_current(save)
+                result = {
+                    "ok": True,
+                    "method": revive_result.get("method", method),
+                    "narrative": revive_result.get("narrative", ""),
+                    "penalties": {
+                        "gold_lost": revive_result["penalties_applied"].gold_lost,
+                        "exp_lost": revive_result["penalties_applied"].exp_lost,
+                        "weakness_duration_min": revive_result["penalties_applied"].weakness_duration_min,
+                    },
+                }
+                event = ToolEvent(
+                    tool_name="player_revive",
+                    ok=True,
+                    summary=f"revived by {method}",
+                    payload={"method": method},
+                )
+                logger.info("tool_call player_revive ok: method=%s", method)
+            else:
+                result = {"ok": False, "error": revive_result.get("error", "revive_failed")}
+                event = ToolEvent(tool_name="player_revive", ok=False, summary=result["error"])
+        
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "deal_damage":
+        try:
+            args = json.loads(arg_text)
+        except Exception:
+            event = ToolEvent(tool_name="deal_damage", ok=False, summary="invalid json args")
+            logger.info("tool_call deal_damage failed: invalid_json_args")
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "invalid_json_args"}, ensure_ascii=False)},
+                event,
+            )
+
+        target_type = str(args.get("target_type") or "").strip().lower()
+        damage = max(1, int(args.get("damage") or 1))
+        damage_type = str(args.get("damage_type") or "").strip()
+        attacker_role_id = str(args.get("attacker_role_id") or "").strip() or None
+        reason = str(args.get("reason") or "").strip()
+        skip_death_save = bool(args.get("skip_death_save", False))
+
+        if target_type not in {"player", "role"}:
+            event = ToolEvent(tool_name="deal_damage", ok=False, summary="target_type must be player or role")
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "invalid_target_type"}, ensure_ascii=False)},
+                event,
+            )
+
+        save = get_current_save(default_session_id=payload.session_id)
+        result: dict[str, Any] = {"ok": True, "damage_applied": 0, "hp_remaining": 0, "life_status": "healthy"}
+
+        if target_type == "player":
+            player_sheet = save.player_static_data.dnd5e_sheet
+            hp_before = player_sheet.hit_points.current
+            temp_hp = player_sheet.hit_points.temporary
+
+            # 先扣临时HP
+            remaining_damage = damage
+            if temp_hp > 0:
+                absorbed = min(temp_hp, remaining_damage)
+                player_sheet.hit_points.temporary -= absorbed
+                remaining_damage -= absorbed
+
+            # 扣除当前HP
+            if remaining_damage > 0:
+                player_sheet.hit_points.current = max(0, player_sheet.hit_points.current - remaining_damage)
+
+            hp_after = player_sheet.hit_points.current
+            result["damage_applied"] = damage
+            result["hp_remaining"] = hp_after
+            result["hp_before"] = hp_before
+            result["temp_hp_absorbed"] = min(temp_hp, damage) if temp_hp > 0 else 0
+
+            death_state = player_sheet.death_state
+
+            # 检查死亡流程
+            if hp_after <= 0:
+                # 检查即死条件：单次伤害从正值降到负的最大生命值
+                is_instant_death = skip_death_save
+                if hp_before > 0 and damage >= hp_before + player_sheet.hit_points.maximum:
+                    is_instant_death = True
+
+                if is_instant_death:
+                    # 直接死亡
+                    death_state.life_status = "dead"
+                    death_state.death_count += 1
+                    death_state.death_streak_count += 1
+                    death_state.last_death_at = datetime.now(timezone.utc).isoformat()
+                    death_state.last_death_cause = reason or f"伤害 ({damage_type or '未知'})"
+                    death_state.updated_at = datetime.now(timezone.utc).isoformat()
+                    player_sheet.is_dead = True
+                    player_sheet.status_flags = ["dead"]
+                    result["life_status"] = "dead"
+                    result["declared_death"] = True
+                    result["is_instant_death"] = True
+                    summary = f"deal_damage: player died instantly, damage={damage}"
+                else:
+                    # 进入濒死状态
+                    death_state.life_status = "dying"
+                    death_state.death_save_successes = 0
+                    death_state.death_save_failures = 0
+                    death_state.updated_at = datetime.now(timezone.utc).isoformat()
+                    player_sheet.status_flags = ["dying", "unconscious", "prone"]
+                    result["life_status"] = "dying"
+                    result["entered_dying"] = True
+                    result["death_save"] = {"successes": 0, "failures": 0}
+                    summary = f"deal_damage: player entering dying state, damage={damage}"
+            else:
+                result["life_status"] = death_state.life_status
+                summary = f"deal_damage: player damaged, hp={hp_after}/{player_sheet.hit_points.maximum}"
+
+            save_current(save)
+            event = ToolEvent(tool_name="deal_damage", ok=True, summary=summary, payload={"damage": damage, "hp_remaining": hp_after, "life_status": result["life_status"]})
+            logger.info("tool_call deal_damage ok: target=player damage=%s hp_remaining=%s life_status=%s", damage, hp_after, result["life_status"])
+        else:
+            # target_type == "role"
+            target_role_id = str(args.get("target_role_id") or "").strip()
+            if not target_role_id:
+                event = ToolEvent(tool_name="deal_damage", ok=False, summary="target_role_id is required when target_type is 'role'")
+                return (
+                    {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "target_role_id_required"}, ensure_ascii=False)},
+                    event,
+                )
+
+            role = next((r for r in save.role_pool if r.role_id == target_role_id), None)
+            if role is None:
+                event = ToolEvent(tool_name="deal_damage", ok=False, summary="role not found")
+                return (
+                    {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "role_not_found"}, ensure_ascii=False)},
+                    event,
+                )
+
+            role_sheet = role.profile.dnd5e_sheet
+            hp_before = role_sheet.hit_points.current
+            temp_hp = role_sheet.hit_points.temporary
+
+            # 先扣临时HP
+            remaining_damage = damage
+            if temp_hp > 0:
+                absorbed = min(temp_hp, remaining_damage)
+                role_sheet.hit_points.temporary -= absorbed
+                remaining_damage -= absorbed
+
+            # 扣除当前HP
+            if remaining_damage > 0:
+                role_sheet.hit_points.current = max(0, role_sheet.hit_points.current - remaining_damage)
+
+            hp_after = role_sheet.hit_points.current
+            result["damage_applied"] = damage
+            result["hp_remaining"] = hp_after
+            result["hp_before"] = hp_before
+            result["temp_hp_absorbed"] = min(temp_hp, damage) if temp_hp > 0 else 0
+
+            if hp_after <= 0:
+                role_sheet.is_dead = True
+                role_sheet.status_flags = ["dead", "downed"]
+                result["life_status"] = "dead"
+                summary = f"deal_damage: role died, damage={damage}"
+            else:
+                result["life_status"] = "healthy"
+                summary = f"deal_damage: role damaged, hp={hp_after}/{role_sheet.hit_points.maximum}"
+
+            save_current(save)
+            event = ToolEvent(tool_name="deal_damage", ok=True, summary=summary, payload={"damage": damage, "hp_remaining": hp_after, "life_status": result["life_status"]})
+            logger.info("tool_call deal_damage ok: target_role=%s damage=%s hp_remaining=%s", target_role_id, damage, hp_after)
+
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "spawn_encounter_npc":
+        try:
+            args = json.loads(arg_text)
+        except Exception:
+            event = ToolEvent(tool_name="spawn_encounter_npc", ok=False, summary="invalid json args")
+            logger.info("tool_call spawn_encounter_npc failed: invalid_json_args")
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "invalid_json_args"}, ensure_ascii=False)},
+                event,
+            )
+
+        encounter_id = str(args.get("encounter_id") or "").strip()
+        name = str(args.get("name") or "").strip()
+        title = str(args.get("title") or "").strip()
+        description = str(args.get("description") or "").strip()
+        speaking_style = str(args.get("speaking_style") or "").strip()
+        agenda = str(args.get("agenda") or "").strip()
+        role_type = str(args.get("role_type") or "neutral").strip()
+
+        if not encounter_id or not name:
+            event = ToolEvent(tool_name="spawn_encounter_npc", ok=False, summary="encounter_id and name are required")
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "missing_required_fields"}, ensure_ascii=False)},
+                event,
+            )
+
+        save = get_current_save(default_session_id=payload.session_id)
+        from app.services.encounter_service import _state, _find_encounter, _refresh_participants, _append_step, _touch_state, _utc_now
+
+        state = _state(save)
+        encounter = _find_encounter(state, encounter_id)
+
+        if encounter is None:
+            event = ToolEvent(tool_name="spawn_encounter_npc", ok=False, summary="encounter not found")
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "encounter_not_found"}, ensure_ascii=False)},
+                event,
+            )
+
+        # 创建临时NPC
+        from datetime import datetime, timezone
+        from app.models.schemas import EncounterTemporaryNpc
+
+        temp_npc = EncounterTemporaryNpc(
+            encounter_npc_id=f"encnpc_mid_{datetime.now(timezone.utc).timestamp()}",
+            name=name,
+            title=title,
+            description=description or f"{name}卷入了当前的遭遇。",
+            speaking_style=speaking_style,
+            agenda=agenda or f"{name}正试图处理眼前的情况。",
+            state="active",
+            zone_id=encounter.zone_id,
+            sub_zone_id=encounter.sub_zone_id,
+            introduced_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+        # 添加到遭遇
+        encounter.temporary_npcs.append(temp_npc)
+        if temp_npc.encounter_npc_id not in encounter.participant_role_ids:
+            encounter.participant_role_ids.append(temp_npc.encounter_npc_id)
+        _refresh_participants(save, encounter)
+
+        # 记录日志
+        _append_step(
+            encounter,
+            kind="npc_entrance",
+            actor_type="temporary_npc",
+            actor_id=temp_npc.encounter_npc_id,
+            actor_name=name,
+            content=f"新角色入场：{name}" + (f"（{title}）" if title else "") + "。",
+            metadata={"npc_name": name, "role_type": role_type},
+        )
+        _touch_state(state)
+        save_current(save)
+
+        result = {
+            "ok": True,
+            "encounter_npc_id": temp_npc.encounter_npc_id,
+            "name": name,
+            "title": title,
+            "role_type": role_type,
+        }
+        event = ToolEvent(
+            tool_name="spawn_encounter_npc",
+            ok=True,
+            summary=f"spawned encounter npc: {name}",
+            payload={"npc_id": temp_npc.encounter_npc_id, "name": name},
+        )
+        logger.info("tool_call spawn_encounter_npc ok: encounter=%s npc=%s", encounter_id, name)
+
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "get_encounter_participants":
+        try:
+            args = json.loads(arg_text)
+        except Exception:
+            event = ToolEvent(tool_name="get_encounter_participants", ok=False, summary="invalid json args")
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "invalid_json_args"}, ensure_ascii=False)},
+                event,
+            )
+
+        encounter_id = str(args.get("encounter_id") or "").strip()
+        if not encounter_id:
+            event = ToolEvent(tool_name="get_encounter_participants", ok=False, summary="encounter_id is required")
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "encounter_id_required"}, ensure_ascii=False)},
+                event,
+            )
+
+        save = get_current_save(default_session_id=payload.session_id)
+        from app.services.encounter_service import _state, _find_encounter, _visible_participant_text
+
+        state = _state(save)
+        encounter = _find_encounter(state, encounter_id)
+
+        if encounter is None:
+            event = ToolEvent(tool_name="get_encounter_participants", ok=False, summary="encounter not found")
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "encounter_not_found"}, ensure_ascii=False)},
+                event,
+            )
+
+        team_members, visible_npcs = _visible_participant_text(save, encounter)
+
+        result = {
+            "ok": True,
+            "encounter_id": encounter_id,
+            "main_npc_role_id": encounter.npc_role_id,
+            "participant_role_ids": encounter.participant_role_ids,
+            "team_members": team_members,
+            "visible_npcs": visible_npcs,
+            "temporary_npcs": [
+                {
+                    "encounter_npc_id": npc.encounter_npc_id,
+                    "name": npc.name,
+                    "title": npc.title,
+                    "state": npc.state,
+                }
+                for npc in encounter.temporary_npcs
+            ],
+        }
+        event = ToolEvent(
+            tool_name="get_encounter_participants",
+            ok=True,
+            summary=f"participants: {len(encounter.temporary_npcs)} temp npcs",
+            payload={"temp_npc_count": len(encounter.temporary_npcs)},
+        )
+        logger.info("tool_call get_encounter_participants ok: encounter=%s", encounter_id)
+
         return (
             {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
             event,

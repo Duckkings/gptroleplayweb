@@ -193,6 +193,7 @@ def ai_resolve_encounter(encounter: EncounterEntry, req: EncounterActRequest, *,
         player_prompt=req.player_prompt,
         team_members=team_members,
         visible_npcs=visible_npcs,
+        participant_role_ids=", ".join(encounter.participant_role_ids) if encounter.participant_role_ids else "none",
     )
     try:
         client = create_sync_client(config, client_cls=OpenAI)
@@ -224,6 +225,45 @@ def ai_resolve_encounter(encounter: EncounterEntry, req: EncounterActRequest, *,
         termination_updates = parsed.get("termination_updates")
         if not isinstance(termination_updates, list):
             termination_updates = []
+        
+        # 处理NPC生成请求
+        spawn_requests = parsed.get("spawn_requests")
+        if isinstance(spawn_requests, list):
+            for spawn_req in spawn_requests:
+                if not isinstance(spawn_req, dict):
+                    continue
+                name = str(spawn_req.get("name") or "").strip()
+                if not name:
+                    continue
+                # 创建临时NPC
+                from datetime import datetime, timezone
+                from app.models.schemas import EncounterTemporaryNpc
+                temp_npc = EncounterTemporaryNpc(
+                    encounter_npc_id=f"encnpc_mid_{int(datetime.now(timezone.utc).timestamp() * 1000)}",
+                    name=name,
+                    title=str(spawn_req.get("title") or "").strip(),
+                    description=str(spawn_req.get("description") or f"{name}卷入了当前的遭遇。").strip(),
+                    speaking_style=str(spawn_req.get("speaking_style") or "").strip(),
+                    agenda=str(spawn_req.get("agenda") or f"{name}正试图处理眼前的情况。").strip(),
+                    state="active",
+                    zone_id=encounter.zone_id,
+                    sub_zone_id=encounter.sub_zone_id,
+                    introduced_at=datetime.now(timezone.utc).isoformat(),
+                )
+                encounter.temporary_npcs.append(temp_npc)
+                if temp_npc.encounter_npc_id not in encounter.participant_role_ids:
+                    encounter.participant_role_ids.append(temp_npc.encounter_npc_id)
+                legacy._refresh_participants(save, encounter)
+                legacy._append_step(
+                    encounter,
+                    kind="npc_entrance",
+                    actor_type="temporary_npc",
+                    actor_id=temp_npc.encounter_npc_id,
+                    actor_name=name,
+                    content=f"新角色入场：{name}" + (f"（{temp_npc.title}）" if temp_npc.title else "") + "。",
+                    metadata={"npc_name": name, "role_type": str(spawn_req.get("role_type") or "neutral")},
+                )
+        
         return {
             "reply": reply,
             "time_spent_min": minutes,

@@ -281,6 +281,11 @@ class SceneEvent(BaseModel):
         "encounter_world_push",
         "player_reaction_triggered",
         "player_reaction_result",
+        "player_dying",
+        "player_death_save",
+        "player_stabilized",
+        "player_died",
+        "player_revived",
     ]
     actor_role_id: str = Field(default="", min_length=0)
     actor_name: str = Field(default="", min_length=0)
@@ -814,6 +819,44 @@ class EquipmentSlots(BaseModel):
     shield_item_instance_id: str | None = None
 
 
+class PlayerDeathState(BaseModel):
+    """轻量级死亡状态追踪，嵌入 Dnd5eCharacterSheet"""
+    version: str = Field(default="0.1.0")
+    
+    # 生命状态
+    life_status: Literal["healthy", "dying", "stable", "dead"] = "healthy"
+    
+    # 濒死追踪 (0-3)
+    death_save_successes: int = Field(default=0, ge=0, le=3)
+    death_save_failures: int = Field(default=0, ge=0, le=3)
+    
+    # 死亡统计
+    death_count: int = Field(default=0, ge=0)
+    death_streak_count: int = Field(default=0, ge=0)  # 24小时内
+    death_streak_reset_at: str | None = None
+    
+    # 上次死亡信息
+    last_death_at: str | None = None
+    last_death_zone_id: str | None = None
+    last_death_sub_zone_id: str | None = None
+    last_death_cause: str = Field(default="")
+    
+    # 复活追踪
+    revived_at: str | None = None
+    revival_method: Literal["shrine", "teammate", "item"] | None = None
+    revival_weakness_until: str | None = None
+    
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class DeathPenalties(BaseModel):
+    """死亡惩罚计算结果"""
+    gold_lost: int = 0
+    exp_lost: int = 0
+    items_lost: list[str] = Field(default_factory=list)  # item_instance_ids
+    weakness_duration_min: int = 60
+
+
 class Dnd5eCharacterSheet(BaseModel):
     level: int = Field(default=1, ge=1, le=20)
     experience_current: int = Field(default=0, ge=0)
@@ -850,6 +893,7 @@ class Dnd5eCharacterSheet(BaseModel):
     spell_slots_max: Dnd5eSpellSlots = Field(default_factory=Dnd5eSpellSlots)
     spell_slots_current: Dnd5eSpellSlots = Field(default_factory=Dnd5eSpellSlots)
     notes: str = Field(default="", min_length=0)
+    death_state: PlayerDeathState = Field(default_factory=PlayerDeathState)
 
 
 class PlayerStaticData(BaseModel):
@@ -1268,6 +1312,7 @@ class CombatantState(BaseModel):
     equipped_armor_instance_id: str | None = None
     equipped_shield_instance_id: str | None = None
     inventory_items: list[InventoryItem] = Field(default_factory=list)
+    death_state: PlayerDeathState = Field(default_factory=PlayerDeathState)
 
 
 class CombatState(BaseModel):
@@ -1283,7 +1328,7 @@ class CombatState(BaseModel):
 
 class BattleRollPrompt(BaseModel):
     prompt_id: str = Field(..., min_length=1)
-    roll_kind: Literal["initiative", "attack", "observe", "escape", "reaction", "item_use"] = "attack"
+    roll_kind: Literal["initiative", "attack", "observe", "escape", "reaction", "item_use", "death_save", "stabilize"] = "attack"
     actor_combatant_id: str = Field(..., min_length=1)
     actor_name: str = Field(..., min_length=1)
     ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] = "strength"
@@ -2539,6 +2584,74 @@ class PlayerSpellSlotAdjustRequest(BaseModel):
 
 class PlayerStaminaAdjustRequest(BaseModel):
     amount: int = Field(default=1, ge=1)
+
+
+class DeathStatusResponse(BaseModel):
+    """获取当前死亡状态响应"""
+    ok: bool = True
+    session_id: str
+    life_status: Literal["healthy", "dying", "stable", "dead"] = "healthy"
+    death_state: PlayerDeathState = Field(default_factory=PlayerDeathState)
+    can_be_stabilized: bool = False
+    nearby_medical_items: list[str] = Field(default_factory=list)
+    nearby_allies: list[str] = Field(default_factory=list)
+
+
+class StabilizeRequest(BaseModel):
+    """尝试稳定濒死玩家请求"""
+    session_id: str = Field(..., min_length=1)
+    target_player_id: str = Field(..., min_length=1)
+    method: Literal["medicine_check", "healing_kit", "spell"] = "medicine_check"
+    item_instance_id: str | None = None
+    medic_role_id: str | None = None
+
+
+class StabilizeResponse(BaseModel):
+    """尝试稳定濒死玩家响应"""
+    ok: bool = True
+    session_id: str
+    success: bool
+    stabilized: bool
+    roll_result: BattleRollResolution | None = None
+    narrative: str = Field(default="", min_length=0)
+    scene_events: list[SceneEvent] = Field(default_factory=list)
+
+
+class ReviveRequest(BaseModel):
+    """执行复活请求"""
+    session_id: str = Field(..., min_length=1)
+    method: Literal["shrine", "item", "teammate"] = "shrine"
+    shrine_zone_id: str | None = None
+    item_instance_id: str | None = None
+    teammate_role_id: str | None = None
+
+
+class ReviveResponse(BaseModel):
+    """执行复活响应"""
+    ok: bool = True
+    session_id: str
+    success: bool
+    method: str = "shrine"
+    penalties_applied: DeathPenalties = Field(default_factory=DeathPenalties)
+    narrative: str = Field(default="", min_length=0)
+    scene_events: list[SceneEvent] = Field(default_factory=list)
+    state_sync: MapStateSyncBundle | None = None
+
+
+class DeathDeclareRequest(BaseModel):
+    """宣告玩家死亡请求（调试/剧情用）"""
+    session_id: str = Field(..., min_length=1)
+    cause: str = Field(default="", min_length=0)
+    is_instant: bool = False
+
+
+class DeathDeclareResponse(BaseModel):
+    """宣告玩家死亡响应"""
+    ok: bool = True
+    session_id: str
+    declared: bool
+    death_state: PlayerDeathState = Field(default_factory=PlayerDeathState)
+    scene_events: list[SceneEvent] = Field(default_factory=list)
 
 
 RoleDesire.model_rebuild()

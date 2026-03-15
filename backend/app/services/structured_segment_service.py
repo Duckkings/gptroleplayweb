@@ -373,13 +373,29 @@ async def _stream_segment(
             },
         )
     if profile == "openai_schema_stream":
-        return await _stream_openai_schema_segment(
-            config=config,
-            messages=messages,
-            segment_model=segment_model,
-            emit_reply_delta=emit_reply_delta,
-            check_cancelled=check_cancelled,
-        )
+        try:
+            return await _stream_openai_schema_segment(
+                config=config,
+                messages=messages,
+                segment_model=segment_model,
+                emit_reply_delta=emit_reply_delta,
+                check_cancelled=check_cancelled,
+            )
+        except Exception as exc:
+            # Fallback to completion mode if streaming fails
+            if debug_log is not None:
+                debug_log.record(
+                    "structured_stream_fallback",
+                    "openai schema stream failed, falling back to completion",
+                    {"error": str(exc)},
+                )
+            return await _complete_openai_schema_segment(
+                config=config,
+                messages=messages,
+                segment_model=segment_model,
+                emit_reply_delta=emit_reply_delta,
+                check_cancelled=check_cancelled,
+            )
     if profile == "deepseek_json_two_phase":
         return await _run_deepseek_two_phase_segment(
             config=config,

@@ -15,6 +15,9 @@ from app.models.schemas import (
     AreaCurrentResponse,
     AreaDiscoverInteractionsRequest,
     AreaDiscoverInteractionsResolvedResponse,
+    DeathDeclareRequest,
+    DeathDeclareResponse,
+    DeathStatusResponse,
     EncounterActRequest,
     EncounterActResponse,
     EncounterCheckRequest,
@@ -264,6 +267,7 @@ from app.services.team_service import (
 )
 
 from app.services.retained_npc_service import retained_npc_service
+from app.services.death_service import death_service
 
 router = APIRouter(prefix="/api/v1", tags=["api"])
 
@@ -1495,3 +1499,133 @@ async def action_check_run(payload: ActionCheckRequest) -> ActionCheckResponse:
         raise HTTPException(status_code=404, detail="role not found")
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+
+
+# ========== Death System APIs ==========
+
+@router.get("/death/status", response_model=DeathStatusResponse)
+async def get_death_status(session_id: str) -> DeathStatusResponse:
+    """获取当前死亡状态（用于濒死 UI）"""
+    try:
+        save = get_current_save(default_session_id=session_id)
+        player = save.player_static_data
+        death_state = player.dnd5e_sheet.death_state
+        
+        # 检查虚弱是否过期
+        death_service.check_weakness_expired(player.dnd5e_sheet)
+        
+        # 获取附近队友（用于显示可救援者）
+        nearby_allies = []
+        if save.team_state and save.team_state.members:
+            nearby_allies = [
+                m.name for m in save.team_state.members
+                if m.status == "active"
+            ][:3]
+        
+        # 获取医疗物品
+        nearby_medical_items = [
+            item.name for item in player.dnd5e_sheet.backpack.items
+            if any(keyword in f"{item.item_type} {item.name} {item.effect}".lower() 
+                   for keyword in ["heal", "healing", "回复", "治疗", "potion", "药水"])
+        ][:3]
+        
+        return DeathStatusResponse(
+            ok=True,
+            session_id=session_id,
+            life_status=death_state.life_status,
+            death_state=death_state,
+            can_be_stabilized=death_state.life_status == "dying",
+            nearby_medical_items=nearby_medical_items,
+            nearby_allies=nearby_allies,
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="save not found")
+
+
+@router.post("/death/declare", response_model=DeathDeclareResponse)
+async def declare_player_death(payload: DeathDeclareRequest) -> DeathDeclareResponse:
+    """宣告玩家死亡（调试/剧情用）"""
+    try:
+        save = get_current_save(default_session_id=payload.session_id)
+        
+        # 创建临时 CombatantState 用于死亡宣告
+        from app.models.schemas import CombatantState, PlayerDeathState
+        player_combatant = CombatantState(
+            combatant_id="player_001",
+            source_kind="player",
+            display_name=save.player_static_data.name,
+            side="player_side",
+            max_hp=save.player_static_data.dnd5e_sheet.hit_points.maximum,
+            current_hp=0,
+            death_state=save.player_static_data.dnd5e_sheet.death_state,
+        )
+        
+        # 更新死亡状态
+        death_service.declare_death(
+            save, player_combatant,
+            is_instant=payload.is_instant,
+            cause=payload.cause,
+        )
+        
+        # 同步回玩家数据
+        save.player_static_data.dnd5e_sheet.death_state = player_combatant.death_state
+        save.player_static_data.dnd5e_sheet.is_dead = True
+        save.player_static_data.dnd5e_sheet.hit_points.current = 0
+        
+        # 保存
+        storage_state.save_cache[payload.session_id] = save
+        
+        scene_event = death_service.create_scene_event(
+            kind="player_died",
+            content=f"{save.player_static_data.name} 死亡。" + (f"（{payload.cause}）" if payload.cause else ""),
+            metadata={
+                "is_instant": payload.is_instant,
+                "cause": payload.cause,
+                "death_count": player_combatant.death_state.death_count,
+            },
+        )
+        
+        return DeathDeclareResponse(
+            ok=True,
+            session_id=payload.session_id,
+            declared=True,
+            death_state=save.player_static_data.dnd5e_sheet.death_state,
+            scene_events=[scene_event],
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="save not found")
+
+
+@router.post("/death/revive", response_model=DeathDeclareResponse)
+async def revive_player(payload: DeathDeclareRequest) -> DeathDeclareResponse:
+    """在神庙复活玩家"""
+    try:
+        save = get_current_save(default_session_id=payload.session_id)
+        
+        result = death_service.revive_at_shrine(save, shrine_zone_id=None)
+        
+        if not result["success"]:
+            raise HTTPException(status_code=400, detail=result.get("error", "revive failed"))
+        
+        # 保存
+        storage_state.save_cache[payload.session_id] = save
+        
+        scene_event = death_service.create_scene_event(
+            kind="player_revived",
+            content=result["narrative"],
+            metadata={
+                "method": result["method"],
+                "cost": result.get("cost", 0),
+                "death_count": save.player_static_data.dnd5e_sheet.death_state.death_count,
+            },
+        )
+        
+        return DeathDeclareResponse(
+            ok=True,
+            session_id=payload.session_id,
+            declared=False,
+            death_state=save.player_static_data.dnd5e_sheet.death_state,
+            scene_events=[scene_event],
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="save not found")
