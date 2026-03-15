@@ -6,7 +6,9 @@ from unittest.mock import patch
 from app.core.storage import storage_state
 from app.models.schemas import (
     ActionCheckResponse,
+    InventoryConsumeRequest,
     InventoryEquipRequest,
+    InventoryGrantRequest,
     InventoryInteractRequest,
     InventoryItem,
     InventoryOwnerRef,
@@ -17,7 +19,9 @@ from app.services.world_service import (
     _build_npc_profile,
     clear_current_save,
     get_current_save,
+    inventory_consume,
     inventory_equip,
+    inventory_grant,
     inventory_interact,
     inventory_unequip,
     save_current,
@@ -208,6 +212,103 @@ class InventoryInteractionTests(unittest.TestCase):
                     prompt="直接喝掉",
                 )
             )
+
+    def test_inventory_grant_adds_item_to_player_backpack(self) -> None:
+        sid = "sess_inventory_grant_player"
+        self._seed_save(sid)
+
+        response = inventory_grant(
+            InventoryGrantRequest(
+                session_id=sid,
+                owner=InventoryOwnerRef(owner_type="player"),
+                item=InventoryItem(item_id="gift_apple", name="Apple", quantity=2, slot_type="misc"),
+                reason="scene reward",
+            )
+        )
+
+        self.assertEqual(response.item_id, "gift_apple")
+        self.assertEqual(response.amount_changed, 2)
+        self.assertEqual(response.quantity_after, 2)
+        updated = get_current_save(sid)
+        item = next(entry for entry in updated.player_static_data.dnd5e_sheet.backpack.items if entry.item_id == "gift_apple")
+        self.assertEqual(item.quantity, 2)
+
+    def test_inventory_grant_adds_item_to_role_backpack(self) -> None:
+        sid = "sess_inventory_grant_role"
+        self._seed_save(sid)
+
+        response = inventory_grant(
+            InventoryGrantRequest(
+                session_id=sid,
+                owner=InventoryOwnerRef(owner_type="role", role_id="npc_inv"),
+                item=InventoryItem(item_id="npc_token", name="Token", quantity=1, slot_type="misc"),
+            )
+        )
+
+        self.assertIsNotNone(response.role)
+        updated = get_current_save(sid)
+        role = next(item for item in updated.role_pool if item.role_id == "npc_inv")
+        item = next(entry for entry in role.profile.dnd5e_sheet.backpack.items if entry.item_id == "npc_token")
+        self.assertEqual(item.quantity, 1)
+
+    def test_inventory_consume_reduces_quantity_and_removes_when_empty(self) -> None:
+        sid = "sess_inventory_consume_quantity"
+        self._seed_save(sid)
+        save = get_current_save(sid)
+        save.player_static_data.dnd5e_sheet.backpack.items.append(
+            InventoryItem(item_id="rations", name="Rations", quantity=2, slot_type="misc")
+        )
+        save_current(save)
+
+        first = inventory_consume(
+            InventoryConsumeRequest(
+                session_id=sid,
+                owner=InventoryOwnerRef(owner_type="player"),
+                item_id="rations",
+                amount=1,
+                consume_mode="quantity",
+            )
+        )
+        self.assertEqual(first.quantity_after, 1)
+
+        second = inventory_consume(
+            InventoryConsumeRequest(
+                session_id=sid,
+                owner=InventoryOwnerRef(owner_type="player"),
+                item_id="rations",
+                amount=1,
+                consume_mode="quantity",
+            )
+        )
+        self.assertEqual(second.quantity_after, 0)
+        updated = get_current_save(sid)
+        self.assertFalse(any(entry.item_id == "rations" for entry in updated.player_static_data.dnd5e_sheet.backpack.items))
+
+    def test_inventory_consume_reduces_uses_for_role_item(self) -> None:
+        sid = "sess_inventory_consume_uses"
+        self._seed_save(sid)
+        save = get_current_save(sid)
+        role = next(item for item in save.role_pool if item.role_id == "npc_inv")
+        item = next(entry for entry in role.profile.dnd5e_sheet.backpack.items if entry.item_id == "npc_potion")
+        item.uses_max = 3
+        item.uses_left = 2
+        save_current(save)
+
+        response = inventory_consume(
+            InventoryConsumeRequest(
+                session_id=sid,
+                owner=InventoryOwnerRef(owner_type="role", role_id="npc_inv"),
+                item_id="npc_potion",
+                amount=1,
+                consume_mode="uses",
+            )
+        )
+
+        self.assertEqual(response.uses_left_after, 1)
+        updated = get_current_save(sid)
+        role = next(item for item in updated.role_pool if item.role_id == "npc_inv")
+        item = next(entry for entry in role.profile.dnd5e_sheet.backpack.items if entry.item_id == "npc_potion")
+        self.assertEqual(item.uses_left, 1)
 
 
 if __name__ == "__main__":

@@ -59,6 +59,8 @@ from app.models.schemas import (
     InventoryEquipRequest,
     InventoryUnequipRequest,
     InventoryMutationResponse,
+    InventoryGrantRequest,
+    InventoryConsumeRequest,
     MapRenderPayload,
     InventoryInteractRequest,
     InventoryInteractResponse,
@@ -91,6 +93,7 @@ from app.models.schemas import (
     RenderSubNode,
     SaveFile,
     SceneEvent,
+    SceneInteractable,
     SubZoneChatContext,
     SubZoneChatTurn,
     SubZoneChatTurnEvent,
@@ -109,6 +112,16 @@ from app.services.consistency_service import (
     player_mentions_unknown_npc,
     reconcile_consistency,
 )
+from app.services.item_instance_service import (
+    create_item_instance,
+    ensure_item_system,
+    get_owner_instance,
+    get_owner_instance_by_ref,
+    remove_item_instance,
+    resolve_owner_instances,
+)
+from app.services.item_template_service import ensure_definition_for_inventory_item, get_template_library_status, infer_interactable_template_id
+from app.services.scene_interaction_service import execute_scene_interaction_in_save, list_scene_interactables
 
 
 @dataclass
@@ -1786,6 +1799,8 @@ def _load_current_save(default_session_id: str = "sess_default") -> SaveFile:
         _recompute_player_derived(role.profile)
         if _ensure_npc_role_complete(save, role):
             changed = True
+    if ensure_item_system(save):
+        changed = True
     _, reconciled = reconcile_consistency(save, session_id=save.session_id or default_session_id, reason="load")
     if changed or reconciled:
         _persist_save(save)
@@ -1826,12 +1841,14 @@ def get_current_save(default_session_id: str = "sess_default") -> SaveFile:
         for role in save.role_pool:
             _recompute_player_derived(role.profile)
             _ensure_npc_role_complete(save, role)
+        ensure_item_system(save)
         return save
     return _load_current_save(default_session_id)
 
 
 def save_current(save: SaveFile) -> None:
     txn = current_save_transaction()
+    ensure_item_system(save)
     if txn is not None:
         ensure_world_state(save)
         save.updated_at = _utc_now()
@@ -1904,6 +1921,67 @@ def _get_inventory_item_for_owner(profile: PlayerStaticData, item_id: str) -> In
     item = next((entry for entry in profile.dnd5e_sheet.backpack.items if entry.item_id == item_id), None)
     if item is None:
         raise KeyError("ITEM_NOT_FOUND")
+    return item
+
+
+def _merge_inventory_item(existing: InventoryItem, incoming: InventoryItem) -> InventoryItem:
+    existing.quantity += incoming.quantity
+    if existing.description == "" and incoming.description:
+        existing.description = incoming.description
+    if existing.effect == "" and incoming.effect:
+        existing.effect = incoming.effect
+    if existing.uses_max is None and incoming.uses_max is not None:
+        existing.uses_max = incoming.uses_max
+    if existing.uses_left is None and incoming.uses_left is not None:
+        existing.uses_left = incoming.uses_left
+    if existing.cooldown_min == 0 and incoming.cooldown_min:
+        existing.cooldown_min = incoming.cooldown_min
+    existing.bound = existing.bound or incoming.bound
+    existing.attack_bonus = max(existing.attack_bonus, incoming.attack_bonus)
+    existing.armor_bonus = max(existing.armor_bonus, incoming.armor_bonus)
+    return existing
+
+
+def _grant_inventory_item_to_profile(profile: PlayerStaticData, item: InventoryItem) -> InventoryItem:
+    items = profile.dnd5e_sheet.backpack.items
+    existing = next((it for it in items if it.item_id == item.item_id), None)
+    if existing is not None:
+        return _merge_inventory_item(existing, item)
+    cloned = item.model_copy(deep=True)
+    if cloned.uses_max is not None and cloned.uses_left is None:
+        cloned.uses_left = cloned.uses_max
+    items.append(cloned)
+    return cloned
+
+
+def _consume_inventory_item_from_profile(
+    profile: PlayerStaticData,
+    *,
+    item_id: str,
+    amount: int,
+    consume_mode: str,
+) -> InventoryItem:
+    item = _get_inventory_item_for_owner(profile, item_id)
+    mode = consume_mode if consume_mode in {"auto", "quantity", "uses"} else "auto"
+    use_charges = item.uses_left is not None if mode == "auto" else mode == "uses"
+    if use_charges:
+        if item.uses_left is None:
+            raise ValueError("ITEM_HAS_NO_USES")
+        if item.uses_left < amount:
+            raise ValueError("ITEM_USES_INSUFFICIENT")
+        item.uses_left -= amount
+        if item.uses_left == 0 and item.quantity > 1:
+            item.quantity -= 1
+            if item.uses_max is not None:
+                item.uses_left = item.uses_max
+        elif item.uses_left == 0 and item.quantity <= 1:
+            profile.dnd5e_sheet.backpack.items = [entry for entry in profile.dnd5e_sheet.backpack.items if entry.item_id != item.item_id]
+        return item
+    if item.quantity < amount:
+        raise ValueError("ITEM_QUANTITY_INSUFFICIENT")
+    item.quantity -= amount
+    if item.quantity <= 0:
+        profile.dnd5e_sheet.backpack.items = [entry for entry in profile.dnd5e_sheet.backpack.items if entry.item_id != item.item_id]
     return item
 
 
@@ -2028,8 +2106,26 @@ def _generate_inventory_interaction_reply(
 def inventory_equip(payload: InventoryEquipRequest) -> InventoryMutationResponse:
     save = get_current_save(default_session_id=payload.session_id)
     save.session_id = payload.session_id
+    ensure_item_system(save)
     owner_id, owner_name, profile, role = _resolve_inventory_owner(save, payload.owner)
-    item = _equip_profile_item(profile, payload.item_id, payload.slot)
+    instance = get_owner_instance_by_ref(
+        save,
+        owner_kind=("player" if payload.owner.owner_type == "player" else "role"),
+        owner_id=owner_id,
+        item_ref=payload.item_id,
+    )
+    item = _get_inventory_item_for_owner(profile, instance.metadata.get("compat_item_id", instance.item_instance_id))
+    if payload.slot == "weapon" and item.slot_type != "weapon":
+        raise ValueError("ITEM_SLOT_MISMATCH")
+    if payload.slot == "armor" and item.slot_type != "armor":
+        raise ValueError("ITEM_SLOT_MISMATCH")
+    if payload.slot == "weapon":
+        profile.dnd5e_sheet.equipment_slots.weapon_item_instance_id = instance.item_instance_id
+        profile.dnd5e_sheet.equipment_slots.weapon_item_id = item.item_id
+    else:
+        profile.dnd5e_sheet.equipment_slots.armor_item_instance_id = instance.item_instance_id
+        profile.dnd5e_sheet.equipment_slots.armor_item_id = item.item_id
+    ensure_item_system(save)
     _recompute_player_derived(profile)
     if role is not None:
         role.profile = profile
@@ -2038,6 +2134,7 @@ def inventory_equip(payload: InventoryEquipRequest) -> InventoryMutationResponse
         session_id=payload.session_id,
         owner=payload.owner,
         message=f"{owner_name} 装备了【{item.name}】。",
+        item_id=item.item_id,
         player=profile if payload.owner.owner_type == "player" else None,
         role=role,
     )
@@ -2046,11 +2143,20 @@ def inventory_equip(payload: InventoryEquipRequest) -> InventoryMutationResponse
 def inventory_unequip(payload: InventoryUnequipRequest) -> InventoryMutationResponse:
     save = get_current_save(default_session_id=payload.session_id)
     save.session_id = payload.session_id
+    ensure_item_system(save)
     owner_id, owner_name, profile, role = _resolve_inventory_owner(save, payload.owner)
-    equipped_id = _unequip_profile_item(profile, payload.slot)
+    if payload.slot == "weapon":
+        equipped_id = profile.dnd5e_sheet.equipment_slots.weapon_item_instance_id
+        profile.dnd5e_sheet.equipment_slots.weapon_item_instance_id = None
+        profile.dnd5e_sheet.equipment_slots.weapon_item_id = None
+    else:
+        equipped_id = profile.dnd5e_sheet.equipment_slots.armor_item_instance_id
+        profile.dnd5e_sheet.equipment_slots.armor_item_instance_id = None
+        profile.dnd5e_sheet.equipment_slots.armor_item_id = None
     equipped_name = None
     if equipped_id:
         equipped_name = next((item.name for item in profile.dnd5e_sheet.backpack.items if item.item_id == equipped_id), None)
+    ensure_item_system(save)
     _recompute_player_derived(profile)
     if role is not None:
         role.profile = profile
@@ -2060,6 +2166,153 @@ def inventory_unequip(payload: InventoryUnequipRequest) -> InventoryMutationResp
         session_id=payload.session_id,
         owner=payload.owner,
         message=f"{owner_name} 卸下了{slot_label}{f'【{equipped_name}】' if equipped_name else ''}。",
+        item_id=equipped_id,
+        player=profile if payload.owner.owner_type == "player" else None,
+        role=role,
+    )
+
+
+def inventory_grant(payload: InventoryGrantRequest) -> InventoryMutationResponse:
+    save = get_current_save(default_session_id=payload.session_id)
+    save.session_id = payload.session_id
+    ensure_item_system(save)
+    owner_id, owner_name, profile, role = _resolve_inventory_owner(save, payload.owner)
+    owner_kind = "player" if payload.owner.owner_type == "player" else "role"
+    definition_id = ensure_definition_for_inventory_item(payload.item)
+    existing = next(
+        (
+            entry
+            for entry in resolve_owner_instances(save, owner_kind=owner_kind, owner_id=owner_id)
+            if entry.definition_id == definition_id
+            and (entry.uses_max == payload.item.uses_max)
+            and (entry.display_name or payload.item.name) == payload.item.name
+            and str(entry.metadata.get("compat_item_id") or payload.item.item_id) == payload.item.item_id
+        ),
+        None,
+    )
+    if existing is not None:
+        existing.quantity += max(1, payload.item.quantity)
+        if existing.uses_left is None and payload.item.uses_left is not None:
+            existing.uses_left = payload.item.uses_left
+        if existing.uses_max is None and payload.item.uses_max is not None:
+            existing.uses_max = payload.item.uses_max
+        existing.updated_at = _utc_now()
+        item_id = existing.item_instance_id
+        quantity_after = existing.quantity
+        uses_left_after = existing.uses_left
+    else:
+        created = create_item_instance(
+            save,
+            definition_id=definition_id,
+            owner_kind=owner_kind,
+            owner_id=owner_id,
+            quantity=max(1, payload.item.quantity),
+            uses_left=payload.item.uses_left,
+            uses_max=payload.item.uses_max,
+            display_name=payload.item.name,
+            description_override=payload.item.description,
+            zone_id=save.area_snapshot.current_zone_id,
+            sub_zone_id=save.area_snapshot.current_sub_zone_id,
+            metadata={"reason": payload.reason.strip()[:120], "legacy_item_id": payload.item.item_id, "compat_item_id": payload.item.item_id},
+        )
+        item_id = created.item_instance_id
+        quantity_after = created.quantity
+        uses_left_after = created.uses_left
+    ensure_item_system(save)
+    item = _get_inventory_item_for_owner(profile, payload.item.item_id)
+    _recompute_player_derived(profile)
+    if role is not None:
+        role.profile = profile
+    save.game_logs.append(
+        _new_game_log(
+            payload.session_id,
+            "inventory_grant",
+            f"{owner_name} 获得了【{item.name}】。",
+            {
+                "owner_type": payload.owner.owner_type,
+                "owner_id": owner_id,
+                "item_id": payload.item.item_id,
+                "quantity": quantity_after,
+                "reason": payload.reason[:120],
+            },
+        )
+    )
+    save_current(save)
+    return InventoryMutationResponse(
+        session_id=payload.session_id,
+        owner=payload.owner,
+        message=(f"{owner_name} 获得了【{item.name}】。" if not payload.reason.strip() else f"{owner_name} 获得了【{item.name}】。原因：{payload.reason.strip()[:120]}"),
+        item_id=payload.item.item_id,
+        amount_changed=max(1, payload.item.quantity),
+        quantity_after=quantity_after,
+        uses_left_after=uses_left_after,
+        player=profile if payload.owner.owner_type == "player" else None,
+        role=role,
+    )
+
+
+def inventory_consume(payload: InventoryConsumeRequest) -> InventoryMutationResponse:
+    save = get_current_save(default_session_id=payload.session_id)
+    save.session_id = payload.session_id
+    ensure_item_system(save)
+    owner_id, owner_name, profile, role = _resolve_inventory_owner(save, payload.owner)
+    before = _get_inventory_item_for_owner(profile, payload.item_id)
+    item_name = before.name
+    owner_kind = "player" if payload.owner.owner_type == "player" else "role"
+    instance = get_owner_instance_by_ref(save, owner_kind=owner_kind, owner_id=owner_id, item_ref=payload.item_id)
+    mode = payload.consume_mode if payload.consume_mode in {"auto", "quantity", "uses"} else "auto"
+    use_charges = instance.uses_left is not None if mode == "auto" else mode == "uses"
+    if use_charges:
+        if instance.uses_left is None:
+            raise ValueError("ITEM_HAS_NO_USES")
+        if instance.uses_left < payload.amount:
+            raise ValueError("ITEM_USES_INSUFFICIENT")
+        instance.uses_left -= payload.amount
+        if instance.uses_left == 0 and instance.quantity > 1:
+            instance.quantity -= 1
+            instance.uses_left = instance.uses_max
+        elif instance.uses_left == 0 and instance.quantity <= 1:
+            remove_item_instance(save, instance.item_instance_id)
+            instance = None  # type: ignore[assignment]
+    else:
+        if instance.quantity < payload.amount:
+            raise ValueError("ITEM_QUANTITY_INSUFFICIENT")
+        instance.quantity -= payload.amount
+        if instance.quantity <= 0:
+            remove_item_instance(save, instance.item_instance_id)
+            instance = None  # type: ignore[assignment]
+    ensure_item_system(save)
+    updated_item = next((entry for entry in profile.dnd5e_sheet.backpack.items if entry.item_id == payload.item_id), None)
+    _recompute_player_derived(profile)
+    if role is not None:
+        role.profile = profile
+    save.game_logs.append(
+        _new_game_log(
+            payload.session_id,
+            "inventory_consume",
+            f"{owner_name} 消耗了【{item_name}】。",
+            {
+                "owner_type": payload.owner.owner_type,
+                "owner_id": owner_id,
+                "item_id": payload.item_id,
+                "amount": payload.amount,
+                "consume_mode": payload.consume_mode,
+                "reason": payload.reason[:120],
+            },
+        )
+    )
+    save_current(save)
+    after_quantity = updated_item.quantity if updated_item is not None else 0
+    after_uses = updated_item.uses_left if updated_item is not None else 0
+    reason_suffix = f" 原因：{payload.reason.strip()[:120]}" if payload.reason.strip() else ""
+    return InventoryMutationResponse(
+        session_id=payload.session_id,
+        owner=payload.owner,
+        message=f"{owner_name} 消耗了【{item_name}】。{('剩余数量 ' + str(after_quantity)) if updated_item is not None else '该物品已耗尽。'}{reason_suffix}".strip(),
+        item_id=payload.item_id,
+        amount_changed=-payload.amount,
+        quantity_after=after_quantity,
+        uses_left_after=after_uses,
         player=profile if payload.owner.owner_type == "player" else None,
         role=role,
     )
@@ -2068,6 +2321,7 @@ def inventory_unequip(payload: InventoryUnequipRequest) -> InventoryMutationResp
 def inventory_interact(payload: InventoryInteractRequest) -> InventoryInteractResponse:
     save = get_current_save(default_session_id=payload.session_id)
     save.session_id = payload.session_id
+    ensure_item_system(save)
     owner_id, owner_name, profile, role = _resolve_inventory_owner(save, payload.owner)
     item = _get_inventory_item_for_owner(profile, payload.item_id)
     action_result: ActionCheckResponse | None = None
@@ -2100,10 +2354,22 @@ def inventory_interact(payload: InventoryInteractRequest) -> InventoryInteractRe
         time_spent_min = max(1, action_result.time_spent_min)
         save = get_current_save(default_session_id=payload.session_id)
         save.session_id = payload.session_id
+        ensure_item_system(save)
         owner_id, owner_name, profile, role = _resolve_inventory_owner(save, payload.owner)
         item = _get_inventory_item_for_owner(profile, payload.item_id)
-        if action_result.success and item.uses_left is not None:
-            item.uses_left = max(0, item.uses_left - 1)
+        if action_result.success:
+            owner_kind = "player" if payload.owner.owner_type == "player" else "role"
+            instance = get_owner_instance_by_ref(save, owner_kind=owner_kind, owner_id=owner_id, item_ref=payload.item_id)
+            if instance.uses_left is not None:
+                instance.uses_left = max(0, instance.uses_left - 1)
+                if instance.uses_left == 0 and instance.quantity <= 1:
+                    remove_item_instance(save, instance.item_instance_id)
+            elif instance.quantity > 0:
+                instance.quantity = max(0, instance.quantity - 1)
+                if instance.quantity == 0:
+                    remove_item_instance(save, instance.item_instance_id)
+            ensure_item_system(save)
+            item = next((entry for entry in profile.dnd5e_sheet.backpack.items if entry.item_id == payload.item_id), item)
         if payload.action_check is not None and save.area_snapshot.clock is not None:
             save.area_snapshot.clock = _advance_clock(save.area_snapshot.clock, time_spent_min)
     reply = _generate_inventory_interaction_reply(
@@ -5486,6 +5752,7 @@ def discover_interactions(req: AreaDiscoverInteractionsRequest) -> AreaDiscoverI
     if save.session_id != req.session_id:
         raise ValueError("session mismatch with current save")
     _ensure_area_snapshot(save)
+    ensure_item_system(save)
     snap = save.area_snapshot
     target = next((s for s in snap.sub_zones if s.sub_zone_id == req.sub_zone_id), None)
     if target is None:
@@ -5538,7 +5805,26 @@ def discover_interactions(req: AreaDiscoverInteractionsRequest) -> AreaDiscoverI
             )
         ]
 
-    target.key_interactions.extend(deduped)
+    for interaction in deduped:
+        save.scene_interactable_state.items.append(
+            SceneInteractable(
+                interactable_id=interaction.interaction_id,
+                template_id=infer_interactable_template_id(interaction.name, interaction.type),
+                zone_id=target.zone_id,
+                sub_zone_id=target.sub_zone_id,
+                name=interaction.name,
+                interactable_kind=("item_proxy" if interaction.type == "item" else "scene"),  # type: ignore[arg-type]
+                description="",
+                allowed_actions=(["inspect", "pickup"] if interaction.type == "item" else ["inspect"]),
+                state_tags=["visible"],
+                status=interaction.status,
+                generated_mode="instant",
+                placeholder=True,
+                updated_at=_utc_now(),
+            )
+        )
+    save.scene_interactable_state.updated_at = _utc_now()
+    ensure_item_system(save)
     if snap.clock is not None:
         snap.clock = _advance_clock(snap.clock, 1)
 
@@ -5554,7 +5840,8 @@ def discover_interactions(req: AreaDiscoverInteractionsRequest) -> AreaDiscoverI
         )
     )
     save_current(save)
-    return AreaDiscoverInteractionsResponse(ok=True, generated_mode="instant", new_interactions=deduped)
+    refreshed_target = next((s for s in snap.sub_zones if s.sub_zone_id == req.sub_zone_id), target)
+    return AreaDiscoverInteractionsResponse(ok=True, generated_mode="instant", new_interactions=list(refreshed_target.key_interactions))
 
 
 def discover_interactions_in_save(req: AreaDiscoverInteractionsRequest) -> AreaDiscoverInteractionsResponse:
@@ -5566,31 +5853,27 @@ def execute_interaction(req: AreaExecuteInteractionRequest) -> AreaExecuteIntera
     if save.session_id != req.session_id:
         raise ValueError("session mismatch with current save")
     _ensure_area_snapshot(save)
-
-    found = False
-    for sub in save.area_snapshot.sub_zones:
-        if any(it.interaction_id == req.interaction_id for it in sub.key_interactions):
-            found = True
-            break
-    if not found:
-        raise KeyError("AREA_INVALID_INTERACTION")
-
-    if save.area_snapshot.clock is not None:
-        save.area_snapshot.clock = _advance_clock(save.area_snapshot.clock, 1)
-    save.game_logs.append(
-        _new_game_log(
-            req.session_id,
-            "area_interaction_placeholder",
-            f"触发交互 {req.interaction_id}（占位）",
-            {"interaction_id": req.interaction_id},
-        )
-    )
+    result = execute_scene_interaction_in_save(save, req)
     save_current(save)
-    return AreaExecuteInteractionResponse(ok=True, status="placeholder", message="待开发")
+    return result
 
 
 def execute_interaction_in_save(req: AreaExecuteInteractionRequest) -> AreaExecuteInteractionResponse:
     return execute_interaction(req)
+
+
+def get_scene_interactables(session_id: str, sub_zone_id: str | None = None) -> list[SceneInteractable]:
+    save = get_current_save(default_session_id=session_id)
+    if save.session_id != session_id:
+        raise ValueError("session mismatch with current save")
+    return list_scene_interactables(save, sub_zone_id=sub_zone_id)
+
+
+def get_template_library_status_payload(session_id: str) -> dict[str, object]:
+    save = get_current_save(default_session_id=session_id)
+    if save.session_id != session_id:
+        raise ValueError("session mismatch with current save")
+    return get_template_library_status()
 
 
 def describe_behavior(session_id: str, movement_log: MovementLog, config: ChatConfig) -> BehaviorDescribeResponse:

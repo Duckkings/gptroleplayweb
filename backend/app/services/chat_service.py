@@ -17,6 +17,8 @@ from app.models.schemas import (
     EncounterEscapeRequest,
     EncounterRejoinRequest,
     InventoryEquipRequest,
+    InventoryConsumeRequest,
+    InventoryGrantRequest,
     InventoryInteractRequest,
     InventoryUnequipRequest,
     Message,
@@ -66,6 +68,8 @@ from app.services.world_service import (
     get_area_current,
     get_current_save,
     get_game_logs,
+    get_scene_interactables,
+    get_template_library_status_payload,
     recover_spell_slots,
     recover_stamina,
     remove_player_buff,
@@ -74,6 +78,8 @@ from app.services.world_service import (
     remove_player_spell,
     set_role_relation,
     inventory_equip,
+    inventory_consume,
+    inventory_grant,
     inventory_interact,
     inventory_unequip,
     spawn_persistent_scene_npc_in_save,
@@ -754,6 +760,59 @@ def _tools_schema() -> list[dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "inventory_grant_item",
+                "description": "Grant one item into player or one role inventory. Use this when AI should hand an item to the player or an NPC.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "owner_type": {"type": "string", "enum": ["player", "role"]},
+                        "role_id": {"type": "string"},
+                        "item_id": {"type": "string"},
+                        "name": {"type": "string"},
+                        "item_type": {"type": "string"},
+                        "description": {"type": "string"},
+                        "weight": {"type": "number", "minimum": 0},
+                        "rarity": {"type": "string"},
+                        "value": {"type": "integer", "minimum": 0},
+                        "effect": {"type": "string"},
+                        "uses_max": {"type": "integer", "minimum": 0},
+                        "uses_left": {"type": "integer", "minimum": 0},
+                        "cooldown_min": {"type": "integer", "minimum": 0},
+                        "bound": {"type": "boolean"},
+                        "quantity": {"type": "integer", "minimum": 1},
+                        "slot_type": {"type": "string", "enum": ["weapon", "armor", "misc"]},
+                        "attack_bonus": {"type": "integer"},
+                        "armor_bonus": {"type": "integer"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["owner_type", "item_id", "name"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "inventory_consume_item",
+                "description": "Consume one player or role inventory item. Use this when an item is spent, used up, or intentionally consumed.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "owner_type": {"type": "string", "enum": ["player", "role"]},
+                        "role_id": {"type": "string"},
+                        "item_id": {"type": "string"},
+                        "amount": {"type": "integer", "minimum": 1},
+                        "consume_mode": {"type": "string", "enum": ["auto", "quantity", "uses"]},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["owner_type", "item_id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "team_chat",
                 "description": "Send one player message into current party chat and return each current teammate response.",
                 "parameters": {
@@ -890,6 +949,28 @@ def _tools_schema() -> list[dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "get_scene_interactables",
+                "description": "Return current or target sub-zone scene interactables from the formal persistent interactable state.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "sub_zone_id": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_template_library_status",
+                "description": "Return current account template-library counts for item/equipment/interactable definitions.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "spawn_scene_npc",
                 "description": "Create one persistent NPC in the current sub-zone so the role can immediately join the scene.",
                 "parameters": {
@@ -944,11 +1025,16 @@ def _tools_schema() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "execute_interaction",
-                "description": "Execute placeholder interaction. Returns fixed placeholder message for now.",
+                "description": "Execute one formal scene interaction against the persistent scene interactable state.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "interaction_id": {"type": "string"},
+                        "action_kind": {"type": "string"},
+                        "actor_kind": {"type": "string", "enum": ["player", "role"]},
+                        "actor_role_id": {"type": "string"},
+                        "item_instance_id": {"type": "string"},
+                        "prompt": {"type": "string"},
                     },
                     "required": ["interaction_id"],
                     "additionalProperties": False,
@@ -1682,6 +1768,76 @@ async def _handle_tool_call(payload: ChatRequest, tool_call: Any) -> tuple[dict[
             event,
         )
 
+    if tool_name == "inventory_grant_item":
+        try:
+            args = json.loads(arg_text)
+            owner = InventoryOwnerRef(
+                owner_type=str(args.get("owner_type") or "player").strip().lower(),
+                role_id=(str(args.get("role_id") or "").strip() or None),
+            )
+            item = InventoryItem(
+                item_id=str(args.get("item_id") or "").strip(),
+                name=str(args.get("name") or "").strip(),
+                item_type=str(args.get("item_type") or "misc").strip() or "misc",
+                description=str(args.get("description") or "").strip(),
+                weight=max(0.0, float(args.get("weight") or 0.0)),
+                rarity=str(args.get("rarity") or "common").strip() or "common",
+                value=max(0, int(args.get("value") or 0)),
+                effect=str(args.get("effect") or "").strip(),
+                uses_max=(int(args["uses_max"]) if args.get("uses_max") is not None else None),
+                uses_left=(int(args["uses_left"]) if args.get("uses_left") is not None else None),
+                cooldown_min=max(0, int(args.get("cooldown_min") or 0)),
+                bound=bool(args.get("bound", False)),
+                quantity=max(1, int(args.get("quantity") or 1)),
+                slot_type=str(args.get("slot_type") or "misc"),  # type: ignore[arg-type]
+                attack_bonus=int(args.get("attack_bonus") or 0),
+                armor_bonus=int(args.get("armor_bonus") or 0),
+            )
+            response = inventory_grant(
+                InventoryGrantRequest(
+                    session_id=payload.session_id,
+                    owner=owner,
+                    item=item,
+                    reason=str(args.get("reason") or "").strip(),
+                )
+            )
+            result = {"ok": True, **response.model_dump(mode="json")}
+            event = ToolEvent(tool_name="inventory_grant_item", ok=True, summary=response.message or "inventory grant ok")
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="inventory_grant_item", ok=False, summary=f"inventory grant failed: {exc}")
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "inventory_consume_item":
+        try:
+            args = json.loads(arg_text)
+            owner = InventoryOwnerRef(
+                owner_type=str(args.get("owner_type") or "player").strip().lower(),
+                role_id=(str(args.get("role_id") or "").strip() or None),
+            )
+            response = inventory_consume(
+                InventoryConsumeRequest(
+                    session_id=payload.session_id,
+                    owner=owner,
+                    item_id=str(args.get("item_id") or "").strip(),
+                    amount=max(1, int(args.get("amount") or 1)),
+                    consume_mode=str(args.get("consume_mode") or "auto").strip().lower(),  # type: ignore[arg-type]
+                    reason=str(args.get("reason") or "").strip(),
+                )
+            )
+            result = {"ok": True, **response.model_dump(mode="json")}
+            event = ToolEvent(tool_name="inventory_consume_item", ok=True, summary=response.message or "inventory consume ok")
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="inventory_consume_item", ok=False, summary=f"inventory consume failed: {exc}")
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
     if tool_name == "team_chat":
         try:
             args = json.loads(arg_text)
@@ -1949,6 +2105,40 @@ async def _handle_tool_call(payload: ChatRequest, tool_call: Any) -> tuple[dict[
             event,
         )
 
+    if tool_name == "get_scene_interactables":
+        try:
+            args = json.loads(arg_text) if arg_text else {}
+        except Exception:
+            args = {}
+        sub_zone_id = str(args.get("sub_zone_id") or "").strip() or None
+        items = get_scene_interactables(payload.session_id, sub_zone_id=sub_zone_id)
+        result = {
+            "ok": True,
+            "count": len(items),
+            "items": [item.model_dump(mode="json") for item in items],
+        }
+        event = ToolEvent(tool_name="get_scene_interactables", ok=True, summary=f"scene interactables returned: {len(items)}")
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(result, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "get_template_library_status":
+        status = get_template_library_status_payload(payload.session_id)
+        event = ToolEvent(tool_name="get_template_library_status", ok=True, summary="template library status returned")
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps({"ok": True, **status}, ensure_ascii=False),
+            },
+            event,
+        )
+
     if tool_name == "spawn_scene_npc":
         try:
             args = json.loads(arg_text)
@@ -2084,8 +2274,18 @@ async def _handle_tool_call(payload: ChatRequest, tool_call: Any) -> tuple[dict[
         try:
             args = json.loads(arg_text)
             interaction_id = str(args.get("interaction_id") or "").strip()
+            action_kind = str(args.get("action_kind") or "inspect").strip() or "inspect"
+            actor_kind = str(args.get("actor_kind") or "player").strip() or "player"
+            actor_role_id = str(args.get("actor_role_id") or "").strip() or None
+            item_instance_id = str(args.get("item_instance_id") or "").strip() or None
+            prompt = str(args.get("prompt") or "").strip()
         except Exception:
             interaction_id = ""
+            action_kind = "inspect"
+            actor_kind = "player"
+            actor_role_id = None
+            item_instance_id = None
+            prompt = ""
         if not interaction_id:
             event = ToolEvent(tool_name="execute_interaction", ok=False, summary="interaction_id is required")
             return (
@@ -2098,10 +2298,19 @@ async def _handle_tool_call(payload: ChatRequest, tool_call: Any) -> tuple[dict[
             )
         try:
             executed = execute_interaction(
-                AreaExecuteInteractionRequest(session_id=payload.session_id, interaction_id=interaction_id)
+                AreaExecuteInteractionRequest(
+                    session_id=payload.session_id,
+                    interaction_id=interaction_id,
+                    action_kind=action_kind,
+                    actor_kind=actor_kind,  # type: ignore[arg-type]
+                    actor_role_id=actor_role_id,
+                    item_instance_id=item_instance_id,
+                    prompt=prompt,
+                    config=payload.config,
+                )
             )
             result = executed.model_dump(mode="json")
-            event = ToolEvent(tool_name="execute_interaction", ok=True, summary="placeholder interaction executed")
+            event = ToolEvent(tool_name="execute_interaction", ok=True, summary=executed.reply or executed.message or "scene interaction executed")
         except Exception as exc:
             result = {"ok": False, "error": str(exc)}
             event = ToolEvent(tool_name="execute_interaction", ok=False, summary=f"execute failed: {exc}")

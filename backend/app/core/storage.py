@@ -183,6 +183,8 @@ def _assemble_bundle(bundle_dir: Path, manifest: dict[str, Any]) -> dict[str, An
     reputation_state = _read_part("reputation_state", {})
     zone_metric_state = _read_part("zone_metric_state", {})
     travel_companion_state = _read_part("travel_companion_state", {})
+    item_instance_state = _read_part("item_instance_state", {})
+    scene_interactable_state = _read_part("scene_interactable_state", {})
     world_state = _read_part("world_state", {})
     quest_state = _read_part("quest_state", {})
     encounter_state = _read_part("encounter_state", {})
@@ -204,6 +206,8 @@ def _assemble_bundle(bundle_dir: Path, manifest: dict[str, Any]) -> dict[str, An
         "reputation_state": reputation_state,
         "zone_metric_state": zone_metric_state,
         "travel_companion_state": travel_companion_state,
+        "item_instance_state": item_instance_state,
+        "scene_interactable_state": scene_interactable_state,
         "quest_state": quest_state,
         "encounter_state": encounter_state,
         "fate_state": fate_state,
@@ -262,6 +266,8 @@ def write_save_payload(save_path: Path, payload: dict[str, Any]) -> None:
         "reputation_state": ("reputation_state.json", payload.get("reputation_state", {})),
         "zone_metric_state": ("zone_metric_state.json", payload.get("zone_metric_state", {})),
         "travel_companion_state": ("travel_companion_state.json", payload.get("travel_companion_state", {})),
+        "item_instance_state": ("item_instance_state.json", payload.get("item_instance_state", {})),
+        "scene_interactable_state": ("scene_interactable_state.json", payload.get("scene_interactable_state", {})),
         "quest_state": ("quest_state.json", payload.get("quest_state", {})),
         "encounter_state": ("encounter_state.json", payload.get("encounter_state", {})),
         "fate_state": ("fate_state.json", payload.get("fate_state", {})),

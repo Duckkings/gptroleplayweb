@@ -493,6 +493,116 @@ class AreaInteraction(BaseModel):
     placeholder: bool = True
 
 
+class ItemDefinition(BaseModel):
+    definition_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    item_kind: str = Field(default="misc", min_length=1)
+    sub_kind: str = Field(default="", min_length=0)
+    description: str = Field(default="", min_length=0)
+    rarity: str = Field(default="common", min_length=1)
+    weight: float = Field(default=0, ge=0)
+    value: int = Field(default=0, ge=0)
+    stackable: bool = True
+    max_stack: int = Field(default=1, ge=1)
+    use_tags: list[str] = Field(default_factory=list)
+    interaction_tags: list[str] = Field(default_factory=list)
+    combat_tags: list[str] = Field(default_factory=list)
+    effect_prompt_hint: str = Field(default="", min_length=0)
+
+
+class EquipmentDefinition(BaseModel):
+    definition_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    equipment_kind: Literal["weapon", "armor", "shield"] = "weapon"
+    slot_type: Literal["weapon", "armor", "shield"] = "weapon"
+    damage_dice: str = Field(default="", min_length=0)
+    damage_type: str = Field(default="bludgeoning", min_length=1)
+    attack_bonus: int = 0
+    armor_bonus: int = 0
+    range_normal: int = Field(default=0, ge=0)
+    range_long: int = Field(default=0, ge=0)
+    two_handed: bool = False
+    light: bool = False
+    heavy: bool = False
+    thrown: bool = False
+    finesse: bool = False
+    ammunition: bool = False
+    description: str = Field(default="", min_length=0)
+    rarity: str = Field(default="common", min_length=1)
+    weight: float = Field(default=0, ge=0)
+    value: int = Field(default=0, ge=0)
+
+
+class InteractableTemplate(BaseModel):
+    template_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    interactable_kind: Literal["item_proxy", "container", "clue", "door", "path", "mechanism", "hazard", "scene"] = "scene"
+    description: str = Field(default="", min_length=0)
+    allowed_actions: list[str] = Field(default_factory=list)
+    initial_state_tags: list[str] = Field(default_factory=list)
+    loot_mode: Literal["none", "fixed", "ai_first_open"] = "none"
+    allowed_item_tags: list[str] = Field(default_factory=list)
+    allowed_definition_ids: list[str] = Field(default_factory=list)
+    can_pick_up: bool = False
+    can_drop_into: bool = False
+    can_lock: bool = False
+    can_break: bool = False
+    can_trigger: bool = False
+
+
+class ItemInstance(BaseModel):
+    item_instance_id: str = Field(..., min_length=1)
+    definition_id: str = Field(..., min_length=1)
+    quantity: int = Field(default=1, ge=0)
+    uses_left: int | None = Field(default=None, ge=0)
+    uses_max: int | None = Field(default=None, ge=0)
+    durability: int | None = Field(default=None, ge=0)
+    owner_kind: Literal["player", "role", "scene", "container"] = "player"
+    owner_id: str = Field(..., min_length=1)
+    zone_id: str | None = None
+    sub_zone_id: str | None = None
+    display_name: str = Field(default="", min_length=0)
+    description_override: str = Field(default="", min_length=0)
+    tags: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class ItemInstanceState(BaseModel):
+    version: str = Field(default="0.1.0")
+    items: list[ItemInstance] = Field(default_factory=list)
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class SceneInteractable(BaseModel):
+    interactable_id: str = Field(..., min_length=1)
+    template_id: str = Field(..., min_length=1)
+    zone_id: str = Field(..., min_length=1)
+    sub_zone_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    interactable_kind: Literal["item_proxy", "container", "clue", "door", "path", "mechanism", "hazard", "scene"] = "scene"
+    description: str = Field(default="", min_length=0)
+    allowed_actions: list[str] = Field(default_factory=list)
+    state_tags: list[str] = Field(default_factory=list)
+    status: Literal["ready", "disabled", "hidden"] = "ready"
+    generated_mode: Literal["pre", "instant", "migrated"] = "pre"
+    placeholder: bool = False
+    item_instance_id: str | None = None
+    contained_item_instance_ids: list[str] = Field(default_factory=list)
+    loot_generation_status: Literal["ungenerated", "generated"] = "ungenerated"
+    first_generated_at: str | None = None
+    clue_payload: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class SceneInteractableState(BaseModel):
+    version: str = Field(default="0.1.0")
+    items: list[SceneInteractable] = Field(default_factory=list)
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
 class AreaNpc(BaseModel):
     npc_id: str = Field(..., min_length=1)
     name: str = Field(..., min_length=1)
@@ -691,12 +801,17 @@ class InventoryItem(BaseModel):
 
 class InventoryData(BaseModel):
     gold: int = Field(default=0, ge=0)
+    item_instance_ids: list[str] = Field(default_factory=list)
     items: list[InventoryItem] = Field(default_factory=list)
 
 
 class EquipmentSlots(BaseModel):
     weapon_item_id: str | None = None
     armor_item_id: str | None = None
+    shield_item_id: str | None = None
+    weapon_item_instance_id: str | None = None
+    armor_item_instance_id: str | None = None
+    shield_item_instance_id: str | None = None
 
 
 class Dnd5eCharacterSheet(BaseModel):
@@ -1068,6 +1183,226 @@ class TravelCompanionState(BaseModel):
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
+class BattleDamageProfile(BaseModel):
+    dice: str = Field(default="1d4", min_length=1)
+    damage_type: str = Field(default="bludgeoning", min_length=1)
+    flat_bonus: int = 0
+
+
+class BattleFieldState(BaseModel):
+    zone_id: str | None = None
+    zone_name: str = Field(default="", min_length=0)
+    sub_zone_id: str | None = None
+    sub_zone_name: str = Field(default="", min_length=0)
+    description: str = Field(default="", min_length=0)
+    feature_tags: list[str] = Field(default_factory=list)
+    danger_score: int | None = Field(default=None, ge=0, le=100)
+    reputation_score: int | None = Field(default=None, ge=0, le=100)
+
+
+class BattleStepEntry(BaseModel):
+    step_id: str = Field(..., min_length=1)
+    round: int = Field(default=1, ge=1)
+    kind: Literal[
+        "setup",
+        "initiative",
+        "turn_start",
+        "attack",
+        "damage",
+        "move",
+        "defend",
+        "disengage",
+        "escape",
+        "observe",
+        "item_use",
+        "reaction_prompt",
+        "reaction_result",
+        "defeat",
+        "end",
+        "system",
+    ] = "system"
+    actor_combatant_id: str | None = None
+    actor_name: str = Field(default="", min_length=0)
+    content: str = Field(..., min_length=1)
+    metadata: dict[str, str | int | float | bool] = Field(default_factory=dict)
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class CombatantState(BaseModel):
+    combatant_id: str = Field(..., min_length=1)
+    source_kind: Literal["player", "team", "npc", "test_monster"] = "player"
+    role_id: str | None = None
+    display_name: str = Field(..., min_length=1)
+    side: Literal["player_side", "enemy_side"] = "player_side"
+    template_id: str | None = None
+    role_kind: Literal["brute", "skirmisher", "ranged", "support", "beast", "adventurer"] = "adventurer"
+    ai_style: str = Field(default="hold_line", min_length=1)
+    level_hint: int = Field(default=1, ge=1)
+    max_hp: int = Field(default=10, ge=1)
+    current_hp: int = Field(default=10, ge=0)
+    temp_hp: int = Field(default=0, ge=0)
+    base_armor_class: int = Field(default=10, ge=0)
+    armor_class: int = Field(default=10, ge=0)
+    speed: int = Field(default=6, ge=0)
+    initiative: int = 0
+    initiative_bonus: int = 0
+    attack_bonus: int = 0
+    damage_profile: BattleDamageProfile = Field(default_factory=BattleDamageProfile)
+    ability_modifiers: Dnd5eAbilityModifiers = Field(default_factory=Dnd5eAbilityModifiers)
+    saving_throw_bonuses: Dnd5eAbilityModifiers = Field(default_factory=Dnd5eAbilityModifiers)
+    position_band: Literal["engaged", "near", "far", "remote"] = "near"
+    position_feature_tags: list[str] = Field(default_factory=list)
+    action_available: bool = True
+    bonus_action_available: bool = True
+    reaction_available: bool = True
+    movement_remaining: int = Field(default=6, ge=0)
+    conditions: list[str] = Field(default_factory=list)
+    alive: bool = True
+    downed: bool = False
+    escaped: bool = False
+    temporary_ac_bonus: int = 0
+    next_attack_bonus_against: str | None = None
+    next_attack_bonus_amount: int = 0
+    inventory_item_instance_ids: list[str] = Field(default_factory=list)
+    equipped_weapon_instance_id: str | None = None
+    equipped_armor_instance_id: str | None = None
+    equipped_shield_instance_id: str | None = None
+    inventory_items: list[InventoryItem] = Field(default_factory=list)
+
+
+class CombatState(BaseModel):
+    round: int = Field(default=1, ge=1)
+    phase: Literal["initiative", "turn", "resolution", "ended"] = "initiative"
+    active_combatant_id: str | None = None
+    initiative_order: list[str] = Field(default_factory=list)
+    momentum_value: int = 0
+    combatants: list[CombatantState] = Field(default_factory=list)
+    recent_steps: list[BattleStepEntry] = Field(default_factory=list)
+    winner_side: Literal["player_side", "enemy_side", "escaped", "cancelled"] | None = None
+
+
+class BattleRollPrompt(BaseModel):
+    prompt_id: str = Field(..., min_length=1)
+    roll_kind: Literal["initiative", "attack", "observe", "escape", "reaction", "item_use"] = "attack"
+    actor_combatant_id: str = Field(..., min_length=1)
+    actor_name: str = Field(..., min_length=1)
+    ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] = "strength"
+    ability_modifier: int = 0
+    dc: int = Field(default=10, ge=1, le=30)
+    check_task: str = Field(..., min_length=1)
+    source_label: str | None = None
+    threatened_consequence: str | None = None
+    success_hint: str | None = None
+    failure_hint: str | None = None
+    target_combatant_id: str | None = None
+    action_name: str = Field(default="", min_length=0)
+    metadata: dict[str, str | int | float | bool] = Field(default_factory=dict)
+
+
+class BattleRollResolution(BaseModel):
+    prompt_id: str = Field(..., min_length=1)
+    actor_combatant_id: str = Field(..., min_length=1)
+    actor_name: str = Field(..., min_length=1)
+    roll_kind: Literal["initiative", "attack", "observe", "escape", "reaction", "item_use"] = "attack"
+    ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] = "strength"
+    ability_modifier: int = 0
+    dc: int = Field(default=10, ge=1, le=30)
+    dice_roll: int = Field(..., ge=1, le=20)
+    total_score: int
+    success: bool
+    critical: Literal["none", "critical_success", "critical_failure"] = "none"
+    summary: str = Field(..., min_length=1)
+
+
+class BattleUiFlags(BaseModel):
+    ai_pacing: Literal["step", "auto"] = "step"
+    can_continue_ai: bool = False
+
+
+class BattleSandboxState(BaseModel):
+    battle_id: str = Field(..., min_length=1)
+    session_id: str = Field(..., min_length=1)
+    status: Literal["setup", "active", "awaiting_player_action", "awaiting_player_roll", "awaiting_ai_continue", "ended", "cancelled"] = "setup"
+    source_kind: Literal["debug_template", "debug_ai_generated"] = "debug_template"
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    battlefield: BattleFieldState = Field(default_factory=BattleFieldState)
+    player_snapshot: CombatantState
+    ally_snapshots: list[CombatantState] = Field(default_factory=list)
+    enemy_snapshots: list[CombatantState] = Field(default_factory=list)
+    combat_state: CombatState = Field(default_factory=CombatState)
+    pending_roll: BattleRollPrompt | None = None
+    last_roll_result: BattleRollResolution | None = None
+    battle_logs: list[BattleStepEntry] = Field(default_factory=list)
+    ui_flags: BattleUiFlags = Field(default_factory=BattleUiFlags)
+
+
+class BattleStartRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    mode: Literal["template", "ai_generated"] = "template"
+    template_group: str | None = None
+    ai_scale: Literal["single", "squad"] = "single"
+    ai_strength: Literal["weak", "standard", "strong"] = "standard"
+    ai_pacing: Literal["step", "auto"] = "step"
+    config: ChatConfig | None = None
+
+
+class BattleStartResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    battle: BattleSandboxState
+
+
+class BattleActionRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    action_kind: Literal["attack", "defend", "move", "disengage", "escape", "use_item", "observe", "end_turn"]
+    target_combatant_id: str | None = None
+    destination_band: Literal["engaged", "near", "far", "remote"] | None = None
+    item_id: str | None = None
+
+
+class BattleActionResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    battle: BattleSandboxState
+
+
+class BattleContinueAiRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    ai_pacing: Literal["step", "auto"] | None = None
+
+
+class BattleContinueAiResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    battle: BattleSandboxState
+
+
+class BattleResolveRollRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    forced_dice_roll: int = Field(..., ge=1, le=20)
+
+
+class BattleResolveRollResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    battle: BattleSandboxState
+    roll_result: BattleRollResolution | None = None
+
+
+class BattleCurrentResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    battle: BattleSandboxState | None = None
+
+
+class BattleEndResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    battle_id: str | None = None
+    ended: bool = True
+
+
 class SaveFile(BaseModel):
     version: str = Field(default="1.4.0")
     session_id: str = Field(..., min_length=1)
@@ -1083,6 +1418,8 @@ class SaveFile(BaseModel):
     reputation_state: ReputationState = Field(default_factory=ReputationState)
     zone_metric_state: ZoneMetricState = Field(default_factory=ZoneMetricState)
     travel_companion_state: TravelCompanionState = Field(default_factory=TravelCompanionState)
+    item_instance_state: ItemInstanceState = Field(default_factory=ItemInstanceState)
+    scene_interactable_state: SceneInteractableState = Field(default_factory=SceneInteractableState)
     quest_state: QuestState = Field(default_factory=lambda: QuestState())
     encounter_state: EncounterState = Field(default_factory=lambda: EncounterState())
     fate_state: FateState = Field(default_factory=lambda: FateState())
@@ -1566,12 +1903,23 @@ class AreaDiscoverInteractionsResponse(BaseModel):
 class AreaExecuteInteractionRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     interaction_id: str = Field(..., min_length=1)
+    action_kind: str = Field(default="inspect", min_length=1)
+    actor_kind: Literal["player", "role"] = "player"
+    actor_role_id: str | None = None
+    item_instance_id: str | None = None
+    prompt: str = Field(default="", min_length=0)
+    action_check: "ActionCheckResponse | None" = None
+    config: ChatConfig | None = None
 
 
 class AreaExecuteInteractionResponse(BaseModel):
     ok: bool = True
-    status: Literal["placeholder"] = "placeholder"
+    status: Literal["placeholder", "ok", "fallback"] = "placeholder"
     message: str = Field(default="待开发", min_length=1)
+    reply: str = Field(default="", min_length=0)
+    scene_events: list[SceneEvent] = Field(default_factory=list)
+    inventory_changes: list[dict[str, Any]] = Field(default_factory=list)
+    interactable_updates: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AreaDiscoverInteractionsResolvedResponse(AreaDiscoverInteractionsResponse):
@@ -1581,6 +1929,30 @@ class AreaDiscoverInteractionsResolvedResponse(AreaDiscoverInteractionsResponse)
 
 class AreaExecuteInteractionResolvedResponse(AreaExecuteInteractionResponse):
     state_sync: MapStateSyncBundle
+
+
+class TemplateLibraryStatusResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    template_dir: str
+    item_definition_count: int = Field(default=0, ge=0)
+    equipment_definition_count: int = Field(default=0, ge=0)
+    interactable_template_count: int = Field(default=0, ge=0)
+    last_filled_at: str | None = None
+
+
+class TemplateLibraryFillRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    config: ChatConfig | None = None
+
+
+class TemplateLibraryFillResponse(TemplateLibraryStatusResponse):
+    appended_item_definition_ids: list[str] = Field(default_factory=list)
+    appended_equipment_definition_ids: list[str] = Field(default_factory=list)
+    appended_interactable_template_ids: list[str] = Field(default_factory=list)
+    updated_item_definition_ids: list[str] = Field(default_factory=list)
+    updated_equipment_definition_ids: list[str] = Field(default_factory=list)
+    updated_interactable_template_ids: list[str] = Field(default_factory=list)
 
 
 class RolePoolListResponse(BaseModel):
@@ -2078,8 +2450,28 @@ class InventoryMutationResponse(BaseModel):
     session_id: str
     owner: InventoryOwnerRef
     message: str = Field(default="", min_length=0)
+    item_id: str | None = None
+    amount_changed: int = 0
+    quantity_after: int | None = None
+    uses_left_after: int | None = None
     player: PlayerStaticData | None = None
     role: NpcRoleCard | None = None
+
+
+class InventoryGrantRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    owner: InventoryOwnerRef
+    item: InventoryItem
+    reason: str = Field(default="", min_length=0)
+
+
+class InventoryConsumeRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    owner: InventoryOwnerRef
+    item_id: str = Field(..., min_length=1)
+    amount: int = Field(default=1, ge=1)
+    reason: str = Field(default="", min_length=0)
+    consume_mode: Literal["auto", "quantity", "uses"] = "auto"
 
 
 class InventoryInteractRequest(BaseModel):

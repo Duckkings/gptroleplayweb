@@ -748,6 +748,10 @@ async def execute_area_interaction(payload: AreaExecuteInteractionRequest) -> Ar
                     ok=executed.ok,
                     status=executed.status,
                     message=executed.message,
+                    reply=executed.reply,
+                    scene_events=executed.scene_events,
+                    inventory_changes=executed.inventory_changes,
+                    interactable_updates=executed.interactable_updates,
                     state_sync=state_sync,
                 )
                 debug_log.finish(

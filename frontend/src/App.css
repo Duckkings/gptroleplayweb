@@ -1604,3 +1604,136 @@ button:disabled {
     max-width: 100%;
   }
 }
+
+.battle-start-dialog {
+  max-width: 720px;
+}
+
+.battle-start-summary {
+  margin: 0.75rem 0;
+  padding: 0.75rem;
+  border: 1px solid rgba(130, 150, 170, 0.22);
+  border-radius: 12px;
+  background: rgba(20, 30, 44, 0.65);
+}
+
+.battle-start-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.battle-modal {
+  width: min(1100px, 92vw);
+  max-height: 90vh;
+  overflow: auto;
+}
+
+.battle-modal-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: flex-start;
+}
+
+.battle-panel {
+  margin-top: 0.9rem;
+  padding: 0.85rem;
+  border: 1px solid rgba(130, 150, 170, 0.18);
+  border-radius: 12px;
+  background: rgba(14, 22, 34, 0.75);
+}
+
+.battle-panel h4 {
+  margin: 0 0 0.65rem;
+}
+
+.battle-turn-order {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.battle-turn-chip {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.35rem 0.6rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.battle-turn-chip.active {
+  background: rgba(83, 161, 110, 0.28);
+}
+
+.battle-roster-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.9rem;
+}
+
+.battle-combatant-list {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.battle-combatant-card {
+  padding: 0.7rem;
+  border-radius: 12px;
+  border: 1px solid rgba(130, 150, 170, 0.18);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.battle-combatant-card header {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.4rem;
+}
+
+.battle-combatant-card.player_side.active {
+  border-color: rgba(83, 161, 110, 0.55);
+}
+
+.battle-combatant-card.enemy_side.active {
+  border-color: rgba(201, 91, 84, 0.6);
+}
+
+.battle-log-scroll {
+  max-height: 260px;
+  overflow-y: auto;
+  display: grid;
+  gap: 0.45rem;
+  padding-right: 0.35rem;
+}
+
+.battle-log-entry {
+  padding: 0.55rem 0.65rem;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.battle-action-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.battle-actions {
+  margin-top: 0.8rem;
+  flex-wrap: wrap;
+}
+
+.battle-ai-controls button.active {
+  border-color: rgba(83, 161, 110, 0.55);
+  background: rgba(83, 161, 110, 0.18);
+}
+
+@media (max-width: 900px) {
+  .battle-roster-grid,
+  .battle-start-grid,
+  .battle-action-grid {
+    grid-template-columns: 1fr;
+  }
+}

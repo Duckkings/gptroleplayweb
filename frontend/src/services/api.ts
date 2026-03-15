@@ -6,6 +6,16 @@
   AreaMoveResolvedResponse,
   AreaSnapshot,
   AppConfig,
+  BattleActionRequest,
+  BattleActionResponse,
+  BattleContinueAiRequest,
+  BattleContinueAiResponse,
+  BattleCurrentResponse,
+  BattleEndResponse,
+  BattleResolveRollRequest,
+  BattleResolveRollResponse,
+  BattleStartRequest,
+  BattleStartResponse,
   ChatMessage,
   ChatResponse,
   ConsistencyRunResponse,
@@ -54,6 +64,8 @@
   TeamMutationResponse,
   TeamChatResponse,
   TeamStateResponse,
+  TemplateLibraryFillResponse,
+  TemplateLibraryStatusResponse,
   LiveToolEvent,
   StreamPhaseEvent,
   ToolEvent,
@@ -480,6 +492,86 @@ export async function getCurrentPendingTurn(
   report?: DebugReporter,
 ): Promise<PendingTurnContinueResponse | null> {
   return requestJson(`/pending-turns/current?session_id=${encodeURIComponent(sessionId)}`, { method: 'GET' }, report);
+}
+
+export async function startDebugBattle(payload: BattleStartRequest, report?: DebugReporter): Promise<BattleStartResponse> {
+  return requestJson(
+    '/battle/debug/start',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function getCurrentDebugBattle(sessionId: string, report?: DebugReporter): Promise<BattleCurrentResponse> {
+  return requestJson(`/battle/debug/current?session_id=${encodeURIComponent(sessionId)}`, { method: 'GET' }, report);
+}
+
+export async function submitBattlePlayerAction(
+  battleId: string,
+  payload: BattleActionRequest,
+  report?: DebugReporter,
+): Promise<BattleActionResponse> {
+  return requestJson(
+    `/battle/${encodeURIComponent(battleId)}/player-action`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function continueBattleAi(
+  battleId: string,
+  payload: BattleContinueAiRequest,
+  report?: DebugReporter,
+): Promise<BattleContinueAiResponse> {
+  return requestJson(
+    `/battle/${encodeURIComponent(battleId)}/continue-ai`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function resolveBattleRoll(
+  battleId: string,
+  payload: BattleResolveRollRequest,
+  report?: DebugReporter,
+): Promise<BattleResolveRollResponse> {
+  return requestJson(
+    `/battle/${encodeURIComponent(battleId)}/resolve-roll`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function endDebugBattle(
+  battleId: string,
+  payload: BattleContinueAiRequest,
+  report?: DebugReporter,
+): Promise<BattleEndResponse> {
+  return requestJson(
+    `/battle/${encodeURIComponent(battleId)}/end`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
 }
 
 export async function getConfigPath(report?: DebugReporter): Promise<PathStatus> {
@@ -1555,11 +1647,43 @@ export async function discoverAreaInteractions(
 }
 
 export async function executeAreaInteraction(
-  payload: { session_id: string; interaction_id: string },
+  payload: {
+    session_id: string;
+    interaction_id: string;
+    action_kind?: string;
+    actor_kind?: 'player' | 'role';
+    actor_role_id?: string;
+    item_instance_id?: string;
+    prompt?: string;
+    action_check?: ActionCheckResult | null;
+    config?: AppConfig;
+  },
   report?: DebugReporter,
 ): Promise<AreaExecuteInteractionResolvedResponse> {
   return requestJson(
     '/world/area/interactions/execute',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function getTemplateLibraryStatus(
+  sessionId: string,
+  report?: DebugReporter,
+): Promise<TemplateLibraryStatusResponse> {
+  return requestJson(`/debug/template-library/status?session_id=${encodeURIComponent(sessionId)}`, { method: 'GET' }, report);
+}
+
+export async function fillTemplateLibrary(
+  payload: { session_id: string; config?: AppConfig },
+  report?: DebugReporter,
+): Promise<TemplateLibraryFillResponse> {
+  return requestJson(
+    '/debug/template-library/fill',
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

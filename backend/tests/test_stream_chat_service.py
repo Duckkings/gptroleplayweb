@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 from app.core.storage import storage_state
 from app.core.user_context import get_current_user, set_current_user
 from app.models.schemas import ActionCheckResponse, AreaSnapshot, AreaSubZone, ChatRequest, ChatConfig, Coord3D, EncounterCheckResponse, EncounterEntry, EncounterTerminationCondition, Message, NpcRoleCard, SceneEvent, TeamMember, ToolEvent, WorldClock
-from app.services.stream_chat_service import StreamProtocolError, StreamingTurnParser, _execute_planned_tools, _main_turn_summary_from_scene_events, apply_structured_main_turn_bundle, run_main_turn_stream
+from app.services.stream_chat_service import StreamProtocolError, StreamingTurnParser, _PLANNER_TOOLS, _execute_planned_tools, _main_turn_summary_from_scene_events, apply_structured_main_turn_bundle, run_main_turn_stream
 from app.services.world_service import clear_current_save, get_current_save, save_current, save_transaction
 
 
@@ -84,6 +84,10 @@ class SaveTransactionTests(unittest.TestCase):
 
 
 class PlannedToolExecutionTests(unittest.TestCase):
+    def test_planner_tools_expose_inventory_grant_and_consume(self) -> None:
+        self.assertIn("inventory_grant_item", _PLANNER_TOOLS)
+        self.assertIn("inventory_consume_item", _PLANNER_TOOLS)
+
     def test_failed_planned_tool_does_not_abort_turn(self) -> None:
         payload = ChatRequest(
             session_id="sess_planner_skip",

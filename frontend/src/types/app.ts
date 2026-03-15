@@ -158,6 +158,225 @@ export type PendingTurnContinueResponse = {
   npc_role_id?: string | null;
 };
 
+export type BattleDamageProfile = {
+  dice: string;
+  damage_type: string;
+  flat_bonus: number;
+};
+
+export type BattleFieldState = {
+  zone_id?: string | null;
+  zone_name: string;
+  sub_zone_id?: string | null;
+  sub_zone_name: string;
+  description: string;
+  feature_tags: string[];
+  danger_score?: number | null;
+  reputation_score?: number | null;
+};
+
+export type BattleStepEntry = {
+  step_id: string;
+  round: number;
+  kind:
+    | 'setup'
+    | 'initiative'
+    | 'turn_start'
+    | 'attack'
+    | 'damage'
+    | 'move'
+    | 'defend'
+    | 'disengage'
+    | 'escape'
+    | 'observe'
+    | 'item_use'
+    | 'reaction_prompt'
+    | 'reaction_result'
+    | 'defeat'
+    | 'end'
+    | 'system';
+  actor_combatant_id?: string | null;
+  actor_name: string;
+  content: string;
+  metadata: Record<string, string | number | boolean>;
+  created_at: string;
+};
+
+export type CombatantState = {
+  combatant_id: string;
+  source_kind: 'player' | 'team' | 'npc' | 'test_monster';
+  role_id?: string | null;
+  display_name: string;
+  side: 'player_side' | 'enemy_side';
+  template_id?: string | null;
+  role_kind: 'brute' | 'skirmisher' | 'ranged' | 'support' | 'beast' | 'adventurer';
+  ai_style: string;
+  level_hint: number;
+  max_hp: number;
+  current_hp: number;
+  temp_hp: number;
+  base_armor_class: number;
+  armor_class: number;
+  speed: number;
+  initiative: number;
+  initiative_bonus: number;
+  attack_bonus: number;
+  damage_profile: BattleDamageProfile;
+  ability_modifiers: Dnd5eAbilityModifiers;
+  saving_throw_bonuses: Dnd5eAbilityModifiers;
+  position_band: 'engaged' | 'near' | 'far' | 'remote';
+  position_feature_tags: string[];
+  action_available: boolean;
+  bonus_action_available: boolean;
+  reaction_available: boolean;
+  movement_remaining: number;
+  conditions: string[];
+  alive: boolean;
+  downed: boolean;
+  escaped: boolean;
+  temporary_ac_bonus: number;
+  next_attack_bonus_against?: string | null;
+  next_attack_bonus_amount: number;
+  inventory_item_instance_ids?: string[];
+  equipped_weapon_instance_id?: string | null;
+  equipped_armor_instance_id?: string | null;
+  equipped_shield_instance_id?: string | null;
+  inventory_items: InventoryItem[];
+};
+
+export type CombatState = {
+  round: number;
+  phase: 'initiative' | 'turn' | 'resolution' | 'ended';
+  active_combatant_id?: string | null;
+  initiative_order: string[];
+  momentum_value: number;
+  combatants: CombatantState[];
+  recent_steps: BattleStepEntry[];
+  winner_side?: 'player_side' | 'enemy_side' | 'escaped' | 'cancelled' | null;
+};
+
+export type BattleRollPrompt = {
+  prompt_id: string;
+  roll_kind: 'initiative' | 'attack' | 'observe' | 'escape' | 'reaction' | 'item_use';
+  actor_combatant_id: string;
+  actor_name: string;
+  ability_used: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
+  ability_modifier: number;
+  dc: number;
+  check_task: string;
+  source_label?: string | null;
+  threatened_consequence?: string | null;
+  success_hint?: string | null;
+  failure_hint?: string | null;
+  target_combatant_id?: string | null;
+  action_name: string;
+  metadata: Record<string, string | number | boolean>;
+};
+
+export type BattleRollResolution = {
+  prompt_id: string;
+  actor_combatant_id: string;
+  actor_name: string;
+  roll_kind: 'initiative' | 'attack' | 'observe' | 'escape' | 'reaction' | 'item_use';
+  ability_used: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
+  ability_modifier: number;
+  dc: number;
+  dice_roll: number;
+  total_score: number;
+  success: boolean;
+  critical: 'none' | 'critical_success' | 'critical_failure';
+  summary: string;
+};
+
+export type BattleUiFlags = {
+  ai_pacing: 'step' | 'auto';
+  can_continue_ai: boolean;
+};
+
+export type BattleSandboxState = {
+  battle_id: string;
+  session_id: string;
+  status: 'setup' | 'active' | 'awaiting_player_action' | 'awaiting_player_roll' | 'awaiting_ai_continue' | 'ended' | 'cancelled';
+  source_kind: 'debug_template' | 'debug_ai_generated';
+  created_at: string;
+  updated_at: string;
+  battlefield: BattleFieldState;
+  player_snapshot: CombatantState;
+  ally_snapshots: CombatantState[];
+  enemy_snapshots: CombatantState[];
+  combat_state: CombatState;
+  pending_roll?: BattleRollPrompt | null;
+  last_roll_result?: BattleRollResolution | null;
+  battle_logs: BattleStepEntry[];
+  ui_flags: BattleUiFlags;
+};
+
+export type BattleStartRequest = {
+  session_id: string;
+  mode: 'template' | 'ai_generated';
+  template_group?: string | null;
+  ai_scale: 'single' | 'squad';
+  ai_strength: 'weak' | 'standard' | 'strong';
+  ai_pacing: 'step' | 'auto';
+  config?: AppConfig | null;
+};
+
+export type BattleStartResponse = {
+  ok: boolean;
+  session_id: string;
+  battle: BattleSandboxState;
+};
+
+export type BattleActionRequest = {
+  session_id: string;
+  action_kind: 'attack' | 'defend' | 'move' | 'disengage' | 'escape' | 'use_item' | 'observe' | 'end_turn';
+  target_combatant_id?: string | null;
+  destination_band?: 'engaged' | 'near' | 'far' | 'remote' | null;
+  item_id?: string | null;
+};
+
+export type BattleActionResponse = {
+  ok: boolean;
+  session_id: string;
+  battle: BattleSandboxState;
+};
+
+export type BattleContinueAiRequest = {
+  session_id: string;
+  ai_pacing?: 'step' | 'auto' | null;
+};
+
+export type BattleContinueAiResponse = {
+  ok: boolean;
+  session_id: string;
+  battle: BattleSandboxState;
+};
+
+export type BattleResolveRollRequest = {
+  session_id: string;
+  forced_dice_roll: number;
+};
+
+export type BattleResolveRollResponse = {
+  ok: boolean;
+  session_id: string;
+  battle: BattleSandboxState;
+  roll_result?: BattleRollResolution | null;
+};
+
+export type BattleCurrentResponse = {
+  ok: boolean;
+  session_id: string;
+  battle?: BattleSandboxState | null;
+};
+
+export type BattleEndResponse = {
+  ok: boolean;
+  session_id: string;
+  battle_id?: string | null;
+  ended: boolean;
+};
+
 export type ToolEvent = {
   tool_name: string;
   ok: boolean;
@@ -1090,8 +1309,12 @@ export type AreaDiscoverInteractionsResolvedResponse = {
 
 export type AreaExecuteInteractionResolvedResponse = {
   ok: boolean;
-  status: 'placeholder';
+  status: 'placeholder' | 'ok' | 'fallback';
   message: string;
+  reply: string;
+  scene_events: SceneEvent[];
+  inventory_changes: Record<string, JsonValue>[];
+  interactable_updates: Record<string, JsonValue>[];
   state_sync: MapStateSyncBundle;
 };
 
@@ -1198,12 +1421,17 @@ export type InventoryItem = {
 
 export type InventoryData = {
   gold: number;
+  item_instance_ids?: string[];
   items: InventoryItem[];
 };
 
 export type EquipmentSlots = {
   weapon_item_id: string | null;
   armor_item_id: string | null;
+  shield_item_id?: string | null;
+  weapon_item_instance_id?: string | null;
+  armor_item_instance_id?: string | null;
+  shield_item_instance_id?: string | null;
 };
 
 export type Dnd5eCharacterSheet = {
@@ -1635,8 +1863,31 @@ export type InventoryMutationResponse = {
   session_id: string;
   owner: InventoryOwnerRef;
   message: string;
+  item_id?: string | null;
+  amount_changed?: number;
+  quantity_after?: number;
+  uses_left_after?: number | null;
   player: PlayerStaticData | null;
   role: NpcRoleCard | null;
+};
+
+export type TemplateLibraryStatusResponse = {
+  ok: boolean;
+  session_id: string;
+  template_dir: string;
+  item_definition_count: number;
+  equipment_definition_count: number;
+  interactable_template_count: number;
+  last_filled_at?: string | null;
+};
+
+export type TemplateLibraryFillResponse = TemplateLibraryStatusResponse & {
+  appended_item_definition_ids: string[];
+  appended_equipment_definition_ids: string[];
+  appended_interactable_template_ids: string[];
+  updated_item_definition_ids: string[];
+  updated_equipment_definition_ids: string[];
+  updated_interactable_template_ids: string[];
 };
 
 export type InventoryInteractRequest = {

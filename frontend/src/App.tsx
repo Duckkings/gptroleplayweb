@@ -23,9 +23,12 @@ import { TeamPanel } from './components/TeamPanel';
 import { ActionCheckPanel } from './components/ActionCheckPanel';
 import { ActionCheckRollModal } from './components/ActionCheckRollModal';
 import { AuthPanel } from './components/AuthPanel';
+import { BattleModal } from './components/BattleModal';
+import { BattleStartDialog } from './components/BattleStartDialog';
 import {
   acceptQuest,
   bootstrapWorldMap,
+  continueBattleAi,
   checkEncounters,
   cancelPendingTurn,
   continuePendingTurn,
@@ -37,8 +40,11 @@ import {
   equipInventoryItem,
   evaluateAllQuests,
   evaluateFate,
+  executeAreaInteraction,
+  fillTemplateLibrary,
   generateFate,
   generateDebugTeammate,
+  getCurrentDebugBattle,
   getConsistencyStatus,
   getGameLogs,
   getGameLogSettings,
@@ -56,6 +62,7 @@ import {
   getRoleCard,
   getRolePool,
   getTeamState,
+  getTemplateLibraryStatus,
   getSavePath,
   getStorySnapshot,
   getTokenUsage,
@@ -66,6 +73,7 @@ import {
   leaveNpcFromTeam,
   moveToZone,
   npcChat,
+  endDebugBattle,
   sendTeamChat,
   pickSavePath,
   planActionCheck,
@@ -73,11 +81,14 @@ import {
   regenerateFate,
   rejectQuest,
   rejoinEncounter,
+  resolveBattleRoll,
   runActionCheck,
   moveToSubZone,
   renderWorldMap,
   runConsistencyCheck,
   saveConfig,
+  startDebugBattle,
+  submitBattlePlayerAction,
   sendChat,
   setGameLogSettings,
   setPlayerRuntime,
@@ -106,6 +117,9 @@ import {
   type ActionCheckPlan,
   type ApiDebugEntry,
   type ActionCheckResult,
+  type BattleRollPrompt,
+  type BattleRollResolution,
+  type BattleSandboxState,
   type EncounterEntry,
   type EncounterState,
   type AreaSnapshot,
@@ -127,6 +141,7 @@ import {
   type PlayerReactionCheck,
   type PlayerStaticData,
   type NpcRoleCard,
+  type TemplateLibraryStatusResponse,
   type NpcChatResponse,
   type Position,
   type ProviderConfigMap,
@@ -407,6 +422,7 @@ function App() {
   const [debugCollapsed, setDebugCollapsed] = useState(true);
   const [debugEntries, setDebugEntries] = useState<ApiDebugEntry[]>([]);
   const [savePath, setSvPath] = useState<PathStatus | null>(null);
+  const [templateLibraryStatus, setTemplateLibraryStatus] = useState<TemplateLibraryStatusResponse | null>(null);
 
   const [mapEnabled, setMapEnabled] = useState(false);
   const [mapPromptDialogOpen, setMapPromptDialogOpen] = useState(false);
@@ -472,6 +488,11 @@ function App() {
   const [questModalBusy, setQuestModalBusy] = useState(false);
   const [encounterModalBusy, setEncounterModalBusy] = useState(false);
   const [encounterModalEncounterId, setEncounterModalEncounterId] = useState<string | null>(null);
+  const [battleStartDialogOpen, setBattleStartDialogOpen] = useState(false);
+  const [battleStartBusy, setBattleStartBusy] = useState(false);
+  const [activeBattle, setActiveBattle] = useState<BattleSandboxState | null>(null);
+  const [battleBusy, setBattleBusy] = useState(false);
+  const [battleRollState, setBattleRollState] = useState<ActionCheckRollState>(DEFAULT_ACTION_CHECK_ROLL_STATE);
 
   const abortRef = useRef<AbortController | null>(null);
   const activeStreamRef = useRef<{ kind: 'main' } | { kind: 'npc'; npcId: string; previousMessages: ChatMessage[] } | null>(null);
@@ -659,7 +680,16 @@ function App() {
   }, [encounterState.encounters, encounterModalEncounterId]);
   const encounterModalOpen = Boolean(encounterModalEncounter);
   const blockingModalOpen = Boolean(
-    pendingQuest || mapPromptDialogOpen || aiWaiting || actionCheckRollState.open || reactionCheckRollState.open || encounterModalBusy || encounterModalOpen,
+    pendingQuest ||
+      mapPromptDialogOpen ||
+      aiWaiting ||
+      actionCheckRollState.open ||
+      reactionCheckRollState.open ||
+      battleRollState.open ||
+      battleStartDialogOpen ||
+      activeBattle ||
+      encounterModalBusy ||
+      encounterModalOpen,
   );
   const hasActionInput = actionInput.trim().length > 0;
   const hasSpeechInput = speechInput.trim().length > 0;
@@ -877,6 +907,9 @@ function App() {
   const resetReactionCheckRollState = () => {
     setReactionCheckRollState(DEFAULT_ACTION_CHECK_ROLL_STATE);
   };
+  const resetBattleRollState = () => {
+    setBattleRollState(DEFAULT_ACTION_CHECK_ROLL_STATE);
+  };
   const buildReactionPlan = (reaction: PlayerReactionCheck): ActionCheckPlan => ({
     ok: true,
     session_id: sessionId,
@@ -894,6 +927,55 @@ function App() {
     source_label: reaction.source_label,
     threatened_consequence: reaction.threatened_consequence,
   });
+  const buildBattleRollPlan = (prompt: BattleRollPrompt): ActionCheckPlan => ({
+    ok: true,
+    session_id: sessionId,
+    actor_role_id: prompt.actor_combatant_id,
+    actor_name: prompt.actor_name,
+    actor_kind: 'player',
+    action_type: prompt.roll_kind === 'attack' ? 'attack' : prompt.roll_kind === 'item_use' ? 'item_use' : 'check',
+    check_mode: prompt.roll_kind === 'reaction' ? 'reaction_save' : 'action',
+    requires_check: true,
+    ability_used: prompt.ability_used,
+    ability_modifier: prompt.ability_modifier,
+    dc: prompt.dc,
+    time_spent_min: 1,
+    check_task: prompt.check_task,
+    source_label: prompt.source_label ?? null,
+    threatened_consequence: prompt.threatened_consequence ?? null,
+  });
+  const buildBattleRollResult = (prompt: BattleRollPrompt, result: BattleRollResolution): ActionCheckResult => ({
+    ok: true,
+    session_id: sessionId,
+    actor_role_id: result.actor_combatant_id,
+    actor_name: result.actor_name,
+    actor_kind: 'player',
+    action_type: result.roll_kind === 'attack' ? 'attack' : result.roll_kind === 'item_use' ? 'item_use' : 'check',
+    check_mode: result.roll_kind === 'reaction' ? 'reaction_save' : 'action',
+    requires_check: true,
+    ability_used: result.ability_used,
+    ability_modifier: result.ability_modifier,
+    dc: result.dc,
+    check_task: prompt.check_task,
+    dice_roll: result.dice_roll,
+    total_score: result.total_score,
+    success: result.success,
+    critical: result.critical,
+    time_spent_min: 1,
+    narrative: result.summary,
+    applied_effects: [],
+    relation_tag_suggestion: null,
+    source_label: prompt.source_label ?? null,
+    threatened_consequence: prompt.threatened_consequence ?? null,
+  });
+  const openBattleRollModal = (battle: BattleSandboxState) => {
+    if (!battle.pending_roll) return;
+    setBattleRollState({
+      ...DEFAULT_ACTION_CHECK_ROLL_STATE,
+      open: true,
+      plan: buildBattleRollPlan(battle.pending_roll),
+    });
+  };
   const openPendingReaction = (response: PendingTurnContinueResponse) => {
     if (!response.pending_turn_id || !response.pending_reaction) return;
     pendingReactionResponseRef.current = null;
@@ -945,6 +1027,27 @@ function App() {
       }
     })();
   }, [sessionId, pendingReactionState, actionCheckRollState.open, reactionCheckRollState.open]);
+
+  useEffect(() => {
+    if (!sessionId || activeBattle || battleStartDialogOpen || battleRollState.open) return;
+    void (async () => {
+      try {
+        const current = await getCurrentDebugBattle(sessionId, report);
+        if (!current.battle) return;
+        setActiveBattle(current.battle);
+        if (current.battle.pending_roll) {
+          openBattleRollModal(current.battle);
+        }
+      } catch {
+        // Ignore restore failures.
+      }
+    })();
+  }, [sessionId, activeBattle, battleStartDialogOpen, battleRollState.open]);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    void refreshTemplateLibraryStatus();
+  }, [sessionId]);
 
   const refreshTokenUsage = async (sid: string = sessionId) => {
     try {
@@ -2786,6 +2889,15 @@ function App() {
     }
   };
 
+  const refreshTemplateLibraryStatus = async () => {
+    try {
+      const status = await getTemplateLibraryStatus(sessionId, report);
+      setTemplateLibraryStatus(status);
+    } catch {
+      // Ignore template library status failures during passive refresh.
+    }
+  };
+
   const onInitAreaClock = async () => {
     try {
       await initWorldClock({ session_id: sessionId, calendar: 'fantasy_default' }, report);
@@ -2823,6 +2935,31 @@ function App() {
     }
   };
 
+  const inferSceneActionKind = (prompt: string): string => {
+    const text = prompt.trim();
+    if (!text) return 'inspect';
+    if (/(拾起|拿起|捡起|收起|带走|pickup|take)/i.test(text)) return 'pickup';
+    if (/(打开|搜索|翻找|open|search)/i.test(text)) return text.includes('搜索') || /search/i.test(text) ? 'search' : 'open';
+    if (/(全部拿走|take all)/i.test(text)) return 'take_all';
+    if (/(放进|塞进|put in)/i.test(text)) return 'put_in';
+    if (/(装备|穿上|拿在手里|equip)/i.test(text)) return 'equip';
+    if (/(丢下|drop)/i.test(text)) return 'drop';
+    if (/(交给|give)/i.test(text)) return 'give';
+    if (/(使用|use)/i.test(text)) return 'use';
+    if (/(触发|拉下|按下|trigger)/i.test(text)) return 'trigger';
+    if (/(重置|reset)/i.test(text)) return 'reset';
+    if (/(解除|disable|拆除)/i.test(text)) return 'disable';
+    if (/(进入|穿过|通过|enter)/i.test(text)) return 'enter';
+    if (/(强行打开|force)/i.test(text)) return 'force_open';
+    if (/(点燃|ignite)/i.test(text)) return 'ignite';
+    if (/(利用|exploit)/i.test(text)) return 'exploit';
+    if (/(解除陷阱|拆陷阱|disarm)/i.test(text)) return 'disarm';
+    if (/(收集证据|取证|collect evidence)/i.test(text)) return 'collect_evidence';
+    if (/(标记|mark)/i.test(text)) return 'mark';
+    if (/(给npc看|展示|show)/i.test(text)) return 'show_to_npc';
+    return 'inspect';
+  };
+
   const onUseAreaItem = async (interactionId: string, itemName: string) => {
     if (encounterEngaged) {
       setError('遭遇进行中，请直接在主聊天描述动作或发言。');
@@ -2831,20 +2968,22 @@ function App() {
     const prompt = window.prompt(`你想如何使用/观察【${itemName}】？`);
     if (!prompt || !prompt.trim()) return;
     try {
-      const result = await performActionCheckWithRoll({
-        action_type: 'item_use',
-        action_prompt: `interaction_id=${interactionId}; item=${itemName}; prompt=${prompt.trim()}`,
-        actor_role_id: playerStatic.player_id,
-        source_context: 'area_item',
-        post_close_output: 'main_chat',
-        resolution_context: 'standalone',
-        return_state_sync: true,
-        post_trigger_kind: 'quest_rule',
-      });
-      if (!result) return;
-      setLastActionResult(result);
-      await publishActionCheckOutcome(result, 'area_item', 'main_chat');
-      pushTimeNotice(result.time_spent_min, `物品使用:${itemName}`);
+      const actionKind = inferSceneActionKind(prompt);
+      const response = await executeAreaInteraction(
+        {
+          session_id: sessionId,
+          interaction_id: interactionId,
+          action_kind: actionKind,
+          actor_kind: 'player',
+          prompt: prompt.trim(),
+          config,
+        },
+        report,
+      );
+      applyMapStateSync(response.state_sync, sessionId);
+      await syncEncounterLaneAfterSceneEvents(response.scene_events ?? []);
+      setMainOutput('system_output', response.reply || response.message, response.scene_events ?? []);
+      pushTimeNotice(1, `场景交互:${itemName}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : '物品使用失败');
     }
@@ -3044,6 +3183,167 @@ function App() {
       await refreshTokenUsage(sessionId);
     } finally {
       setAiWaiting(false);
+    }
+  };
+
+  const onFillTemplateLibrary = async () => {
+    setAiWaitingText('正在请求 AI 补全模板库...');
+    setAiWaiting(true);
+    try {
+      const response = await fillTemplateLibrary({ session_id: sessionId, config }, report);
+      setTemplateLibraryStatus(response);
+      setConfigHint(
+        `模板库已更新：新增 物品${response.appended_item_definition_ids.length} / 装备${response.appended_equipment_definition_ids.length} / 交互${response.appended_interactable_template_ids.length}，补空字段 ${response.updated_item_definition_ids.length + response.updated_equipment_definition_ids.length + response.updated_interactable_template_ids.length} 处。`,
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'AI 填充模板库失败');
+    } finally {
+      setAiWaiting(false);
+    }
+  };
+
+  const syncBattleState = (battle: BattleSandboxState | null) => {
+    setActiveBattle(battle);
+    if (!battle?.pending_roll) {
+      resetBattleRollState();
+      return;
+    }
+    openBattleRollModal(battle);
+  };
+
+  const onOpenBattleStart = () => {
+    setBattleStartDialogOpen(true);
+  };
+
+  const onConfirmBattleStart = async (payload: {
+    mode: 'template' | 'ai_generated';
+    template_group?: string | null;
+    ai_scale: 'single' | 'squad';
+    ai_strength: 'weak' | 'standard' | 'strong';
+    ai_pacing: 'step' | 'auto';
+    config?: AppConfig | null;
+  }) => {
+    try {
+      setBattleStartBusy(true);
+      const response = await startDebugBattle(
+        {
+          session_id: sessionId,
+          mode: payload.mode,
+          template_group: payload.template_group ?? null,
+          ai_scale: payload.ai_scale,
+          ai_strength: payload.ai_strength,
+          ai_pacing: payload.ai_pacing,
+          config: payload.config ?? null,
+        },
+        report,
+      );
+      setBattleStartDialogOpen(false);
+      syncBattleState(response.battle);
+      setConfigHint('战斗测试已启动。');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '启动战斗测试失败');
+    } finally {
+      setBattleStartBusy(false);
+    }
+  };
+
+  const onBattleAction = async (payload: {
+    action_kind: 'attack' | 'defend' | 'move' | 'disengage' | 'escape' | 'use_item' | 'observe' | 'end_turn';
+    target_combatant_id?: string | null;
+    destination_band?: 'engaged' | 'near' | 'far' | 'remote' | null;
+    item_id?: string | null;
+  }) => {
+    if (!activeBattle) return;
+    try {
+      setBattleBusy(true);
+      const response = await submitBattlePlayerAction(
+        activeBattle.battle_id,
+        {
+          session_id: sessionId,
+          action_kind: payload.action_kind,
+          target_combatant_id: payload.target_combatant_id ?? null,
+          destination_band: payload.destination_band ?? null,
+          item_id: payload.item_id ?? null,
+        },
+        report,
+      );
+      syncBattleState(response.battle);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '战斗动作提交失败');
+    } finally {
+      setBattleBusy(false);
+    }
+  };
+
+  const onBattleContinueAi = async (aiPacing: 'step' | 'auto') => {
+    if (!activeBattle) return;
+    try {
+      setBattleBusy(true);
+      const response = await continueBattleAi(activeBattle.battle_id, { session_id: sessionId, ai_pacing: aiPacing }, report);
+      syncBattleState(response.battle);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '推进 AI 行动失败');
+    } finally {
+      setBattleBusy(false);
+    }
+  };
+
+  const onSetBattleAiPacing = (aiPacing: 'step' | 'auto') => {
+    setActiveBattle((prev) => (prev ? { ...prev, ui_flags: { ...prev.ui_flags, ai_pacing: aiPacing } } : prev));
+  };
+
+  const onTriggerBattleRoll = () => {
+    if (battleRollState.phase !== 'ready' || !activeBattle?.pending_roll) return;
+    const prompt = activeBattle.pending_roll;
+    const rollValue = Math.floor(Math.random() * 20) + 1;
+    const rotation = {
+      x: Math.floor(Math.random() * 720),
+      y: Math.floor(Math.random() * 720),
+      z: Math.floor(Math.random() * 720),
+    };
+    setBattleRollState((current) => ({ ...current, phase: 'rolling', rollValue, rotation }));
+    window.setTimeout(async () => {
+      try {
+        setBattleRollState((current) => ({ ...current, phase: 'resolving', rollValue }));
+        const response = await resolveBattleRoll(activeBattle.battle_id, { session_id: sessionId, forced_dice_roll: rollValue }, report);
+        syncBattleState(response.battle);
+        setBattleRollState((current) => ({
+          ...current,
+          phase: 'resolved',
+          result: response.roll_result ? buildBattleRollResult(prompt, response.roll_result) : null,
+        }));
+      } catch (e) {
+        const message = e instanceof Error ? e.message : '战斗掷骰失败';
+        setBattleRollState((current) => ({ ...current, phase: 'error', errorMessage: message }));
+      }
+    }, 900);
+  };
+
+  const onCloseBattleRoll = () => {
+    resetBattleRollState();
+    if (activeBattle?.status === 'ended') {
+      setConfigHint('战斗已结束，可关闭战斗窗口查看结果。');
+    }
+  };
+
+  const onEndBattle = async () => {
+    if (!activeBattle) return;
+    if (activeBattle.status === 'ended' || activeBattle.status === 'cancelled') {
+      setActiveBattle(null);
+      resetBattleRollState();
+      setConfigHint('战斗测试已关闭。');
+      return;
+    }
+    try {
+      setBattleBusy(true);
+      await endDebugBattle(activeBattle.battle_id, { session_id: sessionId, ai_pacing: activeBattle.ui_flags.ai_pacing }, report);
+      setActiveBattle(null);
+      resetBattleRollState();
+      setConfigHint('战斗测试已结束，日志已写入 sandbox/debug。');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '结束战斗测试失败');
+    } finally {
+      setBattleBusy(false);
     }
   };
 
@@ -3617,6 +3917,8 @@ function App() {
         onOpenNpcPool={() => void onOpenNpcPool()}
         onOpenTeamPanel={() => void onOpenTeamPanel()}
         onGenerateDebugTeammate={() => void onGenerateDebugTeamMember()}
+        onOpenBattleStart={onOpenBattleStart}
+        onFillTemplateLibrary={() => void onFillTemplateLibrary()}
         onOpenActionPanel={() => void onOpenActionPanel()}
         onGenerateQuest={() => void onGenerateQuest()}
         onGenerateFate={() => void onGenerateFate()}
@@ -3629,6 +3931,7 @@ function App() {
         onSelectSaveFile={(file) => void onSelectSaveFile(file)}
         onClearSave={() => void onClearSave()}
         onPickSavePath={() => void onPickSavePath()}
+        templateLibraryStatus={templateLibraryStatus}
       />
 
       <section className="card chat-card">
@@ -4011,6 +4314,20 @@ function App() {
         </div>
       )}
 
+      <BattleStartDialog
+        open={battleStartDialogOpen}
+        busy={battleStartBusy}
+        currentZoneName={currentZone?.name ?? areaSnapshot?.current_zone_id ?? '未知大区块'}
+        currentSubZoneName={currentSubZone?.name ?? areaSnapshot?.current_sub_zone_id ?? '未知子区块'}
+        subZoneDescription={currentSubZone?.description ?? ''}
+        dangerScore={currentZoneMetric?.danger_score}
+        reputationScore={currentZoneMetric?.reputation_score}
+        onClose={() => setBattleStartDialogOpen(false)}
+        onConfirm={onConfirmBattleStart}
+        sessionId={sessionId}
+        configPayload={config}
+      />
+
       {aiWaiting && (
         <div className="modal-mask">
           <div className="modal-card">
@@ -4032,6 +4349,21 @@ function App() {
         roleCards={npcPoolItems}
         busy={encounterModalBusy}
         onContinue={onCloseEncounterModal}
+      />
+
+      <BattleModal
+        open={Boolean(activeBattle)}
+        battle={activeBattle}
+        busy={battleBusy}
+        onClose={() => {
+          if (activeBattle?.status === 'ended' || activeBattle?.status === 'cancelled') {
+            setActiveBattle(null);
+          }
+        }}
+        onAction={onBattleAction}
+        onContinueAi={onBattleContinueAi}
+        onSetAiPacing={onSetBattleAiPacing}
+        onEndBattle={() => void onEndBattle()}
       />
 
       <QuestInspectModal quest={questInspectOpen ? currentQuest : null} onClose={() => setQuestInspectOpen(false)} />
@@ -4076,6 +4408,24 @@ function App() {
         failureHint={pendingReactionState?.pending_reaction.failure_hint}
         onTrigger={onTriggerReactionCheckRoll}
         onClose={onCloseReactionCheckRoll}
+      />
+
+      <ActionCheckRollModal
+        open={battleRollState.open}
+        phase={battleRollState.phase}
+        plan={battleRollState.plan}
+        rollValue={battleRollState.rollValue}
+        result={battleRollState.result}
+        errorMessage={battleRollState.errorMessage}
+        rotation={battleRollState.rotation}
+        title={activeBattle?.pending_roll?.roll_kind === 'reaction' ? '战斗反应检定' : '战斗掷骰'}
+        subtitle={activeBattle?.pending_roll?.check_task ?? '点击骰子结算当前战斗检定。'}
+        sourceLabel={activeBattle?.pending_roll?.source_label ?? undefined}
+        threatenedConsequence={activeBattle?.pending_roll?.threatened_consequence ?? undefined}
+        successHint={activeBattle?.pending_roll?.success_hint ?? undefined}
+        failureHint={activeBattle?.pending_roll?.failure_hint ?? undefined}
+        onTrigger={onTriggerBattleRoll}
+        onClose={onCloseBattleRoll}
       />
 
       <div className="time-notice-stack">

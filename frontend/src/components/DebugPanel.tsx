@@ -1,5 +1,5 @@
 ﻿import { useRef } from 'react';
-import type { ApiDebugEntry, PathStatus } from '../types/app';
+import type { ApiDebugEntry, PathStatus, TemplateLibraryStatusResponse } from '../types/app';
 
 type Props = {
   collapsed: boolean;
@@ -13,6 +13,8 @@ type Props = {
   onOpenNpcPool: () => void;
   onOpenTeamPanel: () => void;
   onGenerateDebugTeammate: () => void;
+  onOpenBattleStart: () => void;
+  onFillTemplateLibrary: () => void;
   onOpenActionPanel: () => void;
   onGenerateQuest: () => void;
   onGenerateFate: () => void;
@@ -25,6 +27,7 @@ type Props = {
   onSelectSaveFile: (file: File) => void;
   onClearSave: () => void;
   onPickSavePath: () => void;
+  templateLibraryStatus: TemplateLibraryStatusResponse | null;
 };
 
 export function DebugPanel({
@@ -39,6 +42,8 @@ export function DebugPanel({
   onOpenNpcPool,
   onOpenTeamPanel,
   onGenerateDebugTeammate,
+  onOpenBattleStart,
+  onFillTemplateLibrary,
   onOpenActionPanel,
   onGenerateQuest,
   onGenerateFate,
@@ -51,6 +56,7 @@ export function DebugPanel({
   onSelectSaveFile,
   onClearSave,
   onPickSavePath,
+  templateLibraryStatus,
 }: Props) {
   const saveInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -68,6 +74,8 @@ export function DebugPanel({
             <button onClick={onOpenNpcPool}>NPC角色池</button>
             <button onClick={onOpenTeamPanel}>当前队伍</button>
             <button onClick={onGenerateDebugTeammate}>生成调试队友</button>
+            <button onClick={onOpenBattleStart}>开始战斗测试</button>
+            <button onClick={onFillTemplateLibrary}>AI 填充模板库</button>
             <button onClick={onOpenActionPanel}>行为检定</button>
             <button onClick={onGenerateQuest}>生成任务</button>
             <button onClick={onGenerateFate}>生成命运线</button>
@@ -95,6 +103,14 @@ export function DebugPanel({
           <div className="debug-paths">
             <p>配置路径: {configPath?.path ?? '未加载'}</p>
             <p>存档路径: {savePath?.path ?? '未加载'}</p>
+            {templateLibraryStatus && (
+              <>
+                <p>
+                  模板库: 物品 {templateLibraryStatus.item_definition_count} / 装备 {templateLibraryStatus.equipment_definition_count} / 交互 {templateLibraryStatus.interactable_template_count}
+                </p>
+                <p>模板库目录: {templateLibraryStatus.template_dir}</p>
+              </>
+            )}
           </div>
 
           <section className="debug-entries">

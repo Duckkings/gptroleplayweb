@@ -40,6 +40,16 @@ from app.models.schemas import (
     AreaMoveSubZoneRequest,
     BehaviorDescribeRequest,
     BehaviorDescribeResponse,
+    BattleActionRequest,
+    BattleActionResponse,
+    BattleContinueAiRequest,
+    BattleContinueAiResponse,
+    BattleCurrentResponse,
+    BattleEndResponse,
+    BattleResolveRollRequest,
+    BattleResolveRollResponse,
+    BattleStartRequest,
+    BattleStartResponse,
     ChatConfig,
     FateCurrentResponse,
     FateEvaluateRequest,
@@ -51,6 +61,8 @@ from app.models.schemas import (
     ConsistencyStatusResponse,
     EntityIndexResponse,
     InventoryEquipRequest,
+    InventoryConsumeRequest,
+    InventoryGrantRequest,
     InventoryInteractRequest,
     InventoryInteractResponse,
     InventoryMutationResponse,
@@ -117,6 +129,9 @@ from app.models.schemas import (
     TeamChatResponse,
     TeamMutationResponse,
     TeamStateResponse,
+    TemplateLibraryFillRequest,
+    TemplateLibraryFillResponse,
+    TemplateLibraryStatusResponse,
     TokenUsageResponse,
     ValidateConfigResponse,
     ValidateError,
@@ -125,6 +140,14 @@ from app.models.schemas import (
     NpcKnowledgeResponse,
 )
 from app.services.ai_adapter import discover_models, resolve_model_profile
+from app.services.battle_service import (
+    end_debug_battle,
+    get_current_debug_battle,
+    handle_continue_battle_ai,
+    handle_player_battle_action,
+    handle_resolve_battle_roll,
+    start_debug_battle,
+)
 from app.services.chat_service import MissingAPIKeyError
 from app.services.stream_chat_service import (
     StreamCancelledError,
@@ -144,6 +167,7 @@ from app.services.map_flow_service import (
     run_action_check_with_state_sync,
 )
 from app.services.pending_turn_service import cancel_pending_turn, load_pending_turn
+from app.services.template_library_debug_service import fill_template_library, get_template_library_status_response
 from app.services.world_service import (
     AIBehaviorError,
     AIRegionGenerationError,
@@ -160,8 +184,10 @@ from app.services.world_service import (
     get_game_log_settings,
     get_game_logs,
     get_current_save,
+    get_scene_interactables,
     get_player_runtime,
     get_player_static,
+    get_template_library_status_payload,
     get_role_card,
     get_role_pool,
     add_player_buff,
@@ -189,6 +215,8 @@ from app.services.world_service import (
     set_player_runtime,
     set_player_static,
     inventory_equip,
+    inventory_consume,
+    inventory_grant,
     inventory_interact,
     inventory_unequip,
     unequip_player_item,
@@ -511,6 +539,46 @@ async def pending_turn_current(session_id: str) -> PendingTurnContinueResponse |
         pending_reaction=state.pending_reaction,
         npc_role_id=state.npc_role_id,
     )
+
+
+@router.post("/battle/debug/start", response_model=BattleStartResponse)
+async def battle_debug_start(payload: BattleStartRequest) -> BattleStartResponse:
+    return start_debug_battle(payload)
+
+
+@router.get("/battle/debug/current", response_model=BattleCurrentResponse)
+async def battle_debug_current(session_id: str) -> BattleCurrentResponse:
+    return get_current_debug_battle(session_id)
+
+
+@router.post("/battle/{battle_id}/player-action", response_model=BattleActionResponse)
+async def battle_player_action(battle_id: str, payload: BattleActionRequest) -> BattleActionResponse:
+    battle = handle_player_battle_action(
+        payload.session_id,
+        battle_id,
+        action_kind=payload.action_kind,
+        target_combatant_id=payload.target_combatant_id,
+        destination_band=payload.destination_band,
+        item_id=payload.item_id,
+    )
+    return BattleActionResponse(session_id=payload.session_id, battle=battle)
+
+
+@router.post("/battle/{battle_id}/continue-ai", response_model=BattleContinueAiResponse)
+async def battle_continue_ai(battle_id: str, payload: BattleContinueAiRequest) -> BattleContinueAiResponse:
+    battle = handle_continue_battle_ai(payload.session_id, battle_id, ai_pacing=payload.ai_pacing)
+    return BattleContinueAiResponse(session_id=payload.session_id, battle=battle)
+
+
+@router.post("/battle/{battle_id}/resolve-roll", response_model=BattleResolveRollResponse)
+async def battle_resolve_roll(battle_id: str, payload: BattleResolveRollRequest) -> BattleResolveRollResponse:
+    battle, result = handle_resolve_battle_roll(payload.session_id, battle_id, forced_dice_roll=payload.forced_dice_roll)
+    return BattleResolveRollResponse(session_id=payload.session_id, battle=battle, roll_result=result)
+
+
+@router.post("/battle/{battle_id}/end", response_model=BattleEndResponse)
+async def battle_end(battle_id: str, payload: BattleContinueAiRequest) -> BattleEndResponse:
+    return end_debug_battle(payload.session_id, battle_id)
 
 
 def _require_user() -> str:
@@ -966,6 +1034,32 @@ async def inventory_interact_item(payload: InventoryInteractRequest) -> Inventor
         raise HTTPException(status_code=409, detail=str(exc))
 
 
+@router.post("/inventory/grant", response_model=InventoryMutationResponse)
+async def inventory_grant_item(payload: InventoryGrantRequest) -> InventoryMutationResponse:
+    try:
+        return inventory_grant(payload)
+    except KeyError as exc:
+        code = str(exc)
+        if "ROLE_NOT_FOUND" in code:
+            raise HTTPException(status_code=404, detail="role not found")
+        raise HTTPException(status_code=404, detail="item not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/inventory/consume", response_model=InventoryMutationResponse)
+async def inventory_consume_item(payload: InventoryConsumeRequest) -> InventoryMutationResponse:
+    try:
+        return inventory_consume(payload)
+    except KeyError as exc:
+        code = str(exc)
+        if "ROLE_NOT_FOUND" in code:
+            raise HTTPException(status_code=404, detail="role not found")
+        raise HTTPException(status_code=404, detail="item not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
 @router.post("/player/buffs/add", response_model=PlayerStaticData)
 async def player_buff_add(session_id: str, payload: PlayerBuffAddRequest) -> PlayerStaticData:
     return add_player_buff(session_id, payload)
@@ -1254,6 +1348,24 @@ async def world_area_execute_interaction(payload: AreaExecuteInteractionRequest)
         raise HTTPException(status_code=404, detail="interaction not found")
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.get("/debug/template-library/status", response_model=TemplateLibraryStatusResponse)
+async def debug_template_library_status(session_id: str) -> TemplateLibraryStatusResponse:
+    try:
+        return get_template_library_status_response(session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/debug/template-library/fill", response_model=TemplateLibraryFillResponse)
+async def debug_template_library_fill(payload: TemplateLibraryFillRequest) -> TemplateLibraryFillResponse:
+    try:
+        return fill_template_library(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except APIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
 
 
 @router.post("/actions/check/plan", response_model=ActionCheckPlanResponse)
