@@ -32,10 +32,18 @@ class SubZoneDebugConfig(BaseModel):
         return self
 
 
+class PublicSceneConfig(BaseModel):
+    active_actor_limit: int = Field(default=8, ge=1, le=16)
+    idle_actor_limit: int = Field(default=2, ge=1, le=8)
+    max_world_pushes: int = Field(default=2, ge=0, le=4)
+    uncertain_actions_require_check: bool = True
+
+
 class ChatRuntimeConfig(BaseModel):
     temperature: float | None = Field(default=None, ge=0, le=2)
     max_tokens: int | None = Field(default=None, gt=0)
     max_completion_tokens: int | None = Field(default=None, gt=0)
+    structured_output_mode: Literal["auto", "legacy_tags"] = "auto"
 
 
 AIProvider = Literal["openai", "deepseek", "gemini"]
@@ -50,6 +58,11 @@ def _normalize_runtime_payload(raw: Any) -> dict[str, Any]:
         runtime.pop("max_tokens", None)
     if "max_completion_tokens" in runtime and runtime["max_completion_tokens"] in ("", None):
         runtime.pop("max_completion_tokens", None)
+    mode = str(runtime.get("structured_output_mode") or "").strip().lower()
+    if mode in {"auto", "legacy_tags"}:
+        runtime["structured_output_mode"] = mode
+    elif "structured_output_mode" in runtime:
+        runtime.pop("structured_output_mode", None)
     return runtime
 
 
@@ -115,6 +128,7 @@ class ChatConfig(BaseModel):
     gm_prompt: str = Field(..., min_length=1)
     speech_time_per_50_tokens_min: int = Field(default=1, ge=1, le=30)
     sub_zone_debug: SubZoneDebugConfig = Field(default_factory=SubZoneDebugConfig)
+    public_scene: PublicSceneConfig = Field(default_factory=PublicSceneConfig)
     ui: UIConfig | None = None
 
     @model_validator(mode="before")
@@ -264,6 +278,9 @@ class SceneEvent(BaseModel):
         "encounter_resolution",
         "encounter_background",
         "encounter_situation_update",
+        "encounter_world_push",
+        "player_reaction_triggered",
+        "player_reaction_result",
     ]
     actor_role_id: str = Field(default="", min_length=0)
     actor_name: str = Field(default="", min_length=0)
@@ -280,6 +297,8 @@ class ChatResponse(BaseModel):
     scene_events: list[SceneEvent] = Field(default_factory=list)
     time_spent_min: int = 0
     archived_sub_zone_turn_id: str | None = None
+    main_turn_summary: "MainTurnSummary | None" = None
+    current_zone_metric: "ZoneMetricEntry | None" = None
 
 
 class HealthResponse(BaseModel):
@@ -289,6 +308,129 @@ class HealthResponse(BaseModel):
 
 class PathConfig(BaseModel):
     path: str = Field(..., min_length=1)
+
+
+class MainTurnSummary(BaseModel):
+    player_situation_delta: int = 0
+    public_actor_situation_delta_total: int = 0
+    world_push_situation_delta_total: int = 0
+    turn_total_delta: int = 0
+    situation_value_before: int | None = None
+    situation_value_after: int | None = None
+
+
+class PlayerReactionCheck(BaseModel):
+    reaction_id: str = Field(..., min_length=1)
+    source_kind: Literal["npc_action", "environment", "world_push", "encounter_effect", "npc_chat", "map_arrival"]
+    source_actor_id: str | None = None
+    source_actor_name: str | None = None
+    source_label: str = Field(..., min_length=1)
+    trigger_summary: str = Field(..., min_length=1)
+    threatened_consequence: str = Field(..., min_length=1)
+    ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"]
+    dc: int = Field(..., ge=5, le=30)
+    check_task: str = Field(..., min_length=1)
+    resolution_context: Literal["main_chat", "encounter", "npc_chat", "map_move"]
+    success_hint: str = Field(default="", min_length=0)
+    failure_hint: str = Field(default="", min_length=0)
+    critical_success_hint: str = Field(default="", min_length=0)
+    critical_failure_hint: str = Field(default="", min_length=0)
+
+
+class PlayerReactionCheckSeed(BaseModel):
+    source_kind: Literal["npc_action", "environment", "world_push", "encounter_effect", "npc_chat", "map_arrival"]
+    source_actor_id: str | None = None
+    source_actor_name: str | None = None
+    source_label: str = Field(..., min_length=1)
+    trigger_summary: str = Field(..., min_length=1)
+    threatened_consequence: str = Field(..., min_length=1)
+    ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"]
+    dc: int = Field(..., ge=5, le=30)
+    check_task: str = Field(..., min_length=1)
+    success_hint: str = Field(default="", min_length=0)
+    failure_hint: str = Field(default="", min_length=0)
+    critical_success_hint: str = Field(default="", min_length=0)
+    critical_failure_hint: str = Field(default="", min_length=0)
+
+
+class MainTurnSegment(BaseModel):
+    reply_text: str = Field(default="", min_length=0)
+    public_actor_updates: list[dict[str, Any]] = Field(default_factory=list)
+    public_round_resolution: str = Field(default="", min_length=0)
+    encounter_update: dict[str, Any] = Field(default_factory=dict)
+    player_reaction_check: PlayerReactionCheckSeed | None = None
+    segment_status: Literal["completed", "awaiting_reaction"] = "completed"
+
+    @model_validator(mode="after")
+    def _validate_reaction_checkpoint(self) -> "MainTurnSegment":
+        if self.segment_status == "awaiting_reaction" and self.player_reaction_check is None:
+            raise ValueError("awaiting_reaction requires player_reaction_check")
+        if self.segment_status == "completed" and self.player_reaction_check is not None:
+            raise ValueError("completed segment must not include player_reaction_check")
+        return self
+
+
+class NpcChatBundleSegment(BaseModel):
+    action_reaction: str = Field(default="", min_length=0)
+    speech_reply: str = Field(default="", min_length=0)
+    relation_tag: Literal["ally", "friendly", "met", "neutral", "wary", "hostile"] = "neutral"
+
+
+class NpcChatSegment(BaseModel):
+    reply_text: str = Field(default="", min_length=0)
+    npc_bundle: NpcChatBundleSegment = Field(default_factory=NpcChatBundleSegment)
+    player_reaction_check: PlayerReactionCheckSeed | None = None
+    segment_status: Literal["completed", "awaiting_reaction"] = "completed"
+
+    @model_validator(mode="after")
+    def _validate_reaction_checkpoint(self) -> "NpcChatSegment":
+        if self.segment_status == "awaiting_reaction" and self.player_reaction_check is None:
+            raise ValueError("awaiting_reaction requires player_reaction_check")
+        if self.segment_status == "completed" and self.player_reaction_check is not None:
+            raise ValueError("completed segment must not include player_reaction_check")
+        return self
+
+
+class PendingTurnState(BaseModel):
+    pending_turn_id: str = Field(..., min_length=1)
+    session_id: str = Field(..., min_length=1)
+    flow_kind: Literal["main_chat", "encounter", "npc_chat", "map_move"]
+    status: Literal["awaiting_reaction", "cancelled", "completed"] = "awaiting_reaction"
+    staged_save: dict[str, Any] = Field(default_factory=dict)
+    original_request: dict[str, Any] = Field(default_factory=dict)
+    accumulated_reply_text: str = Field(default="", min_length=0)
+    accumulated_scene_events: list[SceneEvent] = Field(default_factory=list)
+    accumulated_tool_events: list[ToolEvent] = Field(default_factory=list)
+    time_spent_min: int = 0
+    pending_reaction: PlayerReactionCheck
+    continuation_index: int = 0
+    usage: Usage = Field(default_factory=Usage)
+    npc_role_id: str | None = None
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class PendingTurnContinueRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    pending_turn_id: str = Field(..., min_length=1)
+    forced_dice_roll: int = Field(..., ge=1, le=20)
+    config: ChatConfig | None = None
+
+
+class PendingTurnContinueResponse(BaseModel):
+    session_id: str
+    pending_turn_id: str | None = None
+    flow_kind: Literal["main_chat", "encounter", "npc_chat", "map_move"]
+    status: Literal["awaiting_reaction", "completed", "cancelled"]
+    reply_text: str = Field(default="", min_length=0)
+    scene_events: list[SceneEvent] = Field(default_factory=list)
+    tool_events: list[ToolEvent] = Field(default_factory=list)
+    main_turn_summary: "MainTurnSummary | None" = None
+    current_zone_metric: "ZoneMetricEntry | None" = None
+    pending_reaction: PlayerReactionCheck | None = None
+    reaction_result: "ActionCheckResponse | None" = None
+    archived_sub_zone_turn_id: str | None = None
+    npc_role_id: str | None = None
 
 
 class PathStatusResponse(BaseModel):
@@ -381,6 +523,7 @@ class SubZoneChatTurnEvent(BaseModel):
         "companion_story_surface",
         "reputation_update",
         "encounter_situation_update",
+        "encounter_world_push",
     ] = "system_notice"
     actor_type: Literal["npc", "team", "encounter_temp_npc", "system"] = "system"
     actor_id: str = Field(default="", min_length=0)
@@ -759,6 +902,25 @@ class ReputationState(BaseModel):
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
+class ZoneMetricEntry(BaseModel):
+    zone_id: str = Field(..., min_length=1)
+    zone_name: str = Field(..., min_length=1)
+    reputation_score: int = Field(default=50, ge=0, le=100)
+    reputation_band: Literal["hostile", "cold", "neutral", "trusted", "favored"] = "neutral"
+    danger_score: int = Field(default=50, ge=0, le=100)
+    danger_band: Literal["low", "medium", "high"] = "medium"
+    reputation_reasons: list[str] = Field(default_factory=list)
+    danger_reasons: list[str] = Field(default_factory=list)
+    seed_source: Literal["ai_generated", "migration_backfill", "system_default"] = "system_default"
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class ZoneMetricState(BaseModel):
+    version: str = Field(default="0.1.0")
+    entries: list[ZoneMetricEntry] = Field(default_factory=list)
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
 class StoryQuestSummary(BaseModel):
     quest_id: str = Field(..., min_length=1)
     title: str = Field(..., min_length=1)
@@ -815,6 +977,8 @@ class EncounterOutcomeChange(BaseModel):
 class EncounterOutcomePackage(BaseModel):
     result: Literal["success", "failure"] = "success"
     reputation_delta: int = 0
+    zone_reputation_delta: int = 0
+    zone_danger_delta: int = 0
     npc_relation_deltas: list[EncounterOutcomeChange] = Field(default_factory=list)
     team_deltas: list[EncounterOutcomeChange] = Field(default_factory=list)
     item_rewards: list[InventoryItem] = Field(default_factory=list)
@@ -828,6 +992,7 @@ class PublicSceneState(BaseModel):
     current_zone_id: str | None = None
     current_sub_zone_id: str | None = None
     current_reputation: SubZoneReputationEntry | None = None
+    current_zone_metric: ZoneMetricEntry | None = None
     visible_npcs: list[StoryNpcSummary] = Field(default_factory=list)
     team_members: list[StoryNpcSummary] = Field(default_factory=list)
     candidate_actors: list[PublicSceneActorCandidate] = Field(default_factory=list)
@@ -873,7 +1038,7 @@ class TeamReaction(BaseModel):
     reaction_id: str = Field(..., min_length=1)
     member_role_id: str = Field(..., min_length=1)
     member_name: str = Field(..., min_length=1)
-    trigger_kind: Literal["main_chat", "npc_chat", "zone_move", "sub_zone_move", "action_check", "team_chat", "public_chat", "encounter", "system"] = "system"
+    trigger_kind: Literal["main_chat", "npc_chat", "zone_move", "sub_zone_move", "action_check", "team_chat", "public_chat", "public_turn", "encounter", "system"] = "system"
     content: str = Field(..., min_length=1)
     affinity_delta: int = 0
     trust_delta: int = 0
@@ -884,6 +1049,22 @@ class TeamState(BaseModel):
     version: str = Field(default="0.1.0")
     members: list[TeamMember] = Field(default_factory=list)
     reactions: list[TeamReaction] = Field(default_factory=list)
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class TravelCompanionEntry(BaseModel):
+    role_id: str = Field(..., min_length=1)
+    role_name: str = Field(..., min_length=1)
+    source_kind: Literal["npc", "team"] = "npc"
+    destination_zone_id: str = Field(..., min_length=1)
+    destination_sub_zone_id: str | None = None
+    follow_until_arrival: bool = True
+    declared_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class TravelCompanionState(BaseModel):
+    version: str = Field(default="0.1.0")
+    companions: list[TravelCompanionEntry] = Field(default_factory=list)
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -900,6 +1081,8 @@ class SaveFile(BaseModel):
     role_pool: list[NpcRoleCard] = Field(default_factory=list)
     team_state: TeamState = Field(default_factory=TeamState)
     reputation_state: ReputationState = Field(default_factory=ReputationState)
+    zone_metric_state: ZoneMetricState = Field(default_factory=ZoneMetricState)
+    travel_companion_state: TravelCompanionState = Field(default_factory=TravelCompanionState)
     quest_state: QuestState = Field(default_factory=lambda: QuestState())
     encounter_state: EncounterState = Field(default_factory=lambda: EncounterState())
     fate_state: FateState = Field(default_factory=lambda: FateState())
@@ -934,10 +1117,19 @@ class RegionGenerateResponse(BaseModel):
     zones: list[Zone]
 
 
+class MapRenderPayload(BaseModel):
+    viewport: dict[str, int]
+    nodes: list["RenderNode"]
+    sub_nodes: list["RenderSubNode"] = Field(default_factory=list)
+    circles: list["RenderCircle"] = Field(default_factory=list)
+    player_marker: dict[str, int]
+
+
 class RenderMapRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     zones: list[Zone] = Field(default_factory=list)
     player_position: Position
+    zone_metric_state: ZoneMetricState | None = None
 
 
 class RenderNode(BaseModel):
@@ -960,6 +1152,9 @@ class RenderCircle(BaseModel):
     center_x: int
     center_y: int
     radius_m: int
+    danger_score: int | None = None
+    danger_band: Literal["low", "medium", "high"] | None = None
+    fill_color: str | None = None
 
 
 class RenderMapResponse(BaseModel):
@@ -969,6 +1164,11 @@ class RenderMapResponse(BaseModel):
     sub_nodes: list[RenderSubNode] = Field(default_factory=list)
     circles: list[RenderCircle] = Field(default_factory=list)
     player_marker: dict[str, int]
+
+
+class MapNarrativePayload(BaseModel):
+    text: str = Field(default="", min_length=0)
+    source: Literal["ai", "deterministic", "none"] = "none"
 
 
 class MovementLog(BaseModel):
@@ -983,6 +1183,8 @@ class MoveRequest(BaseModel):
     from_zone_id: str = Field(..., min_length=1)
     to_zone_id: str = Field(..., min_length=1)
     player_name: str | None = None
+    config: ChatConfig | None = None
+    config: ChatConfig | None = None
 
 
 class MoveResponse(BaseModel):
@@ -990,6 +1192,16 @@ class MoveResponse(BaseModel):
     new_position: Position
     duration_min: int
     movement_log: MovementLog
+
+
+class MapPostChecksBundle(BaseModel):
+    trigger_kind: Literal["random_move", "random_dialog", "scripted", "quest_rule", "fate_rule", "debug_forced"] | None = None
+    quests_evaluated: bool = False
+    fate_evaluated: bool = False
+    encounter_checked: bool = False
+    encounter_generated: bool = False
+    generated_encounter_id: str | None = None
+    blocked_by_higher_priority_modal: bool = False
 
 
 class BehaviorDescribeRequest(BaseModel):
@@ -1137,6 +1349,8 @@ class EncounterTemporaryNpc(BaseModel):
     speaking_style: str = Field(default="", min_length=0)
     agenda: str = Field(default="", min_length=0)
     state: str = Field(default="active", min_length=1)
+    zone_id: str | None = None
+    sub_zone_id: str | None = None
     introduced_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -1150,11 +1364,12 @@ class EncounterTerminationCondition(BaseModel):
 
 class EncounterStepEntry(BaseModel):
     step_id: str = Field(..., min_length=1)
-    kind: Literal["announcement", "player_action", "gm_update", "npc_reaction", "team_reaction", "temp_npc_action", "escape_attempt", "background_tick", "resolution"] = "gm_update"
+    kind: Literal["announcement", "player_action", "gm_update", "npc_reaction", "team_reaction", "temp_npc_action", "escape_attempt", "background_tick", "world_push", "resolution"] = "gm_update"
     actor_type: Literal["player", "npc", "team", "encounter_temp_npc", "system"] = "system"
     actor_id: str = Field(default="", min_length=0)
     actor_name: str = Field(default="", min_length=0)
     content: str = Field(..., min_length=1)
+    metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -1289,6 +1504,52 @@ class AreaMoveResult(BaseModel):
     movement_feedback: str = Field(..., min_length=1)
 
 
+class MapStateSyncBundle(BaseModel):
+    map_snapshot: MapSnapshot
+    area_snapshot: AreaSnapshot
+    render: MapRenderPayload
+    world_state: WorldState
+    player_static_data: PlayerStaticData
+    player_runtime_data: PlayerRuntimeData
+    role_pool: list[NpcRoleCard] = Field(default_factory=list)
+    current_reputation: SubZoneReputationEntry | None = None
+    current_zone_metric: ZoneMetricEntry | None = None
+    zone_metric_state: ZoneMetricState = Field(default_factory=ZoneMetricState)
+    quest_state: QuestState
+    pending_offers: list[QuestEntry] = Field(default_factory=list)
+    tracked_quest: QuestEntry | None = None
+    encounter_state: EncounterState
+    pending_encounters: list[EncounterEntry] = Field(default_factory=list)
+    active_encounter: EncounterEntry | None = None
+    fate_state: FateState
+    team_state: TeamState
+    team_members: list[TeamMember] = Field(default_factory=list)
+    game_logs: list[GameLogEntry] = Field(default_factory=list)
+
+
+class MapBootstrapResponse(BaseModel):
+    ok: bool = True
+    operation: Literal["bootstrap"] = "bootstrap"
+    generated: bool = False
+    narration: MapNarrativePayload = Field(default_factory=MapNarrativePayload)
+    state_sync: MapStateSyncBundle
+
+
+class MoveResolvedResponse(MoveResponse):
+    narration: MapNarrativePayload = Field(default_factory=MapNarrativePayload)
+    post_checks: MapPostChecksBundle = Field(default_factory=MapPostChecksBundle)
+    state_sync: MapStateSyncBundle
+    scene_events: list[SceneEvent] = Field(default_factory=list)
+    main_turn_summary: MainTurnSummary | None = None
+    current_zone_metric: ZoneMetricEntry | None = None
+
+
+class AreaMoveResolvedResponse(AreaMoveResult):
+    narration: MapNarrativePayload = Field(default_factory=MapNarrativePayload)
+    post_checks: MapPostChecksBundle = Field(default_factory=MapPostChecksBundle)
+    state_sync: MapStateSyncBundle
+
+
 class AreaDiscoverInteractionsRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     sub_zone_id: str = Field(..., min_length=1)
@@ -1311,6 +1572,15 @@ class AreaExecuteInteractionResponse(BaseModel):
     ok: bool = True
     status: Literal["placeholder"] = "placeholder"
     message: str = Field(default="待开发", min_length=1)
+
+
+class AreaDiscoverInteractionsResolvedResponse(AreaDiscoverInteractionsResponse):
+    narration: MapNarrativePayload = Field(default_factory=MapNarrativePayload)
+    state_sync: MapStateSyncBundle
+
+
+class AreaExecuteInteractionResolvedResponse(AreaExecuteInteractionResponse):
+    state_sync: MapStateSyncBundle
 
 
 class RolePoolListResponse(BaseModel):
@@ -1367,8 +1637,12 @@ class NpcChatResponse(BaseModel):
 class ActionCheckRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     action_type: Literal["attack", "check", "item_use"] = "check"
+    check_mode: Literal["action", "reaction_save"] = "action"
     action_prompt: str = Field(..., min_length=1)
     actor_role_id: str | None = None
+    pending_turn_id: str | None = None
+    source_label: str | None = None
+    threatened_consequence: str | None = None
     forced_dice_roll: int | None = Field(default=None, ge=1, le=20)
     allow_backend_roll: bool = False
     resolution_context: Literal["standalone", "embedded"] = "standalone"
@@ -1377,14 +1651,19 @@ class ActionCheckRequest(BaseModel):
     planned_time_spent_min: int | None = Field(default=None, ge=1, le=180)
     planned_requires_check: bool | None = None
     planned_check_task: str | None = None
+    return_state_sync: bool = False
+    post_trigger_kind: Literal["random_move", "random_dialog", "scripted", "quest_rule", "fate_rule", "debug_forced"] | None = None
     config: ChatConfig | None = None
 
 
 class ActionCheckPlanRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     action_type: Literal["attack", "check", "item_use"] = "check"
+    check_mode: Literal["action", "reaction_save"] = "action"
     action_prompt: str = Field(..., min_length=1)
     actor_role_id: str | None = None
+    source_label: str | None = None
+    threatened_consequence: str | None = None
     config: ChatConfig | None = None
 
 
@@ -1395,12 +1674,15 @@ class ActionCheckPlanResponse(BaseModel):
     actor_name: str
     actor_kind: Literal["player", "npc"] = "player"
     action_type: Literal["attack", "check", "item_use"]
+    check_mode: Literal["action", "reaction_save"] = "action"
     requires_check: bool
     ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"]
     ability_modifier: int
     dc: int
     time_spent_min: int = Field(ge=1)
     check_task: str = Field(default="", min_length=0)
+    source_label: str | None = None
+    threatened_consequence: str | None = None
 
 
 class ActionCheckResponse(BaseModel):
@@ -1410,11 +1692,14 @@ class ActionCheckResponse(BaseModel):
     actor_name: str
     actor_kind: Literal["player", "npc"] = "player"
     action_type: Literal["attack", "check", "item_use"]
+    check_mode: Literal["action", "reaction_save"] = "action"
     requires_check: bool
     ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"]
     ability_modifier: int
     dc: int
     check_task: str = Field(default="", min_length=0)
+    source_label: str | None = None
+    threatened_consequence: str | None = None
     dice_roll: int | None = None
     total_score: int | None = None
     success: bool
@@ -1424,6 +1709,8 @@ class ActionCheckResponse(BaseModel):
     applied_effects: list[str] = Field(default_factory=list)
     relation_tag_suggestion: str | None = None
     scene_events: list[SceneEvent] = Field(default_factory=list)
+    state_sync: MapStateSyncBundle | None = None
+    post_checks: MapPostChecksBundle | None = None
 
 
 class QuestDraft(BaseModel):
@@ -1865,3 +2152,5 @@ class PlayerStaminaAdjustRequest(BaseModel):
 RoleDesire.model_rebuild()
 PublicSceneState.model_rebuild()
 EncounterEntry.model_rebuild()
+ChatResponse.model_rebuild()
+PendingTurnContinueResponse.model_rebuild()

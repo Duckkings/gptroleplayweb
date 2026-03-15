@@ -17,6 +17,12 @@ type Props = {
   result: ActionCheckResult | null;
   errorMessage: string;
   rotation: Rotation;
+  title?: string;
+  subtitle?: string;
+  sourceLabel?: string;
+  threatenedConsequence?: string;
+  successHint?: string;
+  failureHint?: string;
   onTrigger: () => void;
   onClose: () => void;
 };
@@ -35,6 +41,12 @@ export function ActionCheckRollModal({
   result,
   errorMessage,
   rotation,
+  title,
+  subtitle,
+  sourceLabel,
+  threatenedConsequence,
+  successHint,
+  failureHint,
   onTrigger,
   onClose,
 }: Props) {
@@ -65,19 +77,23 @@ export function ActionCheckRollModal({
       >
         <div className="roll-modal-header">
           <div>
-            <h3>检定掷骰</h3>
-            <p>点击下方骰子开始掷出本轮 d20。</p>
+            <h3>{title ?? '检定掷骰'}</h3>
+            <p>{subtitle ?? '点击下方骰子开始掷出本轮 d20。'}</p>
           </div>
         </div>
 
         {plan && (
           <section className="roll-result-card">
-            <p>执行者: {plan.actor_name}</p>
-            <p>检定目标: {plan.check_task || '当前行动是否顺利完成'}</p>
+            {sourceLabel && <p>来源：{sourceLabel}</p>}
+            <p>执行者：{plan.actor_name}</p>
+            <p>检定目标：{plan.check_task || '当前行动是否顺利完成'}</p>
+            {threatenedConsequence && <p>威胁：{threatenedConsequence}</p>}
             <p>
-              属性: {plan.ability_used} | 加值: {planModifierText}
+              属性：{plan.ability_used} | 调整值：{planModifierText}
             </p>
-            <p>DC: {plan.dc}</p>
+            <p>DC：{plan.dc}</p>
+            {successHint && <p>成功后果：{successHint}</p>}
+            {failureHint && <p>失败后果：{failureHint}</p>}
           </section>
         )}
 
@@ -105,7 +121,7 @@ export function ActionCheckRollModal({
         {phase === 'resolved' && result && (
           <section className={`roll-result-card ${result.success ? 'is-success' : 'is-failure'}`}>
             <p>
-              结果: {result.success ? '成功' : '失败'} | {describeCritical(result.critical)}
+              结果：{result.success ? '成功' : '失败'} | {describeCritical(result.critical)}
             </p>
             {result.requires_check ? (
               <p>
@@ -115,14 +131,12 @@ export function ActionCheckRollModal({
             ) : (
               <p>本次行动无需正式检定，系统按常理直接推进。</p>
             )}
-            <p>叙事结果会在关闭后交给后续聊天或系统反馈继续处理。</p>
+            <p>关闭后会继续本轮聊天或系统结算。</p>
           </section>
         )}
 
         <div className="actions">
-          {(phase === 'resolved' || phase === 'error') && (
-            <button onClick={onClose}>{phase === 'resolved' ? '继续' : '关闭'}</button>
-          )}
+          {(phase === 'resolved' || phase === 'error') && <button onClick={onClose}>{phase === 'resolved' ? '继续' : '关闭'}</button>}
         </div>
       </div>
     </div>

@@ -1,10 +1,11 @@
 import { useMemo, useState } from 'react';
-import type { NpcRoleCard, TeamChatReply, TeamState } from '../types/app';
+import type { AreaSnapshot, NpcRoleCard, TeamChatReply, TeamState } from '../types/app';
 
 type Props = {
   open: boolean;
   state: TeamState;
   roleCards: NpcRoleCard[];
+  areaSnapshot: AreaSnapshot | null;
   chatReplies: TeamChatReply[];
   chatBusy: boolean;
   chatBlocked?: boolean;
@@ -21,6 +22,7 @@ export function TeamPanel({
   open,
   state,
   roleCards,
+  areaSnapshot,
   chatReplies,
   chatBusy,
   chatBlocked = false,
@@ -34,6 +36,14 @@ export function TeamPanel({
 }: Props) {
   const [teamChatInput, setTeamChatInput] = useState('');
   const roleMap = useMemo(() => new Map(roleCards.map((item) => [item.role_id, item])), [roleCards]);
+  const zoneNameMap = useMemo(
+    () => new Map((areaSnapshot?.zones ?? []).map((zone) => [zone.zone_id, zone.name])),
+    [areaSnapshot],
+  );
+  const subZoneNameMap = useMemo(
+    () => new Map((areaSnapshot?.sub_zones ?? []).map((subZone) => [subZone.sub_zone_id, subZone.name])),
+    [areaSnapshot],
+  );
 
   if (!open) return null;
 
@@ -125,6 +135,10 @@ export function TeamPanel({
                 {role && (
                   <>
                     <p>状态: {role.state}</p>
+                    <p>
+                      当前所在: {role.zone_id ? (zoneNameMap.get(role.zone_id) ?? role.zone_id) : '-'} /{' '}
+                      {role.sub_zone_id ? (subZoneNameMap.get(role.sub_zone_id) ?? role.sub_zone_id) : '-'}
+                    </p>
                     <p>性格: {role.personality || '-'}</p>
                     <p>说话方式: {role.speaking_style || '-'}</p>
                     <p>

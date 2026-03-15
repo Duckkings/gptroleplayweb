@@ -3,19 +3,18 @@
 import asyncio
 from datetime import datetime, timezone
 import json
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from openai import APIError, RateLimitError
 from pydantic import ValidationError
 
 from app.core.dialogs import pick_directory
 from app.core.storage import read_json, storage_state, write_json_atomic
-from app.core.token_usage import token_usage_store
 from app.core.user_context import get_current_user
 from app.models.schemas import (
     AreaCurrentResponse,
     AreaDiscoverInteractionsRequest,
-    AreaDiscoverInteractionsResponse,
+    AreaDiscoverInteractionsResolvedResponse,
     EncounterActRequest,
     EncounterActResponse,
     EncounterCheckRequest,
@@ -32,12 +31,12 @@ from app.models.schemas import (
     EncounterRejoinRequest,
     EncounterRejoinResponse,
     AreaExecuteInteractionRequest,
-    AreaExecuteInteractionResponse,
+    AreaExecuteInteractionResolvedResponse,
     ActionCheckRequest,
     ActionCheckPlanRequest,
     ActionCheckPlanResponse,
     ActionCheckResponse,
-    AreaMoveResult,
+    AreaMoveResolvedResponse,
     AreaMoveSubZoneRequest,
     BehaviorDescribeRequest,
     BehaviorDescribeResponse,
@@ -64,7 +63,7 @@ from app.models.schemas import (
     ChatResponse,
     HealthResponse,
     MoveRequest,
-    MoveResponse,
+    MoveResolvedResponse,
     ModelDiscoverResponse,
     ModelProfileRequest,
     ModelProfileResponse,
@@ -74,6 +73,8 @@ from app.models.schemas import (
     NpcGreetResponse,
     PathConfig,
     PathStatusResponse,
+    PendingTurnContinueRequest,
+    PendingTurnContinueResponse,
     PlayerBuffAddRequest,
     PlayerBuffRemoveRequest,
     PlayerEquipRequest,
@@ -88,6 +89,7 @@ from app.models.schemas import (
     PlayerUnequipRequest,
     PublicSceneStateResponse,
     ReputationStateResponse,
+    MapBootstrapResponse,
     RegionGenerateRequest,
     RegionGenerateResponse,
     RoleDrivesResponse,
@@ -123,7 +125,25 @@ from app.models.schemas import (
     NpcKnowledgeResponse,
 )
 from app.services.ai_adapter import discover_models, resolve_model_profile
-from app.services.chat_service import MissingAPIKeyError, resolve_main_chat_turn
+from app.services.chat_service import MissingAPIKeyError
+from app.services.stream_chat_service import (
+    StreamCancelledError,
+    run_main_turn_once,
+    run_main_turn_stream,
+    run_pending_turn_once,
+    run_pending_turn_stream,
+    run_npc_chat_once,
+    run_npc_chat_stream,
+)
+from app.services.map_flow_service import (
+    bootstrap_world_map,
+    discover_area_interactions,
+    execute_area_interaction,
+    move_world_map,
+    move_world_sub_zone,
+    run_action_check_with_state_sync,
+)
+from app.services.pending_turn_service import cancel_pending_turn, load_pending_turn
 from app.services.world_service import (
     AIBehaviorError,
     AIRegionGenerationError,
@@ -163,7 +183,6 @@ from app.services.world_service import (
     move_to_sub_zone,
     NpcChatConfigError,
     NpcChatGenerationError,
-    npc_chat,
     render_map,
     save_current,
     set_game_log_settings,
@@ -219,6 +238,10 @@ from app.services.team_service import (
 router = APIRouter(prefix="/api/v1", tags=["api"])
 
 
+def _sse_frame(event: str, payload: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
 @router.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     return HealthResponse(ok=True, time=datetime.now(timezone.utc).isoformat())
@@ -262,10 +285,10 @@ async def config_model_profile(payload: ModelProfileRequest) -> ModelProfileResp
     return ModelProfileResponse(model=resolve_model_profile(payload.provider, model).to_schema())
 
 
-@router.post("/chat", response_model=ChatResponse)
-async def chat(payload: ChatRequest) -> ChatResponse:
+@router.post("/chat", response_model=ChatResponse | PendingTurnContinueResponse)
+async def chat(payload: ChatRequest) -> ChatResponse | PendingTurnContinueResponse:
     try:
-        reply, usage, tool_events, scene_events, time_spent_min, archived_sub_zone_turn_id = await resolve_main_chat_turn(payload)
+        return await run_main_turn_once(payload)
     except MissingAPIKeyError:
         raise HTTPException(status_code=401, detail="api_key is not configured in config")
     except ValueError as exc:
@@ -276,94 +299,218 @@ async def chat(payload: ChatRequest) -> ChatResponse:
         raise HTTPException(status_code=429, detail=str(exc))
     except APIError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
-    token_usage_store.add(payload.session_id, "chat", usage.input_tokens, usage.output_tokens)
-    last_user = next((m for m in reversed(payload.messages) if m.role == "user"), None)
-    if last_user is not None:
-        add_game_log(
-            GameLogAddRequest(
-                session_id=payload.session_id,
-                kind="player_input",
-                message=last_user.content,
-            )
-        )
-    add_game_log(
-        GameLogAddRequest(
-            session_id=payload.session_id,
-            kind="gm_reply",
-            message=reply.content,
-        )
-    )
-    return ChatResponse(
-        session_id=payload.session_id,
-        reply=reply,
-        usage=usage,
-        tool_events=tool_events,
-        scene_events=scene_events,
-        time_spent_min=time_spent_min,
-        archived_sub_zone_turn_id=archived_sub_zone_turn_id,
-    )
 
 
 @router.post("/chat/stream")
-async def chat_sse(payload: ChatRequest) -> StreamingResponse:
+async def chat_sse(request: Request, payload: ChatRequest) -> StreamingResponse:
     if not payload.config.stream:
         raise HTTPException(status_code=400, detail="config.stream must be true")
 
     async def event_gen():
-        yield "event: start\ndata: {\"session_id\":\"%s\"}\n\n" % payload.session_id
-        last_user = next((m for m in reversed(payload.messages) if m.role == "user"), None)
-        try:
-            reply, usage, tool_events, scene_events, time_spent_min, archived_sub_zone_turn_id = await resolve_main_chat_turn(payload)
-            data = json.dumps({"content": reply.content}, ensure_ascii=False)
-            yield f"event: delta\ndata: {data}\n\n"
-        except MissingAPIKeyError:
-            data = json.dumps({"code": 401, "message": "api_key is not configured in config"})
-            yield f"event: error\ndata: {data}\n\n"
-            return
-        except ValueError as exc:
-            if str(exc) == "PASSIVE_TURN_REQUIRES_ACTIVE_ENCOUNTER":
-                data = json.dumps({"code": 409, "message": str(exc)})
-                yield f"event: error\ndata: {data}\n\n"
-                return
-            raise
-        except RateLimitError as exc:
-            data = json.dumps({"code": 429, "message": str(exc)})
-            yield f"event: error\ndata: {data}\n\n"
-            return
-        except APIError as exc:
-            data = json.dumps({"code": 502, "message": str(exc)})
-            yield f"event: error\ndata: {data}\n\n"
-            return
+        queue: asyncio.Queue[tuple[str | None, dict | None]] = asyncio.Queue()
 
-        token_usage_store.add(payload.session_id, "chat", usage.input_tokens, usage.output_tokens)
-        if last_user is not None:
-            add_game_log(
-                GameLogAddRequest(
-                    session_id=payload.session_id,
-                    kind="player_input",
-                    message=last_user.content,
+        async def emit(event: str, data: dict) -> None:
+            await queue.put((event, data))
+
+        async def worker() -> None:
+            try:
+                result = await run_main_turn_stream(
+                    payload,
+                    emit=emit,
+                    is_cancelled=request.is_disconnected,
                 )
-            )
-        add_game_log(
-            GameLogAddRequest(
-                session_id=payload.session_id,
-                kind="gm_reply",
-                message=reply.content,
-            )
-        )
-        usage_data = json.dumps(
-            {
-                "usage": {"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens},
-                "tool_events": [ev.model_dump(mode="json") for ev in tool_events],
-                "scene_events": [ev.model_dump(mode="json") for ev in scene_events],
-                "time_spent_min": time_spent_min,
-                "archived_sub_zone_turn_id": archived_sub_zone_turn_id,
-            },
-            ensure_ascii=False,
-        )
-        yield f"event: end\ndata: {usage_data}\n\n"
+                if not isinstance(result, PendingTurnContinueResponse):
+                    await queue.put(
+                        (
+                            "end",
+                            {
+                                "usage": result.usage.model_dump(mode="json"),
+                                "tool_events": [item.model_dump(mode="json") for item in result.tool_events],
+                                "scene_events": [item.model_dump(mode="json") for item in result.scene_events],
+                                "time_spent_min": result.time_spent_min,
+                                "archived_sub_zone_turn_id": result.archived_sub_zone_turn_id,
+                                "main_turn_summary": (
+                                    result.main_turn_summary.model_dump(mode="json") if result.main_turn_summary is not None else None
+                                ),
+                            },
+                        )
+                    )
+            except StreamCancelledError:
+                pass
+            except MissingAPIKeyError:
+                await queue.put(("error", {"code": 401, "message": "api_key is not configured in config"}))
+            except ValueError as exc:
+                code = 409 if str(exc) == "PASSIVE_TURN_REQUIRES_ACTIVE_ENCOUNTER" else 400
+                await queue.put(("error", {"code": code, "message": str(exc)}))
+            except RateLimitError as exc:
+                await queue.put(("error", {"code": 429, "message": str(exc)}))
+            except APIError as exc:
+                await queue.put(("error", {"code": 502, "message": str(exc)}))
+            except Exception as exc:
+                await queue.put(("error", {"code": 500, "message": str(exc)}))
+            finally:
+                await queue.put((None, None))
+
+        task = asyncio.create_task(worker())
+        yield _sse_frame("start", {"session_id": payload.session_id})
+        try:
+            while True:
+                event, data = await queue.get()
+                if event is None:
+                    break
+                yield _sse_frame(event, data or {})
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+
+@router.post("/chat/pending/continue", response_model=PendingTurnContinueResponse)
+async def chat_pending_continue(payload: PendingTurnContinueRequest) -> PendingTurnContinueResponse:
+    try:
+        return await run_pending_turn_once(payload)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="role not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except RateLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except APIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.post("/chat/pending/continue/stream")
+async def chat_pending_continue_stream(request: Request, payload: PendingTurnContinueRequest) -> StreamingResponse:
+    async def event_gen():
+        queue: asyncio.Queue[tuple[str | None, dict | None]] = asyncio.Queue()
+
+        async def emit(event: str, data: dict) -> None:
+            await queue.put((event, data))
+
+        async def worker() -> None:
+            try:
+                result = await run_pending_turn_stream(
+                    payload,
+                    emit=emit,
+                    is_cancelled=request.is_disconnected,
+                )
+                if result.status == "awaiting_reaction":
+                    await queue.put(
+                        (
+                            "reaction_check_required",
+                            {
+                                "pending_turn_id": result.pending_turn_id,
+                                "flow_kind": result.flow_kind,
+                                "reply_so_far": result.reply_text,
+                                "scene_events_so_far": [item.model_dump(mode="json") for item in result.scene_events],
+                                "pending_reaction": (
+                                    result.pending_reaction.model_dump(mode="json") if result.pending_reaction is not None else None
+                                ),
+                                "npc_role_id": result.npc_role_id,
+                            },
+                        )
+                    )
+                elif result.flow_kind == "main_chat":
+                    await queue.put(
+                        (
+                            "end",
+                            {
+                                "tool_events": [item.model_dump(mode="json") for item in result.tool_events],
+                                "scene_events": [item.model_dump(mode="json") for item in result.scene_events],
+                                "time_spent_min": 0,
+                                "archived_sub_zone_turn_id": result.archived_sub_zone_turn_id,
+                                "main_turn_summary": (
+                                    result.main_turn_summary.model_dump(mode="json") if result.main_turn_summary is not None else None
+                                ),
+                            },
+                        )
+                    )
+                else:
+                    await queue.put(
+                        (
+                            "end",
+                            {
+                                "time_spent_min": 0,
+                                "dialogue_logs": [],
+                                "scene_events": [item.model_dump(mode="json") for item in result.scene_events],
+                            },
+                        )
+                    )
+            except StreamCancelledError:
+                pass
+            except KeyError:
+                await queue.put(("error", {"code": 404, "message": "role not found"}))
+            except ValueError as exc:
+                await queue.put(("error", {"code": 409, "message": str(exc)}))
+            except RateLimitError as exc:
+                await queue.put(("error", {"code": 429, "message": str(exc)}))
+            except APIError as exc:
+                await queue.put(("error", {"code": 502, "message": str(exc)}))
+            except Exception as exc:
+                await queue.put(("error", {"code": 500, "message": str(exc)}))
+            finally:
+                await queue.put((None, None))
+
+        task = asyncio.create_task(worker())
+        yield _sse_frame("start", {"session_id": payload.session_id, "pending_turn_id": payload.pending_turn_id})
+        try:
+            while True:
+                event, data = await queue.get()
+                if event is None:
+                    break
+                yield _sse_frame(event, data or {})
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+
+@router.post("/pending-turns/{pending_turn_id}/cancel", response_model=PendingTurnContinueResponse)
+async def pending_turn_cancel(pending_turn_id: str, session_id: str) -> PendingTurnContinueResponse:
+    state = cancel_pending_turn(session_id, pending_turn_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="pending turn not found")
+    return PendingTurnContinueResponse(
+        session_id=session_id,
+        pending_turn_id=None,
+        flow_kind=state.flow_kind,
+        status="cancelled",
+        reply_text="",
+        scene_events=[],
+        tool_events=[],
+        pending_reaction=None,
+        npc_role_id=state.npc_role_id,
+    )
+
+
+@router.get("/pending-turns/current", response_model=PendingTurnContinueResponse | None)
+async def pending_turn_current(session_id: str) -> PendingTurnContinueResponse | None:
+    state = load_pending_turn(session_id)
+    if state is None:
+        return None
+    return PendingTurnContinueResponse(
+        session_id=state.session_id,
+        pending_turn_id=state.pending_turn_id,
+        flow_kind=state.flow_kind,
+        status="awaiting_reaction",
+        reply_text=state.accumulated_reply_text,
+        scene_events=state.accumulated_scene_events,
+        tool_events=state.accumulated_tool_events,
+        main_turn_summary=None,
+        current_zone_metric=None,
+        pending_reaction=state.pending_reaction,
+        npc_role_id=state.npc_role_id,
+    )
 
 
 def _require_user() -> str:
@@ -469,15 +616,23 @@ async def world_map_generate(payload: RegionGenerateRequest) -> RegionGenerateRe
         raise HTTPException(status_code=502, detail=f"地图区块 AI 生成失败: {exc}")
 
 
+@router.post("/world-map/bootstrap", response_model=MapBootstrapResponse)
+async def world_map_bootstrap(payload: RegionGenerateRequest) -> MapBootstrapResponse:
+    try:
+        return await bootstrap_world_map(payload)
+    except AIRegionGenerationError as exc:
+        raise HTTPException(status_code=502, detail=f"地图区块 AI 生成失败: {exc}")
+
+
 @router.post("/world-map/render", response_model=RenderMapResponse)
 async def world_map_render(payload: RenderMapRequest) -> RenderMapResponse:
     return render_map(payload)
 
 
-@router.post("/world-map/move", response_model=MoveResponse)
-async def world_map_move(payload: MoveRequest) -> MoveResponse:
+@router.post("/world-map/move", response_model=MoveResolvedResponse)
+async def world_map_move(payload: MoveRequest) -> MoveResolvedResponse:
     try:
-        return move_to_zone(payload)
+        return await move_world_map(payload)
     except KeyError:
         raise HTTPException(status_code=404, detail="zone not found")
     except ValueError as exc:
@@ -927,10 +1082,10 @@ async def npc_greet_run(payload: NpcGreetRequest) -> NpcGreetResponse:
         raise HTTPException(status_code=404, detail="role not found")
 
 
-@router.post("/npc/chat", response_model=NpcChatResponse)
-async def npc_chat_run(payload: NpcChatRequest) -> NpcChatResponse:
+@router.post("/npc/chat", response_model=NpcChatResponse | PendingTurnContinueResponse)
+async def npc_chat_run(payload: NpcChatRequest) -> NpcChatResponse | PendingTurnContinueResponse:
     try:
-        return npc_chat(payload)
+        return await run_npc_chat_once(payload)
     except KeyError:
         raise HTTPException(status_code=404, detail="role not found")
     except NpcChatConfigError as exc:
@@ -997,45 +1152,62 @@ async def team_chat_run(payload: TeamChatRequest) -> TeamChatResponse:
 
 
 @router.post("/npc/chat/stream")
-async def npc_chat_stream(payload: NpcChatRequest) -> StreamingResponse:
+async def npc_chat_stream(request: Request, payload: NpcChatRequest) -> StreamingResponse:
     if payload.config is not None and not payload.config.stream:
         raise HTTPException(status_code=400, detail="config.stream must be true")
 
     async def event_gen():
-        yield "event: start\ndata: {\"session_id\":\"%s\",\"npc_role_id\":\"%s\"}\n\n" % (payload.session_id, payload.npc_role_id)
-        try:
-            result = npc_chat(payload)
-            reply_text = result.reply
-            step = 14
-            for idx in range(0, len(reply_text), step):
-                chunk = reply_text[idx : idx + step]
-                yield f"event: delta\ndata: {json.dumps({'content': chunk}, ensure_ascii=False)}\n\n"
-                await asyncio.sleep(0.015)
-        except KeyError:
-            data = json.dumps({"code": 404, "message": "role not found"}, ensure_ascii=False)
-            yield f"event: error\ndata: {data}\n\n"
-            return
-        except NpcChatConfigError as exc:
-            data = json.dumps({"code": 400, "message": str(exc)}, ensure_ascii=False)
-            yield f"event: error\ndata: {data}\n\n"
-            return
-        except NpcChatGenerationError as exc:
-            data = json.dumps({"code": 502, "message": str(exc)}, ensure_ascii=False)
-            yield f"event: error\ndata: {data}\n\n"
-            return
-        except Exception as exc:
-            data = json.dumps({"code": 500, "message": str(exc)}, ensure_ascii=False)
-            yield f"event: error\ndata: {data}\n\n"
-            return
+        queue: asyncio.Queue[tuple[str | None, dict | None]] = asyncio.Queue()
 
-        data = json.dumps(
-            {
-                "time_spent_min": result.time_spent_min,
-                "dialogue_logs": [item.model_dump(mode="json") for item in result.dialogue_logs],
-            },
-            ensure_ascii=False,
-        )
-        yield f"event: end\ndata: {data}\n\n"
+        async def emit(event: str, data: dict) -> None:
+            await queue.put((event, data))
+
+        async def worker() -> None:
+            try:
+                result = await run_npc_chat_stream(
+                    payload,
+                    emit=emit,
+                    is_cancelled=request.is_disconnected,
+                )
+                if not isinstance(result, PendingTurnContinueResponse):
+                    await queue.put(
+                        (
+                            "end",
+                            {
+                                "time_spent_min": result.time_spent_min,
+                                "dialogue_logs": [item.model_dump(mode="json") for item in result.dialogue_logs],
+                                "scene_events": [item.model_dump(mode="json") for item in result.scene_events],
+                            },
+                        )
+                    )
+            except StreamCancelledError:
+                pass
+            except KeyError:
+                await queue.put(("error", {"code": 404, "message": "role not found"}))
+            except NpcChatConfigError as exc:
+                await queue.put(("error", {"code": 400, "message": str(exc)}))
+            except NpcChatGenerationError as exc:
+                await queue.put(("error", {"code": 502, "message": str(exc)}))
+            except Exception as exc:
+                await queue.put(("error", {"code": 500, "message": str(exc)}))
+            finally:
+                await queue.put((None, None))
+
+        task = asyncio.create_task(worker())
+        yield _sse_frame("start", {"session_id": payload.session_id, "npc_role_id": payload.npc_role_id})
+        try:
+            while True:
+                event, data = await queue.get()
+                if event is None:
+                    break
+                yield _sse_frame(event, data or {})
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
@@ -1050,10 +1222,10 @@ async def world_area_current(session_id: str) -> AreaCurrentResponse:
     return get_area_current(session_id)
 
 
-@router.post("/world/area/move-sub-zone", response_model=AreaMoveResult)
-async def world_area_move_sub_zone(payload: AreaMoveSubZoneRequest) -> AreaMoveResult:
+@router.post("/world/area/move-sub-zone", response_model=AreaMoveResolvedResponse)
+async def world_area_move_sub_zone(payload: AreaMoveSubZoneRequest) -> AreaMoveResolvedResponse:
     try:
-        return move_to_sub_zone(payload)
+        return await move_world_sub_zone(payload)
     except KeyError as exc:
         if str(exc) == "'AREA_SUB_ZONE_NOT_FOUND'":
             raise HTTPException(status_code=404, detail="sub zone not found")
@@ -1064,20 +1236,20 @@ async def world_area_move_sub_zone(payload: AreaMoveSubZoneRequest) -> AreaMoveR
         raise HTTPException(status_code=409, detail=str(exc))
 
 
-@router.post("/world/area/interactions/discover", response_model=AreaDiscoverInteractionsResponse)
-async def world_area_discover_interactions(payload: AreaDiscoverInteractionsRequest) -> AreaDiscoverInteractionsResponse:
+@router.post("/world/area/interactions/discover", response_model=AreaDiscoverInteractionsResolvedResponse)
+async def world_area_discover_interactions(payload: AreaDiscoverInteractionsRequest) -> AreaDiscoverInteractionsResolvedResponse:
     try:
-        return discover_interactions(payload)
+        return await discover_area_interactions(payload)
     except KeyError:
         raise HTTPException(status_code=404, detail="sub zone not found")
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
 
-@router.post("/world/area/interactions/execute", response_model=AreaExecuteInteractionResponse)
-async def world_area_execute_interaction(payload: AreaExecuteInteractionRequest) -> AreaExecuteInteractionResponse:
+@router.post("/world/area/interactions/execute", response_model=AreaExecuteInteractionResolvedResponse)
+async def world_area_execute_interaction(payload: AreaExecuteInteractionRequest) -> AreaExecuteInteractionResolvedResponse:
     try:
-        return execute_interaction(payload)
+        return await execute_area_interaction(payload)
     except KeyError:
         raise HTTPException(status_code=404, detail="interaction not found")
     except ValueError as exc:
@@ -1095,6 +1267,8 @@ async def action_check_plan_run(payload: ActionCheckPlanRequest) -> ActionCheckP
 @router.post("/actions/check", response_model=ActionCheckResponse)
 async def action_check_run(payload: ActionCheckRequest) -> ActionCheckResponse:
     try:
+        if payload.return_state_sync:
+            return await run_action_check_with_state_sync(payload)
         return action_check(payload)
     except KeyError:
         raise HTTPException(status_code=404, detail="role not found")

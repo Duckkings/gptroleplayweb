@@ -8,6 +8,7 @@ from app.core.prompt_keys import PromptKeys
 from app.core.prompt_table import prompt_table
 from app.models.schemas import ChatConfig, NpcRoleCard, PublicSceneActorCandidate, PublicSceneState, SceneEvent, StoryNpcSummary
 from app.services.ai_adapter import build_completion_options, create_sync_client
+from app.services import zone_metric_service
 
 
 def _legacy():
@@ -33,15 +34,164 @@ def _matched_actor_ids(text: str, actors: list[dict[str, object]]) -> list[str]:
     return matches
 
 
+def _local_public_roles(save) -> list:
+    legacy = _legacy()
+    current_sub_zone_id = save.area_snapshot.current_sub_zone_id
+    current_zone_id = save.area_snapshot.current_zone_id
+    roles = list(legacy._visible_public_roles(save))
+    seen_ids = {role.role_id for role in roles}
+    for role in save.role_pool:
+        if role.role_id in seen_ids or role.state == "in_team":
+            continue
+        if current_sub_zone_id and role.sub_zone_id == current_sub_zone_id:
+            roles.append(role)
+            seen_ids.add(role.role_id)
+            continue
+        if not current_sub_zone_id and current_zone_id and role.zone_id == current_zone_id:
+            roles.append(role)
+            seen_ids.add(role.role_id)
+    return roles
+
+
+def _candidate_limit(active_encounter, config: ChatConfig | None) -> int:
+    scene_config = getattr(config, "public_scene", None)
+    active_limit = int(getattr(scene_config, "active_actor_limit", 8) or 8)
+    idle_limit = int(getattr(scene_config, "idle_actor_limit", 2) or 2)
+    if active_encounter is not None and active_encounter.status == "active":
+        return max(1, min(active_limit, 16))
+    return max(1, min(idle_limit, 8))
+
+
+def should_force_public_action_check(
+    save,
+    actor: dict[str, object] | None,
+    payload: dict[str, object],
+    *,
+    config: ChatConfig | None = None,
+) -> bool:
+    if bool(payload.get("needs_check")):
+        return True
+    scene_config = getattr(config, "public_scene", None)
+    if not bool(getattr(scene_config, "uncertain_actions_require_check", True)):
+        return False
+    outcome_certainty = str(payload.get("outcome_certainty") or "").strip().lower()
+    action_type = str(payload.get("action_type") or "check").strip().lower()
+    specific_threat = str(payload.get("specific_threat") or "").strip()
+    target_label = str(payload.get("target_label") or "").strip()
+    actor_type = str((actor or {}).get("actor_type") or "npc")
+    active_encounter = _legacy()._active_encounter_for_current_sub_zone(save)
+    active_risk = active_encounter is not None and active_encounter.status == "active"
+    if outcome_certainty == "uncertain":
+        return True
+    if action_type == "attack":
+        return True
+    if specific_threat:
+        return True
+    if active_risk and action_type in {"check", "item_use"}:
+        return True
+    if active_risk and actor_type == "encounter_temp_npc" and target_label:
+        return True
+    return False
+
+
+_TEAM_AUDIENCE_HINTS = (
+    "队友",
+    "同伴",
+    "我们这边",
+    "我们队里",
+    "队里",
+    "你们几个",
+    "你们俩",
+    "伙伴们",
+)
+
+
+def actor_affiliation(actor: dict[str, object] | None) -> tuple[str, str]:
+    actor_type = str((actor or {}).get("actor_type") or "npc")
+    if actor_type == "team":
+        return "team", "队友"
+    if actor_type == "encounter_temp_npc":
+        return "encounter_temp_npc", "遭遇NPC"
+    return "public_npc", "在场NPC"
+
+
+def build_public_audience_context(save, intent: dict[str, object]) -> dict[str, object]:
+    legacy = _legacy()
+    team_roles = legacy._team_role_map(save)
+    team_name_to_id = {str(role.name or "").strip(): role.role_id for role in team_roles.values() if str(role.name or "").strip()}
+    addressed_role_name = str(intent.get("addressed_role_name") or "").strip()
+    referenced_role_names = [str(item).strip() for item in list(intent.get("referenced_role_names") or []) if str(item).strip()]
+    raw_text = str(intent.get("raw_text") or "")
+    addressed_role_id = team_name_to_id.get(addressed_role_name, "")
+    referenced_team_ids = [team_name_to_id[name] for name in referenced_role_names if name in team_name_to_id]
+    if addressed_role_name:
+        scope = "named_target"
+    elif referenced_team_ids or any(token in raw_text for token in _TEAM_AUDIENCE_HINTS):
+        scope = "team_only"
+    else:
+        scope = "public_broadcast"
+    return {
+        "scope": scope,
+        "addressed_role_name": addressed_role_name,
+        "addressed_role_id": addressed_role_id,
+        "referenced_role_names": referenced_role_names,
+        "referenced_team_ids": referenced_team_ids,
+    }
+
+
+def actor_is_explicitly_addressed(actor: dict[str, object] | None, audience_context: dict[str, object]) -> bool:
+    actor_id = str((actor or {}).get("actor_id") or "")
+    actor_name = str((actor or {}).get("name") or "").strip()
+    addressed_role_id = str(audience_context.get("addressed_role_id") or "")
+    addressed_role_name = str(audience_context.get("addressed_role_name") or "").strip()
+    if addressed_role_id and actor_id == addressed_role_id:
+        return True
+    return bool(addressed_role_name and actor_name and actor_name == addressed_role_name)
+
+
+def actor_may_speak_in_public_turn(actor: dict[str, object] | None, audience_context: dict[str, object]) -> bool:
+    scope = str(audience_context.get("scope") or "public_broadcast")
+    actor_type = str((actor or {}).get("actor_type") or "npc")
+    if scope == "public_broadcast":
+        return True
+    if scope == "team_only":
+        return actor_type == "team"
+    return actor_is_explicitly_addressed(actor, audience_context)
+
+
+def build_public_check_result(action_result, *, requires_check: bool) -> dict[str, object]:
+    if not requires_check or action_result is None:
+        return {"requires_check": False, "outcome_label": "无需检定"}
+    critical = str(getattr(action_result, "critical", "none") or "none")
+    if critical == "critical_success":
+        outcome_label = "大成功"
+    elif critical == "critical_failure":
+        outcome_label = "大失败"
+    else:
+        outcome_label = "成功" if bool(getattr(action_result, "success", False)) else "失败"
+    return {
+        "requires_check": True,
+        "ability_used": str(getattr(action_result, "ability_used", "") or ""),
+        "ability_modifier": int(getattr(action_result, "ability_modifier", 0) or 0),
+        "dice_roll": getattr(action_result, "dice_roll", None),
+        "total_score": getattr(action_result, "total_score", None),
+        "dc": int(getattr(action_result, "dc", 0) or 0),
+        "success": bool(getattr(action_result, "success", False)),
+        "critical": critical,
+        "outcome_label": outcome_label,
+    }
+
+
 def candidate_rows(
     save,
     *,
     player_text: str,
     addressed_role_name: str = "",
     incoming_target_candidates: list[str] | None = None,
+    config: ChatConfig | None = None,
 ) -> list[dict[str, object]]:
     legacy = _legacy()
-    visible_npcs = legacy._visible_public_roles(save)
+    visible_npcs = _local_public_roles(save)
     team_roles = list(legacy._team_role_map(save).values())
     active_encounter = legacy._active_encounter_for_current_sub_zone(save)
     temp_npcs = legacy._encounter_temp_npcs(save)
@@ -110,11 +260,21 @@ def candidate_rows(
             continue
         seen_ids.add(actor_id)
         deduped.append(candidate)
+    limit = _candidate_limit(active_encounter, config)
     if not deduped and visible_rows:
-        visible_npc = next((item for item in visible_rows if item.get("actor_type") == "npc"), None)
-        if visible_npc is not None:
-            deduped.append({**visible_npc, "priority_reason": "scene_fallback_observer"})
-    limit = 4 if active_encounter is not None and active_encounter.status == "active" else 2
+        actor_priority = {"npc": 0, "team": 1, "encounter_temp_npc": 2}
+        ordered = sorted(
+            visible_rows,
+            key=lambda item: (
+                actor_priority.get(str(item.get("actor_type") or "npc"), 9),
+                str(item.get("name") or ""),
+                str(item.get("actor_id") or ""),
+            ),
+        )
+        for item in ordered:
+            if len(deduped) >= limit:
+                break
+            deduped.append({**item, "priority_reason": "scene_fallback_observer"})
     return deduped[:limit]
 
 
@@ -123,6 +283,7 @@ def build_public_scene_state(save, *, session_id: str, player_text: str = "") ->
     intent = legacy._parse_player_intent(player_text)
     addressed_role_name = str(intent.get("addressed_role_name") or "").strip()
     rep = legacy.get_current_sub_zone_reputation(save, create=True)
+    zone_metric = zone_metric_service.get_current_zone_metric(save, create=True)
     team_roles = legacy._team_role_map(save)
     candidates = candidate_rows(
         save,
@@ -135,9 +296,10 @@ def build_public_scene_state(save, *, session_id: str, player_text: str = "") ->
         current_zone_id=save.area_snapshot.current_zone_id,
         current_sub_zone_id=save.area_snapshot.current_sub_zone_id,
         current_reputation=rep,
+        current_zone_metric=zone_metric,
         visible_npcs=[
             StoryNpcSummary(role_id=role.role_id, name=role.name, zone_id=role.zone_id, sub_zone_id=role.sub_zone_id)
-            for role in legacy._visible_public_roles(save)
+            for role in _local_public_roles(save)
         ],
         team_members=[
             StoryNpcSummary(role_id=role.role_id, name=role.name, zone_id=role.zone_id, sub_zone_id=role.sub_zone_id)
@@ -420,6 +582,7 @@ def advance_public_scene_in_save(
     legacy = _legacy()
     intent = legacy._parse_player_intent(player_text)
     display_text = str(intent.get("display_text") or player_text).strip()
+    audience_context = build_public_audience_context(save, intent)
     if not bool(intent.get("passive_turn")) and not legacy._public_behavior_triggered(str(intent.get("action_text") or ""), str(intent.get("speech_text") or ""), str(intent.get("raw_text") or "")):
         return []
     if scene_context is None:
@@ -428,13 +591,14 @@ def advance_public_scene_in_save(
         scene_context = _build_scene_context_payload(save, player_text=player_text, gm_narration=gm_summary, recent_turn_count=4)
     addressed_role_name = str(intent.get("addressed_role_name") or "").strip()
     active_encounter = legacy._active_encounter_for_current_sub_zone(save)
-    reputation_entry = legacy.get_current_sub_zone_reputation(save, create=True)
-    reputation_score = reputation_entry.score if reputation_entry is not None else 50
+    zone_metric = zone_metric_service.get_current_zone_metric(save, create=True)
+    reputation_score = zone_metric.reputation_score if zone_metric is not None else 50
     candidates = candidate_rows(
         save,
         player_text=display_text,
         addressed_role_name=addressed_role_name,
         incoming_target_candidates=[str(item) for item in list(intent.get("incoming_target_candidates") or [])],
+        config=config,
     )
     if not candidates:
         return []
@@ -463,6 +627,11 @@ def advance_public_scene_in_save(
             gm_summary=gm_summary,
             incoming_interaction=incoming,
         )
+        response_mode = str(payload.get("response_mode") or "respond").strip().lower() or "respond"
+        if not actor_may_speak_in_public_turn(actor, audience_context):
+            payload["speech_line"] = ""
+            payload["speech_summary"] = ""
+            response_mode = "ignore"
         risk_key = (str(payload.get("risk_source") or ""), str(payload.get("risk_object") or ""), str(payload.get("risk_location") or ""))
         if risk_key in seen_risks:
             payload["risk_object"] = f"{actor.get('name') or '该角色'}眼前那一处最容易出事的地方"
@@ -483,8 +652,10 @@ def advance_public_scene_in_save(
             )
         )
         legacy._append_actor_memory(save, actor, display_text=display_text, action_line=action_content, priority_reason=str(actor.get("priority_reason") or ""))
+        requires_check = should_force_public_action_check(save, actor, payload, config=config)
+        payload["needs_check"] = requires_check
         action_result = None
-        if bool(payload.get("needs_check")):
+        if requires_check:
             action_result = legacy._actor_check(
                 save,
                 actor_id,
@@ -501,6 +672,21 @@ def advance_public_scene_in_save(
         applied_relation_delta = 0
         if isinstance(role, NpcRoleCard) and relation_delta != 0:
             applied_relation_delta = legacy._apply_actor_relation_delta(save, role, str(actor.get("actor_type") or "npc"), relation_delta, reputation_score)
+        affiliation_kind, affiliation_label = actor_affiliation(actor)
+        check_result = build_public_check_result(action_result, requires_check=requires_check)
+        scene_events[-1].metadata = {
+            "actor_type": str(actor.get("actor_type") or "npc"),
+            "affiliation_kind": affiliation_kind,
+            "affiliation_label": affiliation_label,
+            "response_mode": response_mode,
+            "action_type": str(payload.get("action_type") or "check"),
+            "target_label": str(payload.get("target_label") or ""),
+            "specific_threat": str(payload.get("specific_threat") or ""),
+            "external_action_narration": str(payload.get("external_action_narration") or ""),
+            "speech_line": str(payload.get("speech_line") or ""),
+            "visible_intent": str(payload.get("visible_intent") or ""),
+            "check_result": check_result,
+        }
         affected_object = str(payload.get("target_label") or payload.get("risk_object") or "眼前局面")
         if action_result is not None and action_result.narrative:
           concrete_effect = str(action_result.narrative).strip()[:220]
@@ -538,11 +724,11 @@ def advance_public_scene_in_save(
         trend = assessment.trend
     resolution_lines = [str(item.get("resolution_line") or "") for item in result_rows if str(item.get("resolution_line") or "").strip()]
     if direction == "stabilize":
-        resolution_lines.append(f"这一轮之后，局势值来到 {predicted_situation_value}/100，现场被暂时压住，玩家下一步可以趁着这点空间继续处理最关键的失控点。")
+        resolution_lines.append("这一轮之后，现场被暂时压住，玩家下一步可以趁着这点空间继续处理最关键的失控点。")
     elif direction == "worsen":
-        resolution_lines.append(f"这一轮之后，局势值掉到 {predicted_situation_value}/100，现场压力继续扩大，玩家下一步必须立刻处理最先要出事的位置。")
+        resolution_lines.append("这一轮之后，现场压力继续扩大，玩家下一步必须立刻处理最先要出事的位置。")
     else:
-        resolution_lines.append(f"这一轮之后，局势值停在 {predicted_situation_value}/100，现场暂时维持僵持，没有继续恶化，但还没有真正突破。")
+        resolution_lines.append("这一轮之后，现场暂时维持僵持，没有继续恶化，但还没有真正突破。")
     fallback_resolution_text = "\n".join(line for line in resolution_lines if line).strip()[:720]
     resolution_text = _ai_round_resolution(
         result_rows,
@@ -559,7 +745,7 @@ def advance_public_scene_in_save(
         scene_events.extend(
             apply_active_encounter_situation_delta_in_save(save, session_id=session_id, delta=total_situation_delta, summary=resolution_text, actor_name="公开轮次")
         )
-    rep_entry, rep_event = legacy.apply_sub_zone_reputation_delta(
+    rep_entry, rep_event = zone_metric_service.apply_zone_reputation_delta(
         save,
         session_id=session_id,
         delta=legacy._clamp(reputation_delta_total, -6, 6),
@@ -570,7 +756,7 @@ def advance_public_scene_in_save(
     )
     if rep_event is not None:
         scene_events.append(rep_event)
-        reputation_score = rep_entry.score if rep_entry is not None else reputation_score
+        reputation_score = rep_entry.reputation_score if rep_entry is not None else reputation_score
     scene_events.append(
         legacy._new_scene_event(
             "public_round_resolution",
@@ -580,12 +766,6 @@ def advance_public_scene_in_save(
                 "actor_type": "system",
                 "candidate_count": len(result_rows),
                 "reputation_score": reputation_score,
-                "predicted_situation_value": predicted_situation_value,
-                "situation_value_before": situation_before,
-                "situation_value_after": predicted_situation_value,
-                "direction": direction,
-                "trend": trend,
-                "result_rows": result_rows,
             },
         )
     )
@@ -596,9 +776,6 @@ def advance_public_scene_in_save(
             f"鍏紑鍦烘櫙鎺ㄨ繘浜?{len(result_rows)} 涓鍔ㄥ０鏄庯紝骞剁粺涓€瀹屾垚杞缁撶畻",
             {
                 "candidate_count": len(result_rows),
-                "predicted_situation_value": predicted_situation_value,
-                "direction": direction,
-                "trend": trend,
                 "reputation_score": reputation_score,
             },
         )

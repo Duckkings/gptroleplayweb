@@ -9,6 +9,7 @@ import { FatePanel } from './components/FatePanel';
 import { GameLogPanel } from './components/GameLogPanel';
 import { InventoryModal } from './components/InventoryModal';
 import { ItemInteractionModal } from './components/ItemInteractionModal';
+import { LiveProgressPanel } from './components/LiveProgressPanel';
 import { MapPanel } from './components/MapPanel';
 import { NpcPoolPanel } from './components/NpcPoolPanel';
 import { PlayerPanel } from './components/PlayerPanel';
@@ -24,17 +25,19 @@ import { ActionCheckRollModal } from './components/ActionCheckRollModal';
 import { AuthPanel } from './components/AuthPanel';
 import {
   acceptQuest,
+  bootstrapWorldMap,
   checkEncounters,
+  cancelPendingTurn,
+  continuePendingTurn,
+  continuePendingTurnStream,
   clearSave,
   debugGenerateQuest,
   discoverConfigModels,
   discoverAreaInteractions,
-  describeBehavior,
   equipInventoryItem,
   evaluateAllQuests,
   evaluateFate,
   generateFate,
-  generateRegions,
   generateDebugTeammate,
   getConsistencyStatus,
   getGameLogs,
@@ -43,6 +46,7 @@ import {
   getConfigModelProfile,
   getStoredConfig,
   getCurrentArea,
+  getCurrentPendingTurn,
   getCurrentSave,
   getFateState,
   getPendingEncounters,
@@ -107,17 +111,23 @@ import {
   type AreaSnapshot,
   type AppConfig,
   type ChatMessage,
+  type ChatResponse,
   type ConsistencyIssue,
   type FateState,
   type GameLogEntry,
   type GlobalStorySnapshot,
   type InventoryOwnerRef,
   type MapSnapshot,
+  type MainTurnSummary,
+  type MapStateSyncBundle,
   type ModelCapabilityInfo,
   type PathStatus,
+  type PendingTurnContinueResponse,
   type PlayerRuntimeData,
+  type PlayerReactionCheck,
   type PlayerStaticData,
   type NpcRoleCard,
+  type NpcChatResponse,
   type Position,
   type ProviderConfigMap,
   type ProviderScopedConfig,
@@ -125,21 +135,28 @@ import {
   type RenderResult,
   type SaveFile,
   type SceneEvent,
+  type LiveProgressEntry,
+  type LiveToolEvent,
+  type StreamPhaseEvent,
   type SubZoneReputationEntry,
   type TeamChatReply,
   type TeamState,
   type TokenUsageSummary,
+  type TurnRollbackPayload,
+  type ZoneMetricEntry,
+  type ZoneMetricState,
 } from './types/app';
 
 type View = 'boot' | 'config' | 'chat';
-type ChatState = 'idle' | 'sending' | 'streaming' | 'error';
+type ChatState = 'idle' | 'sending' | 'streaming' | 'awaiting_reaction' | 'error';
 type ChatMode = 'main' | 'npc';
-type MainOutputStatus = 'idle' | 'streaming' | 'awaiting_archive' | 'error';
+type MainOutputStatus = 'idle' | 'streaming' | 'awaiting_reaction' | 'awaiting_archive' | 'error';
 type MainOutput = {
   source_kind: 'main_turn' | 'system_output';
   reply_text: string;
   scene_events: SceneEvent[];
   archived_sub_zone_turn_id: string | null;
+  main_turn_summary: MainTurnSummary | null;
   status: MainOutputStatus;
 };
 type ActionCheckPayload = {
@@ -150,6 +167,8 @@ type ActionCheckPayload = {
   post_close_output: 'main_chat' | 'suppress';
   resolution_context?: 'standalone' | 'embedded';
   skip_if_no_check?: boolean;
+  return_state_sync?: boolean;
+  post_trigger_kind?: 'random_move' | 'random_dialog' | 'scripted' | 'quest_rule' | 'fate_rule' | 'debug_forced';
 };
 type ActionCheckRollPhase = 'ready' | 'rolling' | 'resolving' | 'resolved' | 'error';
 type ActionCheckRollState = {
@@ -161,6 +180,26 @@ type ActionCheckRollState = {
   errorMessage: string;
   rotation: { x: number; y: number; z: number };
 };
+type PendingReactionState = {
+  pending_turn_id: string;
+  flow_kind: PendingTurnContinueResponse['flow_kind'];
+  npc_role_id?: string | null;
+  pending_reaction: PlayerReactionCheck;
+};
+
+function isPendingTurnContinueResponse(
+  response: ChatResponse | PendingTurnContinueResponse | NpcChatResponse,
+): response is PendingTurnContinueResponse {
+  return 'status' in response && 'reply_text' in response;
+}
+
+function isChatTurnResponse(response: ChatResponse | PendingTurnContinueResponse): response is ChatResponse {
+  return 'reply' in response;
+}
+
+function isNpcTurnResponse(response: NpcChatResponse | PendingTurnContinueResponse): response is NpcChatResponse {
+  return 'dialogue_logs' in response;
+}
 
 const DEFAULT_POSITION: Position = { x: 0, y: 0, z: 0, zone_id: 'zone_0_0_0' };
 const MAP_PROMPT_STORAGE_KEY = 'rpw_map_world_prompt';
@@ -189,14 +228,24 @@ const MAIN_OUTPUT_SCENE_EVENT_KINDS = new Set<SceneEvent['kind']>([
   'encounter_started',
   'encounter_background',
   'encounter_situation_update',
+  'encounter_world_push',
+  'player_reaction_triggered',
+  'player_reaction_result',
   'encounter_progress',
   'encounter_resolution',
 ]);
+const FOLDED_MAIN_SCENE_EVENT_KINDS = new Set<SceneEvent['kind']>(['public_round_resolution']);
 
 function selectCurrentReputation(save: SaveFile): SubZoneReputationEntry | null {
   const subZoneId = save.area_snapshot?.current_sub_zone_id ?? null;
   if (!subZoneId) return null;
   return save.reputation_state?.entries?.find((item) => item.sub_zone_id === subZoneId) ?? null;
+}
+
+function selectCurrentZoneMetric(save: SaveFile): ZoneMetricEntry | null {
+  const zoneId = save.area_snapshot?.current_zone_id ?? null;
+  if (!zoneId) return null;
+  return save.zone_metric_state?.entries?.find((item) => item.zone_id === zoneId) ?? null;
 }
 
 function cloneRuntimeConfig(runtime?: AppConfig['runtime']): AppConfig['runtime'] {
@@ -246,6 +295,10 @@ function normalizeConfig(config: AppConfig): AppConfig {
     model: currentProviderConfig.model,
     runtime: cloneRuntimeConfig(currentProviderConfig.runtime),
     provider_configs: providerConfigs,
+    public_scene: {
+      ...defaultConfig.public_scene,
+      ...(config.public_scene ?? {}),
+    },
   };
 }
 
@@ -286,9 +339,13 @@ function selectProviderConfig(config: AppConfig, provider: AppConfig['provider']
 
 function applyModelProfile(config: AppConfig, profile: ModelCapabilityInfo | null): AppConfig {
   if (!profile) {
-    return updateCurrentProviderConfig(config, { runtime: {} });
+    return updateCurrentProviderConfig(config, {
+      runtime: { structured_output_mode: config.runtime?.structured_output_mode ?? 'auto' },
+    });
   }
-  const runtime: AppConfig['runtime'] = {};
+  const runtime: AppConfig['runtime'] = {
+    structured_output_mode: config.runtime?.structured_output_mode ?? 'auto',
+  };
   for (const key of profile.supported_params) {
     const current = config.runtime?.[key];
     const fallback = profile.defaults[key];
@@ -322,7 +379,10 @@ function App() {
   const [configReturnView, setConfigReturnView] = useState<View>('boot');
   const [config, setConfig] = useState<AppConfig>(defaultConfig);
   const [currentMainOutput, setCurrentMainOutput] = useState<MainOutput | null>(null);
+  const [showFoldedMainSceneEvents, setShowFoldedMainSceneEvents] = useState(false);
+  const [mainLiveProgress, setMainLiveProgress] = useState<LiveProgressEntry[]>([]);
   const [npcChatMessages, setNpcChatMessages] = useState<Record<string, ChatMessage[]>>({});
+  const [npcLiveProgress, setNpcLiveProgress] = useState<Record<string, LiveProgressEntry[]>>({});
   const [chatMode, setChatMode] = useState<ChatMode>('main');
   const [activeNpcChat, setActiveNpcChat] = useState<{ npcId: string; npcName: string } | null>(null);
   const [lastActionInput, setLastActionInput] = useState('');
@@ -356,6 +416,8 @@ function App() {
   const [logOpen, setLogOpen] = useState(false);
   const [areaSnapshot, setAreaSnapshot] = useState<AreaSnapshot | null>(null);
   const [currentReputation, setCurrentReputation] = useState<SubZoneReputationEntry | null>(null);
+  const [currentZoneMetric, setCurrentZoneMetric] = useState<ZoneMetricEntry | null>(null);
+  const [zoneMetricState, setZoneMetricState] = useState<ZoneMetricState>({ version: '0.1.0', entries: [], updated_at: '' });
   const [questState, setQuestState] = useState<QuestState>(defaultQuestState);
   const [encounterState, setEncounterState] = useState<EncounterState>(defaultEncounterState);
   const [fateState, setFateState] = useState<FateState>(defaultFateState);
@@ -396,6 +458,8 @@ function App() {
   const [actionPanelOpen, setActionPanelOpen] = useState(false);
   const [lastActionResult, setLastActionResult] = useState<ActionCheckResult | null>(null);
   const [actionCheckRollState, setActionCheckRollState] = useState<ActionCheckRollState>(DEFAULT_ACTION_CHECK_ROLL_STATE);
+  const [reactionCheckRollState, setReactionCheckRollState] = useState<ActionCheckRollState>(DEFAULT_ACTION_CHECK_ROLL_STATE);
+  const [pendingReactionState, setPendingReactionState] = useState<PendingReactionState | null>(null);
   const [timeNotices, setTimeNotices] = useState<Array<{ id: number; text: string }>>([]);
   const [playerStatic, setPlayerStaticState] = useState<PlayerStaticData>(defaultPlayerStaticData);
   const [playerRuntime, setPlayerRuntimeState] = useState<PlayerRuntimeData>({
@@ -410,15 +474,18 @@ function App() {
   const [encounterModalEncounterId, setEncounterModalEncounterId] = useState<string | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
+  const activeStreamRef = useRef<{ kind: 'main' } | { kind: 'npc'; npcId: string; previousMessages: ChatMessage[] } | null>(null);
   const announcedEncounterIdsRef = useRef<Set<string>>(new Set());
   const autoRejoinEncounterIdRef = useRef<string | null>(null);
   const pendingActionCheckRef = useRef<ActionCheckPayload | null>(null);
   const actionCheckPromiseRef = useRef<{ resolve: (result: ActionCheckResult | null) => void; reject: (error: Error) => void } | null>(null);
+  const pendingReactionResponseRef = useRef<PendingTurnContinueResponse | null>(null);
   const actionInputRef = useRef<HTMLTextAreaElement | null>(null);
 
   const statusText = useMemo(() => {
     if (chatState === 'sending') return '发送中...';
     if (chatState === 'streaming') return '生成中...';
+    if (chatState === 'awaiting_reaction') return '等待反应检定...';
     if (chatState === 'error') return `错误: ${error}`;
     return '就绪';
   }, [chatState, error]);
@@ -546,6 +613,10 @@ function App() {
     if (!areaSnapshot?.current_sub_zone_id) return null;
     return areaSnapshot.sub_zones.find((s) => s.sub_zone_id === areaSnapshot.current_sub_zone_id) ?? null;
   }, [areaSnapshot]);
+  const currentZone = useMemo(() => {
+    if (!areaSnapshot?.current_zone_id) return null;
+    return areaSnapshot.zones.find((z) => z.zone_id === areaSnapshot.current_zone_id) ?? null;
+  }, [areaSnapshot]);
   const pendingQuest = useMemo(() => {
     const pending = [...(questState.quests ?? [])].filter((item) => item.status === 'pending_offer');
     pending.sort((a, b) => {
@@ -588,7 +659,7 @@ function App() {
   }, [encounterState.encounters, encounterModalEncounterId]);
   const encounterModalOpen = Boolean(encounterModalEncounter);
   const blockingModalOpen = Boolean(
-    pendingQuest || mapPromptDialogOpen || aiWaiting || actionCheckRollState.open || encounterModalBusy || encounterModalOpen,
+    pendingQuest || mapPromptDialogOpen || aiWaiting || actionCheckRollState.open || reactionCheckRollState.open || encounterModalBusy || encounterModalOpen,
   );
   const hasActionInput = actionInput.trim().length > 0;
   const hasSpeechInput = speechInput.trim().length > 0;
@@ -609,6 +680,62 @@ function App() {
       return { ...prev, [npcId]: resolved };
     });
   };
+  const upsertLiveProgress = (entries: LiveProgressEntry[], next: LiveProgressEntry): LiveProgressEntry[] => {
+    const existingIndex = entries.findIndex((entry) => entry.id === next.id);
+    if (existingIndex < 0) {
+      return [...entries, next];
+    }
+    const updated = [...entries];
+    updated[existingIndex] = next;
+    return updated;
+  };
+  const toPhaseProgressEntry = (event: StreamPhaseEvent): LiveProgressEntry => ({
+    id: `phase:${event.code}`,
+    kind: 'phase',
+    label: event.label || event.code,
+    status: event.status,
+    detail: event.detail,
+  });
+  const toToolProgressEntry = (event: LiveToolEvent): LiveProgressEntry => ({
+    id: `tool:${event.tool_name}`,
+    kind: 'tool',
+    label: event.tool_name,
+    status: event.status,
+    detail: event.summary,
+  });
+  const clearLiveProgress = () => {
+    setMainLiveProgress([]);
+    setNpcLiveProgress({});
+  };
+  const clearNpcLiveProgress = (npcId: string) => {
+    setNpcLiveProgress((prev) => {
+      if (!(npcId in prev)) return prev;
+      const next = { ...prev };
+      delete next[npcId];
+      return next;
+    });
+  };
+  const restoreAbortedNpcStream = () => {
+    const activeStream = activeStreamRef.current;
+    if (!activeStream || activeStream.kind !== 'npc') return;
+    setNpcChatMessages((prev) => ({
+      ...prev,
+      [activeStream.npcId]: activeStream.previousMessages,
+    }));
+    clearNpcLiveProgress(activeStream.npcId);
+    activeStreamRef.current = null;
+  };
+  const handleStreamRollback = (payload: TurnRollbackPayload) => {
+    void payload;
+    if (activeStreamRef.current?.kind === 'main') {
+      setCurrentMainOutput(null);
+    }
+    if (activeStreamRef.current?.kind === 'npc') {
+      restoreAbortedNpcStream();
+    }
+    clearLiveProgress();
+    activeStreamRef.current = null;
+  };
   const isAlreadyThereHint = (text: string): boolean => text.trim().startsWith('你已在');
   const showAlreadyTherePopup = (text: string): void => {
     window.alert(text);
@@ -619,7 +746,7 @@ function App() {
     sourceKind: MainOutput['source_kind'],
     replyText: string,
     sceneEvents: SceneEvent[] = [],
-    options?: { archivedSubZoneTurnId?: string | null; status?: MainOutputStatus },
+    options?: { archivedSubZoneTurnId?: string | null; mainTurnSummary?: MainTurnSummary | null; status?: MainOutputStatus },
   ): void => {
     const trimmedReply = replyText.trim();
     if (trimmedReply && isAlreadyThereHint(trimmedReply)) {
@@ -631,11 +758,13 @@ function App() {
       setCurrentMainOutput(null);
       return;
     }
+    setShowFoldedMainSceneEvents(false);
     setCurrentMainOutput({
       source_kind: sourceKind,
       reply_text: replyText,
       scene_events: visibleSceneEvents,
       archived_sub_zone_turn_id: options?.archivedSubZoneTurnId ?? null,
+      main_turn_summary: options?.mainTurnSummary ?? null,
       status: options?.status ?? 'idle',
     });
   };
@@ -745,6 +874,42 @@ function App() {
   const resetActionCheckRollState = () => {
     setActionCheckRollState(DEFAULT_ACTION_CHECK_ROLL_STATE);
   };
+  const resetReactionCheckRollState = () => {
+    setReactionCheckRollState(DEFAULT_ACTION_CHECK_ROLL_STATE);
+  };
+  const buildReactionPlan = (reaction: PlayerReactionCheck): ActionCheckPlan => ({
+    ok: true,
+    session_id: sessionId,
+    actor_role_id: playerStatic.player_id,
+    actor_name: playerStatic.name,
+    actor_kind: 'player',
+    action_type: 'check',
+    check_mode: 'reaction_save',
+    requires_check: true,
+    ability_used: reaction.ability_used,
+    ability_modifier: playerStatic.dnd5e_sheet.current_ability_modifiers[reaction.ability_used],
+    dc: reaction.dc,
+    time_spent_min: 1,
+    check_task: reaction.check_task,
+    source_label: reaction.source_label,
+    threatened_consequence: reaction.threatened_consequence,
+  });
+  const openPendingReaction = (response: PendingTurnContinueResponse) => {
+    if (!response.pending_turn_id || !response.pending_reaction) return;
+    pendingReactionResponseRef.current = null;
+    setPendingReactionState({
+      pending_turn_id: response.pending_turn_id,
+      flow_kind: response.flow_kind,
+      npc_role_id: response.npc_role_id ?? null,
+      pending_reaction: response.pending_reaction,
+    });
+    setReactionCheckRollState({
+      ...DEFAULT_ACTION_CHECK_ROLL_STATE,
+      open: true,
+      plan: buildReactionPlan(response.pending_reaction),
+    });
+    setChatState('awaiting_reaction');
+  };
 
   useEffect(() => {
     if (!currentMainOutput || currentMainOutput.source_kind !== 'main_turn') return;
@@ -755,6 +920,32 @@ function App() {
     setCurrentMainOutput(null);
   }, [currentMainOutput, currentSubZone]);
 
+  useEffect(() => {
+    if (!sessionId || pendingReactionState || actionCheckRollState.open || reactionCheckRollState.open) return;
+    void (async () => {
+      try {
+        const pending = await getCurrentPendingTurn(sessionId);
+        if (!pending || pending.status !== 'awaiting_reaction' || !pending.pending_reaction) return;
+        if (pending.flow_kind === 'main_chat') {
+          setCurrentMainOutput({
+            source_kind: 'main_turn',
+            reply_text: pending.reply_text,
+            scene_events: pending.scene_events,
+            archived_sub_zone_turn_id: pending.archived_sub_zone_turn_id ?? null,
+            main_turn_summary: pending.main_turn_summary ?? null,
+            status: 'awaiting_reaction',
+          });
+          setShowFoldedMainSceneEvents(false);
+        } else if (pending.flow_kind === 'npc_chat') {
+          applyPendingNpcTurnState(pending);
+        }
+        openPendingReaction(pending);
+      } catch {
+        // Ignore restore failures to avoid blocking the app boot flow.
+      }
+    })();
+  }, [sessionId, pendingReactionState, actionCheckRollState.open, reactionCheckRollState.open]);
+
   const refreshTokenUsage = async (sid: string = sessionId) => {
     try {
       const usage = await getTokenUsage(sid, report);
@@ -762,6 +953,41 @@ function App() {
     } catch {
       // Ignore token usage refresh failure.
     }
+  };
+
+  useEffect(() => {
+    const zoneId = areaSnapshot?.current_zone_id ?? null;
+    if (!zoneId) {
+      setCurrentZoneMetric(null);
+      return;
+    }
+    setCurrentZoneMetric(zoneMetricState.entries.find((item) => item.zone_id === zoneId) ?? null);
+  }, [areaSnapshot, zoneMetricState]);
+
+  const applyMapStateSync = (sync: MapStateSyncBundle, sid: string = sessionId) => {
+    const effectiveSessionId = sync.player_runtime_data?.session_id || sid;
+    setMapSnapshot(sync.map_snapshot ?? { zones: [], player_position: DEFAULT_POSITION });
+    setAreaSnapshot(sync.area_snapshot ?? null);
+    setCurrentReputation(sync.current_reputation ?? null);
+    setCurrentZoneMetric(sync.current_zone_metric ?? null);
+    setZoneMetricState(sync.zone_metric_state ?? { version: '0.1.0', entries: [], updated_at: '' });
+    setQuestState(sync.quest_state ?? defaultQuestState);
+    setEncounterState(sync.encounter_state ?? defaultEncounterState);
+    setFateState(sync.fate_state ?? defaultFateState);
+    setTeamState(sync.team_state ?? defaultTeamState);
+    setNpcPoolItems(sync.role_pool ?? []);
+    setNpcPoolTotal((sync.role_pool ?? []).length);
+    setWorldState(sync.world_state ?? defaultWorldState);
+    setPlayerStaticState(sync.player_static_data ?? defaultPlayerStaticData);
+    setPlayerRuntimeState(
+      sync.player_runtime_data ?? {
+        session_id: effectiveSessionId,
+        current_position: sync.map_snapshot?.player_position ?? DEFAULT_POSITION,
+        updated_at: new Date().toISOString(),
+      },
+    );
+    setMapRender({ session_id: effectiveSessionId, ...sync.render });
+    setGameLogs(sync.game_logs ?? []);
   };
 
   const refreshQuestState = async (sid: string = sessionId) => {
@@ -785,7 +1011,7 @@ function App() {
   const syncEncounterLaneAfterSceneEvents = async (events: SceneEvent[]) => {
     if (
       events.some((event) =>
-        ['encounter_started', 'encounter_background', 'encounter_progress', 'encounter_resolution', 'encounter_situation_update'].includes(event.kind),
+        ['encounter_started', 'encounter_background', 'encounter_progress', 'encounter_resolution', 'encounter_situation_update', 'encounter_world_push'].includes(event.kind),
       )
     ) {
       await refreshEncounterState(sessionId);
@@ -833,6 +1059,8 @@ function App() {
       setMapSnapshot(toMapSnapshot(save));
       setAreaSnapshot(save.area_snapshot ?? null);
       setCurrentReputation(selectCurrentReputation(save));
+      setCurrentZoneMetric(selectCurrentZoneMetric(save));
+      setZoneMetricState(save.zone_metric_state ?? { version: '0.1.0', entries: [], updated_at: '' });
       setQuestState(save.quest_state ?? defaultQuestState);
       setEncounterState(save.encounter_state ?? defaultEncounterState);
       setFateState(save.fate_state ?? defaultFateState);
@@ -857,6 +1085,7 @@ function App() {
             session_id: sid,
             zones: snapshot.zones,
             player_position: snapshot.player_position ?? DEFAULT_POSITION,
+            zone_metric_state: save.zone_metric_state,
           },
           report,
         );
@@ -957,6 +1186,8 @@ function App() {
         setMapSnapshot(toMapSnapshot(save));
         setAreaSnapshot(save.area_snapshot ?? null);
         setCurrentReputation(selectCurrentReputation(save));
+        setCurrentZoneMetric(selectCurrentZoneMetric(save));
+        setZoneMetricState(save.zone_metric_state ?? { version: '0.1.0', entries: [], updated_at: '' });
         setQuestState(save.quest_state ?? defaultQuestState);
         setEncounterState(save.encounter_state ?? defaultEncounterState);
         setFateState(save.fate_state ?? defaultFateState);
@@ -1253,6 +1484,8 @@ function App() {
           planned_time_spent_min: plan.time_spent_min,
           planned_requires_check: plan.requires_check,
           planned_check_task: plan.check_task,
+          return_state_sync: payload.return_state_sync,
+          post_trigger_kind: payload.post_trigger_kind,
           config,
         },
         report,
@@ -1272,6 +1505,8 @@ function App() {
           planned_time_spent_min: plan.time_spent_min,
           planned_requires_check: plan.requires_check,
           planned_check_task: plan.check_task,
+          return_state_sync: payload.return_state_sync,
+          post_trigger_kind: payload.post_trigger_kind,
           config,
         },
         report,
@@ -1329,6 +1564,8 @@ function App() {
               planned_time_spent_min: plan.time_spent_min,
               planned_requires_check: plan.requires_check,
               planned_check_task: plan.check_task,
+              return_state_sync: payload.return_state_sync,
+              post_trigger_kind: payload.post_trigger_kind,
               config,
             },
             report,
@@ -1367,6 +1604,235 @@ function App() {
     pending.reject(new Error(errorMessage));
   };
 
+  const onTriggerReactionCheckRoll = () => {
+    if (reactionCheckRollState.phase !== 'ready' || !pendingReactionState || !reactionCheckRollState.plan) return;
+    const rollValue = Math.floor(Math.random() * 20) + 1;
+    const rotation = {
+      x: 1080 + Math.floor(Math.random() * 720),
+      y: 1440 + Math.floor(Math.random() * 720),
+      z: 900 + Math.floor(Math.random() * 720),
+    };
+    setReactionCheckRollState((current) => ({
+      ...current,
+      phase: 'rolling',
+      rollValue,
+      result: null,
+      errorMessage: '',
+      rotation,
+    }));
+    window.setTimeout(() => {
+      void (async () => {
+        setReactionCheckRollState((current) => ({ ...current, phase: 'resolving', rollValue }));
+        try {
+          const pending = pendingReactionState;
+          if (!pending) {
+            throw new Error('待续回合不存在');
+          }
+          if (config.stream && (pending.flow_kind === 'main_chat' || pending.flow_kind === 'npc_chat')) {
+            const controller = new AbortController();
+            abortRef.current = controller;
+            let streamedReply =
+              pending.flow_kind === 'main_chat'
+                ? currentMainOutput?.reply_text ?? pending.pending_reaction.trigger_summary
+                : pending.npc_role_id
+                  ? npcChatMessages[pending.npc_role_id]?.[npcChatMessages[pending.npc_role_id].length - 1]?.content ?? pending.pending_reaction.trigger_summary
+                  : pending.pending_reaction.trigger_summary;
+            let streamedSceneEvents = pending.flow_kind === 'main_chat' ? currentMainOutput?.scene_events ?? [] : [];
+            let finalResponse: PendingTurnContinueResponse | null = null;
+            let resumedResult: ActionCheckResult | null = null;
+
+            await continuePendingTurnStream(
+              {
+                session_id: sessionId,
+                pending_turn_id: pending.pending_turn_id,
+                forced_dice_roll: rollValue,
+                config,
+              },
+              {
+                onDelta: (delta) => {
+                  streamedReply = `${streamedReply}${delta}`;
+                  if (pending.flow_kind === 'main_chat') {
+                    setCurrentMainOutput((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            reply_text: streamedReply,
+                            status: 'streaming',
+                          }
+                        : prev,
+                    );
+                  } else if (pending.flow_kind === 'npc_chat' && pending.npc_role_id) {
+                    setNpcChatMessages((prev) => {
+                      const current = [...(prev[pending.npc_role_id!] ?? [])];
+                      if (current.length > 0 && current[current.length - 1]?.role === 'assistant') {
+                        current[current.length - 1] = { ...current[current.length - 1], content: streamedReply };
+                      }
+                      return { ...prev, [pending.npc_role_id!]: current };
+                    });
+                  }
+                },
+                onReactionCheckResumed: ({ reaction_result }) => {
+                  resumedResult = reaction_result;
+                },
+                onReactionCheckRequired: (payload) => {
+                  finalResponse = {
+                    session_id: sessionId,
+                    pending_turn_id: payload.pending_turn_id,
+                    flow_kind: payload.flow_kind,
+                    status: 'awaiting_reaction',
+                    reply_text: streamedReply,
+                    scene_events: payload.scene_events_so_far,
+                    tool_events: [],
+                    pending_reaction: payload.pending_reaction,
+                    reaction_result: resumedResult,
+                    npc_role_id: payload.npc_role_id ?? null,
+                  };
+                },
+                onSceneEvents: (events) => {
+                  streamedSceneEvents = events;
+                },
+                onEnd: ({ archived_sub_zone_turn_id, main_turn_summary }) => {
+                  finalResponse = {
+                    session_id: sessionId,
+                    pending_turn_id: null,
+                    flow_kind: pending.flow_kind,
+                    status: 'completed',
+                    reply_text: streamedReply,
+                    scene_events: streamedSceneEvents,
+                    tool_events: [],
+                    main_turn_summary: main_turn_summary ?? null,
+                    pending_reaction: null,
+                    reaction_result: resumedResult,
+                    archived_sub_zone_turn_id: archived_sub_zone_turn_id ?? null,
+                    npc_role_id: pending.npc_role_id ?? null,
+                  };
+                },
+                onError: (message) => {
+                  throw new Error(message);
+                },
+              },
+              controller.signal,
+              report,
+            );
+
+            abortRef.current = null;
+            const resolvedResponse = finalResponse as PendingTurnContinueResponse | null;
+            if (!resolvedResponse) {
+              throw new Error('待续回合流式续行未返回结果');
+            }
+            pendingReactionResponseRef.current = resolvedResponse;
+            setReactionCheckRollState((current) => ({
+              ...current,
+              phase: 'resolved',
+              result: resolvedResponse.reaction_result ?? null,
+              errorMessage: '',
+            }));
+            if (resolvedResponse.flow_kind === 'main_chat') {
+              setCurrentMainOutput({
+                source_kind: 'main_turn',
+                reply_text: resolvedResponse.reply_text,
+                scene_events: resolvedResponse.scene_events,
+                archived_sub_zone_turn_id: resolvedResponse.archived_sub_zone_turn_id ?? null,
+                main_turn_summary: resolvedResponse.main_turn_summary ?? null,
+                status: resolvedResponse.status === 'completed' ? 'awaiting_archive' : 'awaiting_reaction',
+              });
+            }
+          } else {
+            const response = await continuePendingTurn(
+              {
+                session_id: sessionId,
+                pending_turn_id: pending.pending_turn_id,
+                forced_dice_roll: rollValue,
+                config,
+              },
+              report,
+            );
+            pendingReactionResponseRef.current = response;
+            setReactionCheckRollState((current) => ({
+              ...current,
+              phase: 'resolved',
+              result: response.reaction_result ?? null,
+              errorMessage: '',
+            }));
+            if (response.flow_kind === 'main_chat') {
+              setCurrentMainOutput({
+                source_kind: 'main_turn',
+                reply_text: response.reply_text,
+                scene_events: response.scene_events,
+                archived_sub_zone_turn_id: response.archived_sub_zone_turn_id ?? null,
+                main_turn_summary: response.main_turn_summary ?? null,
+                status: response.status === 'completed' ? 'awaiting_archive' : 'awaiting_reaction',
+              });
+              setCurrentZoneMetric(response.current_zone_metric ?? null);
+            } else if (response.flow_kind === 'npc_chat' && pending.npc_role_id) {
+              setNpcChatMessages((prev) => {
+                const current = [...(prev[pending.npc_role_id!] ?? [])];
+                if (current.length > 0 && current[current.length - 1]?.role === 'assistant') {
+                  current[current.length - 1] = { ...current[current.length - 1], content: response.reply_text };
+                }
+                return { ...prev, [pending.npc_role_id!]: current };
+              });
+            }
+          }
+        } catch (e) {
+          const message = e instanceof Error ? e.message : '反应检定续行失败';
+          setReactionCheckRollState((current) => ({ ...current, phase: 'error', errorMessage: message }));
+          setChatState('error');
+        }
+      })();
+    }, 1650);
+  };
+
+  const onCloseReactionCheckRoll = () => {
+    const pending = pendingReactionState;
+    const response = pendingReactionResponseRef.current;
+    resetReactionCheckRollState();
+    pendingReactionResponseRef.current = null;
+    if (response) {
+      setPendingReactionState(null);
+      if (response.status === 'awaiting_reaction' && response.pending_reaction) {
+        handlePendingReactionRequired(response);
+        return;
+      }
+      if (response.status === 'completed') {
+        clearPlayerInput();
+      }
+      abortRef.current = null;
+      activeStreamRef.current = null;
+      setChatState('idle');
+      void (async () => {
+        await refreshAreaSnapshot();
+        await syncStateFromSave(sessionId);
+      })();
+      return;
+    }
+    setPendingReactionState(null);
+    if (!pending) {
+      setChatState('idle');
+      return;
+    }
+    void (async () => {
+      try {
+        await cancelPendingTurn({ session_id: sessionId, pending_turn_id: pending.pending_turn_id }, report);
+      } catch {
+        // Ignore cancel failures and still reset the local UI.
+      }
+      if (pending.flow_kind === 'main_chat') {
+        setCurrentMainOutput(null);
+      } else if (pending.flow_kind === 'npc_chat') {
+        const active = activeStreamRef.current;
+        if (active && active.kind === 'npc' && active.npcId === pending.npc_role_id) {
+          setNpcChatMessages((prev) => ({ ...prev, [active.npcId]: active.previousMessages }));
+        }
+      }
+      abortRef.current = null;
+      activeStreamRef.current = null;
+      setMainLiveProgress([]);
+      setChatState('idle');
+      window.alert('本轮已作废');
+    })();
+  };
+
   const publishActionCheckOutcome = async (
     result: ActionCheckResult,
     sourceContext: ActionCheckPayload['source_context'],
@@ -1393,8 +1859,51 @@ function App() {
     } else if (mirroredEvents.length > 0) {
       setMainOutput('system_output', '', mirroredEvents);
     }
-    await syncEncounterLaneAfterSceneEvents(mirroredEvents);
+    if (result.state_sync) {
+      applyMapStateSync(result.state_sync, result.session_id);
+    } else {
+      await syncEncounterLaneAfterSceneEvents(mirroredEvents);
+    }
     return encounterStarted;
+  };
+
+  const applyPendingMainTurnState = (response: PendingTurnContinueResponse) => {
+    setCurrentMainOutput({
+      source_kind: 'main_turn',
+      reply_text: response.reply_text,
+      scene_events: response.scene_events,
+      archived_sub_zone_turn_id: response.archived_sub_zone_turn_id ?? null,
+      main_turn_summary: response.main_turn_summary ?? null,
+      status: 'awaiting_reaction',
+    });
+    setMainLiveProgress([]);
+    if (response.current_zone_metric) {
+      setCurrentZoneMetric(response.current_zone_metric);
+    }
+  };
+
+  const applyPendingNpcTurnState = (response: PendingTurnContinueResponse) => {
+    const npcRoleId = response.npc_role_id;
+    if (!npcRoleId) return;
+    setNpcChatMessages((prev) => {
+      const current = [...(prev[npcRoleId] ?? [])];
+      if (current.length > 0 && current[current.length - 1]?.role === 'assistant') {
+        current[current.length - 1] = { ...current[current.length - 1], content: response.reply_text };
+      } else {
+        current.push({ role: 'assistant', content: response.reply_text });
+      }
+      return { ...prev, [npcRoleId]: current };
+    });
+    setNpcLiveProgress((prev) => ({ ...prev, [npcRoleId]: [] }));
+  };
+
+  const handlePendingReactionRequired = (response: PendingTurnContinueResponse) => {
+    if (response.flow_kind === 'main_chat') {
+      applyPendingMainTurnState(response);
+    } else if (response.flow_kind === 'npc_chat') {
+      applyPendingNpcTurnState(response);
+    }
+    openPendingReaction(response);
   };
 
   const onAcceptQuest = async (questId: string) => {
@@ -1572,9 +2081,6 @@ function App() {
     const speakReason = passiveTurn ? '自动推进' : '发言';
     setLastActionInput(passiveTurn ? '' : actionDescription);
     setLastSpeechInput(passiveTurn ? '' : speechDescription);
-    if (!passiveTurn) {
-      clearPlayerInput();
-    }
     setError('');
     const effectivePrompt = `${config.gm_prompt}\n${NARRATOR_STYLE_PROMPT}${godMode ? `\n${GOD_MODE_PROMPT}` : ''}`;
     const effectiveConfig: AppConfig = { ...config, gm_prompt: effectivePrompt };
@@ -1583,14 +2089,19 @@ function App() {
       setChatState('streaming');
       const controller = new AbortController();
       abortRef.current = controller;
+      activeStreamRef.current = { kind: 'main' };
       let streamedSceneEvents: SceneEvent[] = [];
       let streamedReply = '';
+      let rolledBack = false;
+      setMainLiveProgress([]);
+      setShowFoldedMainSceneEvents(false);
 
       setCurrentMainOutput({
         source_kind: 'main_turn',
         reply_text: '',
         scene_events: [],
         archived_sub_zone_turn_id: null,
+        main_turn_summary: null,
         status: 'streaming',
       });
 
@@ -1614,10 +2125,43 @@ function App() {
                   : prev,
               );
             },
+            onPhase: (event) => {
+              setMainLiveProgress((prev) => upsertLiveProgress(prev, toPhaseProgressEntry(event)));
+            },
+            onToolUpdate: (event) => {
+              setMainLiveProgress((prev) => upsertLiveProgress(prev, toToolProgressEntry(event)));
+            },
+            onRollback: (payload) => {
+              rolledBack = true;
+              handleStreamRollback(payload);
+              window.alert(payload.message);
+              setChatState('idle');
+            },
+            onReactionCheckRequired: (payload) => {
+              abortRef.current = null;
+              activeStreamRef.current = null;
+              streamedSceneEvents = payload.scene_events_so_far;
+              handlePendingReactionRequired({
+                session_id: sessionId,
+                pending_turn_id: payload.pending_turn_id,
+                flow_kind: payload.flow_kind,
+                status: 'awaiting_reaction',
+                reply_text: payload.reply_so_far,
+                scene_events: payload.scene_events_so_far,
+                tool_events: [],
+                pending_reaction: payload.pending_reaction,
+                npc_role_id: payload.npc_role_id ?? null,
+              });
+            },
             onError: (message) => {
               setError(message);
-              setCurrentMainOutput((prev) => (prev ? { ...prev, status: 'error' } : prev));
-              setChatState('error');
+              setCurrentMainOutput(null);
+              setMainLiveProgress([]);
+              activeStreamRef.current = null;
+              if (!rolledBack) {
+                window.alert('本轮生成已作废');
+              }
+              setChatState('idle');
             },
             onUsage: (usage) => {
               report({ endpoint: '/chat/stream', status: 200, ok: true, usage });
@@ -1643,16 +2187,25 @@ function App() {
             onSceneEvents: (events) => {
               streamedSceneEvents = events;
             },
-            onEnd: ({ archived_sub_zone_turn_id }) => {
+            onEnd: ({ archived_sub_zone_turn_id, main_turn_summary }) => {
               abortRef.current = null;
+              activeStreamRef.current = null;
+              setMainLiveProgress([]);
+              if (rolledBack) {
+                return;
+              }
               if (streamedReply && isAlreadyThereHint(streamedReply)) {
                 showAlreadyTherePopup(streamedReply);
                 setCurrentMainOutput(null);
               } else {
                 setMainOutput('main_turn', streamedReply, streamedSceneEvents, {
                   archivedSubZoneTurnId: archived_sub_zone_turn_id ?? null,
+                  mainTurnSummary: main_turn_summary ?? null,
                   status: 'awaiting_archive',
                 });
+              }
+              if (!passiveTurn) {
+                clearPlayerInput();
               }
               setChatState('idle');
               void (async () => {
@@ -1660,6 +2213,7 @@ function App() {
                 await refreshAreaSnapshot();
                 await refreshTokenUsage(sessionId);
                 await runNarrativeChecks('random_dialog');
+                await syncStateFromSave(sessionId);
               })();
             },
           },
@@ -1668,10 +2222,13 @@ function App() {
         );
       } catch (e) {
         abortRef.current = null;
-        if (!controller.signal.aborted) {
+        activeStreamRef.current = null;
+        if (!controller.signal.aborted && !rolledBack) {
           setError(e instanceof Error ? e.message : '流式请求失败');
-          setCurrentMainOutput((prev) => (prev ? { ...prev, status: 'error' } : prev));
-          setChatState('error');
+          setCurrentMainOutput(null);
+          setMainLiveProgress([]);
+          window.alert('本轮生成已作废');
+          setChatState('idle');
         }
       }
       return;
@@ -1687,11 +2244,23 @@ function App() {
         },
         report,
       );
+      if (isPendingTurnContinueResponse(response) && response.status === 'awaiting_reaction') {
+        handlePendingReactionRequired(response);
+        return;
+      }
+      if (!isChatTurnResponse(response)) {
+        throw new Error('主聊天响应类型异常');
+      }
       await syncEncounterLaneAfterSceneEvents(response.scene_events ?? []);
       setMainOutput('main_turn', response.reply.content, response.scene_events ?? [], {
         archivedSubZoneTurnId: response.archived_sub_zone_turn_id ?? null,
+        mainTurnSummary: response.main_turn_summary ?? null,
         status: 'awaiting_archive',
       });
+      if (!passiveTurn) {
+        clearPlayerInput();
+      }
+      setCurrentZoneMetric(response.current_zone_metric ?? null);
       await refreshAreaSnapshot();
       pushTimeNotice(response.time_spent_min ?? 0, speakReason);
       if ((response.tool_events?.length ?? 0) > 0) {
@@ -1709,6 +2278,7 @@ function App() {
       }
       await refreshTokenUsage(sessionId);
       await runNarrativeChecks('random_dialog');
+      await syncStateFromSave(sessionId);
       setChatState('idle');
     } catch (e) {
       setError(e instanceof Error ? e.message : '请求失败');
@@ -1750,13 +2320,17 @@ function App() {
       const previewInput = buildPreviewPlayerInput(actionDescription, speechDescription, actionCheckResult);
       setLastActionInput(actionDescription);
       setLastSpeechInput(speechDescription);
-      clearPlayerInput();
       setError('');
       const speakReason = `发言:${activeNpcChat.npcName}`;
       if (config.stream) {
         setChatState('streaming');
         const controller = new AbortController();
         abortRef.current = controller;
+        const previousNpcMessages = npcChatMessages[activeNpcChat.npcId] ?? [];
+        activeStreamRef.current = { kind: 'npc', npcId: activeNpcChat.npcId, previousMessages: previousNpcMessages };
+        let rolledBack = false;
+        let streamedNpcSceneEvents: SceneEvent[] = [];
+        setNpcLiveProgress((prev) => ({ ...prev, [activeNpcChat.npcId]: [] }));
         setNpcChatMessages((prev) => {
           const current = prev[activeNpcChat.npcId] ?? [];
           return {
@@ -1783,14 +2357,53 @@ function App() {
                   return { ...prev, [activeNpcChat.npcId]: current };
                 });
               },
+              onPhase: (event) => {
+                setNpcLiveProgress((prev) => ({
+                  ...prev,
+                  [activeNpcChat.npcId]: upsertLiveProgress(prev[activeNpcChat.npcId] ?? [], toPhaseProgressEntry(event)),
+                }));
+              },
+              onToolUpdate: (event) => {
+                setNpcLiveProgress((prev) => ({
+                  ...prev,
+                  [activeNpcChat.npcId]: upsertLiveProgress(prev[activeNpcChat.npcId] ?? [], toToolProgressEntry(event)),
+                }));
+              },
+              onRollback: (payload) => {
+                rolledBack = true;
+                handleStreamRollback(payload);
+                window.alert(payload.message);
+                setChatState('idle');
+              },
+              onReactionCheckRequired: (payload) => {
+                abortRef.current = null;
+                handlePendingReactionRequired({
+                  session_id: sessionId,
+                  pending_turn_id: payload.pending_turn_id,
+                  flow_kind: payload.flow_kind,
+                  status: 'awaiting_reaction',
+                  reply_text: payload.reply_so_far,
+                  scene_events: payload.scene_events_so_far,
+                  tool_events: [],
+                  pending_reaction: payload.pending_reaction,
+                  npc_role_id: payload.npc_role_id ?? activeNpcChat.npcId,
+                });
+              },
               onError: (message) => {
                 setError(message);
-                setChatState('error');
+                restoreAbortedNpcStream();
+                activeStreamRef.current = null;
+                if (!rolledBack) {
+                  clearNpcLiveProgress(activeNpcChat.npcId);
+                  window.alert('本轮生成已作废');
+                }
+                setChatState('idle');
               },
               onTimeSpent: (minutes) => {
                 pushTimeNotice(minutes, speakReason);
               },
               onDialogueLogs: (logs) => {
+                if (rolledBack) return;
                 setNpcChatMessages((prev) => ({
                   ...prev,
                   [activeNpcChat.npcId]: (logs ?? []).map((item) => ({
@@ -1799,9 +2412,20 @@ function App() {
                   })),
                 }));
               },
+              onSceneEvents: (events) => {
+                streamedNpcSceneEvents = events;
+              },
               onEnd: () => {
+                abortRef.current = null;
+                activeStreamRef.current = null;
+                clearNpcLiveProgress(activeNpcChat.npcId);
+                if (rolledBack) {
+                  return;
+                }
                 setChatState('idle');
                 void (async () => {
+                  clearPlayerInput();
+                  await syncEncounterLaneAfterSceneEvents(streamedNpcSceneEvents);
                   await refreshTokenUsage(sessionId);
                   await refreshNpcPool(npcPoolSearch);
                   await runNarrativeChecks('random_dialog');
@@ -1815,9 +2439,14 @@ function App() {
             report,
           );
         } catch (e) {
-          if (!controller.signal.aborted) {
+          abortRef.current = null;
+          activeStreamRef.current = null;
+          if (!controller.signal.aborted && !rolledBack) {
+            restoreAbortedNpcStream();
+            clearNpcLiveProgress(activeNpcChat.npcId);
             setError(e instanceof Error ? e.message : 'NPC流式聊天失败');
-            setChatState('error');
+            window.alert('本轮生成已作废');
+            setChatState('idle');
           }
         }
       } else {
@@ -1832,6 +2461,13 @@ function App() {
             },
             report,
           );
+          if (isPendingTurnContinueResponse(response) && response.status === 'awaiting_reaction') {
+            handlePendingReactionRequired(response);
+            return;
+          }
+          if (!isNpcTurnResponse(response)) {
+            throw new Error('NPC 单聊响应类型异常');
+          }
           setNpcChatMessages((prev) => ({
             ...prev,
             [activeNpcChat.npcId]: (response.dialogue_logs ?? []).map((item) => ({
@@ -1839,6 +2475,7 @@ function App() {
               content: `[${item.world_time_text}] ${item.speaker_name}: ${item.content}`,
             })),
           }));
+          clearPlayerInput();
           pushTimeNotice(response.time_spent_min, speakReason);
           await refreshTokenUsage(sessionId);
           await refreshNpcPool(npcPoolSearch);
@@ -1883,6 +2520,13 @@ function App() {
   const onStop = () => {
     abortRef.current?.abort();
     abortRef.current = null;
+    setCurrentMainOutput(null);
+    restoreAbortedNpcStream();
+    clearLiveProgress();
+    activeStreamRef.current = null;
+    setPendingReactionState(null);
+    resetReactionCheckRollState();
+    window.alert('本轮生成已作废');
     setChatState('idle');
   };
 
@@ -1895,7 +2539,11 @@ function App() {
   const onClear = () => {
     abortRef.current?.abort();
     abortRef.current = null;
+    activeStreamRef.current = null;
+    setPendingReactionState(null);
+    resetReactionCheckRollState();
     setCurrentMainOutput(null);
+    clearLiveProgress();
     setNpcChatMessages({});
     setChatMode('main');
     setActiveNpcChat(null);
@@ -2154,8 +2802,7 @@ function App() {
       const moved = await moveToSubZone({ session_id: sessionId, to_sub_zone_id: subZoneId, config }, report);
       setAssistantOnly(moved.movement_feedback);
       pushTimeNotice(moved.duration_min, '子区块移动');
-      await refreshAreaSnapshot();
-      await runNarrativeChecks('random_move');
+      applyMapStateSync(moved.state_sync, sessionId);
     } catch (e) {
       setError(e instanceof Error ? e.message : '子区块移动失败');
     } finally {
@@ -2170,7 +2817,7 @@ function App() {
         report,
       );
       setConfigHint(`发现 ${discovered.new_interactions.length} 个新交互`);
-      await refreshAreaSnapshot();
+      applyMapStateSync(discovered.state_sync, sessionId);
     } catch (e) {
       setError(e instanceof Error ? e.message : '发现交互失败');
     }
@@ -2191,12 +2838,13 @@ function App() {
         source_context: 'area_item',
         post_close_output: 'main_chat',
         resolution_context: 'standalone',
+        return_state_sync: true,
+        post_trigger_kind: 'quest_rule',
       });
       if (!result) return;
       setLastActionResult(result);
       await publishActionCheckOutcome(result, 'area_item', 'main_chat');
       pushTimeNotice(result.time_spent_min, `物品使用:${itemName}`);
-      await runNarrativeChecks('quest_rule');
     } catch (e) {
       setError(e instanceof Error ? e.message : '物品使用失败');
     }
@@ -2227,6 +2875,9 @@ function App() {
   };
 
   const onLeaveNpcChat = () => {
+    if (activeNpcChat) {
+      clearNpcLiveProgress(activeNpcChat.npcId);
+    }
     forceReturnToMainChat('manual');
     setError('');
   };
@@ -2290,6 +2941,8 @@ function App() {
           post_close_output: 'suppress',
           resolution_context: 'embedded',
           skip_if_no_check: false,
+          return_state_sync: true,
+          post_trigger_kind: 'quest_rule',
         });
         if (actionCheckResult) {
           setLastActionResult(actionCheckResult);
@@ -2318,7 +2971,21 @@ function App() {
       );
       setItemInteractionOpen(false);
       if (response.mode === 'use') {
-        await runNarrativeChecks('quest_rule');
+        if (actionCheckResult?.state_sync) {
+          const mergedRolePool = response.role
+            ? [response.role, ...actionCheckResult.state_sync.role_pool.filter((item) => item.role_id !== response.role?.role_id)]
+            : actionCheckResult.state_sync.role_pool;
+          applyMapStateSync(
+            {
+              ...actionCheckResult.state_sync,
+              player_static_data: response.player ?? actionCheckResult.state_sync.player_static_data,
+              role_pool: mergedRolePool,
+            },
+            actionCheckResult.session_id,
+          );
+        } else {
+          await runNarrativeChecks('quest_rule');
+        }
       } else {
         await syncStateFromSave(sessionId);
       }
@@ -2353,51 +3020,37 @@ function App() {
     }
   };
 
-  const ensureMap = async (forceRegenerate = false, snapshotOverride?: MapSnapshot) => {
-    let snapshot = snapshotOverride ?? mapSnapshot;
-    if (snapshot.zones.length === 0 || forceRegenerate) {
-      setAiWaitingText('正在等待 AI 生成地图区块...');
-      setAiWaiting(true);
-      try {
-        const generated = await generateRegions(
-          {
-            session_id: sessionId,
-            config,
-            player_position: snapshot.player_position ?? DEFAULT_POSITION,
-            desired_count: 6,
-            max_count: 10,
-            world_prompt: mapWorldPrompt,
-            force_regenerate: forceRegenerate,
-          },
-          report,
-        );
-        snapshot = {
+  const ensureMap = async (forceRegenerate = false) => {
+    const snapshot = mapSnapshot;
+    setAiWaitingText('正在等待 AI 生成地图区块...');
+    setAiWaiting(true);
+    try {
+      const generated = await bootstrapWorldMap(
+        {
+          session_id: sessionId,
+          config,
           player_position: snapshot.player_position ?? DEFAULT_POSITION,
-          zones: generated.zones,
-        };
-        setMapSnapshot(snapshot);
-        await refreshTokenUsage(sessionId);
-      } finally {
-        setAiWaiting(false);
+          desired_count: 6,
+          max_count: 10,
+          world_prompt: mapWorldPrompt,
+          force_regenerate: forceRegenerate,
+        },
+        report,
+      );
+      applyMapStateSync(generated.state_sync, sessionId);
+      if (generated.narration.text) {
+        setConfigHint(generated.narration.text);
       }
+      await refreshTokenUsage(sessionId);
+    } finally {
+      setAiWaiting(false);
     }
-
-    const render = await renderWorldMap(
-      {
-        session_id: sessionId,
-        zones: snapshot.zones,
-        player_position: snapshot.player_position ?? DEFAULT_POSITION,
-      },
-      report,
-    );
-    setMapRender(render);
   };
 
   const onOpenMap = async () => {
     try {
       setLogOpen(false);
       await ensureMap();
-      await refreshAreaSnapshot();
       setMapOpen(true);
       setQuestInspectOpen(false);
     } catch (e) {
@@ -2412,7 +3065,6 @@ function App() {
     try {
       setLogOpen(false);
       await ensureMap(true);
-      await refreshAreaSnapshot();
       setMapOpen(true);
     } catch (e) {
       setAiWaiting(false);
@@ -2430,7 +3082,7 @@ function App() {
     }
 
     try {
-      setAiWaitingText('正在等待 AI 生成移动反馈...');
+      setAiWaitingText('正在执行区块移动与遭遇判定...');
       setAiWaiting(true);
       const moved = await moveToZone(
         {
@@ -2438,30 +3090,16 @@ function App() {
           from_zone_id: fromId,
           to_zone_id: zoneId,
           player_name: playerStatic.name,
+          config,
         },
         report,
       );
       pushTimeNotice(moved.duration_min, '大区块移动');
-
-      setMapSnapshot((prev) => ({ ...prev, player_position: moved.new_position }));
-      setPlayerRuntimeState((prev) => ({
-        ...prev,
-        session_id: sessionId,
-        current_position: moved.new_position,
-        updated_at: new Date().toISOString(),
-      }));
-
-      const narrated = await describeBehavior(sessionId, config, moved.movement_log, report);
-      setAssistantOnly(narrated.narration);
+      applyMapStateSync(moved.state_sync, sessionId);
+      setMainOutput('main_turn', moved.narration.text || moved.movement_log.summary, moved.scene_events ?? [], {
+        mainTurnSummary: moved.main_turn_summary ?? null,
+      });
       await refreshTokenUsage(sessionId);
-
-      const snapshotAfterMove: MapSnapshot = {
-        zones: mapSnapshot.zones,
-        player_position: moved.new_position,
-      };
-      await ensureMap(false, snapshotAfterMove);
-      await refreshAreaSnapshot();
-      await runNarrativeChecks('random_move');
       setAiWaiting(false);
     } catch (e) {
       setAiWaiting(false);
@@ -2481,6 +3119,8 @@ function App() {
       setMapSnapshot(toMapSnapshot(save));
       setAreaSnapshot(save.area_snapshot ?? null);
       setCurrentReputation(selectCurrentReputation(save));
+      setCurrentZoneMetric(selectCurrentZoneMetric(save));
+      setZoneMetricState(save.zone_metric_state ?? { version: '0.1.0', entries: [], updated_at: '' });
       setQuestState(save.quest_state ?? defaultQuestState);
       setEncounterState(save.encounter_state ?? defaultEncounterState);
       setFateState(save.fate_state ?? defaultFateState);
@@ -2532,6 +3172,8 @@ function App() {
       setMapSnapshot(toMapSnapshot(save));
       setAreaSnapshot(save.area_snapshot ?? null);
       setCurrentReputation(selectCurrentReputation(save));
+      setCurrentZoneMetric(selectCurrentZoneMetric(save));
+      setZoneMetricState(save.zone_metric_state ?? { version: '0.1.0', entries: [], updated_at: '' });
       setQuestState(save.quest_state ?? defaultQuestState);
       setEncounterState(save.encounter_state ?? defaultEncounterState);
       setFateState(save.fate_state ?? defaultFateState);
@@ -2954,6 +3596,13 @@ function App() {
     );
   }
 
+  const mainOutputVisibleEvents = (currentMainOutput?.scene_events ?? []).filter(
+    (event) => !FOLDED_MAIN_SCENE_EVENT_KINDS.has(event.kind),
+  );
+  const mainOutputFoldedEvents = (currentMainOutput?.scene_events ?? []).filter((event) =>
+    FOLDED_MAIN_SCENE_EVENT_KINDS.has(event.kind),
+  );
+
   return (
     <main className="app-shell chat-shell">
       <DebugPanel
@@ -2992,6 +3641,16 @@ function App() {
               当前任务: {currentQuest?.title ?? '无'} | 当前命运: {fateState.current_fate?.title ?? '未生成'}
             </p>
             <p>
+              当前位置: {currentZone?.name ?? areaSnapshot?.current_zone_id ?? '未知'} / {currentSubZone?.name ?? areaSnapshot?.current_sub_zone_id ?? '未知'}
+            </p>
+            <p>
+              区域名声: {typeof currentZoneMetric?.reputation_score === 'number' ? currentZoneMetric.reputation_score : '-'}
+              {currentZoneMetric?.reputation_band ? ` / ${currentZoneMetric.reputation_band}` : ''}
+              {' | '}
+              区域危险: {typeof currentZoneMetric?.danger_score === 'number' ? currentZoneMetric.danger_score : '-'}
+              {currentZoneMetric?.danger_band ? ` / ${currentZoneMetric.danger_band}` : ''}
+            </p>
+            <p>
               Token 消耗(全 AI 请求): in {tokenUsage.total.input_tokens} / out {tokenUsage.total.output_tokens} / total {tokenTotal} | 聊天 {tokenUsage.sources.chat.total_tokens} / 地图 {tokenUsage.sources.map_generation.total_tokens} / 移动反馈 {tokenUsage.sources.movement_narration.total_tokens}
             </p>
           </div>
@@ -3026,11 +3685,34 @@ function App() {
                   <article className="msg assistant">
                     <strong>GM</strong>
                     <p>{currentMainOutput.reply_text}</p>
+                    {currentMainOutput.source_kind === 'main_turn' &&
+                      typeof currentMainOutput.main_turn_summary?.player_situation_delta === 'number' && (
+                        <p className="hint">
+                          玩家本轮局势变化：
+                          {currentMainOutput.main_turn_summary.player_situation_delta >= 0
+                            ? `+${currentMainOutput.main_turn_summary.player_situation_delta}`
+                            : currentMainOutput.main_turn_summary.player_situation_delta}
+                        </p>
+                      )}
                   </article>
                 )}
-                {(currentMainOutput?.scene_events ?? []).map((event) => (
+                {mainOutputVisibleEvents.map((event) => (
                   <SceneEventCard key={event.event_id} event={event} />
                 ))}
+                {mainOutputFoldedEvents.length > 0 && (
+                  <div className="scene-event-fold-group">
+                    <button
+                      type="button"
+                      className="scene-event-fold-toggle"
+                      onClick={() => setShowFoldedMainSceneEvents((prev) => !prev)}
+                    >
+                      {showFoldedMainSceneEvents ? `收起公开结算（${mainOutputFoldedEvents.length}）` : `展开公开结算（${mainOutputFoldedEvents.length}）`}
+                    </button>
+                    {showFoldedMainSceneEvents &&
+                      mainOutputFoldedEvents.map((event) => <SceneEventCard key={event.event_id} event={event} />)}
+                  </div>
+                )}
+                <LiveProgressPanel entries={mainLiveProgress} />
               </section>
             ) : (
               <section className="messages">
@@ -3041,6 +3723,7 @@ function App() {
                     <p>{m.content}</p>
                   </article>
                 ))}
+                <LiveProgressPanel entries={activeNpcChat ? (npcLiveProgress[activeNpcChat.npcId] ?? []) : []} compact />
               </section>
             )}
 
@@ -3156,6 +3839,7 @@ function App() {
             encounter={activeEncounter}
             queuedEncounters={queuedEncounters}
             roleCards={npcPoolItems}
+            areaSnapshot={areaSnapshot}
             busy={encounterModalBusy}
             canRejoin={canRejoinActiveEncounter}
           />
@@ -3168,6 +3852,8 @@ function App() {
         areaSnapshot={areaSnapshot}
         render={mapRender}
         playerPosition={mapSnapshot.player_position}
+        currentZoneMetric={currentZoneMetric}
+        zoneMetricState={zoneMetricState}
         playerSpeedMph={playerStatic.move_speed_mph}
         search={mapSearch}
         onSearch={setMapSearch}
@@ -3272,6 +3958,7 @@ function App() {
         open={teamOpen}
         state={teamState}
         roleCards={npcPoolItems}
+        areaSnapshot={areaSnapshot}
         chatReplies={teamChatReplies}
         chatBusy={teamChatBusy}
         chatBlocked={blockingModalOpen || encounterEngaged}
@@ -3371,6 +4058,24 @@ function App() {
         rotation={actionCheckRollState.rotation}
         onTrigger={onTriggerActionCheckRoll}
         onClose={onCloseActionCheckRoll}
+      />
+
+      <ActionCheckRollModal
+        open={reactionCheckRollState.open}
+        phase={reactionCheckRollState.phase}
+        plan={reactionCheckRollState.plan}
+        rollValue={reactionCheckRollState.rollValue}
+        result={reactionCheckRollState.result}
+        errorMessage={reactionCheckRollState.errorMessage}
+        rotation={reactionCheckRollState.rotation}
+        title="反应检定"
+        subtitle="先确认眼前威胁，再掷骰决定你能否扛住这一击。"
+        sourceLabel={pendingReactionState?.pending_reaction.source_label}
+        threatenedConsequence={pendingReactionState?.pending_reaction.threatened_consequence}
+        successHint={pendingReactionState?.pending_reaction.success_hint}
+        failureHint={pendingReactionState?.pending_reaction.failure_hint}
+        onTrigger={onTriggerReactionCheckRoll}
+        onClose={onCloseReactionCheckRoll}
       />
 
       <div className="time-notice-stack">

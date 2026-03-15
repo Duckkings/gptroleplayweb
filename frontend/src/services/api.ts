@@ -1,7 +1,9 @@
 ﻿import type {
   ActionCheckPlan,
   ActionCheckResult,
-  AreaMoveResult,
+  AreaDiscoverInteractionsResolvedResponse,
+  AreaExecuteInteractionResolvedResponse,
+  AreaMoveResolvedResponse,
   AreaSnapshot,
   AppConfig,
   ChatMessage,
@@ -20,14 +22,19 @@
   FateGenerateResponse,
   GameLogEntry,
   GameLogSettings,
+  MapBootstrapResponse,
   MapSnapshot,
+  MainTurnSummary,
   ModelDiscoverResponse,
   ModelProfileResponse,
+  MoveResolvedResponse,
   MovementLog,
   NpcChatResponse,
   NpcGreetResponse,
   NpcKnowledgeResponse,
   NpcRoleCard,
+  PendingTurnContinueResponse,
+  PlayerReactionCheck,
   QuestMutationResponse,
   QuestStateResponse,
   RoleBuff,
@@ -47,11 +54,15 @@
   TeamMutationResponse,
   TeamChatResponse,
   TeamStateResponse,
+  LiveToolEvent,
+  StreamPhaseEvent,
   ToolEvent,
   TokenUsageSummary,
+  TurnRollbackPayload,
   Usage,
   ValidateConfigResponse,
   Zone,
+  ZoneMetricState,
 } from '../types/app';
 
 const API_BASE = '/api/v1';
@@ -170,7 +181,7 @@ export async function sendChat(
     messages: ChatMessage[];
   },
   report?: DebugReporter,
-): Promise<ChatResponse> {
+): Promise<ChatResponse | PendingTurnContinueResponse> {
   return requestJson(
     '/chat',
     {
@@ -191,7 +202,18 @@ export async function streamChat(
   handlers: {
     onDelta: (delta: string) => void;
     onError: (message: string) => void;
-    onEnd: (payload: { archived_sub_zone_turn_id?: string | null }) => void;
+    onEnd: (payload: { archived_sub_zone_turn_id?: string | null; main_turn_summary?: MainTurnSummary | null }) => void;
+    onReactionCheckRequired: (payload: {
+      pending_turn_id: string;
+      flow_kind: PendingTurnContinueResponse['flow_kind'];
+      reply_so_far: string;
+      scene_events_so_far: SceneEvent[];
+      pending_reaction: PlayerReactionCheck | null;
+      npc_role_id?: string | null;
+    }) => void;
+    onPhase: (event: StreamPhaseEvent) => void;
+    onToolUpdate: (event: LiveToolEvent) => void;
+    onRollback: (payload: TurnRollbackPayload) => void;
     onUsage: (usage: Usage) => void;
     onTimeSpent: (minutes: number) => void;
     onToolEvents: (events: ToolEvent[]) => void;
@@ -245,13 +267,59 @@ export async function streamChat(
           content?: string;
           message?: string;
           usage?: Usage;
+          code?: string;
+          label?: string;
+          status?: 'running' | 'done' | 'failed';
+          detail?: string;
+          tool_name?: string;
+          summary?: string;
+          payload?: Record<string, string | number | boolean>;
           tool_events?: ToolEvent[];
           scene_events?: SceneEvent[];
           time_spent_min?: number;
           archived_sub_zone_turn_id?: string | null;
+          main_turn_summary?: MainTurnSummary | null;
+          reason?: string;
+          discarded?: true;
+          pending_turn_id?: string;
+          flow_kind?: PendingTurnContinueResponse['flow_kind'];
+          reply_so_far?: string;
+          scene_events_so_far?: SceneEvent[];
+          pending_reaction?: PlayerReactionCheck | null;
+          npc_role_id?: string | null;
         };
         if (event === 'delta') {
           handlers.onDelta(data.content ?? '');
+        } else if (event === 'phase') {
+          handlers.onPhase({
+            code: (data.code ?? 'prepare') as StreamPhaseEvent['code'],
+            label: data.label ?? '',
+            status: data.status ?? 'running',
+            detail: data.detail ?? '',
+          });
+        } else if (event === 'tool') {
+          handlers.onToolUpdate({
+            tool_name: data.tool_name ?? '',
+            status: data.status ?? 'running',
+            summary: data.summary ?? '',
+            payload: data.payload ?? {},
+          });
+        } else if (event === 'rollback') {
+          handlers.onRollback({
+            reason: data.reason ?? 'error',
+            message: data.message ?? '本轮生成已作废',
+            discarded: true,
+          });
+        } else if (event === 'reaction_check_required') {
+          terminalEventReceived = true;
+          handlers.onReactionCheckRequired({
+            pending_turn_id: data.pending_turn_id ?? '',
+            flow_kind: data.flow_kind ?? 'main_chat',
+            reply_so_far: data.reply_so_far ?? '',
+            scene_events_so_far: data.scene_events_so_far ?? [],
+            pending_reaction: data.pending_reaction ?? null,
+            npc_role_id: data.npc_role_id ?? null,
+          });
         } else if (event === 'error') {
           terminalEventReceived = true;
           handlers.onError(data.message ?? '未知错误');
@@ -261,7 +329,10 @@ export async function streamChat(
           handlers.onTimeSpent(data.time_spent_min ?? 0);
           handlers.onToolEvents(data.tool_events ?? []);
           handlers.onSceneEvents(data.scene_events ?? []);
-          handlers.onEnd({ archived_sub_zone_turn_id: data.archived_sub_zone_turn_id ?? null });
+          handlers.onEnd({
+            archived_sub_zone_turn_id: data.archived_sub_zone_turn_id ?? null,
+            main_turn_summary: data.main_turn_summary ?? null,
+          });
         }
       } catch {
         handlers.onError('流消息解析失败');
@@ -270,8 +341,145 @@ export async function streamChat(
   }
 
   if (!terminalEventReceived) {
-    handlers.onEnd({ archived_sub_zone_turn_id: null });
+    handlers.onEnd({ archived_sub_zone_turn_id: null, main_turn_summary: null });
   }
+}
+
+export async function continuePendingTurn(
+  payload: { session_id: string; pending_turn_id: string; forced_dice_roll: number; config?: AppConfig },
+  report?: DebugReporter,
+): Promise<PendingTurnContinueResponse> {
+  return requestJson(
+    '/chat/pending/continue',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function continuePendingTurnStream(
+  payload: { session_id: string; pending_turn_id: string; forced_dice_roll: number; config?: AppConfig },
+  handlers: {
+    onDelta: (delta: string) => void;
+    onError: (message: string) => void;
+    onEnd: (payload: { archived_sub_zone_turn_id?: string | null; main_turn_summary?: MainTurnSummary | null }) => void;
+    onReactionCheckResumed?: (payload: { pending_turn_id: string; reaction_result: ActionCheckResult | null }) => void;
+    onReactionCheckRequired: (payload: {
+      pending_turn_id: string;
+      flow_kind: PendingTurnContinueResponse['flow_kind'];
+      reply_so_far: string;
+      scene_events_so_far: SceneEvent[];
+      pending_reaction: PlayerReactionCheck | null;
+      npc_role_id?: string | null;
+    }) => void;
+    onSceneEvents: (events: SceneEvent[]) => void;
+    onTimeSpent?: (minutes: number) => void;
+  },
+  signal: AbortSignal,
+  report?: DebugReporter,
+): Promise<void> {
+  const endpoint = '/chat/pending/continue/stream';
+  const response = await fetch(`${API_BASE}${endpoint}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal,
+    credentials: 'include',
+  });
+  report?.({ endpoint, status: response.status, ok: response.ok });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`待续回合续行失败(${response.status}): ${text}`);
+  }
+  const reader = response.body?.getReader();
+  if (!reader) {
+    throw new Error('流响应不可用');
+  }
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let terminalEventReceived = false;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const chunks = buffer.split('\n\n');
+    buffer = chunks.pop() ?? '';
+    for (const chunk of chunks) {
+      const lines = chunk.split('\n');
+      const event = lines.find((line) => line.startsWith('event:'))?.replace('event:', '').trim();
+      const dataLine = lines.find((line) => line.startsWith('data:'))?.replace('data:', '').trim() ?? '{}';
+      const data = JSON.parse(dataLine) as {
+        content?: string;
+        message?: string;
+        pending_turn_id?: string;
+        reaction_result?: ActionCheckResult | null;
+        flow_kind?: PendingTurnContinueResponse['flow_kind'];
+        reply_so_far?: string;
+        scene_events_so_far?: SceneEvent[];
+        pending_reaction?: PlayerReactionCheck | null;
+        npc_role_id?: string | null;
+        scene_events?: SceneEvent[];
+        archived_sub_zone_turn_id?: string | null;
+        main_turn_summary?: MainTurnSummary | null;
+        time_spent_min?: number;
+      };
+      if (event === 'delta') {
+        handlers.onDelta(data.content ?? '');
+      } else if (event === 'reaction_check_resumed') {
+        handlers.onReactionCheckResumed?.({
+          pending_turn_id: data.pending_turn_id ?? '',
+          reaction_result: data.reaction_result ?? null,
+        });
+      } else if (event === 'reaction_check_required') {
+        terminalEventReceived = true;
+        handlers.onReactionCheckRequired({
+          pending_turn_id: data.pending_turn_id ?? '',
+          flow_kind: data.flow_kind ?? 'main_chat',
+          reply_so_far: data.reply_so_far ?? '',
+          scene_events_so_far: data.scene_events_so_far ?? [],
+          pending_reaction: data.pending_reaction ?? null,
+          npc_role_id: data.npc_role_id ?? null,
+        });
+      } else if (event === 'end') {
+        terminalEventReceived = true;
+        handlers.onSceneEvents(data.scene_events ?? []);
+        handlers.onTimeSpent?.(data.time_spent_min ?? 0);
+        handlers.onEnd({
+          archived_sub_zone_turn_id: data.archived_sub_zone_turn_id ?? null,
+          main_turn_summary: data.main_turn_summary ?? null,
+        });
+      } else if (event === 'error') {
+        terminalEventReceived = true;
+        handlers.onError(data.message ?? '未知错误');
+      }
+    }
+  }
+  if (!terminalEventReceived) {
+    handlers.onEnd({ archived_sub_zone_turn_id: null, main_turn_summary: null });
+  }
+}
+
+export async function cancelPendingTurn(
+  payload: { session_id: string; pending_turn_id: string },
+  report?: DebugReporter,
+): Promise<PendingTurnContinueResponse> {
+  return requestJson(
+    `/pending-turns/${encodeURIComponent(payload.pending_turn_id)}/cancel?session_id=${encodeURIComponent(payload.session_id)}`,
+    { method: 'POST' },
+    report,
+  );
+}
+
+export async function getCurrentPendingTurn(
+  sessionId: string,
+  report?: DebugReporter,
+): Promise<PendingTurnContinueResponse | null> {
+  return requestJson(`/pending-turns/current?session_id=${encodeURIComponent(sessionId)}`, { method: 'GET' }, report);
 }
 
 export async function getConfigPath(report?: DebugReporter): Promise<PathStatus> {
@@ -393,8 +601,36 @@ export async function generateRegions(
   );
 }
 
+export async function bootstrapWorldMap(
+  payload: {
+    session_id: string;
+    config: AppConfig;
+    player_position: { x: number; y: number; z: number; zone_id: string };
+    desired_count: number;
+    max_count: number;
+    world_prompt: string;
+    force_regenerate?: boolean;
+  },
+  report?: DebugReporter,
+): Promise<MapBootstrapResponse> {
+  return requestJson(
+    '/world-map/bootstrap',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
 export async function renderWorldMap(
-  payload: { session_id: string; zones: Zone[]; player_position: { x: number; y: number; z: number; zone_id: string } },
+  payload: {
+    session_id: string;
+    zones: Zone[];
+    player_position: { x: number; y: number; z: number; zone_id: string };
+    zone_metric_state?: ZoneMetricState;
+  },
   report?: DebugReporter,
 ): Promise<RenderResult> {
   return requestJson(
@@ -409,9 +645,9 @@ export async function renderWorldMap(
 }
 
 export async function moveToZone(
-  payload: { session_id: string; from_zone_id: string; to_zone_id: string; player_name?: string },
+  payload: { session_id: string; from_zone_id: string; to_zone_id: string; player_name?: string; config?: AppConfig },
   report?: DebugReporter,
-): Promise<{ session_id: string; new_position: { x: number; y: number; z: number; zone_id: string }; duration_min: number; movement_log: MovementLog }> {
+): Promise<MoveResolvedResponse> {
   return requestJson(
     '/world-map/move',
     {
@@ -1119,7 +1355,7 @@ export async function npcGreet(
 export async function npcChat(
   payload: { session_id: string; npc_role_id: string; player_message: string; config?: AppConfig },
   report?: DebugReporter,
-): Promise<NpcChatResponse> {
+): Promise<NpcChatResponse | PendingTurnContinueResponse> {
   return requestJson(
     '/npc/chat',
     {
@@ -1137,8 +1373,20 @@ export async function streamNpcChat(
     onDelta: (delta: string) => void;
     onError: (message: string) => void;
     onEnd: () => void;
+    onReactionCheckRequired: (payload: {
+      pending_turn_id: string;
+      flow_kind: PendingTurnContinueResponse['flow_kind'];
+      reply_so_far: string;
+      scene_events_so_far: SceneEvent[];
+      pending_reaction: PlayerReactionCheck | null;
+      npc_role_id?: string | null;
+    }) => void;
+    onPhase: (event: StreamPhaseEvent) => void;
+    onToolUpdate: (event: LiveToolEvent) => void;
+    onRollback: (payload: TurnRollbackPayload) => void;
     onTimeSpent: (minutes: number) => void;
     onDialogueLogs: (logs: NpcChatResponse['dialogue_logs']) => void;
+    onSceneEvents: (events: SceneEvent[]) => void;
   },
   signal: AbortSignal,
   report?: DebugReporter,
@@ -1165,10 +1413,13 @@ export async function streamNpcChat(
 
   const decoder = new TextDecoder();
   let buffer = '';
+  let terminalEventReceived = false;
   while (true) {
     const { value, done } = await reader.read();
     if (done) {
-      handlers.onEnd();
+      if (!terminalEventReceived) {
+        handlers.onEnd();
+      }
       break;
     }
     buffer += decoder.decode(value, { stream: true });
@@ -1182,16 +1433,64 @@ export async function streamNpcChat(
         const data = JSON.parse(dataLine) as {
           content?: string;
           message?: string;
+          code?: string;
+          label?: string;
+          status?: 'running' | 'done' | 'failed';
+          detail?: string;
+          tool_name?: string;
+          summary?: string;
+          payload?: Record<string, string | number | boolean>;
+          reason?: string;
           time_spent_min?: number;
           dialogue_logs?: NpcChatResponse['dialogue_logs'];
+          scene_events?: SceneEvent[];
+          pending_turn_id?: string;
+          flow_kind?: PendingTurnContinueResponse['flow_kind'];
+          reply_so_far?: string;
+          scene_events_so_far?: SceneEvent[];
+          pending_reaction?: PlayerReactionCheck | null;
+          npc_role_id?: string | null;
         };
         if (event === 'delta') {
           handlers.onDelta(data.content ?? '');
+        } else if (event === 'phase') {
+          handlers.onPhase({
+            code: (data.code ?? 'prepare') as StreamPhaseEvent['code'],
+            label: data.label ?? '',
+            status: data.status ?? 'running',
+            detail: data.detail ?? '',
+          });
+        } else if (event === 'tool') {
+          handlers.onToolUpdate({
+            tool_name: data.tool_name ?? '',
+            status: data.status ?? 'running',
+            summary: data.summary ?? '',
+            payload: data.payload ?? {},
+          });
+        } else if (event === 'rollback') {
+          handlers.onRollback({
+            reason: data.reason ?? 'error',
+            message: data.message ?? '本轮生成已作废',
+            discarded: true,
+          });
+        } else if (event === 'reaction_check_required') {
+          terminalEventReceived = true;
+          handlers.onReactionCheckRequired({
+            pending_turn_id: data.pending_turn_id ?? '',
+            flow_kind: data.flow_kind ?? 'npc_chat',
+            reply_so_far: data.reply_so_far ?? '',
+            scene_events_so_far: data.scene_events_so_far ?? [],
+            pending_reaction: data.pending_reaction ?? null,
+            npc_role_id: data.npc_role_id ?? null,
+          });
         } else if (event === 'error') {
+          terminalEventReceived = true;
           handlers.onError(data.message ?? '未知错误');
         } else if (event === 'end') {
+          terminalEventReceived = true;
           handlers.onTimeSpent(data.time_spent_min ?? 0);
           handlers.onDialogueLogs(data.dialogue_logs ?? []);
+          handlers.onSceneEvents(data.scene_events ?? []);
           handlers.onEnd();
         }
       } catch {
@@ -1228,7 +1527,7 @@ export async function getCurrentArea(sessionId: string, report?: DebugReporter):
 export async function moveToSubZone(
   payload: { session_id: string; to_sub_zone_id: string; config?: AppConfig },
   report?: DebugReporter,
-): Promise<AreaMoveResult> {
+): Promise<AreaMoveResolvedResponse> {
   return requestJson(
     '/world/area/move-sub-zone',
     {
@@ -1243,7 +1542,7 @@ export async function moveToSubZone(
 export async function discoverAreaInteractions(
   payload: { session_id: string; sub_zone_id: string; intent: string; config?: AppConfig },
   report?: DebugReporter,
-): Promise<{ ok: boolean; generated_mode: 'instant'; new_interactions: NonNullable<AreaSnapshot['sub_zones']>[number]['key_interactions'] }> {
+): Promise<AreaDiscoverInteractionsResolvedResponse> {
   return requestJson(
     '/world/area/interactions/discover',
     {
@@ -1258,7 +1557,7 @@ export async function discoverAreaInteractions(
 export async function executeAreaInteraction(
   payload: { session_id: string; interaction_id: string },
   report?: DebugReporter,
-): Promise<{ ok: boolean; status: 'placeholder'; message: string }> {
+): Promise<AreaExecuteInteractionResolvedResponse> {
   return requestJson(
     '/world/area/interactions/execute',
     {
@@ -1275,8 +1574,11 @@ export async function planActionCheck(
   payload: {
     session_id: string;
     action_type: 'attack' | 'check' | 'item_use';
+    check_mode?: 'action' | 'reaction_save';
     action_prompt: string;
     actor_role_id?: string;
+    source_label?: string;
+    threatened_consequence?: string;
     config?: AppConfig;
   },
   report?: DebugReporter,
@@ -1297,8 +1599,12 @@ export async function runActionCheck(
   payload: {
     session_id: string;
     action_type: 'attack' | 'check' | 'item_use';
+    check_mode?: 'action' | 'reaction_save';
     action_prompt: string;
     actor_role_id?: string;
+    pending_turn_id?: string;
+    source_label?: string;
+    threatened_consequence?: string;
     forced_dice_roll?: number;
     allow_backend_roll?: boolean;
     resolution_context?: 'standalone' | 'embedded';
@@ -1307,6 +1613,8 @@ export async function runActionCheck(
     planned_time_spent_min?: number;
     planned_requires_check?: boolean;
     planned_check_task?: string;
+    return_state_sync?: boolean;
+    post_trigger_kind?: 'random_move' | 'random_dialog' | 'scripted' | 'quest_rule' | 'fate_rule' | 'debug_forced';
     config?: AppConfig;
   },
   report?: DebugReporter,

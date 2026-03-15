@@ -26,6 +26,7 @@ from app.services.reputation_service import (
     apply_sub_zone_reputation_delta,
     get_current_sub_zone_reputation,
 )
+from app.services import zone_metric_service
 from app.services.world_service import (
     _active_encounter_for_current_sub_zone,
     _append_npc_dialogue,
@@ -65,6 +66,47 @@ def _team_role_map(save: SaveFile) -> dict[str, NpcRoleCard]:
 
 def _team_member_by_role_id(save: SaveFile, role_id: str):
     return next((item for item in getattr(save.team_state, "members", []) if item.role_id == role_id), None)
+
+
+def _candidate_limit(active_encounter, config: ChatConfig | None) -> int:
+    scene_config = getattr(config, "public_scene", None)
+    active_limit = int(getattr(scene_config, "active_actor_limit", 8) or 8)
+    idle_limit = int(getattr(scene_config, "idle_actor_limit", 2) or 2)
+    if active_encounter is not None and active_encounter.status == "active":
+        return max(1, min(active_limit, 16))
+    return max(1, min(idle_limit, 8))
+
+
+def _should_force_public_action_check(
+    save: SaveFile,
+    actor: dict[str, object] | None,
+    payload: dict[str, object],
+    *,
+    config: ChatConfig | None = None,
+) -> bool:
+    if bool(payload.get("needs_check")):
+        return True
+    scene_config = getattr(config, "public_scene", None)
+    if not bool(getattr(scene_config, "uncertain_actions_require_check", True)):
+        return False
+    outcome_certainty = str(payload.get("outcome_certainty") or "").strip().lower()
+    action_type = str(payload.get("action_type") or "check").strip().lower()
+    specific_threat = str(payload.get("specific_threat") or "").strip()
+    target_label = str(payload.get("target_label") or "").strip()
+    actor_type = str((actor or {}).get("actor_type") or "npc")
+    active_encounter = _active_encounter_for_current_sub_zone(save)
+    active_risk = active_encounter is not None and active_encounter.status == "active"
+    if outcome_certainty == "uncertain":
+        return True
+    if action_type == "attack":
+        return True
+    if specific_threat:
+        return True
+    if active_risk and action_type in {"check", "item_use"}:
+        return True
+    if active_risk and actor_type == "encounter_temp_npc" and target_label:
+        return True
+    return False
 
 
 def _encounter_temp_npcs(save: SaveFile) -> list[EncounterTemporaryNpc]:
@@ -392,6 +434,7 @@ def _candidate_rows(
     *,
     player_text: str,
     addressed_role_name: str = "",
+    config: ChatConfig | None = None,
 ) -> list[dict[str, object]]:
     visible_npcs = _visible_public_roles(save)
     team_roles = list(_team_role_map(save).values())
@@ -481,7 +524,7 @@ def _candidate_rows(
             continue
         seen_ids.add(actor_id)
         deduped.append(candidate)
-    limit = 4 if active_encounter is not None and active_encounter.status == "active" else 2
+    limit = _candidate_limit(active_encounter, config)
     return deduped[:limit]
 
 
@@ -494,17 +537,20 @@ def build_public_scene_state(
     intent = _parse_player_intent(player_text)
     addressed_role_name = str(intent.get("addressed_role_name") or "").strip()
     rep = get_current_sub_zone_reputation(save, create=True)
+    zone_metric = zone_metric_service.get_current_zone_metric(save, create=True)
     team_roles = _team_role_map(save)
     candidates = _candidate_rows(
         save,
         player_text=str(intent.get("display_text") or player_text).strip(),
         addressed_role_name=addressed_role_name,
+        config=None,
     )
     return PublicSceneState(
         session_id=session_id,
         current_zone_id=save.area_snapshot.current_zone_id,
         current_sub_zone_id=save.area_snapshot.current_sub_zone_id,
         current_reputation=rep,
+        current_zone_metric=zone_metric,
         visible_npcs=[
             StoryNpcSummary(
                 role_id=role.role_id,
@@ -614,7 +660,7 @@ def _fallback_round_resolution(records: list[dict[str, object]], *, predicted_si
         else:
             lines.append(f"{name}已经把动作落到了{target_label}上，意图是{stakes}，现场最危险的是{threat}。")
     if predicted_situation_value:
-        lines.append(f"GM随后把这一轮的结果汇总起来，局势值来到 {predicted_situation_value}/100，下一轮的压力和机会都已经摆在明处。")
+        lines.append("GM随后把这一轮的结果汇总起来，下一轮的压力和机会都已经摆在明处。")
     return "\n".join(lines)[:640]
 
 
@@ -728,12 +774,13 @@ def advance_public_scene_in_save(
         )
 
     active_encounter = _active_encounter_for_current_sub_zone(save)
-    reputation_entry = get_current_sub_zone_reputation(save, create=True)
-    reputation_score = reputation_entry.score if reputation_entry is not None else 50
+    zone_metric = zone_metric_service.get_current_zone_metric(save, create=True)
+    reputation_score = zone_metric.reputation_score if zone_metric is not None else 50
     candidates = _candidate_rows(
         save,
         player_text=display_text,
         addressed_role_name=addressed_role_name,
+        config=config,
     )
     if not candidates:
         return []
@@ -780,8 +827,10 @@ def advance_public_scene_in_save(
             action_line=action_line,
             priority_reason=priority_reason,
         )
+        requires_check = _should_force_public_action_check(save, actor, payload, config=config)
+        payload["needs_check"] = requires_check
         action_result = None
-        if bool(payload.get("needs_check")):
+        if requires_check:
             action_result = _actor_check(
                 save,
                 str(actor.get("actor_id") or ""),
@@ -853,7 +902,7 @@ def advance_public_scene_in_save(
         except Exception:
             pass
 
-    rep_entry, rep_event = apply_sub_zone_reputation_delta(
+    rep_entry, rep_event = zone_metric_service.apply_zone_reputation_delta(
         save,
         session_id=session_id,
         delta=_clamp(reputation_delta_total, -6, 6),
@@ -864,7 +913,7 @@ def advance_public_scene_in_save(
     )
     if rep_event is not None:
         scene_events.append(rep_event)
-        reputation_score = rep_entry.score if rep_entry is not None else reputation_score
+        reputation_score = rep_entry.reputation_score if rep_entry is not None else reputation_score
 
     scene_events.append(
         _new_scene_event(
@@ -875,7 +924,6 @@ def advance_public_scene_in_save(
                 "actor_type": "system",
                 "candidate_count": len(round_records),
                 "reputation_score": reputation_score,
-                "predicted_situation_value": predicted_situation_value,
             },
         )
     )

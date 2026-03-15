@@ -76,6 +76,7 @@ from app.services.world_service import (
     inventory_equip,
     inventory_interact,
     inventory_unequip,
+    spawn_persistent_scene_npc_in_save,
     unequip_player_item,
     move_to_sub_zone,
     move_to_zone,
@@ -884,6 +885,28 @@ def _tools_schema() -> list[dict[str, Any]]:
                 "name": "get_current_sub_zone",
                 "description": "Return current area snapshot including current zone/sub-zone and world clock.",
                 "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "spawn_scene_npc",
+                "description": "Create one persistent NPC in the current sub-zone so the role can immediately join the scene.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "title": {"type": "string"},
+                        "description": {"type": "string"},
+                        "speaking_style": {"type": "string"},
+                        "agenda": {"type": "string"},
+                        "appearance": {"type": "string"},
+                        "alignment": {"type": "string"},
+                        "likes": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["name"],
+                    "additionalProperties": False,
+                },
             },
         },
         {
@@ -1917,6 +1940,59 @@ async def _handle_tool_call(payload: ChatRequest, tool_call: Any) -> tuple[dict[
         result = {"ok": True, "area_snapshot": snap.model_dump(mode="json")}
         event = ToolEvent(tool_name="get_current_sub_zone", ok=True, summary="area snapshot returned")
         logger.info("tool_call get_current_sub_zone ok")
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(result, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "spawn_scene_npc":
+        try:
+            args = json.loads(arg_text)
+        except Exception:
+            args = {}
+        npc_name = str(args.get("name") or "").strip()
+        if not npc_name:
+            event = ToolEvent(tool_name="spawn_scene_npc", ok=False, summary="name is required")
+            return (
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps({"ok": False, "error": "name_required"}, ensure_ascii=False),
+                },
+                event,
+            )
+        try:
+            role = spawn_persistent_scene_npc_in_save(
+                get_current_save(default_session_id=payload.session_id),
+                name=npc_name,
+                title=str(args.get("title") or "").strip(),
+                description=str(args.get("description") or "").strip(),
+                speaking_style=str(args.get("speaking_style") or "").strip(),
+                agenda=str(args.get("agenda") or "").strip(),
+                appearance=str(args.get("appearance") or "").strip(),
+                alignment=str(args.get("alignment") or "").strip(),
+                likes=[str(item) for item in list(args.get("likes") or []) if str(item).strip()],
+            )
+            result = {
+                "ok": True,
+                "role_id": role.role_id,
+                "name": role.name,
+                "zone_id": role.zone_id,
+                "sub_zone_id": role.sub_zone_id,
+            }
+            event = ToolEvent(
+                tool_name="spawn_scene_npc",
+                ok=True,
+                summary=f"spawned scene npc {role.name}",
+                payload={"role_id": role.role_id},
+            )
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="spawn_scene_npc", ok=False, summary=f"spawn failed: {exc}")
         return (
             {
                 "role": "tool",

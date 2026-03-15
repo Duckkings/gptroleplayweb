@@ -863,5 +863,9 @@ def evaluate_all_quests(req: QuestEvaluateAllRequest) -> QuestStateResponse:
     return get_quest_state(req.session_id)
 
 
+def evaluate_all_quests_in_save(req: QuestEvaluateAllRequest) -> QuestStateResponse:
+    return evaluate_all_quests(req)
+
+
 def debug_generate_quest(session_id: str, config: ChatConfig | None = None) -> QuestMutationResponse:
     return publish_quest(QuestPublishRequest(session_id=session_id, source="normal", config=config))

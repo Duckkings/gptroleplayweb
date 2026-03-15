@@ -1,5 +1,5 @@
 ﻿import { useEffect, useMemo, useRef, useState } from 'react';
-import type { AreaSnapshot, Position, RenderResult, Zone } from '../types/app';
+import type { AreaSnapshot, Position, RenderResult, Zone, ZoneMetricEntry, ZoneMetricState } from '../types/app';
 
 type Props = {
   open: boolean;
@@ -7,6 +7,8 @@ type Props = {
   areaSnapshot: AreaSnapshot | null;
   render: RenderResult | null;
   playerPosition: Position | null;
+  currentZoneMetric: ZoneMetricEntry | null;
+  zoneMetricState: ZoneMetricState;
   playerSpeedMph: number;
   search: string;
   onSearch: (next: string) => void;
@@ -57,6 +59,8 @@ export function MapPanel({
   areaSnapshot,
   render,
   playerPosition,
+  currentZoneMetric,
+  zoneMetricState,
   playerSpeedMph,
   search,
   onSearch,
@@ -87,6 +91,10 @@ export function MapPanel({
     [areaSubZones, currentSubZoneId],
   );
   const currentZone = useMemo(() => areaZones.find((z) => z.zone_id === currentZoneId) ?? null, [areaZones, currentZoneId]);
+  const zoneMetricMap = useMemo(
+    () => new Map((zoneMetricState?.entries ?? []).map((entry) => [entry.zone_id, entry])),
+    [zoneMetricState],
+  );
 
   const minX = useMemo(() => {
     const xs = [...((render?.nodes ?? []).map((n) => n.x)), ...((render?.sub_nodes ?? []).map((n) => n.x))];
@@ -226,6 +234,13 @@ export function MapPanel({
           <h2>世界地图</h2>
           <p>当前区块: {currentZoneId || playerPosition?.zone_id || '未知'}</p>
           <p>当前子区块: {currentSubZone?.name ?? '未知'}</p>
+          <p>
+            名声 / 危险: {typeof currentZoneMetric?.reputation_score === 'number' ? currentZoneMetric.reputation_score : '-'}
+            {currentZoneMetric?.reputation_band ? ` / ${currentZoneMetric.reputation_band}` : ''}
+            {' | '}
+            {typeof currentZoneMetric?.danger_score === 'number' ? currentZoneMetric.danger_score : '-'}
+            {currentZoneMetric?.danger_band ? ` / ${currentZoneMetric.danger_band}` : ''}
+          </p>
         </div>
         <div className="actions">
           <button onClick={onInitClock}>初始化时钟</button>
@@ -244,6 +259,7 @@ export function MapPanel({
               .map((z) => {
                 const subZones = areaSubZones.filter((s) => s.zone_id === z.zone_id);
                 const expanded = expandedZoneIds[z.zone_id] ?? currentZoneId === z.zone_id;
+                const metric = zoneMetricMap.get(z.zone_id);
                 return (
                   <div key={z.zone_id} className={`zone-tree-item ${currentZoneId === z.zone_id ? 'current' : ''}`}>
                     <button className="zone-name-item" onClick={() => onZoneListClick(z.zone_id)}>
@@ -253,6 +269,11 @@ export function MapPanel({
                     <p className="zone-meta">
                       类型: {z.zone_type} | 规模: {z.size} | 范围: {z.radius_m}m
                     </p>
+                    {metric && (
+                      <p className="zone-meta">
+                        名声: {metric.reputation_score}/{metric.reputation_band} | 危险: {metric.danger_score}/{metric.danger_band}
+                      </p>
+                    )}
                     {expanded && (
                       <div className="subzone-list">
                         {subZones.map((sub) => (
@@ -327,7 +348,14 @@ export function MapPanel({
                 const zoneName = (render?.nodes ?? []).find((n) => n.zone_id === c.zone_id)?.name ?? c.zone_id;
                 return (
                   <g key={`circle_${c.zone_id}`}>
-                    <circle cx={center.left} cy={center.top} r={Math.max(2, rpx)} className="zone-circle" />
+                    <circle
+                      cx={center.left}
+                      cy={center.top}
+                      r={Math.max(2, rpx)}
+                      className="zone-circle"
+                      fill={c.fill_color ?? undefined}
+                      fillOpacity={c.fill_color ? 0.28 : undefined}
+                    />
                     <text x={center.left} y={center.top} className="zone-circle-label">
                       {zoneName}
                     </text>
@@ -391,11 +419,20 @@ export function MapPanel({
       {detail && (
         <div className="modal-mask">
           <div className="modal-card">
+            {(() => {
+              const metric = zoneMetricMap.get(detail.zone.zone_id);
+              return (
+                <>
             <h3>{detail.zone.name}</h3>
             <p>区块ID: {detail.zone.zone_id}</p>
             <p>
               类型: {detail.zone.zone_type} | 规模: {detail.zone.size} | 范围: {detail.zone.radius_m}m
             </p>
+            {metric && (
+              <p>
+                名声: {metric.reputation_score}/100 / {metric.reputation_band} | 危险: {metric.danger_score}/100 / {metric.danger_band}
+              </p>
+            )}
             <p>
               坐标: ({detail.zone.x}, {detail.zone.y}, {detail.zone.z})
             </p>
@@ -413,6 +450,9 @@ export function MapPanel({
               </button>
               <button onClick={() => setDetail(null)}>返回</button>
             </div>
+                </>
+              );
+            })()}
           </div>
         </div>
       )}

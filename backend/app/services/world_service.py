@@ -1,11 +1,15 @@
 ﻿from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from math import ceil, sqrt
 import random
 import re
+from typing import Iterator
 
 from openai import OpenAI
 
@@ -55,6 +59,7 @@ from app.models.schemas import (
     InventoryEquipRequest,
     InventoryUnequipRequest,
     InventoryMutationResponse,
+    MapRenderPayload,
     InventoryInteractRequest,
     InventoryInteractResponse,
     PlayerRuntimeData,
@@ -78,6 +83,7 @@ from app.models.schemas import (
     RoleBuff,
     Dnd5eAbilityScores,
     Dnd5eAbilityModifiers,
+    EntityRef,
     RenderMapRequest,
     RenderCircle,
     RenderMapResponse,
@@ -103,6 +109,24 @@ from app.services.consistency_service import (
     player_mentions_unknown_npc,
     reconcile_consistency,
 )
+
+
+@dataclass
+class SaveTransaction:
+    save: SaveFile
+    committed: bool = False
+
+    def commit(self) -> SaveFile:
+        if not self.committed:
+            _persist_save(self.save)
+            self.committed = True
+        return self.save
+
+    def rollback(self) -> None:
+        self.committed = False
+
+
+_SAVE_TRANSACTION: ContextVar[SaveTransaction | None] = ContextVar("save_transaction", default=None)
 
 
 class AIRegionGenerationError(RuntimeError):
@@ -221,6 +245,8 @@ def _scene_event_to_turn_event(event: SceneEvent) -> SubZoneChatTurnEvent:
         event_kind = "reputation_update"
     elif event.kind == "encounter_situation_update":
         event_kind = "encounter_situation_update"
+    elif event.kind == "encounter_world_push":
+        event_kind = "encounter_world_push"
     elif event.kind == "encounter_progress":
         event_kind = "encounter_progress"
     elif event.kind == "encounter_resolution":
@@ -291,9 +317,12 @@ def _visible_team_roles(save: SaveFile) -> list[dict[str, str]]:
 
 
 def build_main_turn_context_payload(save: SaveFile, player_message: str, *, recent_turn_count: int = 8) -> dict[str, object]:
+    from app.services import zone_metric_service
+
     _ensure_area_snapshot(save)
     sub_zone = _current_sub_zone(save)
     zone = next((item for item in save.area_snapshot.zones if item.zone_id == save.area_snapshot.current_zone_id), None)
+    zone_metric = zone_metric_service.get_current_zone_metric(save, create=True)
     active_encounter = _active_encounter_for_current_sub_zone(save)
     active_quest = next((item for item in save.quest_state.quests if item.status == "active" and item.is_tracked), None)
     if active_quest is None:
@@ -309,6 +338,10 @@ def build_main_turn_context_payload(save: SaveFile, player_message: str, *, rece
             "sub_zone_id": save.area_snapshot.current_sub_zone_id,
             "sub_zone_name": sub_zone.name if sub_zone is not None else "",
             "sub_zone_description": sub_zone.description if sub_zone is not None else "",
+            "zone_reputation_score": (zone_metric.reputation_score if zone_metric is not None else 50),
+            "zone_reputation_band": (zone_metric.reputation_band if zone_metric is not None else "neutral"),
+            "zone_danger_score": (zone_metric.danger_score if zone_metric is not None else 50),
+            "zone_danger_band": (zone_metric.danger_band if zone_metric is not None else "medium"),
         },
         "world_time": {"world_time_text": world_time_text, **world_time},
         "player_input": {
@@ -1082,12 +1115,646 @@ def _ensure_role_pool_from_area(save: SaveFile) -> bool:
     return changed
 
 
-def get_current_save(default_session_id: str = "sess_default") -> SaveFile:
+def spawn_persistent_scene_npc_in_save(
+    save: SaveFile,
+    *,
+    name: str,
+    title: str = "",
+    description: str = "",
+    speaking_style: str = "",
+    agenda: str = "",
+    appearance: str = "",
+    alignment: str = "",
+    likes: list[str] | None = None,
+) -> NpcRoleCard:
+    current_sub_zone_id = save.area_snapshot.current_sub_zone_id
+    sub = next((item for item in save.area_snapshot.sub_zones if item.sub_zone_id == current_sub_zone_id), None)
+    if sub is None:
+        raise ValueError("CURRENT_SUB_ZONE_NOT_FOUND")
+    zone = next((item for item in save.area_snapshot.zones if item.zone_id == sub.zone_id), None)
+    zone_name = zone.name if zone is not None else (sub.zone_id or "当前区域")
+    world_state = ensure_world_state(save)
+
+    clean_name = " ".join(str(name or "").split()).strip()[:24]
+    if not clean_name:
+        _, clean_name = _build_npc_identity(zone_name, sub.name, sub.sub_zone_id, len(sub.npcs))
+    existing_names = {item.name for item in sub.npcs}
+    final_name = clean_name
+    suffix = 2
+    while final_name in existing_names:
+        final_name = f"{clean_name}{suffix}"
+        suffix += 1
+
+    base_role_id = f"npc_scene_{sub.sub_zone_id}_{int(datetime.now(timezone.utc).timestamp() * 1000)}"
+    role_id = base_role_id
+    seen_role_ids = {role.role_id for role in save.role_pool} | {npc.npc_id for npc in sub.npcs}
+    suffix = 2
+    while role_id in seen_role_ids:
+        role_id = f"{base_role_id}_{suffix}"
+        suffix += 1
+
+    flavor = _build_npc_flavor(role_id, zone_name, sub.name, sub.description)
+    clean_title = " ".join(str(title or "").split()).strip()[:40]
+    clean_description = " ".join(str(description or "").split()).strip()[:160]
+    clean_agenda = " ".join(str(agenda or "").split()).strip()[:120]
+    clean_speaking_style = " ".join(str(speaking_style or "").split()).strip()[:80]
+    clean_appearance = " ".join(str(appearance or "").split()).strip()[:80]
+    clean_alignment = " ".join(str(alignment or "").split()).strip()[:40]
+    clean_likes = [
+        " ".join(str(item or "").split()).strip()[:32]
+        for item in list(likes or [])
+        if " ".join(str(item or "").split()).strip()
+    ][:6]
+    background_parts = [part for part in [clean_title, clean_description or flavor["background"]] if part]
+    background_text = "。".join(background_parts)[:180]
+    secret_text = clean_agenda or flavor["secret"]
+    talkative_maximum = _build_npc_talkative_maximum(role_id, flavor["personality"])
+
+    role = NpcRoleCard(
+        role_id=role_id,
+        name=final_name,
+        zone_id=sub.zone_id,
+        sub_zone_id=sub.sub_zone_id,
+        source_world_revision=world_state.world_revision,
+        source_map_revision=world_state.map_revision,
+        state="idle",
+        personality=flavor["personality"],
+        speaking_style=clean_speaking_style or flavor["speaking_style"],
+        appearance=clean_appearance or flavor["appearance"],
+        background=background_text or flavor["background"],
+        cognition=clean_agenda or flavor["cognition"],
+        alignment=clean_alignment or flavor["alignment"],
+        secret=secret_text,
+        likes=clean_likes or _build_npc_likes(role_id),
+        talkative_maximum=talkative_maximum,
+        talkative_current=talkative_maximum,
+        profile=_build_npc_profile(role_id, final_name),
+        relations=[],
+    )
+    if clean_title:
+        role.profile.dnd5e_sheet.notes = f"{clean_title}。{role.profile.dnd5e_sheet.notes}".strip()
+    _ensure_npc_role_complete(save, role)
+    sub.npcs.append(AreaNpc(npc_id=role.role_id, name=role.name, state="idle"))
+    save.role_pool.append(role)
+    return role
+
+
+def _encounter_location_zone_id(zone_name: str, zone_type_hint: str) -> str:
+    seed = f"{zone_name}|{zone_type_hint}".encode("utf-8")
+    return f"zone_enc_{hashlib.sha1(seed).hexdigest()[:10]}"
+
+
+def _encounter_location_sub_zone_id(zone_id: str, sub_zone_name: str) -> str:
+    seed = f"{zone_id}|{sub_zone_name}".encode("utf-8")
+    return f"sub_{zone_id}_{hashlib.sha1(seed).hexdigest()[:8]}"
+
+
+def _match_zone_for_encounter_location(save: SaveFile, zone_name: str, zone_id: str | None) -> Zone | None:
+    normalized_name = " ".join(zone_name.split()).strip()
+    if zone_id:
+        found = next((item for item in save.map_snapshot.zones if item.zone_id == zone_id), None)
+        if found is not None:
+            return found
+    if not normalized_name:
+        return None
+    return next(
+        (
+            item
+            for item in save.map_snapshot.zones
+            if item.zone_id == normalized_name or " ".join(item.name.split()).strip() == normalized_name
+        ),
+        None,
+    )
+
+
+def _match_sub_zone_for_encounter_location(save: SaveFile, zone_id: str, sub_zone_name: str, sub_zone_id: str | None = None) -> AreaSubZone | None:
+    normalized_name = " ".join(sub_zone_name.split()).strip()
+    if sub_zone_id:
+        found = next((item for item in save.area_snapshot.sub_zones if item.sub_zone_id == sub_zone_id), None)
+        if found is not None:
+            return found
+    if not normalized_name:
+        return None
+    return next(
+        (
+            item
+            for item in save.area_snapshot.sub_zones
+            if item.zone_id == zone_id and (item.sub_zone_id == normalized_name or " ".join(item.name.split()).strip() == normalized_name)
+        ),
+        None,
+    )
+
+
+def _normalize_encounter_location_interactions(payload: object) -> list[dict[str, str]]:
+    if not isinstance(payload, list):
+        return []
+    items: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in payload[:3]:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()[:32]
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        items.append(
+            {
+                "name": name,
+                "type": _coerce_interaction_type(str(item.get("type") or "scene")),
+                "status": _coerce_interaction_status(str(item.get("status") or "ready")),
+            }
+        )
+    return items
+
+
+def _build_encounter_location_prompt(
+    *,
+    encounter_title: str,
+    encounter_description: str,
+    current_zone_name: str,
+    current_zone_description: str,
+    target_zone_name: str,
+    target_zone_description: str,
+    target_zone_type_hint: str,
+    target_sub_zone_name: str,
+    target_sub_zone_description: str,
+    reason: str,
+) -> str:
+    default_prompt = (
+        "你是跑团地图地点生成器，只输出 JSON。"
+        "你要围绕一个遭遇线索，立即生成一个可落地到地图的真实地点内容。"
+        "如果目标大区块已经存在，也要返回与该大区块匹配的子区块内容。"
+        "必须返回严格 JSON，结构为："
+        "{\"zone\":{\"name\":\"\",\"description\":\"\",\"zone_type\":\"city|village|forest|mountain|river|desert|coast|cave|ruins|unknown\",\"size\":\"small|medium|large\",\"radius_m\":120,\"tags\":[\"\"]},"
+        "\"sub_zones\":[{\"name\":\"\",\"description\":\"\",\"offset_x\":0,\"offset_y\":0,\"offset_z\":0,"
+        "\"interactions\":[{\"name\":\"\",\"type\":\"item|scene|npc\",\"status\":\"ready|disabled|hidden\"}]}]}。"
+        "要求："
+        "1. sub_zones 必须包含目标子区块，且名称必须与指定目标子区块完全一致。"
+        "2. 如果指定了目标大区块名称，zone.name 必须与指定目标大区块完全一致。"
+        "3. 内容必须贴合当前遭遇、线索原因和地点语义，不要返回空泛描述。"
+        "4. 生成 3-5 个子区块，目标子区块放在其中；offset_* 使用相对区块中心的米制偏移。"
+        "5. interactions 只为目标子区块生成 1-3 个可交互内容，其它子区块 interactions 可为空。"
+        "6. 所有文本都用简体中文。"
+        "当前遭遇标题=$encounter_title。"
+        "当前遭遇描述=$encounter_description。"
+        "当前参考大区块=$current_zone_name。"
+        "当前参考大区块描述=$current_zone_description。"
+        "目标大区块=$target_zone_name。"
+        "目标大区块补充描述=$target_zone_description。"
+        "目标大区块类型提示=$target_zone_type_hint。"
+        "目标子区块=$target_sub_zone_name。"
+        "目标子区块补充描述=$target_sub_zone_description。"
+        "线索或迁移原因=$reason。"
+    )
+    return prompt_table.render(
+        "world.encounter_location.user",
+        default_prompt,
+        encounter_title=encounter_title,
+        encounter_description=encounter_description,
+        current_zone_name=current_zone_name,
+        current_zone_description=current_zone_description,
+        target_zone_name=target_zone_name,
+        target_zone_description=target_zone_description,
+        target_zone_type_hint=target_zone_type_hint,
+        target_sub_zone_name=target_sub_zone_name,
+        target_sub_zone_description=target_sub_zone_description,
+        reason=reason,
+    )
+
+
+def _ai_generate_encounter_location_content(
+    *,
+    session_id: str,
+    encounter,
+    directive: dict[str, object],
+    config: ChatConfig,
+    existing_zone: Zone | None,
+) -> dict[str, object]:
+    api_key = (config.openai_api_key or "").strip()
+    model = (config.model or "").strip()
+    if not api_key or not model:
+        raise AIRegionGenerationError("encounter_location_target: 缺少有效的模型配置或 API Key")
+
+    requested_zone_name = " ".join(str(directive.get("zone_name") or "").split()).strip()
+    requested_sub_zone_name = " ".join(str(directive.get("sub_zone_name") or "").split()).strip()[:48]
+    if not requested_sub_zone_name:
+        raise AIRegionGenerationError("encounter_location_target: 缺少目标子区块名称")
+
+    requested_zone_description = " ".join(str(directive.get("zone_description") or "").split()).strip()[:160]
+    requested_zone_type_hint = " ".join(str(directive.get("zone_type_hint") or "unknown").split()).strip()[:24] or "unknown"
+    requested_sub_zone_description = " ".join(str(directive.get("sub_zone_description") or "").split()).strip()[:180]
+    reason = " ".join(str(directive.get("reason") or "").split()).strip()[:120]
+
+    prompt = _build_encounter_location_prompt(
+        encounter_title=str(getattr(encounter, "title", "") or "").strip(),
+        encounter_description=str(getattr(encounter, "description", "") or "").strip(),
+        current_zone_name=(existing_zone.name if existing_zone is not None else ""),
+        current_zone_description=(existing_zone.description if existing_zone is not None else ""),
+        target_zone_name=requested_zone_name or (existing_zone.name if existing_zone is not None else ""),
+        target_zone_description=requested_zone_description,
+        target_zone_type_hint=requested_zone_type_hint,
+        target_sub_zone_name=requested_sub_zone_name,
+        target_sub_zone_description=requested_sub_zone_description,
+        reason=reason,
+    )
+
+    try:
+        client = create_sync_client(config, client_cls=OpenAI)
+        resp = client.chat.completions.create(
+            model=model,
+            **build_completion_options(config),
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": prompt_table.get_text("world.region.system", "你是地图设计器，只输出 JSON。")},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        usage = resp.usage
+        token_usage_store.add(
+            session_id,
+            "encounter_location_generation",
+            getattr(usage, "prompt_tokens", 0) or 0,
+            getattr(usage, "completion_tokens", 0) or 0,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        if not content:
+            raise AIRegionGenerationError("encounter_location_target: AI 返回为空")
+        parsed = _extract_json_content(content)
+    except AIRegionGenerationError:
+        raise
+    except Exception as exc:
+        raise AIRegionGenerationError(f"encounter_location_target: {exc}") from exc
+
+    raw_zone = parsed.get("zone") if isinstance(parsed, dict) and isinstance(parsed.get("zone"), dict) else {}
+    raw_sub_zones = parsed.get("sub_zones") if isinstance(parsed, dict) else None
+    if not isinstance(raw_sub_zones, list):
+        raise AIRegionGenerationError("encounter_location_target: sub_zones 缺失")
+
+    allowed_zone_types = {"city", "village", "forest", "mountain", "river", "desert", "coast", "cave", "ruins", "unknown"}
+    zone_name = requested_zone_name or (existing_zone.name if existing_zone is not None else "") or str(raw_zone.get("name") or "").strip()
+    if not zone_name:
+        raise AIRegionGenerationError("encounter_location_target: AI 未返回有效大区块名称")
+    zone_type = str(raw_zone.get("zone_type") or requested_zone_type_hint or (existing_zone.zone_type if existing_zone is not None else "unknown")).strip().lower() or "unknown"
+    if zone_type not in allowed_zone_types:
+        zone_type = "unknown"
+    zone_size = str(raw_zone.get("size") or (existing_zone.size if existing_zone is not None else "small")).strip().lower() or "small"
+    if zone_size not in {"small", "medium", "large"}:
+        zone_size = "small"
+    rmin, rmax = _zone_radius_range(zone_size)
+    default_radius = existing_zone.radius_m if existing_zone is not None else int((rmin + rmax) / 2)
+    zone_radius_m = min(rmax, max(rmin, int(raw_zone.get("radius_m") or default_radius)))
+    zone_description = (
+        str(raw_zone.get("description") or "").strip()
+        or requested_zone_description
+        or (existing_zone.description if existing_zone is not None else "")
+        or requested_sub_zone_description
+        or reason
+        or str(getattr(encounter, "description", "") or "").strip()
+        or "遭遇线索指向的新地点"
+    )[:160]
+    raw_tags = raw_zone.get("tags")
+    zone_tags = [str(item).strip()[:24] for item in raw_tags] if isinstance(raw_tags, list) else []
+    zone_tags = [item for item in zone_tags if item]
+    for extra_tag in ["encounter_generated", "clue_site", zone_type]:
+        if extra_tag and extra_tag not in zone_tags:
+            zone_tags.append(extra_tag)
+
+    seed_payloads: list[dict[str, object]] = []
+    seen_names: set[str] = set()
+    for item in raw_sub_zones[:8]:
+        if not isinstance(item, dict):
+            continue
+        name = " ".join(str(item.get("name") or "").split()).strip()[:48]
+        if not name or name in seen_names:
+            continue
+        seen_names.add(name)
+        seed_payloads.append(
+            {
+                "name": name,
+                "description": (" ".join(str(item.get("description") or "").split()).strip() or zone_description)[:180],
+                "offset_x": int(item.get("offset_x") or 0),
+                "offset_y": int(item.get("offset_y") or 0),
+                "offset_z": int(item.get("offset_z") or 0),
+                "interactions": _normalize_encounter_location_interactions(item.get("interactions")),
+            }
+        )
+
+    target_index = next((idx for idx, item in enumerate(seed_payloads) if item["name"] == requested_sub_zone_name), -1)
+    if target_index < 0:
+        fallback_description = requested_sub_zone_description or (str(seed_payloads[0]["description"]) if seed_payloads else zone_description)
+        fallback_interactions = list(seed_payloads[0].get("interactions") or []) if seed_payloads else []
+        seed_payloads.insert(
+            0,
+            {
+                "name": requested_sub_zone_name,
+                "description": fallback_description[:180],
+                "offset_x": 0,
+                "offset_y": 0,
+                "offset_z": 0,
+                "interactions": fallback_interactions[:3],
+            },
+        )
+    else:
+        seed_payloads[target_index]["name"] = requested_sub_zone_name
+        if requested_sub_zone_description:
+            seed_payloads[target_index]["description"] = requested_sub_zone_description[:180]
+
+    min_count, max_count = _sub_zone_count_range(zone_size, config)
+    default_fillers = _default_sub_zone_seeds(zone_size, zone_name, config)
+    used_names = {str(item["name"]) for item in seed_payloads}
+    for filler in default_fillers:
+        if len(seed_payloads) >= min_count:
+            break
+        if filler.name in used_names or filler.name == requested_sub_zone_name:
+            continue
+        used_names.add(filler.name)
+        seed_payloads.append(
+            {
+                "name": filler.name,
+                "description": filler.description or zone_description,
+                "offset_x": filler.offset_x,
+                "offset_y": filler.offset_y,
+                "offset_z": filler.offset_z,
+                "interactions": [],
+            }
+        )
+    if len(seed_payloads) < min_count:
+        for idx in range(len(seed_payloads), min_count):
+            filler_name = f"{zone_name}扩展点{idx + 1}"
+            if filler_name in used_names:
+                continue
+            used_names.add(filler_name)
+            seed_payloads.append(
+                {
+                    "name": filler_name,
+                    "description": zone_description,
+                    "offset_x": 0,
+                    "offset_y": 0,
+                    "offset_z": 0,
+                    "interactions": [],
+                }
+            )
+    if len(seed_payloads) > max_count:
+        target_seed = next((item for item in seed_payloads if item["name"] == requested_sub_zone_name), seed_payloads[0])
+        others = [item for item in seed_payloads if item["name"] != requested_sub_zone_name][: max(0, max_count - 1)]
+        seed_payloads = [target_seed, *others]
+
+    if not seed_payloads:
+        raise AIRegionGenerationError("encounter_location_target: AI 未返回有效子区块内容")
+
+    normalized_seeds: list[dict[str, object]] = []
+    for payload in seed_payloads:
+        ox, oy = _fit_offset_in_radius(int(payload.get("offset_x") or 0), int(payload.get("offset_y") or 0), zone_radius_m)
+        normalized_seeds.append(
+            {
+                "name": str(payload["name"]),
+                "description": str(payload.get("description") or zone_description)[:180],
+                "offset_x": ox,
+                "offset_y": oy,
+                "offset_z": int(payload.get("offset_z") or 0),
+                "interactions": list(payload.get("interactions") or []),
+            }
+        )
+
+    return {
+        "zone_name": zone_name,
+        "zone_description": zone_description,
+        "zone_type": zone_type,
+        "zone_size": zone_size,
+        "zone_radius_m": zone_radius_m,
+        "zone_tags": zone_tags,
+        "sub_zone_seeds": normalized_seeds,
+        "target_sub_zone_name": requested_sub_zone_name,
+        "target_sub_zone_description": requested_sub_zone_description[:180] or next(
+            (str(item.get("description") or "") for item in normalized_seeds if item["name"] == requested_sub_zone_name),
+            zone_description,
+        ),
+        "target_interactions": next(
+            (list(item.get("interactions") or []) for item in normalized_seeds if item["name"] == requested_sub_zone_name),
+            [],
+        ),
+    }
+
+
+def ensure_encounter_location_target_in_save(
+    save: SaveFile,
+    encounter,
+    directive: dict[str, object],
+    *,
+    session_id: str,
+    config: ChatConfig | None = None,
+) -> dict[str, object]:
+    _ensure_area_snapshot(save)
+
+    zone_name = " ".join(str(directive.get("zone_name") or "").split()).strip()
+    zone_description = " ".join(str(directive.get("zone_description") or "").split()).strip()[:160]
+    zone_type_hint = " ".join(str(directive.get("zone_type_hint") or "unknown").split()).strip()[:24] or "unknown"
+    sub_zone_name = " ".join(str(directive.get("sub_zone_name") or "").split()).strip()[:48]
+    sub_zone_description = " ".join(str(directive.get("sub_zone_description") or "").split()).strip()[:180]
+    reason = " ".join(str(directive.get("reason") or "").split()).strip()[:120]
+    if not sub_zone_name:
+        raise ValueError("ENCOUNTER_LOCATION_TARGET_REQUIRES_SUB_ZONE_NAME")
+
+    reference_zone_id = encounter.zone_id or save.area_snapshot.current_zone_id or (save.map_snapshot.player_position.zone_id if save.map_snapshot.player_position else None)
+    zone = _match_zone_for_encounter_location(save, zone_name, reference_zone_id if not zone_name else None)
+    generated_zone = False
+    ai_payload: dict[str, object] | None = None
+    if zone is None:
+        if config is None:
+            raise AIRegionGenerationError("encounter_location_target: 缺少模型配置，无法即时生成新地点")
+        ai_payload = _ai_generate_encounter_location_content(
+            session_id=session_id,
+            encounter=encounter,
+            directive=directive,
+            config=config,
+            existing_zone=None,
+        )
+        zone_id = _encounter_location_zone_id(str(ai_payload.get("zone_name") or zone_name or (encounter.title or "clue_site")), str(ai_payload.get("zone_type") or zone_type_hint))
+        reference_zone = next((item for item in save.map_snapshot.zones if item.zone_id == reference_zone_id), None)
+        base_x = reference_zone.x if reference_zone is not None else (save.map_snapshot.player_position.x if save.map_snapshot.player_position is not None else 0)
+        base_y = reference_zone.y if reference_zone is not None else (save.map_snapshot.player_position.y if save.map_snapshot.player_position is not None else 0)
+        base_z = reference_zone.z if reference_zone is not None else (save.map_snapshot.player_position.z if save.map_snapshot.player_position is not None else 0)
+        offset = 180 + (len(save.map_snapshot.zones) % 5) * 36
+        zone = Zone(
+            zone_id=zone_id,
+            name=str(ai_payload.get("zone_name") or zone_name or (encounter.title or "新地点")),
+            x=base_x + offset,
+            y=base_y - max(60, offset // 2),
+            z=base_z,
+            zone_type=str(ai_payload.get("zone_type") or zone_type_hint or "unknown"),
+            size=str(ai_payload.get("zone_size") or "small"),
+            radius_m=int(ai_payload.get("zone_radius_m") or 120),
+            description=str(ai_payload.get("zone_description") or zone_description or reason or "遭遇线索指向的新地点"),
+            tags=[str(item) for item in list(ai_payload.get("zone_tags") or ["encounter_generated", "clue_site", zone_type_hint])],
+            sub_zones=[
+                ZoneSubZoneSeed(
+                    name=str(item.get("name") or ""),
+                    description=str(item.get("description") or ""),
+                    offset_x=int(item.get("offset_x") or 0),
+                    offset_y=int(item.get("offset_y") or 0),
+                    offset_z=int(item.get("offset_z") or 0),
+                )
+                for item in list(ai_payload.get("sub_zone_seeds") or [])
+                if str(item.get("name") or "").strip()
+            ],
+        )
+        save.map_snapshot.zones.append(zone)
+        _enforce_non_overlap(save.map_snapshot.zones)
+        generated_zone = True
+
+    zone_id = zone.zone_id
+    map_zone = next((item for item in save.map_snapshot.zones if item.zone_id == zone_id), None)
+    if map_zone is None:
+        map_zone = Zone(
+            zone_id=zone.zone_id,
+            name=zone.name,
+            x=zone.x,
+            y=zone.y,
+            z=zone.z,
+            zone_type=zone.zone_type,
+            size=zone.size,
+            radius_m=zone.radius_m,
+            description=zone.description,
+            tags=list(zone.tags),
+            sub_zones=list(zone.sub_zones),
+        )
+        save.map_snapshot.zones.append(map_zone)
+
+    _ensure_zone_subzone_placeholders(save, zone_id)
+    sub_zone = _match_sub_zone_for_encounter_location(save, zone_id, sub_zone_name)
+    generated_sub_zone = False
+    if sub_zone is None:
+        if config is None:
+            raise AIRegionGenerationError("encounter_location_target: 缺少模型配置，无法即时生成新子区块")
+        ai_payload = _ai_generate_encounter_location_content(
+            session_id=session_id,
+            encounter=encounter,
+            directive=directive,
+            config=config,
+            existing_zone=map_zone,
+        )
+        map_zone.description = str(ai_payload.get("zone_description") or map_zone.description)
+        map_zone.zone_type = str(ai_payload.get("zone_type") or map_zone.zone_type)
+        map_zone.size = str(ai_payload.get("zone_size") or map_zone.size)
+        map_zone.radius_m = int(ai_payload.get("zone_radius_m") or map_zone.radius_m)
+        existing_names = {" ".join(item.name.split()).strip() for item in map_zone.sub_zones}
+        for item in list(ai_payload.get("sub_zone_seeds") or []):
+            seed_name = " ".join(str(item.get("name") or "").split()).strip()
+            if not seed_name or seed_name in existing_names:
+                continue
+            existing_names.add(seed_name)
+            map_zone.sub_zones.append(
+                ZoneSubZoneSeed(
+                    name=seed_name,
+                    description=str(item.get("description") or ""),
+                    offset_x=int(item.get("offset_x") or 0),
+                    offset_y=int(item.get("offset_y") or 0),
+                    offset_z=int(item.get("offset_z") or 0),
+                )
+            )
+        _ensure_zone_subzone_placeholders(save, zone_id)
+        sub_zone = _match_sub_zone_for_encounter_location(save, zone_id, sub_zone_name)
+        generated_sub_zone = sub_zone is not None
+
+    if sub_zone is None:
+        raise ValueError("ENCOUNTER_LOCATION_TARGET_SUB_ZONE_NOT_FOUND")
+
+    target_payload = next(
+        (
+            item
+            for item in list((ai_payload or {}).get("sub_zone_seeds") or [])
+            if " ".join(str(item.get("name") or "").split()).strip() == sub_zone_name
+        ),
+        None,
+    )
+    target_description = (
+        str((target_payload or {}).get("description") or "").strip()
+        or str((ai_payload or {}).get("target_sub_zone_description") or "").strip()
+        or sub_zone_description
+        or reason
+        or sub_zone.description
+    )[:180]
+    if target_description:
+        sub_zone.description = target_description
+    sub_zone.generated_mode = "instant" if (generated_zone or generated_sub_zone) else sub_zone.generated_mode
+    target_interactions = list((target_payload or {}).get("interactions") or (ai_payload or {}).get("target_interactions") or [])
+    existing_interaction_names = {item.name for item in sub_zone.key_interactions}
+    for idx, interaction in enumerate(target_interactions):
+        name = str(interaction.get("name") or "").strip()
+        if not name or name in existing_interaction_names:
+            continue
+        existing_interaction_names.add(name)
+        sub_zone.key_interactions.append(
+            AreaInteraction(
+                interaction_id=f"int_{sub_zone.sub_zone_id}_enc_{idx + 1}",
+                name=name,
+                type=_coerce_interaction_type(str(interaction.get("type") or "scene")),
+                status=_coerce_interaction_status(str(interaction.get("status") or "ready")),
+                generated_mode="instant",
+                placeholder=False,
+            )
+        )
+    if not sub_zone.key_interactions:
+        sub_zone.key_interactions.append(
+            AreaInteraction(
+                interaction_id=f"int_{sub_zone.sub_zone_id}_observe",
+                name="观察周边",
+                type="scene",
+                generated_mode="instant",
+                placeholder=True,
+            )
+        )
+
+    area_zone = next((item for item in save.area_snapshot.zones if item.zone_id == zone_id), None)
+    if area_zone is not None:
+        area_zone.description = map_zone.description
+
+    _ensure_role_pool_from_area(save)
+    entity_refs = list(getattr(encounter, "entity_refs", []) or [])
+    for ref in (
+        EntityRef(entity_type="zone", entity_id=zone_id, label=zone.name, source="system"),
+        EntityRef(entity_type="sub_zone", entity_id=sub_zone.sub_zone_id, label=sub_zone.name, source="system"),
+    ):
+        if not any(item.entity_type == ref.entity_type and item.entity_id == ref.entity_id for item in entity_refs):
+            entity_refs.append(ref)
+    encounter.entity_refs = entity_refs
+
+    if bool(directive.get("move_encounter_focus")):
+        encounter.zone_id = zone_id
+        encounter.sub_zone_id = sub_zone.sub_zone_id
+
+    save.game_logs.append(
+        GameLogEntry(
+            id=f"glog_{int(datetime.now(timezone.utc).timestamp() * 1000)}",
+            session_id=session_id,
+            kind="encounter_location_target",
+            message=f"遭遇地点指向 {zone.name}/{sub_zone.name}",
+            payload={
+                "encounter_id": getattr(encounter, "encounter_id", ""),
+                "zone_id": zone_id,
+                "sub_zone_id": sub_zone.sub_zone_id,
+                "generated_zone": generated_zone,
+                "generated_sub_zone": generated_sub_zone,
+            },
+        )
+    )
+    return {
+        "zone_id": zone_id,
+        "sub_zone_id": sub_zone.sub_zone_id,
+        "zone_name": zone.name,
+        "sub_zone_name": sub_zone.name,
+        "target_location_label": f"{zone.name} / {sub_zone.name}",
+        "generated_zone": generated_zone,
+        "generated_sub_zone": generated_sub_zone,
+    }
+
+
+def _load_current_save(default_session_id: str = "sess_default") -> SaveFile:
     payload = read_save_payload(storage_state.save_path)
     if payload is None:
         save = _empty_save(default_session_id)
         ensure_world_state(save)
-        save_current(save)
+        _persist_save(save)
         return save
 
     save = SaveFile.model_validate(payload)
@@ -1121,15 +1788,57 @@ def get_current_save(default_session_id: str = "sess_default") -> SaveFile:
             changed = True
     _, reconciled = reconcile_consistency(save, session_id=save.session_id or default_session_id, reason="load")
     if changed or reconciled:
-        save_current(save)
+        _persist_save(save)
     return save
 
 
-def save_current(save: SaveFile) -> None:
+def _persist_save(save: SaveFile) -> None:
     ensure_world_state(save)
     save.updated_at = _utc_now()
     save.player_runtime_data.updated_at = save.updated_at
     write_save_payload(storage_state.save_path, save.model_dump(mode="json"))
+
+
+def current_save_transaction() -> SaveTransaction | None:
+    return _SAVE_TRANSACTION.get()
+
+
+@contextmanager
+def save_transaction(default_session_id: str = "sess_default") -> Iterator[SaveTransaction]:
+    base_save = _load_current_save(default_session_id)
+    txn = SaveTransaction(save=base_save.model_copy(deep=True))
+    token = _SAVE_TRANSACTION.set(txn)
+    try:
+        yield txn
+    finally:
+        _SAVE_TRANSACTION.reset(token)
+
+
+def get_current_save(default_session_id: str = "sess_default") -> SaveFile:
+    txn = current_save_transaction()
+    if txn is not None:
+        save = txn.save
+        ensure_world_state(save)
+        if not save.player_runtime_data.session_id:
+            save.player_runtime_data.session_id = save.session_id
+        _recompute_player_derived(save.player_static_data)
+        _ensure_area_snapshot(save)
+        for role in save.role_pool:
+            _recompute_player_derived(role.profile)
+            _ensure_npc_role_complete(save, role)
+        return save
+    return _load_current_save(default_session_id)
+
+
+def save_current(save: SaveFile) -> None:
+    txn = current_save_transaction()
+    if txn is not None:
+        ensure_world_state(save)
+        save.updated_at = _utc_now()
+        save.player_runtime_data.updated_at = save.updated_at
+        txn.save = save
+        return
+    _persist_save(save)
 
 
 def clear_current_save(session_id: str) -> SaveFile:
@@ -2067,6 +2776,10 @@ def generate_regions(req: RegionGenerateRequest) -> RegionGenerateResponse:
     return RegionGenerateResponse(session_id=req.session_id, generated=True, zones=zones)
 
 
+def generate_regions_in_save(req: RegionGenerateRequest) -> RegionGenerateResponse:
+    return generate_regions(req)
+
+
 def generate_zones_for_chat(session_id: str, config: ChatConfig, world_prompt: str, count: int = 1) -> list[Zone]:
     save = get_current_save(default_session_id=session_id)
     center = (
@@ -2119,12 +2832,28 @@ def generate_zones_for_chat(session_id: str, config: ChatConfig, world_prompt: s
     return appended
 
 
-def render_map(req: RenderMapRequest) -> RenderMapResponse:
-    nodes = [RenderNode(zone_id=z.zone_id, name=z.name, x=z.x, y=z.y) for z in req.zones]
+def render_map_payload(*, zones: list[Zone], player_position: Position, zone_metrics: dict[str, object] | None = None) -> MapRenderPayload:
+    from app.services import zone_metric_service
+
+    nodes = [RenderNode(zone_id=z.zone_id, name=z.name, x=z.x, y=z.y) for z in zones]
     sub_nodes: list[RenderSubNode] = []
     circles: list[RenderCircle] = []
-    for z in req.zones:
-        circles.append(RenderCircle(zone_id=z.zone_id, center_x=z.x, center_y=z.y, radius_m=z.radius_m))
+    for z in zones:
+        metric = zone_metrics.get(z.zone_id) if isinstance(zone_metrics, dict) else None
+        danger_score = getattr(metric, "danger_score", None)
+        danger_band = getattr(metric, "danger_band", None)
+        fill_color = zone_metric_service.danger_fill_color(int(danger_score)) if isinstance(danger_score, int) else None
+        circles.append(
+            RenderCircle(
+                zone_id=z.zone_id,
+                center_x=z.x,
+                center_y=z.y,
+                radius_m=z.radius_m,
+                danger_score=danger_score if isinstance(danger_score, int) else None,
+                danger_band=danger_band if isinstance(danger_band, str) else None,
+                fill_color=fill_color,
+            )
+        )
         for idx, sub in enumerate(z.sub_zones):
             sub_nodes.append(
                 RenderSubNode(
@@ -2143,14 +2872,21 @@ def render_map(req: RenderMapRequest) -> RenderMapResponse:
         "min_y": min(ys) - 10,
         "max_y": max(ys) + 10,
     }
-    return RenderMapResponse(
-        session_id=req.session_id,
+    return MapRenderPayload(
         viewport=viewport,
         nodes=nodes,
         sub_nodes=sub_nodes,
         circles=circles,
-        player_marker={"x": req.player_position.x, "y": req.player_position.y},
+        player_marker={"x": player_position.x, "y": player_position.y},
     )
+
+
+def render_map(req: RenderMapRequest) -> RenderMapResponse:
+    zone_metrics = None
+    if req.zone_metric_state is not None:
+        zone_metrics = {entry.zone_id: entry for entry in req.zone_metric_state.entries}
+    payload = render_map_payload(zones=req.zones, player_position=req.player_position, zone_metrics=zone_metrics)
+    return RenderMapResponse(session_id=req.session_id, **payload.model_dump())
 
 
 def _distance_m(from_zone: Zone, to_zone: Zone) -> float:
@@ -2313,6 +3049,10 @@ def move_to_zone(req: MoveRequest) -> MoveResponse:
         duration_min=duration_min,
         movement_log=movement_log,
     )
+
+
+def move_to_zone_in_save(req: MoveRequest) -> MoveResponse:
+    return move_to_zone(req)
 
 
 def _default_world_clock(calendar: str = "fantasy_default") -> WorldClock:
@@ -4169,12 +4909,15 @@ def plan_action_check(req: ActionCheckPlanRequest) -> ActionCheckPlanResponse:
         actor_name=profile.name,
         actor_kind=actor_kind,  # type: ignore[arg-type]
         action_type=req.action_type,
+        check_mode=req.check_mode,
         requires_check=bool(plan["requires_check"]),
         ability_used=ability,  # type: ignore[arg-type]
         ability_modifier=_ability_modifier(profile, ability),
         dc=int(plan["dc"]),
         time_spent_min=int(plan["time_spent_min"]),
         check_task=str(plan["check_task"]),
+        source_label=req.source_label,
+        threatened_consequence=req.threatened_consequence,
     )
 
 
@@ -4203,7 +4946,15 @@ def _suggest_relation_tag(req: ActionCheckRequest, success: bool, critical: str)
     if "npc_id=" not in text:
         return None
 
-    if req.config is not None:
+    uses_planned_embedded_resolution = (
+        req.resolution_context == "embedded"
+        and req.planned_ability_used is not None
+        and req.planned_dc is not None
+        and req.planned_time_spent_min is not None
+        and req.planned_requires_check is not None
+    )
+
+    if req.config is not None and not uses_planned_embedded_resolution:
         api_key = (req.config.openai_api_key or "").strip()
         model = (req.config.model or "").strip()
         if api_key and model:
@@ -4434,17 +5185,34 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
         success=success,
         critical=critical,
     )
-    resolution_text = _ai_action_resolution_text(
-        req,
-        actor_name=profile.name,
-        actor_kind=actor_kind,
-        action_type=req.action_type,
-        action_prompt=req.action_prompt,
-        check_task=check_task,
-        success=success,
-        critical=critical,
-        requires_check=requires_check,
+    uses_planned_embedded_resolution = (
+        req.resolution_context == "embedded"
+        and req.planned_ability_used is not None
+        and req.planned_dc is not None
+        and req.planned_time_spent_min is not None
+        and req.planned_requires_check is not None
     )
+    if uses_planned_embedded_resolution:
+        resolution_text = _fallback_action_resolution_text(
+            actor_name=profile.name,
+            action_type=req.action_type,
+            check_task=check_task,
+            success=success,
+            critical=critical,
+            requires_check=requires_check,
+        )
+    else:
+        resolution_text = _ai_action_resolution_text(
+            req,
+            actor_name=profile.name,
+            actor_kind=actor_kind,
+            action_type=req.action_type,
+            action_prompt=req.action_prompt,
+            check_task=check_task,
+            success=success,
+            critical=critical,
+            requires_check=requires_check,
+        )
     narrative = process_text if process_text == resolution_text else f"{process_text}\n{resolution_text}".strip()
     scene_events: list[SceneEvent] = []
 
@@ -4522,11 +5290,14 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
         actor_name=profile.name,
         actor_kind=actor_kind,  # type: ignore[arg-type]
         action_type=req.action_type,
+        check_mode=req.check_mode,
         requires_check=requires_check,
         ability_used=ability,  # type: ignore[arg-type]
         ability_modifier=ability_modifier,
         dc=dc,
         check_task=check_task,
+        source_label=req.source_label,
+        threatened_consequence=req.threatened_consequence,
         dice_roll=dice_roll,
         total_score=total_score,
         success=success,
@@ -4539,7 +5310,11 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
     )
 
 
-def move_to_sub_zone(req: AreaMoveSubZoneRequest) -> AreaMoveResult:
+def action_check_in_save(req: ActionCheckRequest) -> ActionCheckResponse:
+    return action_check(req)
+
+
+def move_to_sub_zone_in_save(req: AreaMoveSubZoneRequest) -> AreaMoveResult:
     _attempt_escape_for_move(
         session_id=req.session_id,
         target_zone_id=None,
@@ -4593,6 +5368,7 @@ def move_to_sub_zone(req: AreaMoveSubZoneRequest) -> AreaMoveResult:
             clock_after=snap.clock,
             movement_feedback=f"你已在【{to_sub.name}】。",
         )
+
     distance_m = _distance3d_m(from_point.coord, to_point.coord)
     speed_mph = max(1, save.player_static_data.move_speed_mph)
     duration_min = max(1, ceil((distance_m / speed_mph) * 60.0))
@@ -4621,41 +5397,8 @@ def move_to_sub_zone(req: AreaMoveSubZoneRequest) -> AreaMoveResult:
             },
         )
     )
-    save_current(save)
 
     movement_feedback = f"你移动到【{to_sub.name}】，花费 {duration_min} 分钟。"
-    if req.config is not None:
-        try:
-            api_key = (req.config.openai_api_key or "").strip()
-            model = (req.config.model or "").strip()
-            if api_key and model:
-                client = create_sync_client(req.config, client_cls=OpenAI)
-                default_prompt = (
-                    "你是跑团GM。基于以下移动结果写一段50-120字叙事。"
-                    "不要编号，不要选项。"
-                    "from=$from_id, to=$to_name, distance_m=$distance_m, duration_min=$duration_min"
-                )
-                prompt = prompt_table.render(
-                    "move.subzone.user",
-                    default_prompt,
-                    from_id=(from_point.sub_zone_id or from_point.zone_id),
-                    to_name=to_sub.name,
-                    distance_m=round(distance_m, 2),
-                    duration_min=duration_min,
-                )
-                resp = client.chat.completions.create(
-                    model=model,
-                    **build_completion_options(req.config),
-                    messages=[
-                        {"role": "system", "content": req.config.gm_prompt},
-                        {"role": "user", "content": prompt},
-                    ],
-                )
-                txt = (resp.choices[0].message.content or "").strip()
-                if txt:
-                    movement_feedback = txt
-        except Exception:
-            pass
     try:
         from app.services.team_service import apply_team_reactions_in_save, sync_team_members_with_player_in_save
 
@@ -4671,7 +5414,7 @@ def move_to_sub_zone(req: AreaMoveSubZoneRequest) -> AreaMoveResult:
     try:
         from app.services.encounter_service import advance_active_encounter_in_save
 
-        advance_active_encounter_in_save(save, session_id=req.session_id, minutes_elapsed=duration_min, config=req.config)
+        advance_active_encounter_in_save(save, session_id=req.session_id, minutes_elapsed=duration_min, config=None)
     except Exception:
         pass
     save_current(save)
@@ -4686,6 +5429,56 @@ def move_to_sub_zone(req: AreaMoveSubZoneRequest) -> AreaMoveResult:
         clock_after=clock_after,
         movement_feedback=movement_feedback,
     )
+
+
+def move_to_sub_zone(req: AreaMoveSubZoneRequest) -> AreaMoveResult:
+    result = move_to_sub_zone_in_save(req)
+    movement_feedback = result.movement_feedback
+    if req.config is not None:
+        try:
+            api_key = (req.config.openai_api_key or "").strip()
+            model = (req.config.model or "").strip()
+            if api_key and model:
+                client = create_sync_client(req.config, client_cls=OpenAI)
+                save = get_current_save(default_session_id=req.session_id)
+                from_name = next(
+                    (item.name for item in save.area_snapshot.sub_zones if item.sub_zone_id == result.from_point.sub_zone_id),
+                    result.from_point.sub_zone_id or result.from_point.zone_id,
+                )
+                to_name = next(
+                    (item.name for item in save.area_snapshot.sub_zones if item.sub_zone_id == result.to_point.sub_zone_id),
+                    result.to_point.sub_zone_id or result.to_point.zone_id,
+                )
+                default_prompt = (
+                    "你是跑团GM。基于以下移动结果写一段50-120字叙事。"
+                    "不要编号，不要选项。"
+                    "from_name=$from_name, from_id=$from_id, to_name=$to_name, to_id=$to_id, "
+                    "distance_m=$distance_m, duration_min=$duration_min"
+                )
+                prompt = prompt_table.render(
+                    "move.subzone.user",
+                    default_prompt,
+                    from_name=from_name,
+                    from_id=(result.from_point.sub_zone_id or result.from_point.zone_id),
+                    to_name=to_name,
+                    to_id=(result.to_point.sub_zone_id or result.to_point.zone_id),
+                    distance_m=round(result.distance_m, 2),
+                    duration_min=result.duration_min,
+                )
+                resp = client.chat.completions.create(
+                    model=model,
+                    **build_completion_options(req.config),
+                    messages=[
+                        {"role": "system", "content": req.config.gm_prompt},
+                        {"role": "user", "content": prompt},
+                    ],
+                )
+                txt = (resp.choices[0].message.content or "").strip()
+                if txt and not re.search(r"\$[A-Za-z_][A-Za-z0-9_]*", txt):
+                    movement_feedback = txt
+        except Exception:
+            pass
+    return result.model_copy(update={"movement_feedback": movement_feedback})
 
 
 def discover_interactions(req: AreaDiscoverInteractionsRequest) -> AreaDiscoverInteractionsResponse:
@@ -4764,6 +5557,10 @@ def discover_interactions(req: AreaDiscoverInteractionsRequest) -> AreaDiscoverI
     return AreaDiscoverInteractionsResponse(ok=True, generated_mode="instant", new_interactions=deduped)
 
 
+def discover_interactions_in_save(req: AreaDiscoverInteractionsRequest) -> AreaDiscoverInteractionsResponse:
+    return discover_interactions(req)
+
+
 def execute_interaction(req: AreaExecuteInteractionRequest) -> AreaExecuteInteractionResponse:
     save = get_current_save(default_session_id=req.session_id)
     if save.session_id != req.session_id:
@@ -4790,6 +5587,10 @@ def execute_interaction(req: AreaExecuteInteractionRequest) -> AreaExecuteIntera
     )
     save_current(save)
     return AreaExecuteInteractionResponse(ok=True, status="placeholder", message="待开发")
+
+
+def execute_interaction_in_save(req: AreaExecuteInteractionRequest) -> AreaExecuteInteractionResponse:
+    return execute_interaction(req)
 
 
 def describe_behavior(session_id: str, movement_log: MovementLog, config: ChatConfig) -> BehaviorDescribeResponse:

@@ -1,10 +1,11 @@
 import { EncounterTimeline } from './EncounterTimeline';
-import type { EncounterEntry, NpcRoleCard } from '../types/app';
+import type { AreaSnapshot, EncounterEntry, NpcRoleCard } from '../types/app';
 
 type Props = {
   encounter: EncounterEntry | null;
   queuedEncounters: EncounterEntry[];
   roleCards?: NpcRoleCard[];
+  areaSnapshot?: AreaSnapshot | null;
   busy?: boolean;
   canRejoin?: boolean;
 };
@@ -39,7 +40,25 @@ function interactiveNpcNames(encounter: EncounterEntry, roleCards: NpcRoleCard[]
   return names;
 }
 
-export function EncounterLane({ encounter, queuedEncounters, roleCards = [], busy = false, canRejoin = false }: Props) {
+function locationLabel(encounter: EncounterEntry, areaSnapshot: AreaSnapshot | null | undefined): string {
+  if (!encounter.zone_id && !encounter.sub_zone_id) return '未知地点';
+  const zoneName =
+    areaSnapshot?.zones.find((item) => item.zone_id === encounter.zone_id)?.name ?? encounter.zone_id ?? '未知区块';
+  const subZoneName =
+    areaSnapshot?.sub_zones.find((item) => item.sub_zone_id === encounter.sub_zone_id)?.name ??
+    encounter.sub_zone_id ??
+    '未知子区块';
+  return `${zoneName} / ${subZoneName}`;
+}
+
+export function EncounterLane({
+  encounter,
+  queuedEncounters,
+  roleCards = [],
+  areaSnapshot,
+  busy = false,
+  canRejoin = false,
+}: Props) {
   if (!encounter && queuedEncounters.length === 0) return null;
 
   return (
@@ -57,17 +76,20 @@ export function EncounterLane({ encounter, queuedEncounters, roleCards = [], bus
             <strong>{encounter.title}</strong>
             <p>{encounter.description}</p>
             <p>
-              局势值: {encounter.situation_value}/100
+              局势值 {encounter.situation_value}/100
               {encounter.situation_start_value ? ` (起始 ${encounter.situation_start_value})` : ''}
             </p>
             <p>趋势: {TREND_LABEL[encounter.situation_trend]}</p>
+            <p>当前地点: {locationLabel(encounter, areaSnapshot)}</p>
             {encounter.scene_summary && <p>当前局势: {encounter.scene_summary}</p>}
             {encounter.latest_outcome_summary && <p>最近进展: {encounter.latest_outcome_summary}</p>}
             {encounter.last_outcome_package?.narrative_summary && <p>结果摘要: {encounter.last_outcome_package.narrative_summary}</p>}
             <p className="hint">遭遇推进请直接在主聊天输入。</p>
             {busy && <p className="hint">遭遇状态同步中...</p>}
-            {encounter.player_presence === 'away' && !canRejoin && <p className="hint">回到遭遇发生地后会自动重新接入。</p>}
-            {encounter.player_presence === 'away' && canRejoin && <p className="hint">已回到遭遇地点，系统正在尝试重新接入。</p>}
+            {encounter.player_presence === 'away' && !canRejoin && (
+              <p className="hint">回到 {locationLabel(encounter, areaSnapshot)} 可重新接入。</p>
+            )}
+            {encounter.player_presence === 'away' && canRejoin && <p className="hint">已回到遭遇地点，可重新接入。</p>}
           </section>
 
           {interactiveNpcNames(encounter, roleCards).length > 0 && (
@@ -95,7 +117,9 @@ export function EncounterLane({ encounter, queuedEncounters, roleCards = [], bus
 
           <section className="encounter-steps">
             <h3>最近步骤</h3>
-            <EncounterTimeline steps={encounter.steps ?? []} />
+            <div className="encounter-steps-scroll">
+              <EncounterTimeline steps={encounter.steps ?? []} />
+            </div>
           </section>
         </>
       ) : (
@@ -110,7 +134,7 @@ export function EncounterLane({ encounter, queuedEncounters, roleCards = [], bus
               <strong>{item.title}</strong>
               <p>{item.description}</p>
               <p>
-                预设局势: {item.situation_value}/100 / {TREND_LABEL[item.situation_trend]}
+                预设局势 {item.situation_value}/100 / {TREND_LABEL[item.situation_trend]}
               </p>
             </article>
           ))}
