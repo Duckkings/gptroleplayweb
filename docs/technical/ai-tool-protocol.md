@@ -138,3 +138,29 @@
 - `backend/tests/test_npc_chat_routes.py`
 - `backend/tests/test_prompt_registry.py`
 
+## 11. Public Turn Runtime Notes (2026-03-18)
+
+- Mainline public scene orchestration is no longer driven by freeform `/chat`.
+- `public turn` uses deterministic backend state plus optional AI actor declaration / action helpers.
+- The runtime still reuses existing public-scene candidate selection, reaction staging, and encounter settlement helpers where practical.
+- New SSE event family:
+  - `phase`
+  - `turn_state`
+  - `narration_delta`
+  - `scene_event`
+  - `impact`
+  - `reaction_check_required`
+  - `reaction_check_resumed`
+  - `round_completed`
+  - `error`
+  - `end`
+- New scene event kinds:
+  - `public_turn_phase`
+  - `public_turn_initiative`
+  - `public_turn_actor_action`
+  - `public_turn_actor_resolution`
+  - `public_turn_situation`
+  - `public_turn_round_end`
+  - `public_turn_relation_update`
+  - `public_turn_team_update`
+  - `public_turn_environment_update`

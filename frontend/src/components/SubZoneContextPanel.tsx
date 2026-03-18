@@ -10,6 +10,8 @@ const HIDDEN_EVENT_KINDS = new Set<SubZoneChatTurnEvent['event_kind']>(['encount
 
 export function SubZoneContextPanel({ subZone }: Props) {
   const turns = subZone?.chat_context?.recent_turns ?? [];
+  const publicTurnState = subZone?.chat_context?.public_turn_state;
+  const currentRound = publicTurnState?.current_round ?? null;
   const subZoneId = subZone?.sub_zone_id ?? null;
   const containerRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
@@ -49,8 +51,14 @@ export function SubZoneContextPanel({ subZone }: Props) {
     <section className="subzone-context-panel">
       <header className="subzone-context-header">
         <div>
-          <h3>地区上下文</h3>
-          <p>{subZone.name} 的历史回合会持续保存，并作为当前地区的长期叙事参考。</p>
+          <h3>子区块上下文</h3>
+          <p>{subZone.name} 的历史公开回合与关键事件会持续保存在这里。</p>
+          {publicTurnState && (
+            <p className="hint">
+              Public Turn: {currentRound ? `round ${currentRound.round_number} / ${currentRound.phase}` : 'idle'} / risk{' '}
+              {currentRound?.environment_risk_level ?? publicTurnState.environment_risk_level}
+            </p>
+          )}
         </div>
       </header>
       <div ref={containerRef} className="subzone-context-list" onScroll={onScroll}>
@@ -63,6 +71,8 @@ export function SubZoneContextPanel({ subZone }: Props) {
                 <strong>{turn.world_time_text}</strong>
                 <div className="subzone-context-meta">
                   <span>{turn.player_mode === 'passive' ? '自动推进' : '主动回合'}</span>
+                  {typeof turn.public_round_number === 'number' && <span>Public Round: {turn.public_round_number}</span>}
+                  {turn.public_phase && <span>Phase: {turn.public_phase}</span>}
                   {turn.active_encounter_title && (
                     <span>
                       遭遇: {turn.active_encounter_title}

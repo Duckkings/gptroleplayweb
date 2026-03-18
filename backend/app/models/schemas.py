@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -270,6 +271,15 @@ class SceneEvent(BaseModel):
         "public_actor_action",
         "public_actor_resolution",
         "public_round_resolution",
+        "public_turn_phase",
+        "public_turn_initiative",
+        "public_turn_actor_action",
+        "public_turn_actor_resolution",
+        "public_turn_situation",
+        "public_turn_round_end",
+        "public_turn_relation_update",
+        "public_turn_team_update",
+        "public_turn_environment_update",
         "role_desire_surface",
         "companion_story_surface",
         "reputation_update",
@@ -326,7 +336,7 @@ class MainTurnSummary(BaseModel):
 
 class PlayerReactionCheck(BaseModel):
     reaction_id: str = Field(..., min_length=1)
-    source_kind: Literal["npc_action", "environment", "world_push", "encounter_effect", "npc_chat", "map_arrival"]
+    source_kind: Literal["npc_action", "environment", "world_push", "encounter_effect", "npc_chat", "map_arrival", "public_turn"]
     source_actor_id: str | None = None
     source_actor_name: str | None = None
     source_label: str = Field(..., min_length=1)
@@ -335,7 +345,7 @@ class PlayerReactionCheck(BaseModel):
     ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"]
     dc: int = Field(..., ge=5, le=30)
     check_task: str = Field(..., min_length=1)
-    resolution_context: Literal["main_chat", "encounter", "npc_chat", "map_move"]
+    resolution_context: Literal["main_chat", "encounter", "npc_chat", "map_move", "public_turn"]
     success_hint: str = Field(default="", min_length=0)
     failure_hint: str = Field(default="", min_length=0)
     critical_success_hint: str = Field(default="", min_length=0)
@@ -343,7 +353,7 @@ class PlayerReactionCheck(BaseModel):
 
 
 class PlayerReactionCheckSeed(BaseModel):
-    source_kind: Literal["npc_action", "environment", "world_push", "encounter_effect", "npc_chat", "map_arrival"]
+    source_kind: Literal["npc_action", "environment", "world_push", "encounter_effect", "npc_chat", "map_arrival", "public_turn"]
     source_actor_id: str | None = None
     source_actor_name: str | None = None
     source_label: str = Field(..., min_length=1)
@@ -399,7 +409,7 @@ class NpcChatSegment(BaseModel):
 class PendingTurnState(BaseModel):
     pending_turn_id: str = Field(..., min_length=1)
     session_id: str = Field(..., min_length=1)
-    flow_kind: Literal["main_chat", "encounter", "npc_chat", "map_move"]
+    flow_kind: Literal["main_chat", "encounter", "npc_chat", "map_move", "public_turn"]
     status: Literal["awaiting_reaction", "cancelled", "completed"] = "awaiting_reaction"
     staged_save: dict[str, Any] = Field(default_factory=dict)
     original_request: dict[str, Any] = Field(default_factory=dict)
@@ -411,6 +421,8 @@ class PendingTurnState(BaseModel):
     continuation_index: int = 0
     usage: Usage = Field(default_factory=Usage)
     npc_role_id: str | None = None
+    public_round_id: str | None = None
+    public_phase_before_pause: "PublicTurnPhase | None" = None
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
@@ -425,7 +437,7 @@ class PendingTurnContinueRequest(BaseModel):
 class PendingTurnContinueResponse(BaseModel):
     session_id: str
     pending_turn_id: str | None = None
-    flow_kind: Literal["main_chat", "encounter", "npc_chat", "map_move"]
+    flow_kind: Literal["main_chat", "encounter", "npc_chat", "map_move", "public_turn"]
     status: Literal["awaiting_reaction", "completed", "cancelled"]
     reply_text: str = Field(default="", min_length=0)
     scene_events: list[SceneEvent] = Field(default_factory=list)
@@ -624,6 +636,100 @@ class SubZoneState(BaseModel):
     flags: list[str] = Field(default_factory=lambda: ["normal"])
 
 
+class PublicTurnPhase(str, Enum):
+    IDLE = "idle"
+    INITIATIVE_DECLARATION = "initiative_declaration"
+    INITIATIVE_EXECUTION = "initiative_execution"
+    NORMAL_ADVANCEMENT = "normal_advancement"
+    SITUATION_ADVANCEMENT = "situation_advancement"
+    AWAITING_PLAYER_REACTION = "awaiting_player_reaction"
+
+
+class EnvironmentRiskLevel(str, Enum):
+    STABLE = "stable"
+    RISKY = "risky"
+    COLLAPSE = "collapse"
+
+
+class PublicTurnEntryType(str, Enum):
+    NEXT_ROUND = "next_round"
+    INITIATIVE = "initiative"
+    GOD_OVERRIDE = "god_override"
+
+
+class PublicTurnActorType(str, Enum):
+    PLAYER = "player"
+    NPC = "npc"
+    TEAM = "team"
+    HIDDEN_NPC = "hidden_npc"
+    ENVIRONMENT = "environment"
+
+
+class PublicTurnActionSubmission(BaseModel):
+    actor_id: str = Field(..., min_length=1)
+    action_text: str = Field(default="", min_length=0)
+    speech_text: str = Field(default="", min_length=0)
+    source_phase: PublicTurnPhase
+    forced_first: bool = False
+
+
+class InitiativeDeclaration(BaseModel):
+    actor_id: str = Field(..., min_length=1)
+    actor_type: Literal["player", "npc", "team", "hidden_npc"] = "npc"
+    actor_name: str = Field(..., min_length=1)
+    declared_action: str = Field(..., min_length=1)
+    dex_modifier: int = 0
+    roll_d20: int | None = Field(default=None, ge=1, le=20)
+    total_initiative: int | None = None
+    is_hidden: bool = False
+    revealed_by_declaration: bool = False
+    forced_first: bool = False
+
+
+class PublicTurnImpact(BaseModel):
+    actor_id: str = Field(..., min_length=1)
+    actor_name: str = Field(..., min_length=1)
+    action_summary: str = Field(default="", min_length=0)
+    check_outcome: Literal["none", "success", "failure", "critical_success", "critical_failure"] = "none"
+    situation_delta: int = 0
+    zone_reputation_delta: int = 0
+    relation_deltas: list[dict[str, Any]] = Field(default_factory=list)
+    team_affinity_deltas: list[dict[str, Any]] = Field(default_factory=list)
+    hp_changes: list[dict[str, Any]] = Field(default_factory=list)
+    environment_shift: int = 0
+    scene_event_ids: list[str] = Field(default_factory=list)
+
+
+class PublicTurnRound(BaseModel):
+    round_id: str = Field(..., min_length=1)
+    round_number: int = Field(default=1, ge=1)
+    phase: PublicTurnPhase = PublicTurnPhase.IDLE
+    initiative_declarations: list[InitiativeDeclaration] = Field(default_factory=list)
+    executed_actor_ids: list[str] = Field(default_factory=list)
+    impacts: list[PublicTurnImpact] = Field(default_factory=list)
+    situation_triggered: bool = False
+    situation_event: str | None = None
+    environment_risk_level: EnvironmentRiskLevel = EnvironmentRiskLevel.STABLE
+    situation_dc: int = 10
+    pending_reaction_check_id: str | None = None
+    current_actor_id: str | None = None
+    awaiting_player_action: bool = False
+    awaiting_player_action_phase: PublicTurnPhase | None = None
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    completed_at: str | None = None
+
+
+class PublicTurnState(BaseModel):
+    version: str = Field(default="0.1.0")
+    current_round: PublicTurnRound | None = None
+    round_history: list[PublicTurnRound] = Field(default_factory=list)
+    max_history: int = Field(default=20, ge=1, le=100)
+    environment_risk_level: EnvironmentRiskLevel = EnvironmentRiskLevel.STABLE
+    situation_dc: int = 10
+    awaiting_player_entry: bool = True
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
 class SubZoneChatTurnEvent(BaseModel):
     event_kind: Literal[
         "encounter_progress",
@@ -634,6 +740,15 @@ class SubZoneChatTurnEvent(BaseModel):
         "public_actor_action",
         "public_actor_resolution",
         "public_round_resolution",
+        "public_turn_phase",
+        "public_turn_initiative",
+        "public_turn_actor_action",
+        "public_turn_actor_resolution",
+        "public_turn_situation",
+        "public_turn_round_end",
+        "public_turn_relation_update",
+        "public_turn_team_update",
+        "public_turn_environment_update",
         "role_desire_surface",
         "companion_story_surface",
         "reputation_update",
@@ -651,6 +766,9 @@ class SubZoneChatTurn(BaseModel):
     turn_id: str = Field(..., min_length=1)
     source: Literal["main_chat", "encounter", "system"] = "main_chat"
     player_mode: Literal["active", "passive"] = "active"
+    public_round_id: str | None = None
+    public_round_number: int | None = None
+    public_phase: PublicTurnPhase | None = None
     world_time_text: str = Field(default="", min_length=0)
     world_time: dict[str, str | int] = Field(default_factory=dict)
     player_action: str = Field(default="", min_length=0)
@@ -665,8 +783,9 @@ class SubZoneChatTurn(BaseModel):
 
 
 class SubZoneChatContext(BaseModel):
-    version: str = Field(default="0.1.0")
+    version: str = Field(default="0.2.0")
     recent_turns: list[SubZoneChatTurn] = Field(default_factory=list)
+    public_turn_state: PublicTurnState = Field(default_factory=PublicTurnState)
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -1157,6 +1276,7 @@ class PublicSceneState(BaseModel):
     candidate_actors: list[PublicSceneActorCandidate] = Field(default_factory=list)
     surfaced_drives: list[RoleDriveSummary] = Field(default_factory=list)
     active_encounter: "EncounterEntry | None" = None
+    public_turn_state: PublicTurnState = Field(default_factory=PublicTurnState)
 
 
 class NpcKnowledgeSnapshot(BaseModel):
@@ -2355,6 +2475,47 @@ class PublicSceneStateResponse(BaseModel):
     ok: bool = True
     session_id: str
     public_scene_state: PublicSceneState
+
+
+class PublicTurnStateResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    public_turn_state: PublicTurnState
+
+
+class PublicTurnEntryRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    entry_type: PublicTurnEntryType
+    player_action: str | None = None
+    config: ChatConfig | None = None
+
+
+class PublicTurnContinueRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    action_submission: PublicTurnActionSubmission | None = None
+    config: ChatConfig | None = None
+
+
+class PublicTurnReactionCheckRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    check_id: str = Field(..., min_length=1)
+    forced_dice_roll: int = Field(..., ge=1, le=20)
+    config: ChatConfig | None = None
+
+
+class PublicTurnResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    phase: PublicTurnPhase = PublicTurnPhase.IDLE
+    narration: str = Field(default="", min_length=0)
+    scene_events: list[SceneEvent] = Field(default_factory=list)
+    reaction_check: PlayerReactionCheck | None = None
+    round_completed: bool = False
+    awaiting_entry: bool = False
+    public_turn_state: PublicTurnState = Field(default_factory=PublicTurnState)
+    archived_sub_zone_turn_id: str | None = None
+    impacts: list[PublicTurnImpact] = Field(default_factory=list)
+    pending_turn_id: str | None = None
 
 
 class NpcKnowledgeResponse(BaseModel):

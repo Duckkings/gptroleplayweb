@@ -42,7 +42,7 @@ def build_player_reaction_check(
         return None
     if ability_used not in {"strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"}:
         return None
-    if source_kind not in {"npc_action", "environment", "world_push", "encounter_effect", "npc_chat", "map_arrival"}:
+    if source_kind not in {"npc_action", "environment", "world_push", "encounter_effect", "npc_chat", "map_arrival", "public_turn"}:
         return None
     if not isinstance(dc_raw, int):
         return None
@@ -157,6 +157,8 @@ def stage_reaction_checkpoint(
     main_turn_summary: MainTurnSummary | None = None,
     current_zone_metric: ZoneMetricEntry | None = None,
     npc_role_id: str | None = None,
+    public_round_id: str | None = None,
+    public_phase_before_pause=None,
 ) -> PendingTurnContinueResponse:
     now = _utc_now()
     pending_turn_id = f"pt_{uuid4().hex}"
@@ -175,6 +177,8 @@ def stage_reaction_checkpoint(
         continuation_index=continuation_index,
         usage=usage or Usage(),
         npc_role_id=npc_role_id,
+        public_round_id=public_round_id,
+        public_phase_before_pause=public_phase_before_pause,
         created_at=now,
         updated_at=now,
     )

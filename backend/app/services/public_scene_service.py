@@ -975,8 +975,12 @@ def build_public_scene_state(
     player_text: str = "",
 ) -> PublicSceneState:
     from app.services.public_scene_runtime_v2 import build_public_scene_state as runtime_v2
+    from app.services.public_turn_state_store import get_public_turn_state_in_save, sync_pending_public_turn_in_save
 
-    return runtime_v2(save, session_id=session_id, player_text=player_text)
+    sync_pending_public_turn_in_save(save, session_id)
+    state = runtime_v2(save, session_id=session_id, player_text=player_text)
+    state.public_turn_state = get_public_turn_state_in_save(save).model_copy(deep=True)
+    return state
 
 
 def advance_public_scene_in_save(

@@ -150,3 +150,24 @@
 - `backend/tests/test_role_system.py`
 - `backend/tests/test_encounter_service.py`
 
+## 10. Public Turn Baseline (2026-03-18)
+
+- Mainline public scene progression now uses `public turn` instead of freeform `/chat`.
+- Backend state machine phases:
+  - `idle`
+  - `initiative_declaration`
+  - `initiative_execution`
+  - `normal_advancement`
+  - `situation_advancement`
+  - `awaiting_player_reaction`
+- Mainline entry points:
+  - `POST /api/v1/public-turn/entry`
+  - `POST /api/v1/public-turn/continue`
+  - `POST /api/v1/public-turn/reaction-check`
+  - `GET /api/v1/public-turn/state`
+- Streaming entry points:
+  - `POST /api/v1/public-turn/entry/stream`
+  - `POST /api/v1/public-turn/continue/stream`
+  - `POST /api/v1/public-turn/reaction-check/stream`
+- Public turn now owns situation, relation, affinity/trust, reputation, environment risk, scene event, and archived sub-zone turn settlement.
+- Legacy `/api/v1/chat` remains for compatibility and debug, but mainline public scenes return `409 MAIN_CHAT_DISABLED_UNDER_PUBLIC_TURN` unless God Mode is active.

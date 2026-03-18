@@ -103,6 +103,11 @@ from app.models.schemas import (
     PlayerStaminaAdjustRequest,
     PlayerUnequipRequest,
     PublicSceneStateResponse,
+    PublicTurnContinueRequest,
+    PublicTurnEntryRequest,
+    PublicTurnReactionCheckRequest,
+    PublicTurnResponse,
+    PublicTurnStateResponse,
     ReputationStateResponse,
     MapBootstrapResponse,
     RegionGenerateRequest,
@@ -239,6 +244,17 @@ from app.services.encounter_service import (
 )
 from app.services.fate_service import evaluate_fate_state, generate_fate, get_fate_state, regenerate_fate
 from app.services.public_scene_service import get_public_scene_state
+from app.services.public_turn_runtime import is_god_mode
+from app.services.public_turn_service import (
+    get_public_turn_state,
+    run_public_turn_continue_once,
+    run_public_turn_continue_stream,
+    run_public_turn_entry_once,
+    run_public_turn_entry_stream,
+    run_public_turn_reaction_once,
+    run_public_turn_reaction_stream,
+)
+from app.services.public_turn_state_store import current_sub_zone as current_public_turn_sub_zone
 from app.services.quest_service import (
     accept_quest,
     debug_generate_quest,
@@ -274,6 +290,26 @@ router = APIRouter(prefix="/api/v1", tags=["api"])
 
 def _sse_frame(event: str, payload: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _public_turn_enabled_for_main_chat(payload: ChatRequest) -> bool:
+    if is_god_mode(payload.config):
+        return False
+    save = get_current_save(default_session_id=payload.session_id)
+    if save.session_id != payload.session_id:
+        save.session_id = payload.session_id
+        save_current(save)
+    return current_public_turn_sub_zone(save) is not None
+
+
+def _public_turn_status_code(detail: str) -> int:
+    if detail in {"PUBLIC_TURN_GOD_MODE_REQUIRED"}:
+        return 403
+    if detail in {"PUBLIC_TURN_PENDING_NOT_FOUND"}:
+        return 404
+    if detail in {"PUBLIC_TURN_REACTION_MISMATCH"}:
+        return 409
+    return 409
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -321,6 +357,8 @@ async def config_model_profile(payload: ModelProfileRequest) -> ModelProfileResp
 
 @router.post("/chat", response_model=ChatResponse | PendingTurnContinueResponse)
 async def chat(payload: ChatRequest) -> ChatResponse | PendingTurnContinueResponse:
+    if _public_turn_enabled_for_main_chat(payload):
+        raise HTTPException(status_code=409, detail="MAIN_CHAT_DISABLED_UNDER_PUBLIC_TURN")
     try:
         return await run_main_turn_once(payload)
     except MissingAPIKeyError:
@@ -339,6 +377,8 @@ async def chat(payload: ChatRequest) -> ChatResponse | PendingTurnContinueRespon
 async def chat_sse(request: Request, payload: ChatRequest) -> StreamingResponse:
     if not payload.config.stream:
         raise HTTPException(status_code=400, detail="config.stream must be true")
+    if _public_turn_enabled_for_main_chat(payload):
+        raise HTTPException(status_code=409, detail="MAIN_CHAT_DISABLED_UNDER_PUBLIC_TURN")
 
     async def event_gen():
         queue: asyncio.Queue[tuple[str | None, dict | None]] = asyncio.Queue()
@@ -545,6 +585,227 @@ async def pending_turn_current(session_id: str) -> PendingTurnContinueResponse |
         pending_reaction=state.pending_reaction,
         npc_role_id=state.npc_role_id,
     )
+
+
+@router.get("/public-turn/state", response_model=PublicTurnStateResponse)
+async def public_turn_state_get(session_id: str) -> PublicTurnStateResponse:
+    return get_public_turn_state(session_id)
+
+
+@router.post("/public-turn/entry", response_model=PublicTurnResponse | PendingTurnContinueResponse)
+async def public_turn_entry(payload: PublicTurnEntryRequest) -> PublicTurnResponse | PendingTurnContinueResponse:
+    try:
+        return run_public_turn_entry_once(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=_public_turn_status_code(str(exc)), detail=str(exc))
+    except RateLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except APIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.post("/public-turn/continue", response_model=PublicTurnResponse | PendingTurnContinueResponse)
+async def public_turn_continue(payload: PublicTurnContinueRequest) -> PublicTurnResponse | PendingTurnContinueResponse:
+    try:
+        return run_public_turn_continue_once(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=_public_turn_status_code(str(exc)), detail=str(exc))
+    except RateLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except APIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.post("/public-turn/reaction-check", response_model=PublicTurnResponse)
+async def public_turn_reaction_check(payload: PublicTurnReactionCheckRequest) -> PublicTurnResponse:
+    try:
+        return run_public_turn_reaction_once(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=_public_turn_status_code(str(exc)), detail=str(exc))
+    except RateLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except APIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.post("/public-turn/entry/stream")
+async def public_turn_entry_stream(request: Request, payload: PublicTurnEntryRequest) -> StreamingResponse:
+    async def event_gen():
+        queue: asyncio.Queue[tuple[str | None, dict | None]] = asyncio.Queue()
+
+        async def emit(event: str, data: dict) -> None:
+            await queue.put((event, data))
+
+        async def worker() -> None:
+            try:
+                result = await run_public_turn_entry_stream(
+                    payload,
+                    emit=emit,
+                    is_cancelled=request.is_disconnected,
+                )
+                if isinstance(result, PendingTurnContinueResponse):
+                    pass
+                else:
+                    await queue.put(
+                        (
+                            "end",
+                            {
+                                "archived_sub_zone_turn_id": result.archived_sub_zone_turn_id,
+                                "round_completed": result.round_completed,
+                                "phase": result.phase.value,
+                                "public_turn_state": result.public_turn_state.model_dump(mode="json"),
+                            },
+                        )
+                    )
+            except asyncio.CancelledError:
+                pass
+            except ValueError as exc:
+                await queue.put(("error", {"code": _public_turn_status_code(str(exc)), "message": str(exc)}))
+            except RateLimitError as exc:
+                await queue.put(("error", {"code": 429, "message": str(exc)}))
+            except APIError as exc:
+                await queue.put(("error", {"code": 502, "message": str(exc)}))
+            except Exception as exc:
+                await queue.put(("error", {"code": 500, "message": str(exc)}))
+            finally:
+                await queue.put((None, None))
+
+        task = asyncio.create_task(worker())
+        yield _sse_frame("start", {"session_id": payload.session_id})
+        try:
+            while True:
+                event, data = await queue.get()
+                if event is None:
+                    break
+                yield _sse_frame(event, data or {})
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+
+@router.post("/public-turn/continue/stream")
+async def public_turn_continue_stream(request: Request, payload: PublicTurnContinueRequest) -> StreamingResponse:
+    async def event_gen():
+        queue: asyncio.Queue[tuple[str | None, dict | None]] = asyncio.Queue()
+
+        async def emit(event: str, data: dict) -> None:
+            await queue.put((event, data))
+
+        async def worker() -> None:
+            try:
+                result = await run_public_turn_continue_stream(
+                    payload,
+                    emit=emit,
+                    is_cancelled=request.is_disconnected,
+                )
+                if isinstance(result, PendingTurnContinueResponse):
+                    pass
+                else:
+                    await queue.put(
+                        (
+                            "end",
+                            {
+                                "archived_sub_zone_turn_id": result.archived_sub_zone_turn_id,
+                                "round_completed": result.round_completed,
+                                "phase": result.phase.value,
+                                "public_turn_state": result.public_turn_state.model_dump(mode="json"),
+                            },
+                        )
+                    )
+            except asyncio.CancelledError:
+                pass
+            except ValueError as exc:
+                await queue.put(("error", {"code": _public_turn_status_code(str(exc)), "message": str(exc)}))
+            except RateLimitError as exc:
+                await queue.put(("error", {"code": 429, "message": str(exc)}))
+            except APIError as exc:
+                await queue.put(("error", {"code": 502, "message": str(exc)}))
+            except Exception as exc:
+                await queue.put(("error", {"code": 500, "message": str(exc)}))
+            finally:
+                await queue.put((None, None))
+
+        task = asyncio.create_task(worker())
+        yield _sse_frame("start", {"session_id": payload.session_id})
+        try:
+            while True:
+                event, data = await queue.get()
+                if event is None:
+                    break
+                yield _sse_frame(event, data or {})
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+
+@router.post("/public-turn/reaction-check/stream")
+async def public_turn_reaction_check_stream(request: Request, payload: PublicTurnReactionCheckRequest) -> StreamingResponse:
+    async def event_gen():
+        queue: asyncio.Queue[tuple[str | None, dict | None]] = asyncio.Queue()
+
+        async def emit(event: str, data: dict) -> None:
+            await queue.put((event, data))
+
+        async def worker() -> None:
+            try:
+                result = await run_public_turn_reaction_stream(
+                    payload,
+                    emit=emit,
+                    is_cancelled=request.is_disconnected,
+                )
+                await queue.put(
+                    (
+                        "end",
+                        {
+                            "archived_sub_zone_turn_id": result.archived_sub_zone_turn_id,
+                            "round_completed": result.round_completed,
+                            "phase": result.phase.value,
+                            "public_turn_state": result.public_turn_state.model_dump(mode="json"),
+                        },
+                    )
+                )
+            except asyncio.CancelledError:
+                pass
+            except ValueError as exc:
+                await queue.put(("error", {"code": _public_turn_status_code(str(exc)), "message": str(exc)}))
+            except RateLimitError as exc:
+                await queue.put(("error", {"code": 429, "message": str(exc)}))
+            except APIError as exc:
+                await queue.put(("error", {"code": 502, "message": str(exc)}))
+            except Exception as exc:
+                await queue.put(("error", {"code": 500, "message": str(exc)}))
+            finally:
+                await queue.put((None, None))
+
+        task = asyncio.create_task(worker())
+        yield _sse_frame("start", {"session_id": payload.session_id, "check_id": payload.check_id})
+        try:
+            while True:
+                event, data = await queue.get()
+                if event is None:
+                    break
+                yield _sse_frame(event, data or {})
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 
 @router.post("/battle/debug/start", response_model=BattleStartResponse)

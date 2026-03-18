@@ -131,3 +131,16 @@
 - `backend/tests/test_team_service.py`
 - `backend/tests/test_inventory_interaction.py`
 
+## 10. Public Turn Persistence (2026-03-18)
+
+- `AreaSubZone.chat_context` now includes `public_turn_state`.
+- `SubZoneChatContext.version` is upgraded to `0.2.0` when public turn state is injected.
+- `SubZoneChatTurn` now persists:
+  - `public_round_id`
+  - `public_round_number`
+  - `public_phase`
+- `PendingTurnState` now persists:
+  - `public_round_id`
+  - `public_phase_before_pause`
+- `PublicSceneState` is now a derived read model and exposes `public_turn_state`.
+- Public turn round history is stored in the existing per-sub-zone chat context rather than a new top-level save shard.

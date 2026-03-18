@@ -46,6 +46,13 @@
   PendingTurnContinueResponse,
   PlayerReactionCheck,
   QuestMutationResponse,
+  PublicTurnActionSubmission,
+  PublicTurnEntryType,
+  PublicTurnImpact,
+  PublicTurnPhase,
+  PublicTurnResponse,
+  PublicTurnState,
+  PublicTurnStateResponse,
   QuestStateResponse,
   RoleBuff,
   InventoryItem,
@@ -1011,6 +1018,217 @@ export async function getRoleDrives(
 
 export async function getPublicSceneState(sessionId: string, report?: DebugReporter): Promise<PublicSceneStateResponse> {
   return requestJson(`/scene/public-state?session_id=${encodeURIComponent(sessionId)}`, { method: 'GET' }, report);
+}
+
+export async function getPublicTurnState(sessionId: string, report?: DebugReporter): Promise<PublicTurnStateResponse> {
+  return requestJson(`/public-turn/state?session_id=${encodeURIComponent(sessionId)}`, { method: 'GET' }, report);
+}
+
+export async function enterPublicTurn(
+  payload: { session_id: string; entry_type: PublicTurnEntryType; player_action?: string; config?: AppConfig },
+  report?: DebugReporter,
+): Promise<PublicTurnResponse | PendingTurnContinueResponse> {
+  return requestJson(
+    '/public-turn/entry',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function continuePublicTurn(
+  payload: { session_id: string; action_submission?: PublicTurnActionSubmission | null; config?: AppConfig },
+  report?: DebugReporter,
+): Promise<PublicTurnResponse | PendingTurnContinueResponse> {
+  return requestJson(
+    '/public-turn/continue',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function resolvePublicTurnReaction(
+  payload: { session_id: string; check_id: string; forced_dice_roll: number; config?: AppConfig },
+  report?: DebugReporter,
+): Promise<PublicTurnResponse> {
+  return requestJson(
+    '/public-turn/reaction-check',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+async function consumePublicTurnStream(
+  endpoint: '/public-turn/entry/stream' | '/public-turn/continue/stream' | '/public-turn/reaction-check/stream',
+  payload: unknown,
+  handlers: {
+    onPhase: (event: StreamPhaseEvent) => void;
+    onTurnState?: (state: PublicTurnState) => void;
+    onDelta: (delta: string) => void;
+    onSceneEvent: (event: SceneEvent) => void;
+    onImpact: (impact: PublicTurnImpact) => void;
+    onReactionCheckRequired: (payload: {
+      pending_turn_id: string;
+      flow_kind: PendingTurnContinueResponse['flow_kind'];
+      reply_so_far: string;
+      scene_events_so_far: SceneEvent[];
+      pending_reaction: PlayerReactionCheck | null;
+      npc_role_id?: string | null;
+    }) => void;
+    onReactionCheckResumed?: (payload: { check_id: string }) => void;
+    onRoundCompleted?: (payload: { archived_sub_zone_turn_id?: string | null; phase?: PublicTurnPhase | string }) => void;
+    onError: (message: string) => void;
+    onEnd: (payload: {
+      archived_sub_zone_turn_id?: string | null;
+      round_completed?: boolean;
+      phase?: PublicTurnPhase | string;
+      public_turn_state?: PublicTurnState | null;
+    }) => void;
+  },
+  signal: AbortSignal,
+  report?: DebugReporter,
+): Promise<void> {
+  const response = await fetch(`${API_BASE}${endpoint}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal,
+    credentials: 'include',
+  });
+  report?.({ endpoint, status: response.status, ok: response.ok });
+  if (!response.ok) {
+    const text = await response.text();
+    report?.({ endpoint, status: response.status, ok: false, detail: text });
+    throw new Error(`${endpoint} 失败(${response.status}): ${text}`);
+  }
+  const reader = response.body?.getReader();
+  if (!reader) {
+    throw new Error('流响应不可用');
+  }
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let terminalEventReceived = false;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const chunks = buffer.split('\n\n');
+    buffer = chunks.pop() ?? '';
+    for (const chunk of chunks) {
+      const lines = chunk.split('\n');
+      const event = lines.find((line) => line.startsWith('event:'))?.replace('event:', '').trim();
+      const dataLine = lines.find((line) => line.startsWith('data:'))?.replace('data:', '').trim() ?? '{}';
+      try {
+        const data = JSON.parse(dataLine) as {
+          code?: string;
+          label?: string;
+          status?: 'running' | 'done' | 'failed';
+          detail?: string;
+          content?: string;
+          pending_turn_id?: string;
+          flow_kind?: PendingTurnContinueResponse['flow_kind'];
+          reply_so_far?: string;
+          scene_events_so_far?: SceneEvent[];
+          pending_reaction?: PlayerReactionCheck | null;
+          npc_role_id?: string | null;
+          archived_sub_zone_turn_id?: string | null;
+          round_completed?: boolean;
+          phase?: PublicTurnPhase | string;
+          public_turn_state?: PublicTurnState | null;
+          check_id?: string;
+        };
+        if (event === 'phase') {
+          handlers.onPhase({
+            code: 'public_turn',
+            label: data.label ?? '',
+            status: data.status ?? 'done',
+            detail: data.detail ?? '',
+          });
+        } else if (event === 'turn_state') {
+          handlers.onTurnState?.(data as unknown as PublicTurnState);
+        } else if (event === 'narration_delta') {
+          handlers.onDelta(data.content ?? '');
+        } else if (event === 'scene_event') {
+          handlers.onSceneEvent(data as unknown as SceneEvent);
+        } else if (event === 'impact') {
+          handlers.onImpact(data as unknown as PublicTurnImpact);
+        } else if (event === 'reaction_check_required') {
+          terminalEventReceived = true;
+          handlers.onReactionCheckRequired({
+            pending_turn_id: data.pending_turn_id ?? '',
+            flow_kind: data.flow_kind ?? 'public_turn',
+            reply_so_far: data.reply_so_far ?? '',
+            scene_events_so_far: data.scene_events_so_far ?? [],
+            pending_reaction: data.pending_reaction ?? null,
+            npc_role_id: data.npc_role_id ?? null,
+          });
+        } else if (event === 'reaction_check_resumed') {
+          handlers.onReactionCheckResumed?.({ check_id: data.check_id ?? '' });
+        } else if (event === 'round_completed') {
+          handlers.onRoundCompleted?.({
+            archived_sub_zone_turn_id: data.archived_sub_zone_turn_id ?? null,
+            phase: data.phase,
+          });
+        } else if (event === 'error') {
+          terminalEventReceived = true;
+          handlers.onError((data as { message?: string }).message ?? '未知错误');
+        } else if (event === 'end') {
+          terminalEventReceived = true;
+          handlers.onEnd({
+            archived_sub_zone_turn_id: data.archived_sub_zone_turn_id ?? null,
+            round_completed: data.round_completed ?? false,
+            phase: data.phase,
+            public_turn_state: data.public_turn_state ?? null,
+          });
+        }
+      } catch {
+        handlers.onError('流消息解析失败');
+      }
+    }
+  }
+  if (!terminalEventReceived) {
+    handlers.onEnd({});
+  }
+}
+
+export async function streamEnterPublicTurn(
+  payload: { session_id: string; entry_type: PublicTurnEntryType; player_action?: string; config?: AppConfig },
+  handlers: Parameters<typeof consumePublicTurnStream>[2],
+  signal: AbortSignal,
+  report?: DebugReporter,
+): Promise<void> {
+  return consumePublicTurnStream('/public-turn/entry/stream', payload, handlers, signal, report);
+}
+
+export async function streamContinuePublicTurn(
+  payload: { session_id: string; action_submission?: PublicTurnActionSubmission | null; config?: AppConfig },
+  handlers: Parameters<typeof consumePublicTurnStream>[2],
+  signal: AbortSignal,
+  report?: DebugReporter,
+): Promise<void> {
+  return consumePublicTurnStream('/public-turn/continue/stream', payload, handlers, signal, report);
+}
+
+export async function streamResolvePublicTurnReaction(
+  payload: { session_id: string; check_id: string; forced_dice_roll: number; config?: AppConfig },
+  handlers: Parameters<typeof consumePublicTurnStream>[2],
+  signal: AbortSignal,
+  report?: DebugReporter,
+): Promise<void> {
+  return consumePublicTurnStream('/public-turn/reaction-check/stream', payload, handlers, signal, report);
 }
 
 export async function generateFate(

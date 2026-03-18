@@ -126,7 +126,7 @@ export type ChatResponse = {
 
 export type PlayerReactionCheck = {
   reaction_id: string;
-  source_kind: 'npc_action' | 'environment' | 'world_push' | 'encounter_effect' | 'npc_chat' | 'map_arrival';
+  source_kind: 'npc_action' | 'environment' | 'world_push' | 'encounter_effect' | 'npc_chat' | 'map_arrival' | 'public_turn';
   source_actor_id?: string | null;
   source_actor_name?: string | null;
   source_label: string;
@@ -135,7 +135,7 @@ export type PlayerReactionCheck = {
   ability_used: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
   dc: number;
   check_task: string;
-  resolution_context: 'main_chat' | 'encounter' | 'npc_chat' | 'map_move';
+  resolution_context: 'main_chat' | 'encounter' | 'npc_chat' | 'map_move' | 'public_turn';
   success_hint: string;
   failure_hint: string;
   critical_success_hint: string;
@@ -145,7 +145,7 @@ export type PlayerReactionCheck = {
 export type PendingTurnContinueResponse = {
   session_id: string;
   pending_turn_id?: string | null;
-  flow_kind: 'main_chat' | 'encounter' | 'npc_chat' | 'map_move';
+  flow_kind: 'main_chat' | 'encounter' | 'npc_chat' | 'map_move' | 'public_turn';
   status: 'awaiting_reaction' | 'completed' | 'cancelled';
   reply_text: string;
   scene_events: SceneEvent[];
@@ -156,6 +156,105 @@ export type PendingTurnContinueResponse = {
   reaction_result?: ActionCheckResult | null;
   archived_sub_zone_turn_id?: string | null;
   npc_role_id?: string | null;
+};
+
+export type PublicTurnPhase =
+  | 'idle'
+  | 'initiative_declaration'
+  | 'initiative_execution'
+  | 'normal_advancement'
+  | 'situation_advancement'
+  | 'awaiting_player_reaction';
+
+export type EnvironmentRiskLevel = 'stable' | 'risky' | 'collapse';
+
+export type PublicTurnEntryType = 'next_round' | 'initiative' | 'god_override';
+
+export type PublicTurnActorType = 'player' | 'npc' | 'team' | 'hidden_npc' | 'environment';
+
+export type PublicTurnActionSubmission = {
+  actor_id: string;
+  action_text: string;
+  speech_text: string;
+  source_phase: PublicTurnPhase;
+  forced_first?: boolean;
+};
+
+export type InitiativeDeclaration = {
+  actor_id: string;
+  actor_name: string;
+  actor_type: PublicTurnActorType;
+  declaration_text: string;
+  dex_modifier: number;
+  dice_roll?: number | null;
+  total_initiative?: number | null;
+  forced_first?: boolean;
+  hidden?: boolean;
+};
+
+export type PublicTurnImpact = {
+  actor_id: string;
+  actor_name: string;
+  action_summary: string;
+  check_outcome: string;
+  situation_delta: number;
+  zone_reputation_delta: number;
+  relation_deltas: Record<string, number>;
+  team_affinity_deltas: Record<string, number>;
+  hp_changes: Record<string, number>;
+  environment_shift: number;
+  scene_event_ids: string[];
+};
+
+export type PublicTurnRound = {
+  round_id: string;
+  round_number: number;
+  phase: PublicTurnPhase;
+  initiative_declarations: InitiativeDeclaration[];
+  executed_actor_ids: string[];
+  impacts: PublicTurnImpact[];
+  situation_triggered: boolean;
+  situation_event?: string | null;
+  environment_risk_level: EnvironmentRiskLevel;
+  situation_dc: number;
+  pending_reaction_check_id?: string | null;
+  current_actor_id?: string | null;
+  awaiting_player_action: boolean;
+  awaiting_player_action_phase?: PublicTurnPhase | null;
+  created_at: string;
+  completed_at?: string | null;
+};
+
+export type PublicTurnState = {
+  version: string;
+  current_round?: PublicTurnRound | null;
+  round_history: PublicTurnRound[];
+  max_history: number;
+  environment_risk_level: EnvironmentRiskLevel;
+  situation_dc: number;
+  awaiting_player_entry: boolean;
+  updated_at: string;
+};
+
+export type PublicTurnStateResponse = {
+  ok: boolean;
+  session_id: string;
+  public_turn_state: PublicTurnState;
+};
+
+export type PublicTurnResponse = {
+  ok: boolean;
+  session_id: string;
+  phase: PublicTurnPhase;
+  narration: string;
+  scene_events: SceneEvent[];
+  reaction_check?: PlayerReactionCheck | null;
+  round_completed: boolean;
+  awaiting_entry: boolean;
+  public_turn_state: PublicTurnState;
+  archived_sub_zone_turn_id?: string | null;
+  impacts: PublicTurnImpact[];
+  pending_turn_id?: string | null;
 };
 
 export type BattleDamageProfile = {
@@ -393,7 +492,8 @@ export type StreamPhaseCode =
   | 'bundle_parse'
   | 'apply'
   | 'commit'
-  | 'rollback';
+  | 'rollback'
+  | 'public_turn';
 
 export type StreamPhaseEvent = {
   code: StreamPhaseCode;
@@ -566,6 +666,15 @@ export type SceneEvent = {
     | 'public_actor_action'
     | 'public_actor_resolution'
     | 'public_round_resolution'
+    | 'public_turn_phase'
+    | 'public_turn_initiative'
+    | 'public_turn_actor_action'
+    | 'public_turn_actor_resolution'
+    | 'public_turn_situation'
+    | 'public_turn_round_end'
+    | 'public_turn_relation_update'
+    | 'public_turn_team_update'
+    | 'public_turn_environment_update'
     | 'role_desire_surface'
     | 'companion_story_surface'
     | 'reputation_update'
@@ -1083,6 +1192,15 @@ export type SubZoneChatTurnEvent = {
     | 'public_actor_action'
     | 'public_actor_resolution'
     | 'public_round_resolution'
+    | 'public_turn_phase'
+    | 'public_turn_initiative'
+    | 'public_turn_actor_action'
+    | 'public_turn_actor_resolution'
+    | 'public_turn_situation'
+    | 'public_turn_round_end'
+    | 'public_turn_relation_update'
+    | 'public_turn_team_update'
+    | 'public_turn_environment_update'
     | 'role_desire_surface'
     | 'companion_story_surface'
     | 'reputation_update'
@@ -1090,7 +1208,7 @@ export type SubZoneChatTurnEvent = {
     | 'encounter_world_push'
     | 'player_reaction_triggered'
     | 'player_reaction_result';
-  actor_type: 'npc' | 'team' | 'encounter_temp_npc' | 'system';
+  actor_type: 'npc' | 'team' | 'encounter_temp_npc' | 'hidden_npc' | 'environment' | 'system';
   actor_id: string;
   actor_name: string;
   content: string;
@@ -1110,6 +1228,9 @@ export type SubZoneChatTurn = {
   active_encounter_id: string | null;
   active_encounter_title: string;
   active_encounter_status: string;
+  public_round_id?: string | null;
+  public_round_number?: number | null;
+  public_phase?: PublicTurnPhase | null;
   events: SubZoneChatTurnEvent[];
   created_at: string;
 };
@@ -1117,6 +1238,7 @@ export type SubZoneChatTurn = {
 export type SubZoneChatContext = {
   version: string;
   recent_turns: SubZoneChatTurn[];
+  public_turn_state: PublicTurnState;
   updated_at: string;
 };
 
@@ -1719,11 +1841,13 @@ export type PublicSceneState = {
   current_zone_id: string | null;
   current_sub_zone_id: string | null;
   current_reputation: SubZoneReputationEntry | null;
+  current_zone_metric?: ZoneMetricEntry | null;
   visible_npcs: StoryNpcSummary[];
   team_members: StoryNpcSummary[];
   candidate_actors: PublicSceneActorCandidate[];
   surfaced_drives: RoleDriveSummary[];
   active_encounter: EncounterEntry | null;
+  public_turn_state: PublicTurnState;
 };
 
 export type NpcKnowledgeSnapshot = {
@@ -2071,6 +2195,17 @@ export const defaultTeamState: TeamState = {
   version: '0.1.0',
   members: [],
   reactions: [],
+  updated_at: new Date(0).toISOString(),
+};
+
+export const defaultPublicTurnState: PublicTurnState = {
+  version: '0.1.0',
+  current_round: null,
+  round_history: [],
+  max_history: 20,
+  environment_risk_level: 'stable',
+  situation_dc: 10,
+  awaiting_player_entry: true,
   updated_at: new Date(0).toISOString(),
 };
 

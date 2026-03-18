@@ -91,6 +91,7 @@ from app.models.schemas import (
     RenderMapResponse,
     RenderNode,
     RenderSubNode,
+    PublicTurnState,
     SaveFile,
     SceneEvent,
     SceneInteractable,
@@ -221,6 +222,9 @@ def _ensure_sub_zone_chat_context(sub_zone: AreaSubZone | None) -> SubZoneChatCo
     context = getattr(sub_zone, "chat_context", None)
     if context is None:
         sub_zone.chat_context = SubZoneChatContext()
+    elif getattr(context, "public_turn_state", None) is None:
+        context.public_turn_state = PublicTurnState()
+        context.version = "0.2.0"
     return sub_zone.chat_context
 
 
@@ -246,6 +250,32 @@ def _scene_event_to_turn_event(event: SceneEvent) -> SubZoneChatTurnEvent:
     elif event.kind == "public_round_resolution":
         actor_type = "system"
         event_kind = "public_round_resolution"
+    elif event.kind == "public_turn_phase":
+        event_kind = "public_turn_phase"
+    elif event.kind == "public_turn_initiative":
+        event_kind = "public_turn_initiative"
+    elif event.kind == "public_turn_actor_action":
+        actor_type = str(event.metadata.get("actor_type") or "system")
+        if actor_type not in {"npc", "team", "encounter_temp_npc", "system"}:
+            actor_type = "system"
+        event_kind = "public_turn_actor_action"
+    elif event.kind == "public_turn_actor_resolution":
+        actor_type = str(event.metadata.get("actor_type") or "system")
+        if actor_type not in {"npc", "team", "encounter_temp_npc", "system"}:
+            actor_type = "system"
+        event_kind = "public_turn_actor_resolution"
+    elif event.kind == "public_turn_situation":
+        event_kind = "public_turn_situation"
+    elif event.kind == "public_turn_round_end":
+        event_kind = "public_turn_round_end"
+    elif event.kind == "public_turn_relation_update":
+        actor_type = "npc"
+        event_kind = "public_turn_relation_update"
+    elif event.kind == "public_turn_team_update":
+        actor_type = "team"
+        event_kind = "public_turn_team_update"
+    elif event.kind == "public_turn_environment_update":
+        event_kind = "public_turn_environment_update"
     elif event.kind == "role_desire_surface":
         actor_type = str(event.metadata.get("actor_type") or "npc")
         if actor_type not in {"npc", "team", "encounter_temp_npc", "system"}:
@@ -298,6 +328,9 @@ def _serialize_recent_sub_zone_turns(sub_zone: AreaSubZone | None, *, limit: int
         items.append(
             {
                 "player_mode": turn.player_mode,
+                "public_round_id": turn.public_round_id,
+                "public_round_number": turn.public_round_number,
+                "public_phase": (turn.public_phase.value if turn.public_phase is not None else None),
                 "world_time_text": turn.world_time_text,
                 "player_action": turn.player_action,
                 "player_speech": turn.player_speech,
@@ -428,6 +461,9 @@ def _record_sub_zone_chat_turn(
     player_action_check: dict[str, object] | None,
     gm_narration: str,
     events: list[SceneEvent],
+    public_round_id: str | None = None,
+    public_round_number: int | None = None,
+    public_phase=None,
 ) -> str | None:
     sub_zone = _current_sub_zone(save)
     context = _ensure_sub_zone_chat_context(sub_zone)
@@ -439,6 +475,9 @@ def _record_sub_zone_chat_turn(
         turn_id=f"sturn_{int(datetime.now(timezone.utc).timestamp() * 1000)}_{random.randint(100, 999)}",
         source=source,  # type: ignore[arg-type]
         player_mode=player_mode,  # type: ignore[arg-type]
+        public_round_id=public_round_id,
+        public_round_number=public_round_number,
+        public_phase=public_phase,
         world_time_text=world_time_text,
         world_time=world_time,
         player_action=player_action,
