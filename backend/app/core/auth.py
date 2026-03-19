@@ -39,7 +39,6 @@ def _legacy_data_dirs() -> list[Path]:
     this_file = Path(__file__).resolve()
     current = data_dir()
     candidates = [
-        this_file.parents[4] / "data",
         this_file.parents[2] / "data",
     ]
     paths: list[Path] = []

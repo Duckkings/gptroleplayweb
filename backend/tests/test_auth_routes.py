@@ -123,6 +123,11 @@ class AuthRouteTests(unittest.TestCase):
         migrated_payload = json.loads(migrated_path.read_text(encoding="utf-8"))
         self.assertIn("legacy_user", migrated_payload["users"])
 
+    def test_legacy_data_dirs_only_points_to_backend_data(self) -> None:
+        legacy_dirs = auth_core._legacy_data_dirs()
+
+        self.assertEqual(legacy_dirs, [auth_core._repo_root() / "backend" / "data"])
+
 
 if __name__ == "__main__":
     unittest.main()
