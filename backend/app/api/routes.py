@@ -105,6 +105,9 @@ from app.models.schemas import (
     PublicSceneStateResponse,
     PublicTurnContinueRequest,
     PublicTurnEntryRequest,
+    PublicTurnOpposedPlanRequest,
+    PublicTurnOpposedPlanResponse,
+    PublicTurnOpposedResolveRequest,
     PublicTurnReactionCheckRequest,
     PublicTurnResponse,
     PublicTurnStateResponse,
@@ -251,10 +254,13 @@ from app.services.public_turn_service import (
     run_public_turn_continue_stream,
     run_public_turn_entry_once,
     run_public_turn_entry_stream,
+    run_public_turn_opposed_once,
+    run_public_turn_opposed_plan_once,
+    run_public_turn_opposed_stream,
     run_public_turn_reaction_once,
     run_public_turn_reaction_stream,
 )
-from app.services.public_turn_state_store import current_sub_zone as current_public_turn_sub_zone
+from app.services.public_turn_state_store import current_sub_zone as current_public_turn_sub_zone, get_public_turn_state_in_save
 from app.services.quest_service import (
     accept_quest,
     debug_generate_quest,
@@ -307,7 +313,7 @@ def _public_turn_status_code(detail: str) -> int:
         return 403
     if detail in {"PUBLIC_TURN_PENDING_NOT_FOUND"}:
         return 404
-    if detail in {"PUBLIC_TURN_REACTION_MISMATCH"}:
+    if detail in {"PUBLIC_TURN_REACTION_MISMATCH", "PUBLIC_TURN_OPPOSED_MISMATCH", "PUBLIC_TURN_PLAYER_CHECK_REQUIRED"}:
         return 409
     return 409
 
@@ -572,17 +578,43 @@ async def pending_turn_current(session_id: str) -> PendingTurnContinueResponse |
     state = load_pending_turn(session_id)
     if state is None:
         return None
+    public_turn_state = None
+    public_turn_presentation = None
+    if state.flow_kind == "public_turn":
+        try:
+            save = SaveFile.model_validate(state.staged_save)
+            public_turn_state = get_public_turn_state_in_save(save)
+            round_state = public_turn_state.current_round
+            if round_state is not None:
+                public_turn_presentation = {
+                    "round_id": round_state.round_id,
+                    "round_number": round_state.round_number,
+                    "phase": round_state.phase,
+                    "initiative_order": round_state.initiative_order,
+                    "settlement_entries": round_state.settlement_entries,
+                    "narrative_entries": round_state.narrative_entries,
+                    "accumulated_narration": round_state.accumulated_narration,
+                    "narrative_status": round_state.narrative_status,
+                    "round_narration": round_state.round_narration,
+                    "round_narration_status": round_state.round_narration_status,
+                }
+        except Exception:
+            public_turn_state = None
+            public_turn_presentation = None
     return PendingTurnContinueResponse(
         session_id=state.session_id,
         pending_turn_id=state.pending_turn_id,
         flow_kind=state.flow_kind,
-        status="awaiting_reaction",
+        status=state.status,
         reply_text=state.accumulated_reply_text,
         scene_events=state.accumulated_scene_events,
         tool_events=state.accumulated_tool_events,
         main_turn_summary=None,
         current_zone_metric=None,
         pending_reaction=state.pending_reaction,
+        public_opposed_prompt=state.public_opposed_prompt,
+        public_turn_state=public_turn_state,
+        public_turn_presentation=public_turn_presentation,
         npc_role_id=state.npc_role_id,
     )
 
@@ -616,10 +648,34 @@ async def public_turn_continue(payload: PublicTurnContinueRequest) -> PublicTurn
         raise HTTPException(status_code=502, detail=str(exc))
 
 
-@router.post("/public-turn/reaction-check", response_model=PublicTurnResponse)
-async def public_turn_reaction_check(payload: PublicTurnReactionCheckRequest) -> PublicTurnResponse:
+@router.post("/public-turn/reaction-check", response_model=PublicTurnResponse | PendingTurnContinueResponse)
+async def public_turn_reaction_check(payload: PublicTurnReactionCheckRequest) -> PublicTurnResponse | PendingTurnContinueResponse:
     try:
         return run_public_turn_reaction_once(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=_public_turn_status_code(str(exc)), detail=str(exc))
+    except RateLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except APIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.post("/public-turn/opposed-check/plan", response_model=PublicTurnOpposedPlanResponse)
+async def public_turn_opposed_check_plan(payload: PublicTurnOpposedPlanRequest) -> PublicTurnOpposedPlanResponse:
+    try:
+        return run_public_turn_opposed_plan_once(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=_public_turn_status_code(str(exc)), detail=str(exc))
+    except RateLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except APIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.post("/public-turn/opposed-check", response_model=PublicTurnResponse | PendingTurnContinueResponse)
+async def public_turn_opposed_check(payload: PublicTurnOpposedResolveRequest) -> PublicTurnResponse | PendingTurnContinueResponse:
+    try:
+        return run_public_turn_opposed_once(payload)
     except ValueError as exc:
         raise HTTPException(status_code=_public_turn_status_code(str(exc)), detail=str(exc))
     except RateLimitError as exc:
@@ -654,6 +710,7 @@ async def public_turn_entry_stream(request: Request, payload: PublicTurnEntryReq
                                 "round_completed": result.round_completed,
                                 "phase": result.phase.value,
                                 "public_turn_state": result.public_turn_state.model_dump(mode="json"),
+                                "presentation": result.presentation.model_dump(mode="json"),
                             },
                         )
                     )
@@ -715,6 +772,7 @@ async def public_turn_continue_stream(request: Request, payload: PublicTurnConti
                                 "round_completed": result.round_completed,
                                 "phase": result.phase.value,
                                 "public_turn_state": result.public_turn_state.model_dump(mode="json"),
+                                "presentation": result.presentation.model_dump(mode="json"),
                             },
                         )
                     )
@@ -765,17 +823,79 @@ async def public_turn_reaction_check_stream(request: Request, payload: PublicTur
                     emit=emit,
                     is_cancelled=request.is_disconnected,
                 )
-                await queue.put(
-                    (
-                        "end",
-                        {
-                            "archived_sub_zone_turn_id": result.archived_sub_zone_turn_id,
-                            "round_completed": result.round_completed,
-                            "phase": result.phase.value,
-                            "public_turn_state": result.public_turn_state.model_dump(mode="json"),
-                        },
+                if isinstance(result, PublicTurnResponse):
+                    await queue.put(
+                        (
+                            "end",
+                            {
+                                "archived_sub_zone_turn_id": result.archived_sub_zone_turn_id,
+                                "round_completed": result.round_completed,
+                                "phase": result.phase.value,
+                                "public_turn_state": result.public_turn_state.model_dump(mode="json"),
+                                "presentation": result.presentation.model_dump(mode="json"),
+                            },
+                        )
                     )
+            except asyncio.CancelledError:
+                pass
+            except ValueError as exc:
+                await queue.put(("error", {"code": _public_turn_status_code(str(exc)), "message": str(exc)}))
+            except RateLimitError as exc:
+                await queue.put(("error", {"code": 429, "message": str(exc)}))
+            except APIError as exc:
+                await queue.put(("error", {"code": 502, "message": str(exc)}))
+            except Exception as exc:
+                await queue.put(("error", {"code": 500, "message": str(exc)}))
+            finally:
+                await queue.put((None, None))
+
+        task = asyncio.create_task(worker())
+        yield _sse_frame("start", {"session_id": payload.session_id, "check_id": payload.check_id})
+        try:
+            while True:
+                event, data = await queue.get()
+                if event is None:
+                    break
+                yield _sse_frame(event, data or {})
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+
+@router.post("/public-turn/opposed-check/stream")
+async def public_turn_opposed_check_stream(request: Request, payload: PublicTurnOpposedResolveRequest) -> StreamingResponse:
+    async def event_gen():
+        queue: asyncio.Queue[tuple[str | None, dict | None]] = asyncio.Queue()
+
+        async def emit(event: str, data: dict) -> None:
+            await queue.put((event, data))
+
+        async def worker() -> None:
+            try:
+                result = await run_public_turn_opposed_stream(
+                    payload,
+                    emit=emit,
+                    is_cancelled=request.is_disconnected,
                 )
+                if isinstance(result, PublicTurnResponse):
+                    await queue.put(
+                        (
+                            "end",
+                            {
+                                "archived_sub_zone_turn_id": result.archived_sub_zone_turn_id,
+                                "round_completed": result.round_completed,
+                                "phase": result.phase.value,
+                                "public_turn_state": result.public_turn_state.model_dump(mode="json"),
+                                "presentation": result.presentation.model_dump(mode="json"),
+                            },
+                        )
+                    )
             except asyncio.CancelledError:
                 pass
             except ValueError as exc:

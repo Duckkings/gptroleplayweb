@@ -146,14 +146,18 @@ export type PendingTurnContinueResponse = {
   session_id: string;
   pending_turn_id?: string | null;
   flow_kind: 'main_chat' | 'encounter' | 'npc_chat' | 'map_move' | 'public_turn';
-  status: 'awaiting_reaction' | 'completed' | 'cancelled';
+  status: 'awaiting_reaction' | 'awaiting_opposed' | 'completed' | 'cancelled';
   reply_text: string;
   scene_events: SceneEvent[];
   tool_events: ToolEvent[];
   main_turn_summary?: MainTurnSummary | null;
   current_zone_metric?: ZoneMetricEntry | null;
   pending_reaction?: PlayerReactionCheck | null;
+  public_opposed_prompt?: PublicTurnOpposedPrompt | null;
   reaction_result?: ActionCheckResult | null;
+  player_action_check_result?: ActionCheckResult | null;
+  public_turn_state?: PublicTurnState | null;
+  public_turn_presentation?: PublicTurnPresentation | null;
   archived_sub_zone_turn_id?: string | null;
   npc_role_id?: string | null;
 };
@@ -163,8 +167,10 @@ export type PublicTurnPhase =
   | 'initiative_declaration'
   | 'initiative_execution'
   | 'normal_advancement'
+  | 'gm_push'
   | 'situation_advancement'
-  | 'awaiting_player_reaction';
+  | 'awaiting_player_reaction'
+  | 'awaiting_player_opposed';
 
 export type EnvironmentRiskLevel = 'stable' | 'risky' | 'collapse';
 
@@ -180,16 +186,63 @@ export type PublicTurnActionSubmission = {
   forced_first?: boolean;
 };
 
+export type PublicTurnPlayerActionCheck = {
+  action_type: 'attack' | 'check' | 'item_use';
+  source_context: 'generic' | 'public_turn';
+  resolution_rule: 'static_dc' | 'opposed_actor';
+  planned_requires_check: boolean;
+  planned_ability_used?: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma' | null;
+  planned_dc?: number | null;
+  planned_time_spent_min?: number | null;
+  planned_check_task?: string | null;
+  forced_dice_roll?: number | null;
+  target_role_id?: string | null;
+  target_name?: string | null;
+  target_actor_kind?: 'player' | 'npc' | null;
+  target_ability_used?: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma' | null;
+  target_ability_modifier?: number | null;
+};
+
 export type InitiativeDeclaration = {
   actor_id: string;
   actor_name: string;
   actor_type: PublicTurnActorType;
-  declaration_text: string;
+  declared_action: string;
   dex_modifier: number;
-  dice_roll?: number | null;
+  roll_d20?: number | null;
   total_initiative?: number | null;
   forced_first?: boolean;
-  hidden?: boolean;
+  is_hidden?: boolean;
+  revealed_by_declaration?: boolean;
+};
+
+export type PublicTurnRelationDelta = {
+  role_id: string;
+  name: string;
+  before_tag: string;
+  after_tag: string;
+  relation_delta: number;
+  reaction_text: string;
+};
+
+export type PublicTurnTeamAffinityDelta = {
+  member_role_id: string;
+  name: string;
+  affinity_before: number;
+  affinity_after: number;
+  affinity_delta: number;
+  trust_before: number;
+  trust_after: number;
+  trust_delta: number;
+  reaction_text: string;
+};
+
+export type PublicTurnHpChange = {
+  target_id: string;
+  target_name: string;
+  hp_before: number;
+  hp_after: number;
+  hp_delta: number;
 };
 
 export type PublicTurnImpact = {
@@ -199,11 +252,114 @@ export type PublicTurnImpact = {
   check_outcome: string;
   situation_delta: number;
   zone_reputation_delta: number;
-  relation_deltas: Record<string, number>;
-  team_affinity_deltas: Record<string, number>;
-  hp_changes: Record<string, number>;
+  relation_deltas: PublicTurnRelationDelta[];
+  team_affinity_deltas: PublicTurnTeamAffinityDelta[];
+  hp_changes: PublicTurnHpChange[];
   environment_shift: number;
   scene_event_ids: string[];
+};
+
+export type PublicTurnInitiativeEntry = {
+  actor_id: string;
+  actor_name: string;
+  actor_type: PublicTurnActorType;
+  dex_modifier: number;
+  roll_d20: number;
+  total_initiative: number;
+  revealed: boolean;
+  order_index: number;
+};
+
+export type PublicTurnSettlementCheck = {
+  resolution_rule: 'static_dc' | 'opposed_actor';
+  ability_used: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
+  ability_modifier: number;
+  dice_roll?: number | null;
+  total_score?: number | null;
+  dc?: number | null;
+  target_name?: string | null;
+  target_ability_used?: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma' | null;
+  target_ability_modifier?: number | null;
+  target_dice_roll?: number | null;
+  target_total_score?: number | null;
+  success: boolean;
+  critical: 'none' | 'critical_success' | 'critical_failure';
+  comparison_text: string;
+  outcome_text: string;
+};
+
+export type PublicTurnSettlementEntry = {
+  entry_id: string;
+  round_id: string;
+  phase: PublicTurnPhase;
+  order_index: number;
+  actor_id: string;
+  actor_name: string;
+  actor_type: PublicTurnActorType;
+  action_summary: string;
+  speech_text: string;
+  narrative_entry_id?: string | null;
+  opposed_target_name?: string | null;
+  opposed_target_action?: string | null;
+  opposed_target_speech?: string | null;
+  check?: PublicTurnSettlementCheck | null;
+  gm_resolution_summary: string;
+  situation_delta: number;
+  zone_reputation_delta: number;
+  relation_deltas: PublicTurnRelationDelta[];
+  team_affinity_deltas: PublicTurnTeamAffinityDelta[];
+  hp_changes: PublicTurnHpChange[];
+  environment_shift: number;
+};
+
+export type PublicTurnRoundNarrationStatus = 'pending' | 'ready' | 'empty' | 'streaming' | 'paused' | 'complete';
+
+export type PublicTurnNarrativeEntry = {
+  narrative_entry_id: string;
+  round_id: string;
+  settlement_entry_id?: string | null;
+  phase: PublicTurnPhase;
+  order_index: number;
+  actor_id: string;
+  actor_name: string;
+  actor_type: PublicTurnActorType;
+  text: string;
+  status: 'streaming' | 'ready';
+};
+
+export type PublicTurnOpposedPrompt = {
+  check_id: string;
+  round_id: string;
+  phase: PublicTurnPhase;
+  source_actor_id: string;
+  source_actor_name: string;
+  source_action_summary: string;
+  source_speech_text: string;
+  target_actor_id: string;
+  target_actor_name: string;
+  stakes_summary: string;
+};
+
+export type PublicTurnOpposedPlanResponse = {
+  ok: boolean;
+  session_id: string;
+  round_id: string;
+  check_id: string;
+  resolution_rule: 'opposed_actor';
+  source_actor_id: string;
+  source_actor_name: string;
+  source_action_summary: string;
+  source_speech_text: string;
+  source_ability_used: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
+  source_ability_modifier: number;
+  target_actor_id: string;
+  target_actor_name: string;
+  target_action_summary: string;
+  target_speech_text: string;
+  target_ability_used: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
+  target_ability_modifier: number;
+  check_task: string;
+  stakes_summary: string;
 };
 
 export type PublicTurnRound = {
@@ -211,8 +367,10 @@ export type PublicTurnRound = {
   round_number: number;
   phase: PublicTurnPhase;
   initiative_declarations: InitiativeDeclaration[];
+  initiative_order: PublicTurnInitiativeEntry[];
   executed_actor_ids: string[];
   impacts: PublicTurnImpact[];
+  settlement_entries: PublicTurnSettlementEntry[];
   situation_triggered: boolean;
   situation_event?: string | null;
   environment_risk_level: EnvironmentRiskLevel;
@@ -221,6 +379,13 @@ export type PublicTurnRound = {
   current_actor_id?: string | null;
   awaiting_player_action: boolean;
   awaiting_player_action_phase?: PublicTurnPhase | null;
+  gm_push_summary: string;
+  gm_push_scene_event_id?: string | null;
+  accumulated_narration: string;
+  narrative_entries: PublicTurnNarrativeEntry[];
+  narrative_status: PublicTurnRoundNarrationStatus;
+  round_narration: string;
+  round_narration_status: PublicTurnRoundNarrationStatus;
   created_at: string;
   completed_at?: string | null;
 };
@@ -242,6 +407,19 @@ export type PublicTurnStateResponse = {
   public_turn_state: PublicTurnState;
 };
 
+export type PublicTurnPresentation = {
+  round_id: string;
+  round_number: number;
+  phase: PublicTurnPhase;
+  initiative_order: PublicTurnInitiativeEntry[];
+  settlement_entries: PublicTurnSettlementEntry[];
+  narrative_entries: PublicTurnNarrativeEntry[];
+  accumulated_narration: string;
+  narrative_status: PublicTurnRoundNarrationStatus;
+  round_narration: string;
+  round_narration_status: PublicTurnRoundNarrationStatus;
+};
+
 export type PublicTurnResponse = {
   ok: boolean;
   session_id: string;
@@ -249,12 +427,15 @@ export type PublicTurnResponse = {
   narration: string;
   scene_events: SceneEvent[];
   reaction_check?: PlayerReactionCheck | null;
+  public_opposed_prompt?: PublicTurnOpposedPrompt | null;
   round_completed: boolean;
   awaiting_entry: boolean;
   public_turn_state: PublicTurnState;
   archived_sub_zone_turn_id?: string | null;
   impacts: PublicTurnImpact[];
   pending_turn_id?: string | null;
+  player_action_check_result?: ActionCheckResult | null;
+  presentation: PublicTurnPresentation;
 };
 
 export type BattleDamageProfile = {
@@ -671,6 +852,7 @@ export type SceneEvent = {
     | 'public_turn_actor_action'
     | 'public_turn_actor_resolution'
     | 'public_turn_situation'
+    | 'public_turn_gm_push'
     | 'public_turn_round_end'
     | 'public_turn_relation_update'
     | 'public_turn_team_update'
@@ -1197,6 +1379,7 @@ export type SubZoneChatTurnEvent = {
     | 'public_turn_actor_action'
     | 'public_turn_actor_resolution'
     | 'public_turn_situation'
+    | 'public_turn_gm_push'
     | 'public_turn_round_end'
     | 'public_turn_relation_update'
     | 'public_turn_team_update'
@@ -1231,6 +1414,7 @@ export type SubZoneChatTurn = {
   public_round_id?: string | null;
   public_round_number?: number | null;
   public_phase?: PublicTurnPhase | null;
+  public_turn_presentation?: PublicTurnPresentation | null;
   events: SubZoneChatTurnEvent[];
   created_at: string;
 };
@@ -1709,13 +1893,23 @@ export type ActionCheckResult = {
   actor_kind: 'player' | 'npc';
   action_type: 'attack' | 'check' | 'item_use';
   check_mode?: 'action' | 'reaction_save';
+  source_context?: 'generic' | 'public_turn';
+  resolution_rule?: 'static_dc' | 'opposed_actor';
   requires_check: boolean;
   ability_used: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
   ability_modifier: number;
   dc: number;
   check_task: string;
+  target_role_id?: string | null;
+  target_name?: string | null;
+  target_actor_kind?: 'player' | 'npc' | null;
+  target_ability_used?: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma' | null;
+  target_ability_modifier?: number | null;
   dice_roll: number | null;
   total_score: number | null;
+  target_dice_roll?: number | null;
+  target_total_score?: number | null;
+  contested_success?: boolean | null;
   success: boolean;
   critical: 'none' | 'critical_success' | 'critical_failure';
   time_spent_min: number;
@@ -1737,6 +1931,8 @@ export type ActionCheckPlan = {
   actor_kind: 'player' | 'npc';
   action_type: 'attack' | 'check' | 'item_use';
   check_mode?: 'action' | 'reaction_save';
+  source_context?: 'generic' | 'public_turn';
+  resolution_rule?: 'static_dc' | 'opposed_actor';
   requires_check: boolean;
   ability_used: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
   ability_modifier: number;
@@ -1745,6 +1941,11 @@ export type ActionCheckPlan = {
   check_task: string;
   source_label?: string | null;
   threatened_consequence?: string | null;
+  target_role_id?: string | null;
+  target_name?: string | null;
+  target_actor_kind?: 'player' | 'npc' | null;
+  target_ability_used?: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma' | null;
+  target_ability_modifier?: number | null;
 };
 
 export type WorldState = {
@@ -2199,7 +2400,7 @@ export const defaultTeamState: TeamState = {
 };
 
 export const defaultPublicTurnState: PublicTurnState = {
-  version: '0.1.0',
+  version: '0.2.0',
   current_round: null,
   round_history: [],
   max_history: 20,

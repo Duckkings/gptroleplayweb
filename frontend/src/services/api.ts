@@ -45,12 +45,18 @@
   NpcRoleCard,
   PendingTurnContinueResponse,
   PlayerReactionCheck,
+  PublicTurnOpposedPlanResponse,
+  PublicTurnOpposedPrompt,
+  PublicTurnPresentation,
   QuestMutationResponse,
   PublicTurnActionSubmission,
   PublicTurnEntryType,
   PublicTurnImpact,
+  PublicTurnInitiativeEntry,
+  PublicTurnPlayerActionCheck,
   PublicTurnPhase,
   PublicTurnResponse,
+  PublicTurnSettlementEntry,
   PublicTurnState,
   PublicTurnStateResponse,
   QuestStateResponse,
@@ -1040,7 +1046,12 @@ export async function enterPublicTurn(
 }
 
 export async function continuePublicTurn(
-  payload: { session_id: string; action_submission?: PublicTurnActionSubmission | null; config?: AppConfig },
+  payload: {
+    session_id: string;
+    action_submission?: PublicTurnActionSubmission | null;
+    player_action_check?: PublicTurnPlayerActionCheck | null;
+    config?: AppConfig;
+  },
   report?: DebugReporter,
 ): Promise<PublicTurnResponse | PendingTurnContinueResponse> {
   return requestJson(
@@ -1057,7 +1068,7 @@ export async function continuePublicTurn(
 export async function resolvePublicTurnReaction(
   payload: { session_id: string; check_id: string; forced_dice_roll: number; config?: AppConfig },
   report?: DebugReporter,
-): Promise<PublicTurnResponse> {
+): Promise<PublicTurnResponse | PendingTurnContinueResponse> {
   return requestJson(
     '/public-turn/reaction-check',
     {
@@ -1069,13 +1080,63 @@ export async function resolvePublicTurnReaction(
   );
 }
 
+export async function planPublicTurnOpposedCheck(
+  payload: {
+    session_id: string;
+    round_id: string;
+    check_id: string;
+    source_actor_id: string;
+    target_actor_id: string;
+    source_action_summary?: string;
+    source_speech_text?: string;
+    target_action_summary?: string;
+    target_speech_text?: string;
+    config?: AppConfig;
+  },
+  report?: DebugReporter,
+): Promise<PublicTurnOpposedPlanResponse> {
+  return requestJson(
+    '/public-turn/opposed-check/plan',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function resolvePublicTurnOpposedCheck(
+  payload: {
+    session_id: string;
+    check_id: string;
+    forced_dice_roll: number;
+    target_action_summary?: string;
+    target_speech_text?: string;
+    config?: AppConfig;
+  },
+  report?: DebugReporter,
+): Promise<PublicTurnResponse | PendingTurnContinueResponse> {
+  return requestJson(
+    '/public-turn/opposed-check',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
 async function consumePublicTurnStream(
-  endpoint: '/public-turn/entry/stream' | '/public-turn/continue/stream' | '/public-turn/reaction-check/stream',
+  endpoint: '/public-turn/entry/stream' | '/public-turn/continue/stream' | '/public-turn/reaction-check/stream' | '/public-turn/opposed-check/stream',
   payload: unknown,
   handlers: {
     onPhase: (event: StreamPhaseEvent) => void;
     onTurnState?: (state: PublicTurnState) => void;
-    onDelta: (delta: string) => void;
+    onInitiativeOrder?: (entries: PublicTurnInitiativeEntry[], meta: { round_id?: string; round_number?: number }) => void;
+    onSettlementEntry?: (entry: PublicTurnSettlementEntry) => void;
+    onRoundNarrationDelta: (delta: string) => void;
     onSceneEvent: (event: SceneEvent) => void;
     onImpact: (impact: PublicTurnImpact) => void;
     onReactionCheckRequired: (payload: {
@@ -1085,8 +1146,21 @@ async function consumePublicTurnStream(
       scene_events_so_far: SceneEvent[];
       pending_reaction: PlayerReactionCheck | null;
       npc_role_id?: string | null;
+      public_turn_state?: PublicTurnState | null;
+      public_turn_presentation?: PublicTurnPresentation | null;
+    }) => void;
+    onOpposedCheckRequired?: (payload: {
+      pending_turn_id: string;
+      flow_kind: PendingTurnContinueResponse['flow_kind'];
+      reply_so_far: string;
+      scene_events_so_far: SceneEvent[];
+      public_opposed_prompt: PublicTurnOpposedPrompt | null;
+      npc_role_id?: string | null;
+      public_turn_state?: PublicTurnState | null;
+      public_turn_presentation?: PublicTurnPresentation | null;
     }) => void;
     onReactionCheckResumed?: (payload: { check_id: string }) => void;
+    onOpposedCheckResolved?: (payload: { check_id: string }) => void;
     onRoundCompleted?: (payload: { archived_sub_zone_turn_id?: string | null; phase?: PublicTurnPhase | string }) => void;
     onError: (message: string) => void;
     onEnd: (payload: {
@@ -1094,6 +1168,7 @@ async function consumePublicTurnStream(
       round_completed?: boolean;
       phase?: PublicTurnPhase | string;
       public_turn_state?: PublicTurnState | null;
+      presentation?: PublicTurnPresentation | null;
     }) => void;
   },
   signal: AbortSignal,
@@ -1143,12 +1218,15 @@ async function consumePublicTurnStream(
           reply_so_far?: string;
           scene_events_so_far?: SceneEvent[];
           pending_reaction?: PlayerReactionCheck | null;
+          public_opposed_prompt?: PublicTurnOpposedPrompt | null;
           npc_role_id?: string | null;
           archived_sub_zone_turn_id?: string | null;
           round_completed?: boolean;
           phase?: PublicTurnPhase | string;
           public_turn_state?: PublicTurnState | null;
+          presentation?: PublicTurnPresentation | null;
           check_id?: string;
+          entries?: PublicTurnInitiativeEntry[];
         };
         if (event === 'phase') {
           handlers.onPhase({
@@ -1159,8 +1237,15 @@ async function consumePublicTurnStream(
           });
         } else if (event === 'turn_state') {
           handlers.onTurnState?.(data as unknown as PublicTurnState);
-        } else if (event === 'narration_delta') {
-          handlers.onDelta(data.content ?? '');
+        } else if (event === 'initiative_order') {
+          handlers.onInitiativeOrder?.(data.entries ?? [], {
+            round_id: (data as { round_id?: string }).round_id,
+            round_number: (data as { round_number?: number }).round_number,
+          });
+        } else if (event === 'settlement_entry') {
+          handlers.onSettlementEntry?.(data as unknown as PublicTurnSettlementEntry);
+        } else if (event === 'round_narration_delta' || event === 'narration_delta') {
+          handlers.onRoundNarrationDelta(data.content ?? '');
         } else if (event === 'scene_event') {
           handlers.onSceneEvent(data as unknown as SceneEvent);
         } else if (event === 'impact') {
@@ -1174,9 +1259,25 @@ async function consumePublicTurnStream(
             scene_events_so_far: data.scene_events_so_far ?? [],
             pending_reaction: data.pending_reaction ?? null,
             npc_role_id: data.npc_role_id ?? null,
+            public_turn_state: data.public_turn_state ?? null,
+            public_turn_presentation: data.presentation ?? (data as { public_turn_presentation?: PublicTurnPresentation | null }).public_turn_presentation ?? null,
+          });
+        } else if (event === 'opposed_check_required') {
+          terminalEventReceived = true;
+          handlers.onOpposedCheckRequired?.({
+            pending_turn_id: data.pending_turn_id ?? '',
+            flow_kind: data.flow_kind ?? 'public_turn',
+            reply_so_far: data.reply_so_far ?? '',
+            scene_events_so_far: data.scene_events_so_far ?? [],
+            public_opposed_prompt: data.public_opposed_prompt ?? null,
+            npc_role_id: data.npc_role_id ?? null,
+            public_turn_state: data.public_turn_state ?? null,
+            public_turn_presentation: data.presentation ?? (data as { public_turn_presentation?: PublicTurnPresentation | null }).public_turn_presentation ?? null,
           });
         } else if (event === 'reaction_check_resumed') {
           handlers.onReactionCheckResumed?.({ check_id: data.check_id ?? '' });
+        } else if (event === 'opposed_check_resolved') {
+          handlers.onOpposedCheckResolved?.({ check_id: data.check_id ?? '' });
         } else if (event === 'round_completed') {
           handlers.onRoundCompleted?.({
             archived_sub_zone_turn_id: data.archived_sub_zone_turn_id ?? null,
@@ -1192,6 +1293,7 @@ async function consumePublicTurnStream(
             round_completed: data.round_completed ?? false,
             phase: data.phase,
             public_turn_state: data.public_turn_state ?? null,
+            presentation: data.presentation ?? null,
           });
         }
       } catch {
@@ -1214,7 +1316,12 @@ export async function streamEnterPublicTurn(
 }
 
 export async function streamContinuePublicTurn(
-  payload: { session_id: string; action_submission?: PublicTurnActionSubmission | null; config?: AppConfig },
+  payload: {
+    session_id: string;
+    action_submission?: PublicTurnActionSubmission | null;
+    player_action_check?: PublicTurnPlayerActionCheck | null;
+    config?: AppConfig;
+  },
   handlers: Parameters<typeof consumePublicTurnStream>[2],
   signal: AbortSignal,
   report?: DebugReporter,
@@ -1229,6 +1336,22 @@ export async function streamResolvePublicTurnReaction(
   report?: DebugReporter,
 ): Promise<void> {
   return consumePublicTurnStream('/public-turn/reaction-check/stream', payload, handlers, signal, report);
+}
+
+export async function streamResolvePublicTurnOpposedCheck(
+  payload: {
+    session_id: string;
+    check_id: string;
+    forced_dice_roll: number;
+    target_action_summary?: string;
+    target_speech_text?: string;
+    config?: AppConfig;
+  },
+  handlers: Parameters<typeof consumePublicTurnStream>[2],
+  signal: AbortSignal,
+  report?: DebugReporter,
+): Promise<void> {
+  return consumePublicTurnStream('/public-turn/opposed-check/stream', payload, handlers, signal, report);
 }
 
 export async function generateFate(
@@ -1968,6 +2091,7 @@ export async function planActionCheck(
     check_mode?: 'action' | 'reaction_save';
     action_prompt: string;
     actor_role_id?: string;
+    source_context?: 'generic' | 'public_turn';
     source_label?: string;
     threatened_consequence?: string;
     config?: AppConfig;
@@ -1993,6 +2117,13 @@ export async function runActionCheck(
     check_mode?: 'action' | 'reaction_save';
     action_prompt: string;
     actor_role_id?: string;
+    source_context?: 'generic' | 'public_turn';
+    resolution_rule?: 'static_dc' | 'opposed_actor';
+    target_role_id?: string | null;
+    target_name?: string | null;
+    target_actor_kind?: 'player' | 'npc' | null;
+    target_ability_used?: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma' | null;
+    target_ability_modifier?: number | null;
     pending_turn_id?: string;
     source_label?: string;
     threatened_consequence?: string;

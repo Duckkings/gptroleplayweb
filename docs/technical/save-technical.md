@@ -144,3 +144,42 @@
   - `public_phase_before_pause`
 - `PublicSceneState` is now a derived read model and exposes `public_turn_state`.
 - Public turn round history is stored in the existing per-sub-zone chat context rather than a new top-level save shard.
+
+## 11. Public Turn 4.2 Save Fields (2026-03-18)
+
+- `PublicTurnImpact.relation_deltas` is stored as structured rows:
+  - `role_id`
+  - `name`
+  - `before_tag`
+  - `after_tag`
+  - `relation_delta`
+  - `reaction_text`
+- `PublicTurnImpact.team_affinity_deltas` is stored as structured rows:
+  - `member_role_id`
+  - `name`
+  - `affinity_before`
+  - `affinity_after`
+  - `affinity_delta`
+  - `trust_before`
+  - `trust_after`
+  - `trust_delta`
+  - `reaction_text`
+- `PublicTurnContinueRequest` persists the optional `player_action_check` payload during request handling but does not add a new save shard.
+- `PublicTurnRound` now persists presentation-facing fields inside `public_turn_state` instead of a new shard:
+  - `initiative_order`
+  - `settlement_entries`
+  - `round_narration`
+  - `round_narration_status`
+
+## Public Turn Scheme A Persistence Note (2026-03-19)
+
+- No new save shard was introduced for Scheme A.
+- Segment planner/narrator models remain runtime-only and are reconstructed per request.
+- Persisted public-turn data still lives under `AreaSubZone.chat_context.public_turn_state`.
+- The persisted round payload continues to expose presentation fields only:
+  - `initiative_order`
+  - `settlement_entries`
+  - `narrative_entries`
+  - `accumulated_narration`
+  - `gm_push_summary`
+  - `round_narration` as compatibility mirror of accumulated narration

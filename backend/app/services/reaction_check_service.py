@@ -11,6 +11,8 @@ from app.models.schemas import (
     PendingTurnContinueResponse,
     PendingTurnState,
     PlayerReactionCheck,
+    PublicTurnPresentation,
+    PublicTurnState,
     SceneEvent,
     ToolEvent,
     Usage,
@@ -159,6 +161,9 @@ def stage_reaction_checkpoint(
     npc_role_id: str | None = None,
     public_round_id: str | None = None,
     public_phase_before_pause=None,
+    player_action_check_result: ActionCheckResponse | None = None,
+    public_turn_state: PublicTurnState | None = None,
+    public_turn_presentation: PublicTurnPresentation | None = None,
 ) -> PendingTurnContinueResponse:
     now = _utc_now()
     pending_turn_id = f"pt_{uuid4().hex}"
@@ -195,6 +200,9 @@ def stage_reaction_checkpoint(
         current_zone_metric=current_zone_metric,
         pending_reaction=pending_reaction,
         npc_role_id=npc_role_id,
+        player_action_check_result=player_action_check_result,
+        public_turn_state=public_turn_state,
+        public_turn_presentation=public_turn_presentation,
     )
 
 

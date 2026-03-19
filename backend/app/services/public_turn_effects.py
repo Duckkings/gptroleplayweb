@@ -6,10 +6,13 @@ from app.models.schemas import (
     ActionCheckResponse,
     EnvironmentRiskLevel,
     PublicTurnImpact,
+    PublicTurnRelationDelta,
+    PublicTurnTeamAffinityDelta,
     SaveFile,
     SceneEvent,
     TeamReaction,
 )
+from app.services import public_scene_service
 from app.services import team_service
 from app.services import world_service as world
 from app.services import zone_metric_service
@@ -61,19 +64,9 @@ def reputation_delta_from_situation(situation_delta: int) -> int:
     return 0
 
 
-def team_reaction_rows(reactions: list[TeamReaction]) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for item in reactions:
-        rows.append(
-            {
-                "member_role_id": item.member_role_id,
-                "member_name": item.member_name,
-                "affinity_delta": item.affinity_delta,
-                "trust_delta": item.trust_delta,
-                "content": item.content,
-            }
-        )
-    return rows
+def _player_relation_tag(role, player_id: str) -> str:
+    relation = next((item for item in role.relations if item.target_role_id == player_id), None)
+    return relation.relation_tag if relation is not None else "neutral"
 
 
 def apply_player_team_reactions(
@@ -82,7 +75,11 @@ def apply_player_team_reactions(
     session_id: str,
     player_text: str,
     summary: str,
-) -> tuple[list[TeamReaction], list[SceneEvent]]:
+) -> tuple[list[PublicTurnTeamAffinityDelta], list[SceneEvent]]:
+    before_rows = {
+        item.role_id: (int(item.affinity), int(item.trust))
+        for item in getattr(save.team_state, "members", [])
+    }
     reactions = team_service.apply_team_reactions_in_save(
         save,
         session_id=session_id,
@@ -90,8 +87,25 @@ def apply_player_team_reactions(
         player_text=player_text,
         summary=summary,
     )
+    rows: list[PublicTurnTeamAffinityDelta] = []
     events: list[SceneEvent] = []
     for reaction in reactions:
+        member = next((item for item in getattr(save.team_state, "members", []) if item.role_id == reaction.member_role_id), None)
+        affinity_before, trust_before = before_rows.get(reaction.member_role_id, (0, 0))
+        affinity_after = int(getattr(member, "affinity", affinity_before))
+        trust_after = int(getattr(member, "trust", trust_before))
+        row = PublicTurnTeamAffinityDelta(
+            member_role_id=reaction.member_role_id,
+            name=reaction.member_name,
+            affinity_before=affinity_before,
+            affinity_after=affinity_after,
+            affinity_delta=affinity_after - affinity_before,
+            trust_before=trust_before,
+            trust_after=trust_after,
+            trust_delta=trust_after - trust_before,
+            reaction_text=reaction.content,
+        )
+        rows.append(row)
         events.append(
             world._new_scene_event(
                 "public_turn_team_update",
@@ -100,12 +114,91 @@ def apply_player_team_reactions(
                 actor_name=reaction.member_name,
                 metadata={
                     "trigger_kind": reaction.trigger_kind,
-                    "affinity_delta": reaction.affinity_delta,
-                    "trust_delta": reaction.trust_delta,
+                    "member_role_id": reaction.member_role_id,
+                    "name": reaction.member_name,
+                    "affinity_before": affinity_before,
+                    "affinity_after": affinity_after,
+                    "affinity_delta": affinity_after - affinity_before,
+                    "trust_before": trust_before,
+                    "trust_after": trust_after,
+                    "trust_delta": trust_after - trust_before,
+                    "reaction_text": reaction.content,
                 },
             )
         )
-    return reactions, events
+    return rows, events
+
+
+def apply_player_npc_reactions(
+    save: SaveFile,
+    *,
+    session_id: str,
+    player_text: str,
+    summary: str,
+    relation_delta: int,
+    target_role_id: str | None = None,
+    max_extra_roles: int = 2,
+) -> tuple[list[PublicTurnRelationDelta], list[SceneEvent]]:
+    del session_id
+    visible_roles = world._visible_public_roles(save)
+    if not visible_roles:
+        return [], []
+    targeted = next((role for role in visible_roles if target_role_id and role.role_id == target_role_id), None)
+    ordered: list[Any] = []
+    if targeted is not None:
+        ordered.append(targeted)
+    for role in visible_roles:
+        if targeted is not None and role.role_id == targeted.role_id:
+            continue
+        if len(ordered) >= 1 + max(0, max_extra_roles):
+            break
+        ordered.append(role)
+    zone_metric = zone_metric_service.get_current_zone_metric(save, create=True)
+    reputation_score = getattr(zone_metric, "reputation_score", 50)
+    rows: list[PublicTurnRelationDelta] = []
+    events: list[SceneEvent] = []
+    for index, role in enumerate(ordered):
+        before_tag = _player_relation_tag(role, save.player_static_data.player_id)
+        line, _ = world._public_npc_reaction(role, player_text, summary)
+        delta_to_apply = relation_delta
+        if index > 0 and relation_delta != 0:
+            delta_to_apply = 1 if relation_delta > 0 else -1
+        applied = 0
+        if delta_to_apply != 0:
+            applied = public_scene_service._apply_actor_relation_delta(
+                save,
+                role,
+                "npc",
+                delta_to_apply,
+                reputation_score,
+            )
+        after_tag = _player_relation_tag(role, save.player_static_data.player_id)
+        row = PublicTurnRelationDelta(
+            role_id=role.role_id,
+            name=role.name,
+            before_tag=before_tag,
+            after_tag=after_tag,
+            relation_delta=applied,
+            reaction_text=line,
+        )
+        rows.append(row)
+        events.append(
+            world._new_scene_event(
+                "public_turn_relation_update",
+                f"{role.name}: {line}",
+                actor_role_id=role.role_id,
+                actor_name=role.name,
+                metadata={
+                    "role_id": role.role_id,
+                    "name": role.name,
+                    "before_tag": before_tag,
+                    "after_tag": after_tag,
+                    "relation_delta": applied,
+                    "reaction_text": line,
+                },
+            )
+        )
+    return rows, events
 
 
 def build_impact(
@@ -116,8 +209,8 @@ def build_impact(
     action_result: ActionCheckResponse | None,
     situation_delta: int = 0,
     zone_reputation_delta: int = 0,
-    relation_deltas: list[dict[str, Any]] | None = None,
-    team_affinity_deltas: list[dict[str, Any]] | None = None,
+    relation_deltas: list[PublicTurnRelationDelta] | None = None,
+    team_affinity_deltas: list[PublicTurnTeamAffinityDelta] | None = None,
     hp_changes: list[dict[str, Any]] | None = None,
     environment_shift: int = 0,
     scene_events: list[SceneEvent] | None = None,

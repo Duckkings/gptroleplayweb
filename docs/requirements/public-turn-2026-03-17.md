@@ -3,11 +3,13 @@
 基于 [docs/design/gamedesign/publicturndesign.md](/c:/Project/gptroleplayweb/docs/design/gamedesign/publicturndesign.md) 修订。
 
 本版文档采用以下原则：
+
 - 公开回合的总体结构以设计文档为主
 - 当前实现不是需求上限，但其中已经验证有效的状态反馈机制必须保留
 - 新系统不仅要有“回合流程”，还要有“动作结果如何改变世界状态”的正式规则
 
 因此，这次修订不再走两个极端：
+
 - 不是继续向当前轻量实现妥协
 - 也不是只保留设计稿的流程骨架、丢掉当前已有的有效数值反馈
 
@@ -16,6 +18,7 @@
 ## 1. 系统定位
 
 `public turn` 是主聊天公开场景的统一回合系统，用于承载：
+
 - 叙事
 - 探索
 - 社交
@@ -28,6 +31,7 @@
 `叙事 -> 局部冲突 -> 战斗 -> 回归叙事`
 
 但这个系统不应只有流程，还必须明确处理以下结果落点：
+
 - 遭遇局势值变化
 - 玩家对队友/在场 NPC 关系与好感的影响
 - 区域或子区域声望变化
@@ -53,6 +57,7 @@
 ### 2.2 必须保留的现有有效机制
 
 以下现有方向应吸收进正式设计，而不是被删掉：
+
 - 单个角色行动会对 encounter 的 `situation_value` / 局势值产生增减
 - 玩家公开行动会对队友 affinity / trust 或 NPC relation 造成影响
 - 公开回合结算会影响区域声望或 zone metric
@@ -151,6 +156,7 @@ AreaSubZone
 ```
 
 原因：
+
 - 公开回合是子区域公开场景状态的一部分
 - 它要与聊天上下文一起保存
 - 不能继续依赖 sidecar 文件承载主状态
@@ -160,6 +166,7 @@ AreaSubZone
 `PendingTurnState` 可以保留，但只能是暂停快照，不是主状态。
 
 规则：
+
 - `PublicTurnState` 是主状态
 - `PendingTurnState` 只负责中断恢复
 - 恢复后必须回写 `PublicTurnState.current_round.phase`
@@ -171,6 +178,7 @@ AreaSubZone
 ### 4.1 玩家入口
 
 主聊天必须提供两个入口：
+
 - `开始下一回合`
 - `优先行动`
 
@@ -190,11 +198,10 @@ AreaSubZone
 
 ```text
 玩家点击【优先行动】
--> 玩家输入行动内容
--> 抢先声明阶段
 -> AI 判断哪些 NPC / hidden NPC / 队友也要抢先
 -> initiative 排序
 -> 抢先执行阶段
+-> 当轮到玩家行动时，暂停输出等待玩家输入
 -> 常规推进阶段
 -> 事态推进阶段
 -> 回合结束
@@ -204,8 +211,11 @@ AreaSubZone
 
 ```text
 玩家点击【开始下一回合】
--> 跳过抢先声明
+-> AI 判断哪些 NPC / hidden NPC / 队友也要抢先
+-> initiative 排序
+-> 抢先执行阶段
 -> 常规推进阶段
+-> 玩家在常规推进阶段优先行动，暂停输出等待玩家输入
 -> 事态推进阶段
 -> 回合结束
 ```
@@ -213,6 +223,7 @@ AreaSubZone
 ### 4.3 回合的本质
 
 每个回合必须同时完成两件事：
+
 - 决定“谁在什么时候行动”
 - 结算“这些行动对场景与状态造成了什么影响”
 
@@ -225,6 +236,7 @@ AreaSubZone
 ### 5.1 抢先声明的用途
 
 抢先声明用于处理：
+
 - 突然行动
 - 先手攻击
 - 打断
@@ -232,6 +244,7 @@ AreaSubZone
 - 埋伏者现身
 
 参与主体包括：
+
 - 玩家
 - 在场 NPC
 - 队友
@@ -242,6 +255,7 @@ AreaSubZone
 当玩家行为具有明确冲突性时，AI GM 必须判断是否有其他主体也加入抢先。
 
 典型触发：
+
 - 攻击
 - 威胁
 - 阻止
@@ -268,6 +282,7 @@ AreaSubZone
 `玩家 -> 关键 NPC -> 普通 NPC`
 
 处理内容：
+
 - 对话
 - 探索
 - 社交互动
@@ -298,6 +313,7 @@ AreaSubZone
 `d20 + attack >= AC`
 
 命中后：
+
 - 伤害计算
 - 需要时先做豁免
 - 生命值变化写入
@@ -313,12 +329,14 @@ AreaSubZone
 ### 7.5 环境破坏行为
 
 例如：
+
 - 砸门
 - 推倒重物
 - 攻击支撑结构
 - 在狭窄空间释放爆炸法术
 
 除普通结算外，还必须触发：
+
 - 事态检定
 - 环境风险升级判断
 - 必要时插入额外事态推进
@@ -362,11 +380,13 @@ AreaSubZone
 ### 9.1 遭遇局势值
 
 必须保留并正式化当前已有的思路：
+
 - 每个行动都可产生 `situation_delta`
 - 多个行动的 `situation_delta` 汇总为本回合 encounter 局势变化
 - `situation_value` 是公开回合与 encounter 之间的关键连接点
 
 设计要求：
+
 - 玩家行动、NPC 行动、队友行动都可推动局势值
 - 成功、失败、暴击、失误都可以映射到不同幅度的局势变化
 - 事态推进阶段可继续修改局势值
@@ -376,6 +396,7 @@ AreaSubZone
 必须保留当前“公开行动影响关系”的方向，并升级为正式机制。
 
 要求：
+
 - 玩家公开行为可影响队友 affinity / trust
 - 玩家公开行为可影响 NPC relation
 - 影响应与行动结果、行动立场、是否帮助/拖累他人有关
@@ -386,6 +407,7 @@ AreaSubZone
 公开回合结算可改变区域或子区域声望。
 
 适用场景：
+
 - 玩家在公开场合帮助众人
 - 玩家制造明显混乱
 - 玩家伤害公众利益
@@ -394,12 +416,14 @@ AreaSubZone
 ### 9.4 生命值与战斗结果
 
 若公开回合中发生战斗行为：
+
 - HP 变化必须纳入 impact 记录
 - 不应再把战斗影响悬空在回合外
 
 ### 9.5 scene events 与 game logs
 
 每回合至少应沉淀：
+
 - 动作事件
 - 检定结果事件
 - 反应检定事件
@@ -415,6 +439,7 @@ scene events 是前端表现层输入，game logs 是系统追踪层输入，两
 ### 10.1 风险等级
 
 独立环境风险等级：
+
 - `stable`
 - `risky`
 - `collapse`
@@ -430,17 +455,21 @@ scene events 是前端表现层输入，game logs 是系统追踪层输入，两
 ### 10.3 后果
 
 #### stable
+
 - 场景稳定
 
 #### risky
+
 - 持续环境压力
 - 回合末可能插入额外事态推进
 
 #### collapse
+
 - 必然触发严重环境后果
 - 可导致伤害、封锁、坍塌、逃生压力、剧情转折
 
 环境风险层不能替代 `situation_value`，两者职责不同：
+
 - `situation_value` 更偏 encounter / 场面压力
 - `environment_risk_level` 更偏环境灾害与结构安全
 
@@ -449,12 +478,14 @@ scene events 是前端表现层输入，game logs 是系统追踪层输入，两
 ## 11. 事态推进阶段
 
 事态推进由 GM 或 AI GM 执行，可在以下时机触发：
+
 - 回合末必定一次
 - 任意破坏性行为后插入
 - 环境风险达到 `risky` 或 `collapse`
 - hidden NPC 暴露引发连锁反应
 
 作用：
+
 - 推进环境变化
 - 推进剧情
 - 改变 NPC 立场
@@ -471,6 +502,7 @@ scene events 是前端表现层输入，game logs 是系统追踪层输入，两
 `encounter` 是公开回合内的临时事件实例。
 
 生命周期：
+
 - 生成
 - 运行
 - 升级
@@ -481,6 +513,7 @@ scene events 是前端表现层输入，game logs 是系统追踪层输入，两
 ### 12.2 hidden NPC
 
 hidden NPC 必须是一等机制：
+
 - 默认不可见
 - 可在抢先声明中介入
 - 可因攻击或敌对行为暴露
@@ -489,6 +522,7 @@ hidden NPC 必须是一等机制：
 ### 12.3 玩家隐藏状态
 
 如果玩家处于潜行/隐藏状态：
+
 - NPC 必须进行感知检定
 - 不能默认所有公开角色都能无条件响应玩家
 
@@ -505,6 +539,7 @@ hidden NPC 必须是一等机制：
 ```
 
 执行中：
+
 - 隐藏普通输入
 - 显示当前回合、当前阶段、当前行动者
 - 等待反应时弹出反应检定窗口
@@ -578,6 +613,7 @@ class PublicTurnResponse(BaseModel):
 ### 14.5 battle 策略
 
 目标不是简单并行保留 battle，而是：
+
 - battle 规则下沉为公共结算模块
 - public turn 调用这些模块
 - 逐步让 public turn 吸收 battle 的主流程职责
@@ -662,6 +698,7 @@ class PublicTurnResponse(BaseModel):
 这次修订后的结论是：
 
 公开回合应当以设计文档为主建立统一状态机与阶段流程，但新系统必须显式保留并正式化当前已经有价值的状态反馈机制，尤其是：
+
 - 动作对 encounter 局势值的影响
 - 动作对关系、好感、信任的影响
 - 动作对区域声望的影响
@@ -671,3 +708,28 @@ class PublicTurnResponse(BaseModel):
 
 **修订日期**：2026-03-18
 **版本**：v4.0
+
+## 18. Implementation Status Note (2026-03-18)
+
+- `4.2 标准流程` has been corrected in code.
+- Main chat presentation is now split into structured settlement output and round-end prose narration.
+- `next_round` now creates a round, runs AI-only initiative judgment/execution first, then pauses at the player's `normal_advancement` slot.
+- `initiative` now inserts the player into initiative order and pauses only when the player slot is reached inside `initiative_execution`.
+- actors executed during initiative are skipped during later normal advancement.
+- player public-turn submissions now settle `situation_value`, visible NPC `relation_tag`, teammate `affinity/trust`, round reputation, `scene_events`, and `game_logs` in one pass.
+- player actions now emit explicit `public_turn_relation_update` and `public_turn_team_update` follow-up reactions, and the same rows are stored on `PublicTurnImpact`.
+- public-turn player checks now require the frontend roll modal:
+  - frontend calls `/api/v1/actions/check/plan` with `source_context="public_turn"`
+  - `/api/v1/public-turn/continue` receives `player_action_check`
+  - backend returns `409 PUBLIC_TURN_PLAYER_CHECK_REQUIRED` if a required player roll is missing
+- opposed public-turn checks are now recognized for direct physical conflict prompts such as `抱起` / `摔` / `推开` / `按住` / `压制` / `拖走` / `拉拽` / `抢夺` / `缴械`.
+
+## 19. Scheme A Status Note (2026-03-19)
+
+- AI-only public-turn progression now follows Scheme A:
+  - one segment planner call
+  - backend-local deterministic settlement
+  - one segment narrator call
+- Stream execution now emits after each resolved segment instead of replaying only after the full request finishes.
+- Embedded public-turn checks no longer re-enter `_ai_action_plan()` or `_ai_action_resolution_text()`.
+- Player settlements and opposed-resume settlements are seeded into the same running narration flow before later AI settlements or `gm_push`.

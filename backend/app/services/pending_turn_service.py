@@ -22,7 +22,7 @@ def load_pending_turn(session_id: str) -> PendingTurnState | None:
         return None
     if state.session_id != session_id:
         return None
-    if state.status != "awaiting_reaction":
+    if state.status not in {"awaiting_reaction", "awaiting_opposed"}:
         return None
     return state
 

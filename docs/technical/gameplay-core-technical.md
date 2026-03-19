@@ -170,4 +170,33 @@
   - `POST /api/v1/public-turn/continue/stream`
   - `POST /api/v1/public-turn/reaction-check/stream`
 - Public turn now owns situation, relation, affinity/trust, reputation, environment risk, scene event, and archived sub-zone turn settlement.
+- Public turn presentation is now split into:
+  - `initiative_order` for left-pane initiative display
+  - `settlement_entries` for structured per-actor action/check/consequence cards
+  - `round_narration` for right-pane whole-round prose generated only after round completion
 - Legacy `/api/v1/chat` remains for compatibility and debug, but mainline public scenes return `409 MAIN_CHAT_DISABLED_UNDER_PUBLIC_TURN` unless God Mode is active.
+
+## Public Turn 4.2 Correction Note (2026-03-18)
+
+- `entry(next_round)` now runs internal AI initiative judgment/execution before pausing at the player's `normal_advancement` slot.
+- `entry(initiative)` now inserts the player into the initiative order and pauses only when the initiative cursor reaches the player.
+- `PublicTurnContinueRequest` now accepts `player_action_check`.
+- public-turn player submissions now settle relation / affinity / trust / reputation in the same action resolution pass.
+- player-facing public-turn checks must be planned through `/api/v1/actions/check/plan` and rolled in the frontend before `/api/v1/public-turn/continue`.
+- opposed public-turn checks are supported through `resolution_rule="opposed_actor"` and are used for direct physical conflict prompts with a resolvable NPC target.
+
+## Public Turn Scheme A Runtime Note (2026-03-19)
+
+- Public-turn runtime now executes AI-only progression as `segment`s instead of per-actor free-running loops.
+- Each AI-only segment uses:
+  - one batch planner pass
+  - one batch narrator pass
+- Embedded public-turn `action_check()` no longer calls `_ai_action_plan()` or `_ai_action_resolution_text()`.
+- NPC/AI dice, opposed comparison, situation/reputation/relation/team settlement remain backend-deterministic.
+- Stream routes no longer wait for the full public-turn request to finish before emitting output.
+- The stream now emits after each resolved segment:
+  - `settlement_entry`
+  - `narrative_fragment_*`
+  - `scene_event`
+  - `impact`
+- Player submissions and opposed resumes are folded into the same segment narration flow by seeding deterministic settlements before the next AI segment or `gm_push`.

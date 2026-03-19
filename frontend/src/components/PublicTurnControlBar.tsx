@@ -18,8 +18,10 @@ const PHASE_LABELS: Record<PublicTurnPhase, string> = {
   initiative_declaration: '抢先声明',
   initiative_execution: '抢先执行',
   normal_advancement: '常规推进',
-  situation_advancement: '事态推进',
+  gm_push: 'GM推动',
+  situation_advancement: '旧事态推进',
   awaiting_player_reaction: '等待反应检定',
+  awaiting_player_opposed: '等待对抗回应',
 };
 
 const RISK_LABELS: Record<EnvironmentRiskLevel, string> = {

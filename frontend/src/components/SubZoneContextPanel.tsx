@@ -1,12 +1,35 @@
-import { useEffect, useRef } from 'react';
-import type { AreaSubZone, SubZoneChatTurnEvent } from '../types/app';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import type { AreaSubZone, PublicTurnPresentation, SubZoneChatTurn } from '../types/app';
+import { PublicTurnNarrativePane } from './PublicTurnNarrativePane';
+import { PublicTurnSettlementPane } from './PublicTurnSettlementPane';
 import { SceneEventCard } from './SceneEventCard';
 
 type Props = {
   subZone: AreaSubZone | null;
 };
 
-const HIDDEN_EVENT_KINDS = new Set<SubZoneChatTurnEvent['event_kind']>(['encounter_progress', 'encounter_resolution']);
+const HIDDEN_EVENT_KINDS = new Set(['encounter_progress', 'encounter_resolution']);
+
+function legacyPresentation(turn: SubZoneChatTurn): PublicTurnPresentation | null {
+  if (turn.public_turn_presentation) {
+    return turn.public_turn_presentation;
+  }
+  if (!turn.gm_narration.trim() && turn.events.length === 0) {
+    return null;
+  }
+  return {
+    round_id: turn.public_round_id ?? turn.turn_id,
+    round_number: turn.public_round_number ?? 0,
+    phase: turn.public_phase ?? 'idle',
+    initiative_order: [],
+    settlement_entries: [],
+    narrative_entries: [],
+    accumulated_narration: turn.gm_narration ?? '',
+    narrative_status: turn.gm_narration.trim() ? 'complete' : 'empty',
+    round_narration: turn.gm_narration ?? '',
+    round_narration_status: turn.gm_narration.trim() ? 'ready' : 'pending',
+  };
+}
 
 export function SubZoneContextPanel({ subZone }: Props) {
   const turns = subZone?.chat_context?.recent_turns ?? [];
@@ -16,12 +39,14 @@ export function SubZoneContextPanel({ subZone }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
   const lastSubZoneIdRef = useRef<string | null>(null);
+  const [collapsed, setCollapsed] = useState(true);
 
   useEffect(() => {
     if (!subZoneId) return;
     if (lastSubZoneIdRef.current === subZoneId) return;
     lastSubZoneIdRef.current = subZoneId;
     stickToBottomRef.current = true;
+    setCollapsed(true);
     window.requestAnimationFrame(() => {
       const node = containerRef.current;
       if (!node) return;
@@ -30,13 +55,23 @@ export function SubZoneContextPanel({ subZone }: Props) {
   }, [subZoneId]);
 
   useEffect(() => {
-    if (!subZoneId || turns.length === 0 || !stickToBottomRef.current) return;
+    if (!subZoneId || turns.length === 0 || !stickToBottomRef.current || collapsed) return;
     window.requestAnimationFrame(() => {
       const node = containerRef.current;
       if (!node) return;
       node.scrollTop = node.scrollHeight;
     });
-  }, [subZoneId, turns.length]);
+  }, [collapsed, subZoneId, turns.length]);
+
+  const renderedTurns = useMemo(
+    () =>
+      turns.map((turn) => ({
+        turn,
+        presentation: legacyPresentation(turn),
+        visibleEvents: turn.events.filter((event) => !HIDDEN_EVENT_KINDS.has(event.event_kind)),
+      })),
+    [turns],
+  );
 
   if (!subZone || turns.length === 0) return null;
 
@@ -51,8 +86,8 @@ export function SubZoneContextPanel({ subZone }: Props) {
     <section className="subzone-context-panel">
       <header className="subzone-context-header">
         <div>
-          <h3>子区块上下文</h3>
-          <p>{subZone.name} 的历史公开回合与关键事件会持续保存在这里。</p>
+          <h3>地区上下文</h3>
+          <p>{subZone.name} 的历史公开回合会保存在这里，默认折叠。</p>
           {publicTurnState && (
             <p className="hint">
               Public Turn: {currentRound ? `round ${currentRound.round_number} / ${currentRound.phase}` : 'idle'} / risk{' '}
@@ -60,12 +95,13 @@ export function SubZoneContextPanel({ subZone }: Props) {
             </p>
           )}
         </div>
+        <button type="button" onClick={() => setCollapsed((prev) => !prev)}>
+          {collapsed ? `展开历史（${turns.length}）` : '收起历史'}
+        </button>
       </header>
-      <div ref={containerRef} className="subzone-context-list" onScroll={onScroll}>
-        {turns.map((turn) => {
-          const visibleEvents = turn.events.filter((event) => !HIDDEN_EVENT_KINDS.has(event.event_kind));
-          const passiveTurn = turn.player_mode === 'passive' && !turn.player_action && !turn.player_speech;
-          return (
+      {!collapsed && (
+        <div ref={containerRef} className="subzone-context-list" onScroll={onScroll}>
+          {renderedTurns.map(({ turn, presentation, visibleEvents }) => (
             <article key={turn.turn_id} className="subzone-context-turn">
               <div className="subzone-context-turn-header">
                 <strong>{turn.world_time_text}</strong>
@@ -73,43 +109,14 @@ export function SubZoneContextPanel({ subZone }: Props) {
                   <span>{turn.player_mode === 'passive' ? '自动推进' : '主动回合'}</span>
                   {typeof turn.public_round_number === 'number' && <span>Public Round: {turn.public_round_number}</span>}
                   {turn.public_phase && <span>Phase: {turn.public_phase}</span>}
-                  {turn.active_encounter_title && (
-                    <span>
-                      遭遇: {turn.active_encounter_title}
-                      {turn.active_encounter_status ? ` / ${turn.active_encounter_status}` : ''}
-                    </span>
-                  )}
                 </div>
               </div>
-              <div className="subzone-context-turn-body">
-                {passiveTurn ? (
-                  <p>
-                    <strong>玩家:</strong>
-                    本轮选择观察与等待，由系统自动推进。
-                  </p>
-                ) : (
-                  <>
-                    {turn.player_action && (
-                      <p>
-                        <strong>动作:</strong>
-                        {turn.player_action}
-                      </p>
-                    )}
-                    {turn.player_speech && (
-                      <p>
-                        <strong>语言:</strong>
-                        {turn.player_speech}
-                      </p>
-                    )}
-                  </>
-                )}
-                {turn.gm_narration && (
-                  <p>
-                    <strong>GM:</strong>
-                    {turn.gm_narration}
-                  </p>
-                )}
-              </div>
+              {presentation ? (
+                <div className="public-turn-output-layout compact">
+                  <PublicTurnSettlementPane presentation={presentation} />
+                  <PublicTurnNarrativePane presentation={presentation} />
+                </div>
+              ) : null}
               {visibleEvents.length > 0 && (
                 <div className="subzone-context-events">
                   {visibleEvents.map((event, index) => (
@@ -127,9 +134,9 @@ export function SubZoneContextPanel({ subZone }: Props) {
                 </div>
               )}
             </article>
-          );
-        })}
-      </div>
+          ))}
+        </div>
+      )}
     </section>
   );
 }

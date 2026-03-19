@@ -142,6 +142,9 @@
 
 - Mainline public scene orchestration is no longer driven by freeform `/chat`.
 - `public turn` uses deterministic backend state plus optional AI actor declaration / action helpers.
+- Public-turn output is now split by contract:
+  - structured initiative / settlement data goes through API fields and SSE events
+  - prose round narration is generated separately at round end and must not include dice/DC/value math
 - The runtime still reuses existing public-scene candidate selection, reaction staging, and encounter settlement helpers where practical.
 - New SSE event family:
   - `phase`
@@ -164,3 +167,33 @@
   - `public_turn_relation_update`
   - `public_turn_team_update`
   - `public_turn_environment_update`
+
+## Public Turn Check Planning (2026-03-18)
+
+- `/api/v1/actions/check/plan` now accepts `source_context="public_turn"`.
+- action check planning / execution now expose:
+  - `resolution_rule`
+  - `target_role_id`
+  - `target_name`
+  - `target_actor_kind`
+  - `target_ability_used`
+  - `target_ability_modifier`
+- public-turn direct physical conflict prompts can resolve as `opposed_actor`.
+- `/api/v1/public-turn/continue` now accepts `player_action_check`, allowing the frontend roll modal to submit the forced player d20 back into public-turn resolution.
+- Public-turn stream events now additionally expose:
+  - `initiative_order`
+  - `settlement_entry`
+  - `round_narration_delta`
+
+## Public Turn Segment Dual-Phase Note (2026-03-19)
+
+- Public turn no longer treats each NPC settlement as an independent LLM narration unit.
+- Current contract for an AI-only segment is:
+  1. planner returns ordered actor directives for the segment
+  2. backend performs all dice / opposed / state settlement locally
+  3. narrator returns ordered prose fragments for the resolved anchors
+- `PublicTurnSegmentPlan`, `PublicTurnSegmentActorDirective`, `PublicTurnSegmentBoundary`, `PublicTurnNarrationInputItem`, and `PublicTurnNarrationFragmentBatch` are internal backend-only parsing models.
+- These internal models are not exposed as public API payloads and are not stored as new save shards.
+- `source_context="public_turn"` plus `resolution_context="embedded"` now guarantees that:
+  - no extra `_ai_action_plan()` call is made inside `action_check()`
+  - no extra `_ai_action_resolution_text()` call is made inside `action_check()`

@@ -285,6 +285,96 @@ button:disabled {
   color: var(--text-dim);
 }
 
+.public-turn-output-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 3fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.public-turn-settlement-pane,
+.public-turn-narrative-pane {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #0d1522;
+  padding: 12px;
+  display: grid;
+  gap: 12px;
+}
+
+.public-turn-pane-header {
+  display: grid;
+  gap: 4px;
+}
+
+.public-turn-pane-header h3,
+.public-turn-pane-header h4,
+.public-turn-pane-header p {
+  margin: 0;
+}
+
+.public-turn-pane-header p {
+  color: var(--text-dim);
+}
+
+.public-turn-initiative-track {
+  display: grid;
+  gap: 10px;
+}
+
+.public-turn-initiative-list {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}
+
+.public-turn-initiative-card {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  background: #0a101a;
+  padding: 10px;
+  display: grid;
+  gap: 4px;
+}
+
+.public-turn-initiative-card strong,
+.public-turn-initiative-card p {
+  margin: 0;
+}
+
+.public-turn-initiative-card p {
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.public-turn-settlement-list {
+  display: grid;
+  gap: 10px;
+}
+
+.public-turn-settlement-card {
+  background: #0a101a;
+}
+
+.public-turn-check-block {
+  display: grid;
+  gap: 4px;
+}
+
+.public-turn-consequence-list {
+  display: grid;
+  gap: 8px;
+}
+
+.public-turn-narrative-card {
+  margin: 0;
+  min-height: 320px;
+}
+
+.public-turn-narrative-card.pending {
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
 .live-progress-panel {
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -589,6 +679,18 @@ button:disabled {
 
   .role-profile-grid {
     grid-template-columns: 1fr;
+  }
+
+  .public-turn-output-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .public-turn-narrative-pane {
+    order: 1;
+  }
+
+  .public-turn-settlement-pane {
+    order: 2;
   }
 }
 

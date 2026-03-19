@@ -25,19 +25,28 @@ type Props = {
 
 const LABEL_MAP: Record<string, string> = {
   public_actor_action: '公开行动',
-  public_round_resolution: 'GM结算',
+  public_round_resolution: 'GM 结算',
   public_actor_resolution: '公开轮次',
-  public_targeted_npc_reply: '公开目标回复',
-  public_bystander_reaction: '旁观反应',
+  public_targeted_npc_reply: '目标 NPC 回应',
+  public_bystander_reaction: '围观反应',
   team_public_reaction: '队友反应',
+  public_turn_phase: '公开回合阶段',
+  public_turn_initiative: '抢先顺序',
+  public_turn_actor_action: '公开回合行动',
+  public_turn_actor_resolution: '公开回合结算',
+  public_turn_situation: '事态推进',
+  public_turn_round_end: '回合结束',
+  public_turn_relation_update: 'NPC 态度变化',
+  public_turn_team_update: '队友态度变化',
+  public_turn_environment_update: '环境风险变化',
   role_desire_surface: '角色欲望',
   companion_story_surface: '队友故事',
-  reputation_update: '区域声望',
+  reputation_update: '地区声望',
   encounter_started: '遭遇触发',
   encounter_progress: '遭遇推进',
   encounter_resolution: '遭遇结算',
-  encounter_background: '遭遇后台',
-  encounter_situation_update: '局势值',
+  encounter_background: '遭遇背景',
+  encounter_situation_update: '局势变化',
   encounter_world_push: '世界推进',
   player_reaction_triggered: '玩家反应检定',
   player_reaction_result: '玩家反应结果',
@@ -93,16 +102,16 @@ function renderCheckBlock(check: PublicActorCheckResult | undefined) {
     return (
       <div className="scene-event-block">
         <span>结果</span>
-        <p>本步无需检定</p>
+        <p>本步骤无需检定</p>
       </div>
     );
   }
   return (
     <div className="scene-event-block">
-      <span>结果</span>
+      <span>检定</span>
       <div className="scene-event-kv-grid">
         <p>属性：{check.ability_used ?? '-'}</p>
-        <p>调整值：{formatModifier(check.ability_modifier)}</p>
+        <p>修正：{formatModifier(check.ability_modifier)}</p>
         <p>d20：{typeof check.dice_roll === 'number' ? check.dice_roll : '-'}</p>
         <p>总值：{typeof check.total_score === 'number' ? check.total_score : '-'}</p>
         <p>DC：{typeof check.dc === 'number' ? check.dc : '-'}</p>
@@ -137,7 +146,7 @@ function renderPlayerReactionResult(event: BaseEvent | TurnEvent, compact: boole
           <span>检定摘要</span>
           <div className="scene-event-kv-grid">
             <p>属性：{String(metadata.ability_used ?? '-')}</p>
-            <p>调整值：{formatModifier(typeof metadata.ability_modifier === 'number' ? metadata.ability_modifier : undefined)}</p>
+            <p>修正：{formatModifier(typeof metadata.ability_modifier === 'number' ? metadata.ability_modifier : undefined)}</p>
             <p>d20：{typeof metadata.dice_roll === 'number' ? metadata.dice_roll : '-'}</p>
             <p>总值：{typeof metadata.total_score === 'number' ? metadata.total_score : '-'}</p>
             <p>DC：{typeof metadata.dc === 'number' ? metadata.dc : '-'}</p>
@@ -149,88 +158,40 @@ function renderPlayerReactionResult(event: BaseEvent | TurnEvent, compact: boole
   );
 }
 
+function renderGenericCard({
+  label,
+  actorName,
+  content,
+  compact,
+}: {
+  label: string;
+  actorName?: string;
+  content: string;
+  compact: boolean;
+}) {
+  return (
+    <article className={`scene-event-card ${compact ? 'compact' : ''}`}>
+      <header className="scene-event-card-header">
+        <strong>{actorName ? `${label} / ${actorName}` : label}</strong>
+      </header>
+      <div className="scene-event-card-body">
+        <p>{content}</p>
+      </div>
+    </article>
+  );
+}
+
 export function SceneEventCard({ event, compact = false }: Props) {
   const kind = eventKindOf(event);
   const label = LABEL_MAP[kind] ?? kind;
   const actorName = event.actor_name?.trim();
+  const metadata = event.metadata ?? {};
 
-  if (kind === 'public_actor_action') {
-    const metadata = asActorActionMetadata(event.metadata);
-    return (
-      <article className={`scene-event-card ${compact ? 'compact' : ''}`}>
-        <header className="scene-event-card-header">
-          <strong>{actorName ? `${label} / ${actorName}` : label}</strong>
-        </header>
-        <div className="scene-event-card-body">
-          {metadata.affiliation_label && (
-            <div className="scene-event-inline-tags">
-              <span className="scene-event-tag">{metadata.affiliation_label}</span>
-            </div>
-          )}
-          {metadata.external_action_narration && (
-            <div className="scene-event-block">
-              <span>外在行为</span>
-              <p>{metadata.external_action_narration}</p>
-            </div>
-          )}
-          {metadata.speech_line && (
-            <div className="scene-event-block">
-              <span>角色语言</span>
-              <p>{metadata.speech_line}</p>
-            </div>
-          )}
-          {!metadata.external_action_narration && !metadata.speech_line && (
-            <div className="scene-event-block">
-              <span>动作</span>
-              <p>{event.content}</p>
-            </div>
-          )}
-          {metadata.checked_action_label && (
-            <div className="scene-event-block">
-              <span>检定行为</span>
-              <p>{metadata.checked_action_label}</p>
-            </div>
-          )}
-          {renderCheckBlock(metadata.check_result)}
-          {metadata.gm_result_summary && (
-            <div className="scene-event-block">
-              <span>GM结果</span>
-              <p>{metadata.gm_result_summary}</p>
-            </div>
-          )}
-          {typeof metadata.situation_delta === 'number' && (
-            <div className="scene-event-block">
-              <span>局势值变化</span>
-              <p>{formatDelta(metadata.situation_delta)}</p>
-            </div>
-          )}
-          {(typeof metadata.team_affinity_before === 'number' ||
-            typeof metadata.team_affinity_after === 'number' ||
-            typeof metadata.team_trust_before === 'number' ||
-            typeof metadata.team_trust_after === 'number') && (
-            <div className="scene-event-block">
-              <span>队友关系</span>
-              <div className="scene-event-kv-grid">
-                <p>
-                  好感：{typeof metadata.team_affinity_before === 'number' ? metadata.team_affinity_before : '-'} -&gt;{' '}
-                  {typeof metadata.team_affinity_after === 'number' ? metadata.team_affinity_after : '-'}
-                  {typeof metadata.team_affinity_delta === 'number' ? ` (${formatDelta(metadata.team_affinity_delta)})` : ''}
-                </p>
-                <p>
-                  信任：{typeof metadata.team_trust_before === 'number' ? metadata.team_trust_before : '-'} -&gt;{' '}
-                  {typeof metadata.team_trust_after === 'number' ? metadata.team_trust_after : '-'}
-                  {typeof metadata.team_trust_delta === 'number' ? ` (${formatDelta(metadata.team_trust_delta)})` : ''}
-                </p>
-              </div>
-            </div>
-          )}
-        </div>
-      </article>
-    );
+  if (kind === 'public_turn_phase' || kind === 'public_turn_initiative' || kind === 'public_turn_situation' || kind === 'public_turn_round_end') {
+    return renderGenericCard({ label, actorName, content: event.content, compact });
   }
 
-  if (kind === 'public_round_resolution') {
-    const metadata = asRoundResolutionMetadata(event.metadata);
+  if (kind === 'public_turn_relation_update') {
     return (
       <article className={`scene-event-card ${compact ? 'compact' : ''}`}>
         <header className="scene-event-card-header">
@@ -238,29 +199,18 @@ export function SceneEventCard({ event, compact = false }: Props) {
         </header>
         <div className="scene-event-card-body">
           <div className="scene-event-block">
-            <span>结算摘要</span>
+            <span>变化</span>
             <p>{event.content}</p>
           </div>
-          {(typeof metadata.candidate_count === 'number' || typeof metadata.reputation_score === 'number') && (
+          <div className="scene-event-kv-grid">
+            <p>角色：{String(metadata.name ?? '-')}</p>
+            <p>关系：{String(metadata.before_tag ?? '-')} -&gt; {String(metadata.after_tag ?? '-')}</p>
+            <p>增量：{formatDelta(typeof metadata.relation_delta === 'number' ? metadata.relation_delta : undefined)}</p>
+          </div>
+          {metadata.reaction_text && (
             <div className="scene-event-block">
-              <span>摘要信息</span>
-              <div className="scene-event-kv-grid">
-                {typeof metadata.candidate_count === 'number' && <p>参与角色：{metadata.candidate_count}</p>}
-                {typeof metadata.reputation_score === 'number' && <p>区域声望：{metadata.reputation_score}</p>}
-              </div>
-            </div>
-          )}
-          {(metadata.team_relation_rows?.length ?? 0) > 0 && (
-            <div className="scene-event-block">
-              <span>队友关系结算</span>
-              <div className="scene-event-kv-grid">
-                {metadata.team_relation_rows?.map((row) => (
-                  <p key={row.role_id}>
-                    {row.name}：好感 {row.affinity_before} -&gt; {row.affinity_after} ({formatDelta(row.affinity_delta)}) / 信任{' '}
-                    {row.trust_before} -&gt; {row.trust_after} ({formatDelta(row.trust_delta)})
-                  </p>
-                ))}
-              </div>
+              <span>反应</span>
+              <p>{String(metadata.reaction_text)}</p>
             </div>
           )}
         </div>
@@ -268,8 +218,39 @@ export function SceneEventCard({ event, compact = false }: Props) {
     );
   }
 
-  if (kind === 'public_actor_resolution') {
-    const metadata = asActorResolutionMetadata(event.metadata);
+  if (kind === 'public_turn_team_update') {
+    return (
+      <article className={`scene-event-card ${compact ? 'compact' : ''}`}>
+        <header className="scene-event-card-header">
+          <strong>{actorName ? `${label} / ${actorName}` : label}</strong>
+        </header>
+        <div className="scene-event-card-body">
+          <div className="scene-event-block">
+            <span>变化</span>
+            <p>{event.content}</p>
+          </div>
+          <div className="scene-event-kv-grid">
+            <p>
+              好感：{typeof metadata.affinity_before === 'number' ? metadata.affinity_before : '-'} -&gt;{' '}
+              {typeof metadata.affinity_after === 'number' ? metadata.affinity_after : '-'} ({formatDelta(typeof metadata.affinity_delta === 'number' ? metadata.affinity_delta : undefined)})
+            </p>
+            <p>
+              信任：{typeof metadata.trust_before === 'number' ? metadata.trust_before : '-'} -&gt;{' '}
+              {typeof metadata.trust_after === 'number' ? metadata.trust_after : '-'} ({formatDelta(typeof metadata.trust_delta === 'number' ? metadata.trust_delta : undefined)})
+            </p>
+          </div>
+          {metadata.reaction_text && (
+            <div className="scene-event-block">
+              <span>反应</span>
+              <p>{String(metadata.reaction_text)}</p>
+            </div>
+          )}
+        </div>
+      </article>
+    );
+  }
+
+  if (kind === 'public_turn_environment_update') {
     return (
       <article className={`scene-event-card ${compact ? 'compact' : ''}`}>
         <header className="scene-event-card-header">
@@ -280,16 +261,81 @@ export function SceneEventCard({ event, compact = false }: Props) {
             <span>结果</span>
             <p>{event.content}</p>
           </div>
-          {(typeof metadata.situation_delta === 'number' ||
-            typeof metadata.relation_delta === 'number' ||
-            typeof metadata.reputation_delta === 'number') && (
+          <div className="scene-event-kv-grid">
+            <p>环境位移：{formatDelta(typeof metadata.environment_shift === 'number' ? metadata.environment_shift : undefined)}</p>
+            <p>风险：{String(metadata.environment_risk_level_before ?? '-')} -&gt; {String(metadata.environment_risk_level_after ?? '-')}</p>
+          </div>
+        </div>
+      </article>
+    );
+  }
+
+  if (kind === 'public_turn_actor_resolution') {
+    return (
+      <article className={`scene-event-card ${compact ? 'compact' : ''}`}>
+        <header className="scene-event-card-header">
+          <strong>{actorName ? `${label} / ${actorName}` : label}</strong>
+        </header>
+        <div className="scene-event-card-body">
+          <div className="scene-event-block">
+            <span>结果</span>
+            <p>{event.content}</p>
+          </div>
+          <div className="scene-event-kv-grid">
+            <p>判定：{String(metadata.check_outcome ?? '-')}</p>
+            <p>规则：{String(metadata.resolution_rule ?? '-')}</p>
+          </div>
+        </div>
+      </article>
+    );
+  }
+
+  if (kind === 'public_turn_actor_action') {
+    return renderGenericCard({ label, actorName, content: event.content, compact });
+  }
+
+  if (kind === 'public_actor_action') {
+    const actorMetadata = asActorActionMetadata(event.metadata);
+    return (
+      <article className={`scene-event-card ${compact ? 'compact' : ''}`}>
+        <header className="scene-event-card-header">
+          <strong>{actorName ? `${label} / ${actorName}` : label}</strong>
+        </header>
+        <div className="scene-event-card-body">
+          {actorMetadata.affiliation_label && (
+            <div className="scene-event-inline-tags">
+              <span className="scene-event-tag">{actorMetadata.affiliation_label}</span>
+            </div>
+          )}
+          {actorMetadata.external_action_narration && (
             <div className="scene-event-block">
-              <span>影响值</span>
-              <p>
-                {typeof metadata.situation_delta === 'number' ? `局势 ${formatDelta(metadata.situation_delta)}` : '局势 +0'}
-                {typeof metadata.relation_delta === 'number' ? ` / 关系 ${formatDelta(metadata.relation_delta)}` : ''}
-                {typeof metadata.reputation_delta === 'number' ? ` / 声望 ${formatDelta(metadata.reputation_delta)}` : ''}
-              </p>
+              <span>外在行为</span>
+              <p>{actorMetadata.external_action_narration}</p>
+            </div>
+          )}
+          {actorMetadata.speech_line && (
+            <div className="scene-event-block">
+              <span>角色语言</span>
+              <p>{actorMetadata.speech_line}</p>
+            </div>
+          )}
+          {!actorMetadata.external_action_narration && !actorMetadata.speech_line && (
+            <div className="scene-event-block">
+              <span>动作</span>
+              <p>{event.content}</p>
+            </div>
+          )}
+          {actorMetadata.checked_action_label && (
+            <div className="scene-event-block">
+              <span>检定行为</span>
+              <p>{actorMetadata.checked_action_label}</p>
+            </div>
+          )}
+          {renderCheckBlock(actorMetadata.check_result)}
+          {actorMetadata.gm_result_summary && (
+            <div className="scene-event-block">
+              <span>GM 结果</span>
+              <p>{actorMetadata.gm_result_summary}</p>
             </div>
           )}
         </div>
@@ -297,44 +343,69 @@ export function SceneEventCard({ event, compact = false }: Props) {
     );
   }
 
-  if (kind === 'encounter_situation_update') {
-    const metadata = asSituationMetadata(event.metadata);
+  if (kind === 'public_round_resolution') {
+    const roundMetadata = asRoundResolutionMetadata(event.metadata);
     return (
       <article className={`scene-event-card ${compact ? 'compact' : ''}`}>
         <header className="scene-event-card-header">
           <strong>{actorName ? `${label} / ${actorName}` : label}</strong>
         </header>
         <div className="scene-event-card-body">
-          {typeof metadata.situation_value_before === 'number' && (
-            <div className="scene-event-block">
-              <span>结算前</span>
-              <p>{metadata.situation_value_before}/100</p>
+          <div className="scene-event-block">
+            <span>摘要</span>
+            <p>{event.content}</p>
+          </div>
+          {(typeof roundMetadata.candidate_count === 'number' || typeof roundMetadata.reputation_score === 'number') && (
+            <div className="scene-event-kv-grid">
+              {typeof roundMetadata.candidate_count === 'number' && <p>参与角色：{roundMetadata.candidate_count}</p>}
+              {typeof roundMetadata.reputation_score === 'number' && <p>地区声望：{roundMetadata.reputation_score}</p>}
             </div>
           )}
-          {(typeof metadata.player_situation_delta === 'number' ||
-            typeof metadata.public_actor_situation_delta_total === 'number' ||
-            typeof metadata.world_push_situation_delta_total === 'number' ||
-            typeof metadata.turn_total_delta === 'number') && (
-            <div className="scene-event-block">
-              <span>本回合拆分</span>
-              <div className="scene-event-kv-grid">
-                <p>玩家：{formatDelta(metadata.player_situation_delta)}</p>
-                <p>公开行动合计：{formatDelta(metadata.public_actor_situation_delta_total)}</p>
-                <p>世界推进：{formatDelta(metadata.world_push_situation_delta_total)}</p>
-                <p>本回合合计：{formatDelta(metadata.turn_total_delta ?? metadata.situation_delta)}</p>
-              </div>
-            </div>
-          )}
-          {(typeof metadata.situation_value_after === 'number' || typeof metadata.situation_value === 'number') && (
-            <div className="scene-event-block">
-              <span>结算后</span>
-              <p>
-                {(metadata.situation_value_after ?? metadata.situation_value)}/100
-                {metadata.direction ? ` / ${metadata.direction}` : ''}
-                {metadata.trend ? ` / ${metadata.trend}` : ''}
-              </p>
-            </div>
-          )}
+        </div>
+      </article>
+    );
+  }
+
+  if (kind === 'public_actor_resolution') {
+    const actorResolution = asActorResolutionMetadata(event.metadata);
+    return (
+      <article className={`scene-event-card ${compact ? 'compact' : ''}`}>
+        <header className="scene-event-card-header">
+          <strong>{actorName ? `${label} / ${actorName}` : label}</strong>
+        </header>
+        <div className="scene-event-card-body">
+          <div className="scene-event-block">
+            <span>结果</span>
+            <p>{event.content}</p>
+          </div>
+          <div className="scene-event-kv-grid">
+            <p>局势：{formatDelta(actorResolution.situation_delta)}</p>
+            <p>关系：{formatDelta(actorResolution.relation_delta)}</p>
+            <p>声望：{formatDelta(actorResolution.reputation_delta)}</p>
+          </div>
+        </div>
+      </article>
+    );
+  }
+
+  if (kind === 'encounter_situation_update') {
+    const situationMetadata = asSituationMetadata(event.metadata);
+    return (
+      <article className={`scene-event-card ${compact ? 'compact' : ''}`}>
+        <header className="scene-event-card-header">
+          <strong>{actorName ? `${label} / ${actorName}` : label}</strong>
+        </header>
+        <div className="scene-event-card-body">
+          <div className="scene-event-kv-grid">
+            {typeof situationMetadata.situation_value_before === 'number' && <p>结算前：{situationMetadata.situation_value_before}/100</p>}
+            <p>玩家：{formatDelta(situationMetadata.player_situation_delta)}</p>
+            <p>公开行动：{formatDelta(situationMetadata.public_actor_situation_delta_total)}</p>
+            <p>世界推进：{formatDelta(situationMetadata.world_push_situation_delta_total)}</p>
+            <p>合计：{formatDelta(situationMetadata.turn_total_delta ?? situationMetadata.situation_delta)}</p>
+            {typeof (situationMetadata.situation_value_after ?? situationMetadata.situation_value) === 'number' && (
+              <p>结算后：{situationMetadata.situation_value_after ?? situationMetadata.situation_value}/100</p>
+            )}
+          </div>
           <div className="scene-event-block">
             <span>结果</span>
             <p>{event.content}</p>
@@ -345,7 +416,7 @@ export function SceneEventCard({ event, compact = false }: Props) {
   }
 
   if (kind === 'encounter_world_push') {
-    const metadata = asWorldPushMetadata(event.metadata);
+    const worldPushMetadata = asWorldPushMetadata(event.metadata);
     return (
       <article className={`scene-event-card ${compact ? 'compact' : ''}`}>
         <header className="scene-event-card-header">
@@ -353,33 +424,15 @@ export function SceneEventCard({ event, compact = false }: Props) {
         </header>
         <div className="scene-event-card-body">
           <div className="scene-event-block">
-            <span>现场推进</span>
+            <span>推进</span>
             <p>{event.content}</p>
           </div>
-          {metadata.target_location_label && (
-            <div className="scene-event-block">
-              <span>关键地点</span>
-              <p>{metadata.target_location_label}</p>
-            </div>
-          )}
-          {metadata.opened_window && (
-            <div className="scene-event-block">
-              <span>新窗口</span>
-              <p>{metadata.opened_window}</p>
-            </div>
-          )}
-          {metadata.pressure_note && (
-            <div className="scene-event-block">
-              <span>新增压力</span>
-              <p>{metadata.pressure_note}</p>
-            </div>
-          )}
-          {metadata.spawned_npc_name && (
-            <div className="scene-event-block">
-              <span>新角色入场</span>
-              <p>{metadata.spawned_npc_name}</p>
-            </div>
-          )}
+          <div className="scene-event-kv-grid">
+            {worldPushMetadata.target_location_label && <p>地点：{worldPushMetadata.target_location_label}</p>}
+            {worldPushMetadata.opened_window && <p>窗口：{worldPushMetadata.opened_window}</p>}
+            {worldPushMetadata.pressure_note && <p>压力：{worldPushMetadata.pressure_note}</p>}
+            {worldPushMetadata.spawned_npc_name && <p>新角色：{worldPushMetadata.spawned_npc_name}</p>}
+          </div>
         </div>
       </article>
     );
@@ -396,18 +449,15 @@ export function SceneEventCard({ event, compact = false }: Props) {
             <span>威胁</span>
             <p>{event.content}</p>
           </div>
-          <div className="scene-event-block">
-            <span>检定</span>
-            <div className="scene-event-kv-grid">
-              <p>来源：{String(event.metadata?.source_label ?? actorName ?? '-')}</p>
-              <p>属性：{String(event.metadata?.ability_used ?? '-')}</p>
-              <p>DC：{typeof event.metadata?.dc === 'number' ? event.metadata.dc : '-'}</p>
-            </div>
+          <div className="scene-event-kv-grid">
+            <p>来源：{String(metadata.source_label ?? actorName ?? '-')}</p>
+            <p>属性：{String(metadata.ability_used ?? '-')}</p>
+            <p>DC：{typeof metadata.dc === 'number' ? metadata.dc : '-'}</p>
           </div>
-          {event.metadata?.threatened_consequence && (
+          {metadata.threatened_consequence && (
             <div className="scene-event-block">
               <span>风险</span>
-              <p>{String(event.metadata.threatened_consequence)}</p>
+              <p>{String(metadata.threatened_consequence)}</p>
             </div>
           )}
         </div>
@@ -419,14 +469,5 @@ export function SceneEventCard({ event, compact = false }: Props) {
     return renderPlayerReactionResult(event, compact, actorName);
   }
 
-  return (
-    <article className={`scene-event-card ${compact ? 'compact' : ''}`}>
-      <header className="scene-event-card-header">
-        <strong>{actorName ? `${label} / ${actorName}` : label}</strong>
-      </header>
-      <div className="scene-event-card-body">
-        <p>{event.content}</p>
-      </div>
-    </article>
-  );
+  return renderGenericCard({ label, actorName, content: event.content, compact });
 }

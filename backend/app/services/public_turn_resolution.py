@@ -12,8 +12,15 @@ from app.models.schemas import (
     InitiativeDeclaration,
     NpcRoleCard,
     PlayerReactionCheck,
+    PublicTurnActorType,
     PublicTurnImpact,
+    PublicTurnInitiativeEntry,
+    PublicTurnOpposedPrompt,
+    PublicTurnOpposedPlanRequest,
+    PublicTurnPlayerActionCheck,
     PublicTurnRound,
+    PublicTurnSettlementCheck,
+    PublicTurnSettlementEntry,
     SaveFile,
     SceneEvent,
 )
@@ -27,9 +34,11 @@ from app.services.public_turn_candidates import (
     actor_name_match,
     dex_modifier_for_actor,
     initiative_actor_rows,
+    public_turn_normal_actor_rows,
     visible_actor_rows,
 )
 from app.services.public_turn_effects import (
+    apply_player_npc_reactions,
     apply_player_team_reactions,
     apply_round_reputation,
     build_impact,
@@ -37,7 +46,6 @@ from app.services.public_turn_effects import (
     next_environment_risk,
     relation_delta_from_result,
     reputation_delta_from_situation,
-    team_reaction_rows,
 )
 
 _HOSTILE_TOKENS = ("攻击", "威胁", "阻止", "抢", "强闯", "拔剑", "射击", "法术", "attack", "threat", "force", "kill")
@@ -51,6 +59,138 @@ def _submission_display_text(action_text: str, speech_text: str) -> str:
     if speech_text.strip():
         parts.append(f"语言:{speech_text.strip()}")
     return "\n".join(parts).strip() or "玩家等待并观察。"
+
+
+def settlement_actor_type(value: str | None) -> PublicTurnActorType:
+    actor_type = str(value or "npc").strip().lower()
+    if actor_type == "player":
+        return PublicTurnActorType.PLAYER
+    if actor_type == "team":
+        return PublicTurnActorType.TEAM
+    if actor_type == "hidden_npc":
+        return PublicTurnActorType.HIDDEN_NPC
+    if actor_type == "environment":
+        return PublicTurnActorType.ENVIRONMENT
+    return PublicTurnActorType.NPC
+
+
+def build_initiative_order(declarations: list[InitiativeDeclaration]) -> list[PublicTurnInitiativeEntry]:
+    rows: list[PublicTurnInitiativeEntry] = []
+    for index, declaration in enumerate(declarations):
+        revealed = (not declaration.is_hidden) or declaration.revealed_by_declaration
+        if not revealed:
+            continue
+        rows.append(
+            PublicTurnInitiativeEntry(
+                actor_id=declaration.actor_id,
+                actor_name=declaration.actor_name,
+                actor_type=settlement_actor_type(declaration.actor_type),
+                dex_modifier=int(declaration.dex_modifier),
+                roll_d20=int(declaration.roll_d20 or 1),
+                total_initiative=int(declaration.total_initiative or (int(declaration.dex_modifier) + int(declaration.roll_d20 or 0))),
+                revealed=True,
+                order_index=index,
+            )
+        )
+    return rows
+
+
+def _last_nonempty_line(text: str) -> str:
+    parts = [part.strip() for part in str(text or "").splitlines() if part.strip()]
+    if not parts:
+        return ""
+    return parts[-1]
+
+
+def _default_gm_resolution_summary(actor_name: str, action_summary: str, situation_delta: int) -> str:
+    clean_action = " ".join(str(action_summary or "").split())
+    if situation_delta >= 4:
+        return f"{actor_name}的动作立刻撬动了现场，让局势明显朝有利方向偏转。"
+    if situation_delta <= -4:
+        return f"{actor_name}的动作没能稳住场面，反而让现场压力继续堆高。"
+    if clean_action:
+        return f"{actor_name}的动作落地后，现场对“{clean_action[:24]}”给出了直接回应。"
+    return f"{actor_name}的动作落地后，周围人的注意力和站位都发生了变化。"
+
+
+def build_settlement_check(action_result: ActionCheckResponse | None) -> PublicTurnSettlementCheck | None:
+    if action_result is None:
+        return None
+    success = bool(action_result.success)
+    outcome_text = "成功" if success else "失败"
+    if action_result.critical == "critical_success":
+        outcome_text = "大成功"
+    elif action_result.critical == "critical_failure":
+        outcome_text = "大失败"
+    if action_result.resolution_rule == "opposed_actor" and action_result.target_name:
+        comparison_text = (
+            f"{action_result.actor_name} d20({action_result.dice_roll if action_result.dice_roll is not None else '-'}) "
+            f"{action_result.ability_modifier:+d} = {action_result.total_score if action_result.total_score is not None else '-'}；"
+            f"{action_result.target_name} d20({action_result.target_dice_roll if action_result.target_dice_roll is not None else '-'}) "
+            f"{int(action_result.target_ability_modifier or 0):+d} = {action_result.target_total_score if action_result.target_total_score is not None else '-'}。"
+        )
+    else:
+        comparison_text = (
+            f"d20({action_result.dice_roll if action_result.dice_roll is not None else '-'}) "
+            f"{action_result.ability_modifier:+d} = {action_result.total_score if action_result.total_score is not None else '-'} "
+            f"vs DC {action_result.dc}"
+        )
+    return PublicTurnSettlementCheck(
+        resolution_rule=action_result.resolution_rule,
+        ability_used=action_result.ability_used,
+        ability_modifier=int(action_result.ability_modifier),
+        dice_roll=action_result.dice_roll,
+        total_score=action_result.total_score,
+        dc=action_result.dc,
+        target_name=action_result.target_name,
+        target_ability_used=action_result.target_ability_used,
+        target_ability_modifier=action_result.target_ability_modifier,
+        target_dice_roll=action_result.target_dice_roll,
+        target_total_score=action_result.target_total_score,
+        success=success,
+        critical=action_result.critical,
+        comparison_text=comparison_text,
+        outcome_text=outcome_text,
+    )
+
+
+def build_settlement_entry(
+    *,
+    round_state: PublicTurnRound,
+    actor_id: str,
+    actor_name: str,
+    actor_type: str,
+    action_summary: str,
+    speech_text: str,
+    action_result: ActionCheckResponse | None,
+    impact: PublicTurnImpact,
+    gm_resolution_summary: str,
+    opposed_target_name: str | None = None,
+    opposed_target_action: str | None = None,
+    opposed_target_speech: str | None = None,
+) -> PublicTurnSettlementEntry:
+    return PublicTurnSettlementEntry(
+        entry_id=f"{round_state.round_id}_{len(round_state.settlement_entries) + 1}",
+        round_id=round_state.round_id,
+        phase=round_state.phase,
+        order_index=len(round_state.settlement_entries),
+        actor_id=actor_id,
+        actor_name=actor_name,
+        actor_type=settlement_actor_type(actor_type),
+        action_summary=action_summary[:200],
+        speech_text=speech_text[:200],
+        opposed_target_name=opposed_target_name or (action_result.target_name if action_result is not None else None),
+        opposed_target_action=(opposed_target_action or "")[:200] or None,
+        opposed_target_speech=(opposed_target_speech or "")[:200] or None,
+        check=build_settlement_check(action_result),
+        gm_resolution_summary=(gm_resolution_summary or _default_gm_resolution_summary(actor_name, action_summary, impact.situation_delta))[:240],
+        situation_delta=impact.situation_delta,
+        zone_reputation_delta=impact.zone_reputation_delta,
+        relation_deltas=list(impact.relation_deltas),
+        team_affinity_deltas=list(impact.team_affinity_deltas),
+        hp_changes=list(impact.hp_changes),
+        environment_shift=impact.environment_shift,
+    )
 
 
 def _action_type_for_text(text: str) -> str:
@@ -169,18 +309,35 @@ def _player_action_check(
     session_id: str,
     actor_id: str,
     text: str,
+    action_check: PublicTurnPlayerActionCheck | None,
     config: ChatConfig | None,
 ) -> ActionCheckResponse | None:
-    if not _requires_action_check(text):
+    if action_check is None:
+        if not _requires_action_check(text):
+            return None
+        raise ValueError("PUBLIC_TURN_PLAYER_CHECK_REQUIRED")
+    if not action_check.planned_requires_check:
         return None
     return world.action_check(
         ActionCheckRequest(
             session_id=session_id,
             actor_role_id=actor_id,
-            action_type=_action_type_for_text(text),  # type: ignore[arg-type]
+            action_type=action_check.action_type,
             action_prompt=text,
-            allow_backend_roll=True,
+            source_context=action_check.source_context,
+            resolution_rule=action_check.resolution_rule,
+            target_role_id=action_check.target_role_id,
+            target_name=action_check.target_name,
+            target_actor_kind=action_check.target_actor_kind,
+            target_ability_used=action_check.target_ability_used,
+            target_ability_modifier=action_check.target_ability_modifier,
+            forced_dice_roll=action_check.forced_dice_roll,
             resolution_context="embedded",
+            planned_ability_used=action_check.planned_ability_used,
+            planned_dc=action_check.planned_dc,
+            planned_time_spent_min=action_check.planned_time_spent_min,
+            planned_requires_check=action_check.planned_requires_check,
+            planned_check_task=action_check.planned_check_task,
             config=config,
         )
     )
@@ -193,20 +350,27 @@ def resolve_player_submission(
     action_text: str,
     speech_text: str,
     round_state: PublicTurnRound,
+    action_check: PublicTurnPlayerActionCheck | None,
     config: ChatConfig | None,
-) -> tuple[str, list[SceneEvent], PublicTurnImpact]:
+) -> tuple[list[SceneEvent], PublicTurnImpact, PublicTurnSettlementEntry, ActionCheckResponse | None]:
     display_text = _submission_display_text(action_text, speech_text)
     action_result = _player_action_check(
         save,
         session_id=session_id,
         actor_id=save.player_static_data.player_id,
         text=display_text,
+        action_check=action_check,
         config=config,
     )
     situation_delta = max(-20, min(20, _situation_hint_from_text(display_text) + check_bonus(action_result)))
-    narration = display_text
-    if action_result is not None:
-        narration = action_result.narrative or display_text
+    relation_delta = relation_delta_from_result(action_result, situation_delta)
+    gm_resolution_summary = _last_nonempty_line(action_result.narrative) if action_result is not None else ""
+    if not gm_resolution_summary:
+        gm_resolution_summary = _default_gm_resolution_summary(
+            save.player_static_data.name,
+            action_text.strip() or display_text,
+            situation_delta,
+        )
     events: list[SceneEvent] = [
         world._new_scene_event(
             "public_turn_actor_action",
@@ -222,40 +386,76 @@ def resolve_player_submission(
             },
         )
     ]
-    if narration:
+    if gm_resolution_summary:
         events.append(
             world._new_scene_event(
                 "public_turn_actor_resolution",
-                narration,
+                gm_resolution_summary,
                 actor_role_id=save.player_static_data.player_id,
                 actor_name=save.player_static_data.name,
                 metadata={
                     "actor_type": "player",
                     "round_id": round_state.round_id,
                     "phase": round_state.phase.value,
+                    "resolution_rule": (action_result.resolution_rule if action_result is not None else (action_check.resolution_rule if action_check is not None else "static_dc")),
                     "check_outcome": ("none" if action_result is None else ("success" if action_result.success else "failure")),
                 },
             )
         )
-    reactions, reaction_events = apply_player_team_reactions(
+    relation_rows, relation_events = apply_player_npc_reactions(
         save,
         session_id=session_id,
         player_text=display_text,
-        summary=narration,
+        summary=gm_resolution_summary or display_text,
+        relation_delta=relation_delta,
+        target_role_id=(action_result.target_role_id if action_result is not None else (action_check.target_role_id if action_check is not None else None)),
     )
+    team_rows, reaction_events = apply_player_team_reactions(
+        save,
+        session_id=session_id,
+        player_text=display_text,
+        summary=gm_resolution_summary or display_text,
+    )
+    save.game_logs.append(
+        world._new_game_log(
+            session_id,
+            "public_turn_player_action",
+            f"{save.player_static_data.name} 在公开回合中行动：{display_text[:120]}",
+            {
+                "round_id": round_state.round_id,
+                "phase": round_state.phase.value,
+                "situation_delta": situation_delta,
+                "relation_delta": relation_delta,
+            },
+        )
+    )
+    events.extend(relation_events)
     events.extend(reaction_events)
     impact = build_impact(
         actor_id=save.player_static_data.player_id,
         actor_name=save.player_static_data.name,
-        action_summary=display_text,
+        action_summary=action_text.strip() or display_text,
         action_result=action_result,
         situation_delta=situation_delta,
         zone_reputation_delta=reputation_delta_from_situation(situation_delta),
-        team_affinity_deltas=team_reaction_rows(reactions),
+        relation_deltas=relation_rows,
+        team_affinity_deltas=team_rows,
         environment_shift=(2 if any(token in display_text.lower() for token in _DESTRUCTIVE_TOKENS) else 0),
         scene_events=events,
     )
-    return narration, events, impact
+    settlement = build_settlement_entry(
+        round_state=round_state,
+        actor_id=save.player_static_data.player_id,
+        actor_name=save.player_static_data.name,
+        actor_type="player",
+        action_summary=action_text.strip() or display_text,
+        speech_text=speech_text.strip(),
+        action_result=action_result,
+        impact=impact,
+        gm_resolution_summary=gm_resolution_summary,
+        opposed_target_name=(action_result.target_name if action_result is not None else None),
+    )
+    return events, impact, settlement, action_result
 
 
 def _build_reaction_for_actor(
@@ -289,151 +489,167 @@ def _build_reaction_for_actor(
     )
 
 
-def resolve_ai_round(
+def _maybe_build_player_opposed_prompt(
     save: SaveFile,
     *,
-    session_id: str,
-    player_text: str,
-    gm_summary: str,
+    actor: dict[str, object],
+    payload: dict[str, object],
     round_state: PublicTurnRound,
-    exclude_actor_ids: set[str],
-    config: ChatConfig | None,
-) -> tuple[str, list[SceneEvent], list[PublicTurnImpact], PlayerReactionCheck | None]:
-    intent = world._parse_player_intent(player_text)
-    display_text = str(intent.get("display_text") or player_text).strip()
-    addressed_role_name = str(intent.get("addressed_role_name") or "").strip()
-    audience_context = public_scene_runtime.build_public_audience_context(save, intent)
-    scene_context = world._build_scene_context_payload(save, player_text=player_text, gm_narration=gm_summary, recent_turn_count=4)
-    candidates = visible_actor_rows(
-        save,
-        player_text=display_text,
-        addressed_role_name=addressed_role_name,
-        incoming_target_candidates=[str(item) for item in list(intent.get("incoming_target_candidates") or [])],
-        config=config,
+    action_content: str,
+) -> PublicTurnOpposedPrompt | None:
+    actor_id = str(actor.get("actor_id") or "")
+    if not actor_id or actor_id == save.player_static_data.player_id:
+        return None
+    action_type = str(payload.get("action_type") or "check").strip().lower()
+    if action_type == "attack":
+        return None
+    combined = "\n".join(
+        part.strip()
+        for part in (
+            str(payload.get("action_prompt") or ""),
+            str(payload.get("external_action_narration") or ""),
+            str(payload.get("visible_intent") or ""),
+            str(payload.get("specific_threat") or ""),
+            str(payload.get("target_label") or ""),
+        )
+        if str(part or "").strip()
     )
-    active_encounter = public_scene_legacy._active_encounter_for_current_sub_zone(save)
-    zone_metric = zone_metric_service.get_current_zone_metric(save, create=True)
-    reputation_score = getattr(zone_metric, "reputation_score", 50)
-    scene_events: list[SceneEvent] = []
-    impacts: list[PublicTurnImpact] = []
-    result_rows: list[dict[str, object]] = []
-    reputation_delta_total = 0
-    total_situation_delta = 0
-    pending_reaction: PlayerReactionCheck | None = None
-    seen_actor_ids = set(exclude_actor_ids)
-    for actor in candidates:
-        actor_id = str(actor.get("actor_id") or "")
-        if not actor_id or actor_id in seen_actor_ids:
-            continue
-        seen_actor_ids.add(actor_id)
-        payload = public_scene_runtime._ai_actor_action(
-            save,
-            actor,
-            player_text=display_text,
-            gm_summary=gm_summary,
-            scene_context=scene_context,
-            incoming_interaction=None,
-            config=config,
-        ) or public_scene_runtime._fallback_actor_action(
-            save,
-            actor,
-            player_text=display_text,
-            gm_summary=gm_summary,
-            incoming_interaction=None,
-        )
-        if not public_scene_runtime.actor_may_speak_in_public_turn(actor, audience_context):
-            payload["speech_line"] = ""
-            payload["speech_summary"] = ""
-        action_content = public_scene_runtime._compose_actor_content(payload)
-        action_event = world._new_scene_event(
-            "public_turn_actor_action",
-            action_content,
-            actor_role_id=actor_id,
-            actor_name=str(actor.get("name") or ""),
-            metadata={
-                "actor_type": str(actor.get("actor_type") or "npc"),
-                "round_id": round_state.round_id,
-                "phase": round_state.phase.value,
-                "target_label": str(payload.get("target_label") or ""),
-                "specific_threat": str(payload.get("specific_threat") or ""),
-            },
-        )
-        scene_events.append(action_event)
-        public_scene_legacy._append_actor_memory(
-            save,
-            actor,
-            display_text=display_text,
-            action_line=action_content,
-            priority_reason=str(actor.get("priority_reason") or ""),
-        )
-        requires_check = public_scene_runtime.should_force_public_action_check(save, actor, payload, config=config)
-        action_result = None
-        if requires_check:
-            action_result = public_scene_legacy._actor_check(
+    if world._opposed_rule_for_prompt(combined) is None:
+        return None
+    player_name = save.player_static_data.name
+    if not any(marker and marker in combined for marker in (player_name, "玩家", "你", "你们")):
+        return None
+    return PublicTurnOpposedPrompt(
+        check_id=f"{round_state.round_id}_{actor_id}_opposed",
+        round_id=round_state.round_id,
+        phase=round_state.phase,
+        source_actor_id=actor_id,
+        source_actor_name=str(actor.get("name") or ""),
+        source_action_summary=str(payload.get("action_narration") or payload.get("visible_intent") or action_content)[:200],
+        source_speech_text=str(payload.get("speech_line") or payload.get("speech_summary") or "")[:200],
+        target_actor_id=save.player_static_data.player_id,
+        target_actor_name=player_name,
+        stakes_summary=str(payload.get("specific_threat") or action_content)[:240],
+    )
+
+
+def _finalize_ai_actor_turn(
+    save: SaveFile,
+    *,
+    actor: dict[str, object],
+    payload: dict[str, object],
+    round_state: PublicTurnRound,
+    action_content: str,
+    action_result: ActionCheckResponse | None,
+    reputation_score: int,
+    base_events: list[SceneEvent],
+    opposed_target_name: str | None = None,
+    opposed_target_action: str | None = None,
+    opposed_target_speech: str | None = None,
+) -> tuple[list[SceneEvent], PublicTurnImpact, PublicTurnSettlementEntry, int]:
+    actor_id = str(actor.get("actor_id") or "")
+    events = list(base_events)
+    situation_delta = public_scene_legacy._clamp(int(payload.get("situation_delta_hint") or 0) + check_bonus(action_result), -20, 20)
+    reputation_delta = reputation_delta_from_situation(situation_delta)
+    relation_rows: list[dict[str, Any]] = []
+    team_rows: list[dict[str, Any]] = []
+    role = actor.get("role")
+    if isinstance(role, NpcRoleCard):
+        before_tag = next((item.relation_tag for item in role.relations if item.target_role_id == save.player_static_data.player_id), "neutral")
+        relation_delta = relation_delta_from_result(action_result, situation_delta)
+        applied = 0
+        if relation_delta != 0:
+            applied = public_scene_legacy._apply_actor_relation_delta(
                 save,
-                actor_id,
-                action_type=str(payload.get("action_type") or "check"),
-                action_prompt=str(payload.get("action_prompt") or action_content),
-                config=config,
+                role,
+                str(actor.get("actor_type") or "npc"),
+                relation_delta,
+                reputation_score,
             )
-        situation_delta = public_scene_legacy._clamp(int(payload.get("situation_delta_hint") or 0) + check_bonus(action_result), -20, 20)
-        total_situation_delta += situation_delta
-        reputation_delta = reputation_delta_from_situation(situation_delta)
-        reputation_delta_total += reputation_delta
-        role = actor.get("role")
-        relation_rows: list[dict[str, Any]] = []
-        team_rows: list[dict[str, Any]] = []
-        if isinstance(role, NpcRoleCard):
+        after_tag = next((item.relation_tag for item in role.relations if item.target_role_id == save.player_static_data.player_id), before_tag)
+        if applied or before_tag != after_tag:
+            relation_rows.append(
+                {
+                    "role_id": role.role_id,
+                    "name": role.name,
+                    "before_tag": before_tag,
+                    "after_tag": after_tag,
+                    "relation_delta": applied,
+                    "reaction_text": "",
+                }
+            )
+            events.append(
+                world._new_scene_event(
+                    "public_turn_relation_update",
+                    f"{role.name} 对你的态度发生变化。",
+                    actor_role_id=role.role_id,
+                    actor_name=role.name,
+                    metadata={
+                        "role_id": role.role_id,
+                        "name": role.name,
+                        "before_tag": before_tag,
+                        "after_tag": after_tag,
+                        "relation_delta": applied,
+                        "reaction_text": "",
+                    },
+                )
+            )
+    if str(actor.get("actor_type") or "npc") == "team":
+        member = next((item for item in getattr(save.team_state, "members", []) if item.role_id == actor_id), None)
+        if member is not None:
+            before_affinity = int(member.affinity)
+            before_trust = int(member.trust)
             relation_delta = relation_delta_from_result(action_result, situation_delta)
-            applied = 0
-            if relation_delta != 0:
-                applied = public_scene_legacy._apply_actor_relation_delta(save, role, str(actor.get("actor_type") or "npc"), relation_delta, reputation_score)
-            if applied:
-                relation_rows.append({"target_role_id": save.player_static_data.player_id, "delta": applied})
-                scene_events.append(
+            if relation_delta:
+                member.affinity = public_scene_legacy._clamp(member.affinity + relation_delta * 3, 0, 100)
+                member.trust = public_scene_legacy._clamp(member.trust + relation_delta * 2, 0, 100)
+            affinity_after = int(member.affinity)
+            trust_after = int(member.trust)
+            affinity_delta = affinity_after - before_affinity
+            trust_delta = trust_after - before_trust
+            if affinity_delta or trust_delta:
+                team_rows.append(
+                    {
+                        "member_role_id": actor_id,
+                        "name": str(actor.get("name") or ""),
+                        "affinity_before": before_affinity,
+                        "affinity_after": affinity_after,
+                        "affinity_delta": affinity_delta,
+                        "trust_before": before_trust,
+                        "trust_after": trust_after,
+                        "trust_delta": trust_delta,
+                        "reaction_text": "",
+                    }
+                )
+                events.append(
                     world._new_scene_event(
-                        "public_turn_relation_update",
-                        f"{role.name} 对你的态度发生变化。",
-                        actor_role_id=role.role_id,
-                        actor_name=role.name,
-                        metadata={"delta": applied, "target_role_id": save.player_static_data.player_id},
+                        "public_turn_team_update",
+                        f"{actor.get('name')}: 好感{affinity_delta:+d} / 信任{trust_delta:+d}",
+                        actor_role_id=actor_id,
+                        actor_name=str(actor.get("name") or ""),
+                        metadata={
+                            "member_role_id": actor_id,
+                            "name": str(actor.get("name") or ""),
+                            "affinity_before": before_affinity,
+                            "affinity_after": affinity_after,
+                            "affinity_delta": affinity_delta,
+                            "trust_before": before_trust,
+                            "trust_after": trust_after,
+                            "trust_delta": trust_delta,
+                            "reaction_text": "",
+                        },
                     )
                 )
-        if str(actor.get("actor_type") or "npc") == "team":
-            member = next((item for item in getattr(save.team_state, "members", []) if item.role_id == actor_id), None)
-            if member is not None:
-                before_affinity = int(member.affinity)
-                before_trust = int(member.trust)
-                # A team member's own success/failure should also shift affinity/trust slightly.
-                relation_delta = relation_delta_from_result(action_result, situation_delta)
-                if relation_delta:
-                    member.affinity = public_scene_legacy._clamp(member.affinity + relation_delta * 3, 0, 100)
-                    member.trust = public_scene_legacy._clamp(member.trust + relation_delta * 2, 0, 100)
-                affinity_delta = int(member.affinity) - before_affinity
-                trust_delta = int(member.trust) - before_trust
-                if affinity_delta or trust_delta:
-                    team_rows.append(
-                        {
-                            "member_role_id": actor_id,
-                            "member_name": str(actor.get("name") or ""),
-                            "affinity_delta": affinity_delta,
-                            "trust_delta": trust_delta,
-                        }
-                    )
-                    scene_events.append(
-                        world._new_scene_event(
-                            "public_turn_team_update",
-                            f"{actor.get('name')}: 好感{affinity_delta:+d} / 信任{trust_delta:+d}",
-                            actor_role_id=actor_id,
-                            actor_name=str(actor.get("name") or ""),
-                            metadata={"affinity_delta": affinity_delta, "trust_delta": trust_delta},
-                        )
-                    )
-        resolution_text = (
-            (action_result.narrative if action_result is not None else "")
-            or f"{actor.get('name')} 把动作落到了眼前局面上。"
+    resolution_text = (action_result.narrative if action_result is not None else "") or f"{actor.get('name')} 把动作落到了眼前局面上。"
+    resolution_text = _last_nonempty_line(resolution_text)
+    if not resolution_text:
+        resolution_text = _default_gm_resolution_summary(
+            str(actor.get("name") or "在场角色"),
+            str(payload.get("action_narration") or payload.get("visible_intent") or action_content),
+            situation_delta,
         )
-        resolution_event = world._new_scene_event(
+    events.append(
+        world._new_scene_event(
             "public_turn_actor_resolution",
             resolution_text,
             actor_role_id=actor_id,
@@ -443,57 +659,448 @@ def resolve_ai_round(
                 "round_id": round_state.round_id,
                 "phase": round_state.phase.value,
                 "situation_delta": situation_delta,
+                "reputation_delta": reputation_delta,
+                "check_outcome": ("none" if action_result is None else ("success" if action_result.success else "failure")),
             },
         )
-        scene_events.append(resolution_event)
-        impacts.append(
-            build_impact(
-                actor_id=actor_id,
-                actor_name=str(actor.get("name") or ""),
-                action_summary=action_content,
-                action_result=action_result,
-                situation_delta=situation_delta,
-                zone_reputation_delta=reputation_delta,
-                relation_deltas=relation_rows,
-                team_affinity_deltas=team_rows,
-                environment_shift=(2 if any(token in str(payload.get("specific_threat") or "") for token in _DESTRUCTIVE_TOKENS) else 0),
-                scene_events=[action_event, resolution_event],
+    )
+    impact = build_impact(
+        actor_id=actor_id,
+        actor_name=str(actor.get("name") or ""),
+        action_summary=str(payload.get("action_narration") or payload.get("visible_intent") or action_content),
+        action_result=action_result,
+        situation_delta=situation_delta,
+        zone_reputation_delta=reputation_delta,
+        relation_deltas=relation_rows,
+        team_affinity_deltas=team_rows,
+        environment_shift=(2 if any(token in str(payload.get("specific_threat") or "") for token in _DESTRUCTIVE_TOKENS) else 0),
+        scene_events=events,
+    )
+    settlement = build_settlement_entry(
+        round_state=round_state,
+        actor_id=actor_id,
+        actor_name=str(actor.get("name") or ""),
+        actor_type=str(actor.get("actor_type") or "npc"),
+        action_summary=str(payload.get("action_narration") or payload.get("visible_intent") or action_content),
+        speech_text=str(payload.get("speech_line") or payload.get("speech_summary") or ""),
+        action_result=action_result,
+        impact=impact,
+        gm_resolution_summary=resolution_text,
+        opposed_target_name=opposed_target_name or (action_result.target_name if action_result is not None else None),
+        opposed_target_action=opposed_target_action,
+        opposed_target_speech=opposed_target_speech,
+    )
+    return events, impact, settlement, situation_delta
+
+
+def resolve_ai_actor_turn(
+    save: SaveFile,
+    *,
+    actor: dict[str, object],
+    player_text: str,
+    gm_summary: str,
+    round_state: PublicTurnRound,
+    scene_context: dict[str, object],
+    audience_context: dict[str, object],
+    reputation_score: int,
+    config: ChatConfig | None,
+) -> tuple[
+    list[SceneEvent],
+    PublicTurnImpact | None,
+    PublicTurnSettlementEntry | None,
+    PlayerReactionCheck | None,
+    PublicTurnOpposedPrompt | None,
+]:
+    actor_id = str(actor.get("actor_id") or "")
+    payload = public_scene_runtime._ai_actor_action(
+        save,
+        actor,
+        player_text=player_text,
+        gm_summary=gm_summary,
+        scene_context=scene_context,
+        incoming_interaction=None,
+        config=config,
+    ) or public_scene_runtime._fallback_actor_action(
+        save,
+        actor,
+        player_text=player_text,
+        gm_summary=gm_summary,
+        incoming_interaction=None,
+    )
+    if not public_scene_runtime.actor_may_speak_in_public_turn(actor, audience_context):
+        payload["speech_line"] = ""
+        payload["speech_summary"] = ""
+    action_content = public_scene_runtime._compose_actor_content(payload)
+    action_event = world._new_scene_event(
+        "public_turn_actor_action",
+        action_content,
+        actor_role_id=actor_id,
+        actor_name=str(actor.get("name") or ""),
+        metadata={
+            "actor_type": str(actor.get("actor_type") or "npc"),
+            "round_id": round_state.round_id,
+            "phase": round_state.phase.value,
+            "target_label": str(payload.get("target_label") or ""),
+            "specific_threat": str(payload.get("specific_threat") or ""),
+        },
+    )
+    events: list[SceneEvent] = [action_event]
+    public_scene_legacy._append_actor_memory(
+        save,
+        actor,
+        display_text=player_text,
+        action_line=action_content,
+        priority_reason=str(actor.get("priority_reason") or ""),
+    )
+    opposed_prompt = _maybe_build_player_opposed_prompt(
+        save,
+        actor=actor,
+        payload=payload,
+        round_state=round_state,
+        action_content=action_content,
+    )
+    if opposed_prompt is not None:
+        return events, None, None, None, opposed_prompt
+    requires_check = public_scene_runtime.should_force_public_action_check(save, actor, payload, config=config)
+    action_result = None
+    if requires_check:
+        action_result = public_scene_legacy._actor_check(
+            save,
+            actor_id,
+            action_type=str(payload.get("action_type") or "check"),
+            action_prompt=str(payload.get("action_prompt") or action_content),
+            config=config,
+        )
+    events, impact, settlement, situation_delta = _finalize_ai_actor_turn(
+        save,
+        actor=actor,
+        payload=payload,
+        round_state=round_state,
+        action_content=action_content,
+        action_result=action_result,
+        reputation_score=reputation_score,
+        base_events=events,
+    )
+    pending_reaction = _build_reaction_for_actor(actor, payload=payload, situation_delta=situation_delta)
+    return events, impact, settlement, pending_reaction, None
+    situation_delta = public_scene_legacy._clamp(int(payload.get("situation_delta_hint") or 0) + check_bonus(action_result), -20, 20)
+    reputation_delta = reputation_delta_from_situation(situation_delta)
+    relation_rows: list[dict[str, Any]] = []
+    team_rows: list[dict[str, Any]] = []
+    role = actor.get("role")
+    if isinstance(role, NpcRoleCard):
+        before_tag = next((item.relation_tag for item in role.relations if item.target_role_id == save.player_static_data.player_id), "neutral")
+        relation_delta = relation_delta_from_result(action_result, situation_delta)
+        applied = 0
+        if relation_delta != 0:
+            applied = public_scene_legacy._apply_actor_relation_delta(
+                save,
+                role,
+                str(actor.get("actor_type") or "npc"),
+                relation_delta,
+                reputation_score,
             )
-        )
-        result_rows.append(
-            {
-                "actor_name": str(actor.get("name") or ""),
-                "resolution_line": resolution_text[:220],
-                "situation_delta": situation_delta,
-            }
-        )
-        pending_reaction = _build_reaction_for_actor(actor, payload=payload, situation_delta=situation_delta)
-        if pending_reaction is not None:
-            break
-    narration = "\n".join(str(row.get("resolution_line") or "") for row in result_rows if str(row.get("resolution_line") or "").strip()).strip()
-    if not narration:
-        narration = "公开回合中的其他参与者暂时没有进一步动作。"
-    if pending_reaction is None:
-        if active_encounter is not None and total_situation_delta:
-            scene_events.extend(
-                apply_active_encounter_situation_delta_in_save(
-                    save,
-                    session_id=session_id,
-                    delta=total_situation_delta,
-                    summary=narration,
-                    actor_name="公开回合",
+        after_tag = next((item.relation_tag for item in role.relations if item.target_role_id == save.player_static_data.player_id), before_tag)
+        if applied or before_tag != after_tag:
+            relation_rows.append(
+                {
+                    "role_id": role.role_id,
+                    "name": role.name,
+                    "before_tag": before_tag,
+                    "after_tag": after_tag,
+                    "relation_delta": applied,
+                    "reaction_text": "",
+                }
+            )
+            events.append(
+                world._new_scene_event(
+                    "public_turn_relation_update",
+                    f"{role.name} 对你的态度发生变化。",
+                    actor_role_id=role.role_id,
+                    actor_name=role.name,
+                    metadata={
+                        "role_id": role.role_id,
+                        "name": role.name,
+                        "before_tag": before_tag,
+                        "after_tag": after_tag,
+                        "relation_delta": applied,
+                        "reaction_text": "",
+                    },
                 )
             )
-        _, rep_event = apply_round_reputation(
-            save,
-            session_id=session_id,
-            delta=reputation_delta_total,
-            reason="公开回合结算",
-            actor_name="公开回合",
+    if str(actor.get("actor_type") or "npc") == "team":
+        member = next((item for item in getattr(save.team_state, "members", []) if item.role_id == actor_id), None)
+        if member is not None:
+            before_affinity = int(member.affinity)
+            before_trust = int(member.trust)
+            relation_delta = relation_delta_from_result(action_result, situation_delta)
+            if relation_delta:
+                member.affinity = public_scene_legacy._clamp(member.affinity + relation_delta * 3, 0, 100)
+                member.trust = public_scene_legacy._clamp(member.trust + relation_delta * 2, 0, 100)
+            affinity_after = int(member.affinity)
+            trust_after = int(member.trust)
+            affinity_delta = affinity_after - before_affinity
+            trust_delta = trust_after - before_trust
+            if affinity_delta or trust_delta:
+                team_rows.append(
+                    {
+                        "member_role_id": actor_id,
+                        "name": str(actor.get("name") or ""),
+                        "affinity_before": before_affinity,
+                        "affinity_after": affinity_after,
+                        "affinity_delta": affinity_delta,
+                        "trust_before": before_trust,
+                        "trust_after": trust_after,
+                        "trust_delta": trust_delta,
+                        "reaction_text": "",
+                    }
+                )
+                events.append(
+                    world._new_scene_event(
+                        "public_turn_team_update",
+                        f"{actor.get('name')}: 好感{affinity_delta:+d} / 信任{trust_delta:+d}",
+                        actor_role_id=actor_id,
+                        actor_name=str(actor.get("name") or ""),
+                        metadata={
+                            "member_role_id": actor_id,
+                            "name": str(actor.get("name") or ""),
+                            "affinity_before": before_affinity,
+                            "affinity_after": affinity_after,
+                            "affinity_delta": affinity_delta,
+                            "trust_before": before_trust,
+                            "trust_after": trust_after,
+                            "trust_delta": trust_delta,
+                            "reaction_text": "",
+                        },
+                    )
+                )
+    resolution_text = (action_result.narrative if action_result is not None else "") or f"{actor.get('name')} 把动作落到了眼前局面上。"
+    resolution_text = _last_nonempty_line(resolution_text)
+    if not resolution_text:
+        resolution_text = _default_gm_resolution_summary(
+            str(actor.get("name") or "在场角色"),
+            str(payload.get("action_narration") or payload.get("visible_intent") or action_content),
+            situation_delta,
         )
-        if rep_event is not None:
-            scene_events.append(rep_event)
-    return narration, scene_events, impacts, pending_reaction
+    resolution_event = world._new_scene_event(
+        "public_turn_actor_resolution",
+        resolution_text,
+        actor_role_id=actor_id,
+        actor_name=str(actor.get("name") or ""),
+        metadata={
+            "actor_type": str(actor.get("actor_type") or "npc"),
+            "round_id": round_state.round_id,
+            "phase": round_state.phase.value,
+            "situation_delta": situation_delta,
+            "reputation_delta": reputation_delta,
+            "check_outcome": ("none" if action_result is None else ("success" if action_result.success else "failure")),
+        },
+    )
+    events.append(resolution_event)
+    impact = build_impact(
+        actor_id=actor_id,
+        actor_name=str(actor.get("name") or ""),
+        action_summary=str(payload.get("action_narration") or payload.get("visible_intent") or action_content),
+        action_result=action_result,
+        situation_delta=situation_delta,
+        zone_reputation_delta=reputation_delta,
+        relation_deltas=relation_rows,
+        team_affinity_deltas=team_rows,
+        environment_shift=(2 if any(token in str(payload.get("specific_threat") or "") for token in _DESTRUCTIVE_TOKENS) else 0),
+        scene_events=events,
+    )
+    settlement = build_settlement_entry(
+        round_state=round_state,
+        actor_id=actor_id,
+        actor_name=str(actor.get("name") or ""),
+        actor_type=str(actor.get("actor_type") or "npc"),
+        action_summary=str(payload.get("action_narration") or payload.get("visible_intent") or action_content),
+        speech_text=str(payload.get("speech_line") or payload.get("speech_summary") or ""),
+        action_result=action_result,
+        impact=impact,
+        gm_resolution_summary=resolution_text,
+        opposed_target_name=(action_result.target_name if action_result is not None else None),
+    )
+    pending_reaction = _build_reaction_for_actor(actor, payload=payload, situation_delta=situation_delta)
+    return events, impact, settlement, pending_reaction
+
+
+def resolve_ai_round(
+    save: SaveFile,
+    *,
+    session_id: str,
+    player_text: str,
+    gm_summary: str,
+    round_state: PublicTurnRound,
+    exclude_actor_ids: set[str],
+    config: ChatConfig | None,
+) -> tuple[
+    list[SceneEvent],
+    list[PublicTurnImpact],
+    list[PublicTurnSettlementEntry],
+    PlayerReactionCheck | None,
+    PublicTurnOpposedPrompt | None,
+]:
+    intent = world._parse_player_intent(player_text)
+    display_text = str(intent.get("display_text") or player_text).strip()
+    addressed_role_name = str(intent.get("addressed_role_name") or "").strip()
+    audience_context = public_scene_runtime.build_public_audience_context(save, intent)
+    scene_context = world._build_scene_context_payload(save, player_text=player_text, gm_narration=gm_summary, recent_turn_count=4)
+    candidates = public_turn_normal_actor_rows(
+        save,
+        player_text=display_text,
+        addressed_role_name=addressed_role_name,
+        incoming_target_candidates=[str(item) for item in list(intent.get("incoming_target_candidates") or [])],
+        config=config,
+    )
+    zone_metric = zone_metric_service.get_current_zone_metric(save, create=True)
+    reputation_score = getattr(zone_metric, "reputation_score", 50)
+    scene_events: list[SceneEvent] = []
+    impacts: list[PublicTurnImpact] = []
+    settlements: list[PublicTurnSettlementEntry] = []
+    pending_reaction: PlayerReactionCheck | None = None
+    opposed_prompt: PublicTurnOpposedPrompt | None = None
+    seen_actor_ids = set(exclude_actor_ids)
+    for actor in candidates:
+        actor_id = str(actor.get("actor_id") or "")
+        if not actor_id or actor_id in seen_actor_ids:
+            continue
+        seen_actor_ids.add(actor_id)
+        actor_events, actor_impact, settlement, pending_reaction, opposed_prompt = resolve_ai_actor_turn(
+            save,
+            actor=actor,
+            player_text=display_text,
+            gm_summary=gm_summary,
+            round_state=round_state,
+            scene_context=scene_context,
+            audience_context=audience_context,
+            reputation_score=reputation_score,
+            config=config,
+        )
+        scene_events.extend(actor_events)
+        if actor_impact is not None:
+            impacts.append(actor_impact)
+        if settlement is not None:
+            settlements.append(settlement)
+        if opposed_prompt is not None:
+            break
+        if pending_reaction is not None:
+            break
+    return scene_events, impacts, settlements, pending_reaction, opposed_prompt
+
+
+def resolve_opposed_prompt_submission(
+    save: SaveFile,
+    *,
+    session_id: str,
+    prompt: PublicTurnOpposedPrompt,
+    target_action_summary: str,
+    target_speech_text: str,
+    forced_dice_roll: int,
+    round_state: PublicTurnRound,
+    config: ChatConfig | None,
+) -> tuple[list[SceneEvent], PublicTurnImpact, PublicTurnSettlementEntry, ActionCheckResponse]:
+    plan = world.plan_public_turn_opposed_exchange(
+        PublicTurnOpposedPlanRequest(
+            session_id=session_id,
+            round_id=prompt.round_id,
+            check_id=prompt.check_id,
+            source_actor_id=prompt.source_actor_id,
+            target_actor_id=prompt.target_actor_id,
+            source_action_summary=prompt.source_action_summary,
+            source_speech_text=prompt.source_speech_text,
+            target_action_summary=target_action_summary,
+            target_speech_text=target_speech_text,
+            config=config,
+        )
+    )
+    source_role = next((item for item in save.role_pool if item.role_id == prompt.source_actor_id), None)
+    actor_type = "team" if any(item.role_id == prompt.source_actor_id for item in getattr(save.team_state, "members", [])) else "npc"
+    actor = {
+        "actor_id": prompt.source_actor_id,
+        "name": prompt.source_actor_name,
+        "actor_type": actor_type,
+        "role": source_role,
+    }
+    action_content = "\n".join(
+        part
+        for part in (prompt.source_action_summary.strip(), prompt.source_speech_text.strip())
+        if part
+    ).strip() or prompt.source_action_summary.strip() or prompt.stakes_summary
+    action_result = world.action_check(
+        ActionCheckRequest(
+            session_id=session_id,
+            actor_role_id=prompt.source_actor_id,
+            action_type="check",
+            action_prompt="\n".join(
+                part
+                for part in (
+                    prompt.source_action_summary.strip(),
+                    prompt.source_speech_text.strip(),
+                    target_action_summary.strip(),
+                    target_speech_text.strip(),
+                )
+                if part
+            ).strip() or prompt.source_action_summary.strip() or prompt.stakes_summary,
+            source_context="public_turn",
+            resolution_rule="opposed_actor",
+            target_role_id=prompt.target_actor_id,
+            target_name=prompt.target_actor_name,
+            target_actor_kind=("player" if prompt.target_actor_id == save.player_static_data.player_id else "npc"),
+            target_ability_used=plan.target_ability_used,
+            target_ability_modifier=plan.target_ability_modifier,
+            forced_target_dice_roll=forced_dice_roll,
+            allow_backend_roll=True,
+            resolution_context="embedded",
+            planned_ability_used=plan.source_ability_used,
+            planned_dc=max(5, min(30, 10 + int(plan.target_ability_modifier))),
+            planned_time_spent_min=1,
+            planned_requires_check=True,
+            planned_check_task=plan.check_task,
+            config=config,
+        )
+    )
+    base_events = [
+        world._new_scene_event(
+            "public_turn_actor_action",
+            action_content,
+            actor_role_id=prompt.source_actor_id,
+            actor_name=prompt.source_actor_name,
+            metadata={
+                "actor_type": actor_type,
+                "round_id": round_state.round_id,
+                "phase": round_state.phase.value,
+                "target_label": prompt.target_actor_name,
+                "specific_threat": prompt.stakes_summary,
+            },
+        )
+    ]
+    zone_metric = zone_metric_service.get_current_zone_metric(save, create=True)
+    reputation_score = getattr(zone_metric, "reputation_score", 50)
+    payload = {
+        "action_narration": prompt.source_action_summary,
+        "visible_intent": prompt.source_action_summary,
+        "speech_line": prompt.source_speech_text,
+        "speech_summary": prompt.source_speech_text,
+        "specific_threat": prompt.stakes_summary,
+        "situation_delta_hint": _situation_hint_from_text(
+            "\n".join(part for part in (prompt.source_action_summary, target_action_summary) if part.strip())
+        ),
+    }
+    events, impact, settlement, _ = _finalize_ai_actor_turn(
+        save,
+        actor=actor,
+        payload=payload,
+        round_state=round_state,
+        action_content=action_content,
+        action_result=action_result,
+        reputation_score=reputation_score,
+        base_events=base_events,
+        opposed_target_name=prompt.target_actor_name,
+        opposed_target_action=target_action_summary,
+        opposed_target_speech=target_speech_text,
+    )
+    return events, impact, settlement, action_result
 
 
 def resolve_situation(
@@ -505,6 +1112,7 @@ def resolve_situation(
 ) -> tuple[str, list[SceneEvent], EnvironmentRiskLevel]:
     total_environment_shift = sum(int(item.environment_shift or 0) for item in impacts)
     total_situation_delta = sum(int(item.situation_delta or 0) for item in impacts)
+    total_reputation_delta = sum(int(item.zone_reputation_delta or 0) for item in impacts)
     destructive_failure = total_environment_shift > 0 and total_situation_delta < 0
     risk = next_environment_risk(
         round_state.environment_risk_level,
@@ -528,4 +1136,38 @@ def resolve_situation(
             },
         )
     ]
+    active_encounter = public_scene_legacy._active_encounter_for_current_sub_zone(save)
+    if active_encounter is not None and total_situation_delta:
+        events.extend(
+            apply_active_encounter_situation_delta_in_save(
+                save,
+                session_id=session_id,
+                delta=total_situation_delta,
+                summary=narration,
+                actor_name="公开回合",
+            )
+        )
+    _, reputation_event = apply_round_reputation(
+        save,
+        session_id=session_id,
+        delta=total_reputation_delta,
+        reason="公开回合结算",
+        actor_name="公开回合",
+    )
+    if reputation_event is not None:
+        events.append(reputation_event)
+    if risk != round_state.environment_risk_level or total_environment_shift:
+        events.append(
+            world._new_scene_event(
+                "public_turn_environment_update",
+                f"环境风险由 {round_state.environment_risk_level.value} 变为 {risk.value}。",
+                actor_name="GM",
+                metadata={
+                    "round_id": round_state.round_id,
+                    "environment_shift": total_environment_shift,
+                    "environment_risk_level_before": round_state.environment_risk_level.value,
+                    "environment_risk_level_after": risk.value,
+                },
+            )
+        )
     return narration, events, risk

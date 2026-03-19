@@ -9,7 +9,7 @@ import json
 from math import ceil, sqrt
 import random
 import re
-from typing import Iterator
+from typing import Iterator, Literal
 
 from openai import OpenAI
 
@@ -92,6 +92,9 @@ from app.models.schemas import (
     RenderNode,
     RenderSubNode,
     PublicTurnState,
+    PublicTurnPresentation,
+    PublicTurnOpposedPlanRequest,
+    PublicTurnOpposedPlanResponse,
     SaveFile,
     SceneEvent,
     SceneInteractable,
@@ -268,6 +271,8 @@ def _scene_event_to_turn_event(event: SceneEvent) -> SubZoneChatTurnEvent:
         event_kind = "public_turn_situation"
     elif event.kind == "public_turn_round_end":
         event_kind = "public_turn_round_end"
+    elif event.kind == "public_turn_gm_push":
+        event_kind = "public_turn_gm_push"
     elif event.kind == "public_turn_relation_update":
         actor_type = "npc"
         event_kind = "public_turn_relation_update"
@@ -331,6 +336,11 @@ def _serialize_recent_sub_zone_turns(sub_zone: AreaSubZone | None, *, limit: int
                 "public_round_id": turn.public_round_id,
                 "public_round_number": turn.public_round_number,
                 "public_phase": (turn.public_phase.value if turn.public_phase is not None else None),
+                "public_turn_presentation": (
+                    turn.public_turn_presentation.model_dump(mode="json")
+                    if turn.public_turn_presentation is not None
+                    else None
+                ),
                 "world_time_text": turn.world_time_text,
                 "player_action": turn.player_action,
                 "player_speech": turn.player_speech,
@@ -464,6 +474,7 @@ def _record_sub_zone_chat_turn(
     public_round_id: str | None = None,
     public_round_number: int | None = None,
     public_phase=None,
+    public_turn_presentation: PublicTurnPresentation | None = None,
 ) -> str | None:
     sub_zone = _current_sub_zone(save)
     context = _ensure_sub_zone_chat_context(sub_zone)
@@ -487,6 +498,7 @@ def _record_sub_zone_chat_turn(
         active_encounter_id=(active_encounter.encounter_id if active_encounter is not None else None),
         active_encounter_title=(active_encounter.title if active_encounter is not None else ""),
         active_encounter_status=(active_encounter.status if active_encounter is not None else ""),
+        public_turn_presentation=public_turn_presentation.model_copy(deep=True) if public_turn_presentation is not None else None,
         events=[_scene_event_to_turn_event(event) for event in events[:_SUB_ZONE_CHAT_EVENT_LIMIT]],
     )
     context.recent_turns.append(turn)
@@ -5133,6 +5145,275 @@ def _fallback_action_plan(action_type: str, action_prompt: str) -> dict[str, int
     )
 
 
+_OPPOSED_STRENGTH_TOKENS = ("抱起", "摔", "推开", "按住", "压制", "拖走", "拉拽", "擒抱", "grapple", "slam", "shove", "restrain", "drag", "tackle")
+_OPPOSED_DEXTERITY_TOKENS = ("抢夺", "缴械", "夺下", "抢走", "disarm", "snatch")
+
+
+def _current_team_roles(save: SaveFile) -> list[NpcRoleCard]:
+    role_ids = {item.role_id for item in getattr(save.team_state, "members", [])}
+    return [role for role in save.role_pool if role.role_id in role_ids]
+
+
+def _extract_target_role_id(action_prompt: str) -> str | None:
+    lowered = action_prompt.lower()
+    for marker in ("npc_id=", "target_role_id="):
+        if marker not in lowered:
+            continue
+        start = lowered.index(marker) + len(marker)
+        value = action_prompt[start:].split(";", 1)[0].split("\n", 1)[0].strip()
+        if value:
+            return value
+    return None
+
+
+def _extract_prompt_value(action_prompt: str, marker: str) -> str:
+    lowered = action_prompt.lower()
+    marker_lower = marker.lower()
+    if marker_lower not in lowered:
+        return ""
+    start = lowered.index(marker_lower) + len(marker_lower)
+    return action_prompt[start:].split(";", 1)[0].split("\n", 1)[0].strip()
+
+
+def _opposed_rule_for_prompt(action_prompt: str) -> tuple[str, str] | None:
+    lowered = (action_prompt or "").lower()
+    if any(token.lower() in lowered for token in _OPPOSED_STRENGTH_TOKENS):
+        return "strength", "max_strength_or_dexterity"
+    if any(token.lower() in lowered for token in _OPPOSED_DEXTERITY_TOKENS):
+        return "dexterity", "max_strength_or_dexterity"
+    return None
+
+
+def _choose_opposed_target_ability(profile: PlayerStaticData, mode: str) -> tuple[str, int]:
+    if mode == "max_strength_or_dexterity":
+        strength_mod = int(profile.dnd5e_sheet.current_ability_modifiers.strength)
+        dexterity_mod = int(profile.dnd5e_sheet.current_ability_modifiers.dexterity)
+        if dexterity_mod > strength_mod:
+            return "dexterity", dexterity_mod
+        return "strength", strength_mod
+    ability = "strength"
+    return ability, int(getattr(profile.dnd5e_sheet.current_ability_modifiers, ability))
+
+
+def _public_turn_target_candidates(save: SaveFile) -> list[NpcRoleCard]:
+    current_sub_zone_id = save.area_snapshot.current_sub_zone_id
+    visible_roles = _visible_public_roles(save)
+    team_roles = [role for role in _current_team_roles(save) if role.sub_zone_id == current_sub_zone_id]
+    seen: set[str] = set()
+    ordered: list[NpcRoleCard] = []
+    for role in [*visible_roles, *team_roles]:
+        if role.role_id in seen:
+            continue
+        seen.add(role.role_id)
+        ordered.append(role)
+    return ordered
+
+
+def _public_turn_actor_candidates(
+    save: SaveFile,
+    *,
+    include_player: bool,
+    exclude_actor_id: str | None = None,
+) -> list[dict[str, object]]:
+    current_sub_zone_id = save.area_snapshot.current_sub_zone_id
+    visible_roles = _visible_public_roles(save)
+    team_roles = [role for role in _current_team_roles(save) if role.sub_zone_id == current_sub_zone_id]
+    seen: set[str] = set()
+    ordered: list[dict[str, object]] = []
+    if include_player and save.player_static_data.player_id != exclude_actor_id:
+        ordered.append(
+            {
+                "actor_id": save.player_static_data.player_id,
+                "name": save.player_static_data.name,
+                "actor_kind": "player",
+            }
+        )
+        seen.add(save.player_static_data.player_id)
+    for role in [*visible_roles, *team_roles]:
+        if role.role_id == exclude_actor_id or role.role_id in seen:
+            continue
+        seen.add(role.role_id)
+        ordered.append(
+            {
+                "actor_id": role.role_id,
+                "name": role.name,
+                "actor_kind": "npc",
+                "role": role,
+            }
+        )
+    return ordered
+
+
+def _resolve_public_turn_opposed_actor_target(
+    save: SaveFile,
+    action_prompt: str,
+    *,
+    actor_role_id: str | None = None,
+    include_player: bool = True,
+    addressed_role_name: str = "",
+) -> dict[str, object] | None:
+    explicit_role_id = _extract_target_role_id(action_prompt)
+    if explicit_role_id:
+        if explicit_role_id == save.player_static_data.player_id:
+            return {
+                "actor_id": save.player_static_data.player_id,
+                "name": save.player_static_data.name,
+                "actor_kind": "player",
+            }
+        role = next((item for item in save.role_pool if item.role_id == explicit_role_id), None)
+        if role is not None:
+            return {"actor_id": role.role_id, "name": role.name, "actor_kind": "npc", "role": role}
+
+    candidates = _public_turn_actor_candidates(
+        save,
+        include_player=include_player,
+        exclude_actor_id=actor_role_id,
+    )
+    if not candidates:
+        return None
+
+    target_value = _extract_prompt_value(action_prompt, "target=")
+    search_text = "\n".join(
+        part
+        for part in (
+            addressed_role_name.strip(),
+            target_value,
+            _humanize_action_prompt(action_prompt),
+            action_prompt,
+        )
+        if part.strip()
+    )
+    normalized_prompt = _humanize_action_prompt(action_prompt) or action_prompt
+    matched: list[dict[str, object]] = []
+    for candidate in sorted(candidates, key=lambda item: len(str(item.get("name") or "")), reverse=True):
+        name = str(candidate.get("name") or "")
+        if name and name in search_text:
+            matched.append(candidate)
+    if len(matched) == 1:
+        return matched[0]
+
+    player_name = save.player_static_data.name
+    if include_player and actor_role_id != save.player_static_data.player_id:
+        player_markers = {player_name, "玩家", "player"}
+        if any(marker and marker.lower() in normalized_prompt.lower() for marker in player_markers):
+            return {
+                "actor_id": save.player_static_data.player_id,
+                "name": player_name,
+                "actor_kind": "player",
+            }
+
+    if len(candidates) == 1 and _opposed_rule_for_prompt(action_prompt) is not None:
+        return candidates[0]
+    return None
+
+
+def _resolve_public_turn_opposed_target(
+    save: SaveFile,
+    action_prompt: str,
+    *,
+    actor_role_id: str | None = None,
+) -> NpcRoleCard | None:
+    target = _resolve_public_turn_opposed_actor_target(
+        save,
+        action_prompt,
+        actor_role_id=actor_role_id,
+        include_player=False,
+    )
+    role = target.get("role") if isinstance(target, dict) else None
+    return role if isinstance(role, NpcRoleCard) else None
+
+
+def _build_public_turn_opposed_plan(
+    save: SaveFile,
+    *,
+    actor_role_id: str,
+    action_type: str,
+    action_prompt: str,
+) -> dict[str, int | bool | str] | None:
+    rule = _opposed_rule_for_prompt(action_prompt)
+    if rule is None:
+        return None
+    target = _resolve_public_turn_opposed_actor_target(
+        save,
+        action_prompt,
+        actor_role_id=actor_role_id,
+        include_player=True,
+    )
+    if target is None:
+        return None
+    target_role_id = str(target.get("actor_id") or "")
+    target_name = str(target.get("name") or "")
+    target_actor_kind = "player" if str(target.get("actor_kind") or "") == "player" else "npc"
+    if not target_role_id or not target_name:
+        return None
+    _, target_profile = _get_actor_profile(save, target_role_id)
+    actor_id, actor_profile = _get_actor_profile(save, actor_role_id)
+    if actor_id != actor_role_id:
+        actor_role_id = actor_id
+    actor_ability = rule[0]
+    target_ability, target_modifier = _choose_opposed_target_ability(target_profile, rule[1])
+    return {
+        "ability_used": actor_ability,
+        "dc": max(5, min(30, 10 + int(target_modifier))),
+        "time_spent_min": 5 if action_type != "item_use" else 3,
+        "requires_check": True,
+        "check_task": f"与{target_name}对抗，尝试完成：{_humanize_action_prompt(action_prompt) or '当前动作'}",
+        "target_role_id": target_role_id,
+        "target_name": target_name,
+        "target_actor_kind": target_actor_kind,
+        "target_ability_used": target_ability,
+        "target_ability_modifier": target_modifier,
+        "actor_ability_modifier": _ability_modifier(actor_profile, actor_ability),
+    }
+
+
+def plan_public_turn_opposed_exchange(req: PublicTurnOpposedPlanRequest) -> PublicTurnOpposedPlanResponse:
+    save = get_current_save(default_session_id=req.session_id)
+    if save.session_id != req.session_id:
+        save.session_id = req.session_id
+    source_actor_id, source_profile = _get_actor_profile(save, req.source_actor_id)
+    target_actor_id, target_profile = _get_actor_profile(save, req.target_actor_id)
+    source_name = source_profile.name
+    target_name = target_profile.name
+    combined_prompt = "\n".join(
+        part.strip()
+        for part in (
+            req.source_action_summary,
+            req.source_speech_text,
+            req.target_action_summary,
+            req.target_speech_text,
+        )
+        if str(part or "").strip()
+    )
+    rule = _opposed_rule_for_prompt(combined_prompt) or _opposed_rule_for_prompt(req.source_action_summary)
+    source_ability = (rule[0] if rule is not None else "strength")
+    target_ability, target_modifier = _choose_opposed_target_ability(
+        target_profile,
+        (rule[1] if rule is not None else "max_strength_or_dexterity"),
+    )
+    source_modifier = _ability_modifier(source_profile, source_ability)
+    task_seed = _humanize_action_prompt(req.source_action_summary) or _humanize_action_prompt(combined_prompt) or "当前对抗"
+    return PublicTurnOpposedPlanResponse(
+        session_id=req.session_id,
+        round_id=req.round_id,
+        check_id=req.check_id,
+        source_actor_id=source_actor_id,
+        source_actor_name=source_name,
+        source_action_summary=req.source_action_summary.strip(),
+        source_speech_text=req.source_speech_text.strip(),
+        source_ability_used=source_ability,
+        source_ability_modifier=source_modifier,
+        target_actor_id=target_actor_id,
+        target_actor_name=target_name,
+        target_action_summary=req.target_action_summary.strip(),
+        target_speech_text=req.target_speech_text.strip(),
+        target_ability_used=target_ability,
+        target_ability_modifier=target_modifier,
+        check_task=f"{source_name} 与 {target_name} 对抗：{task_seed}",
+        stakes_summary=req.source_action_summary.strip() or task_seed,
+    )
+
+
 def _ai_action_plan(
     action_type: str,
     action_prompt: str,
@@ -5207,6 +5488,32 @@ def plan_action_check(req: ActionCheckPlanRequest) -> ActionCheckPlanResponse:
     actor_role_id, profile = _get_actor_profile(save, req.actor_role_id)
     actor_kind = _actor_kind(save, actor_role_id)
     plan = _ai_action_plan(req.action_type, req.action_prompt, req.config)
+    resolution_rule: Literal["static_dc", "opposed_actor"] = "static_dc"
+    target_role_id: str | None = None
+    target_name: str | None = None
+    target_actor_kind: Literal["player", "npc"] | None = None
+    target_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
+    target_ability_modifier: int | None = None
+    if req.source_context == "public_turn":
+        opposed = _build_public_turn_opposed_plan(
+            save,
+            actor_role_id=actor_role_id,
+            action_type=req.action_type,
+            action_prompt=req.action_prompt,
+        )
+        if opposed is not None:
+            plan = opposed
+            resolution_rule = "opposed_actor"
+            target_role_id = str(opposed.get("target_role_id") or "") or None
+            target_name = str(opposed.get("target_name") or "") or None
+            actor_kind_value = str(opposed.get("target_actor_kind") or "").strip()
+            if actor_kind_value in {"player", "npc"}:
+                target_actor_kind = actor_kind_value  # type: ignore[assignment]
+            target_ability_value = str(opposed.get("target_ability_used") or "").strip()
+            if target_ability_value in {"strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"}:
+                target_ability_used = target_ability_value  # type: ignore[assignment]
+            if opposed.get("target_ability_modifier") is not None:
+                target_ability_modifier = int(opposed["target_ability_modifier"])
     ability = str(plan["ability_used"])
     return ActionCheckPlanResponse(
         session_id=req.session_id,
@@ -5215,6 +5522,8 @@ def plan_action_check(req: ActionCheckPlanRequest) -> ActionCheckPlanResponse:
         actor_kind=actor_kind,  # type: ignore[arg-type]
         action_type=req.action_type,
         check_mode=req.check_mode,
+        source_context=req.source_context,
+        resolution_rule=resolution_rule,
         requires_check=bool(plan["requires_check"]),
         ability_used=ability,  # type: ignore[arg-type]
         ability_modifier=_ability_modifier(profile, ability),
@@ -5223,6 +5532,11 @@ def plan_action_check(req: ActionCheckPlanRequest) -> ActionCheckPlanResponse:
         check_task=str(plan["check_task"]),
         source_label=req.source_label,
         threatened_consequence=req.threatened_consequence,
+        target_role_id=target_role_id,
+        target_name=target_name,
+        target_actor_kind=target_actor_kind,
+        target_ability_used=target_ability_used,
+        target_ability_modifier=target_ability_modifier,
     )
 
 
@@ -5248,7 +5562,10 @@ def _apply_penalty(profile: PlayerStaticData, rule_key: str, fail_gap: int) -> l
 
 def _suggest_relation_tag(req: ActionCheckRequest, success: bool, critical: str) -> str | None:
     text = req.action_prompt.lower()
-    if "npc_id=" not in text:
+    target_role_id = req.target_role_id
+    if target_role_id is None and "npc_id=" in text:
+        target_role_id = _extract_target_role_id(req.action_prompt)
+    if target_role_id is None:
         return None
 
     uses_planned_embedded_resolution = (
@@ -5322,12 +5639,18 @@ def _build_action_process_text(
     *,
     actor_name: str,
     check_task: str,
+    resolution_rule: str,
     ability_used: str,
     ability_modifier: int,
     dc: int,
     requires_check: bool,
     dice_roll: int | None,
     total_score: int | None,
+    target_name: str | None = None,
+    target_ability_used: str | None = None,
+    target_ability_modifier: int | None = None,
+    target_dice_roll: int | None = None,
+    target_total_score: int | None = None,
     success: bool,
     critical: str,
 ) -> str:
@@ -5339,6 +5662,18 @@ def _build_action_process_text(
         detail = "掷出天然20，结果大成功。"
     elif critical == "critical_failure":
         detail = "掷出天然1，结果大失败。"
+    if resolution_rule == "opposed_actor" and target_name:
+        target_modifier_text = (
+            f"{int(target_ability_modifier):+d}" if isinstance(target_ability_modifier, int) else "+0"
+        )
+        return (
+            f"【对抗】{actor_name}进行“{check_task}”检定，"
+            f"使用 {ability_used} 调整值 {modifier_text}，"
+            f"d20({dice_roll if dice_roll is not None else '-'}) {modifier_text} = {total_score if total_score is not None else '-'}；"
+            f"{target_name} 使用 {target_ability_used or '-'} 调整值 {target_modifier_text}，"
+            f"d20({target_dice_roll if target_dice_roll is not None else '-'}) {target_modifier_text} = {target_total_score if target_total_score is not None else '-'}。"
+            f"{detail}"
+        )
     return (
         f"【检定】{actor_name}进行“{check_task}”检定，"
         f"使用 {ability_used} 调整值 {modifier_text}，"
@@ -5442,17 +5777,62 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
 
     actor_role_id, profile = _get_actor_profile(save, req.actor_role_id)
     actor_kind = _actor_kind(save, actor_role_id)
-    plan = _planned_action_plan(req) or _ai_action_plan(req.action_type, req.action_prompt, req.config)
+    uses_public_turn_embedded_resolution = (
+        req.source_context == "public_turn"
+        and req.resolution_context == "embedded"
+    )
+    planned_plan = _planned_action_plan(req)
+    if planned_plan is not None:
+        plan = planned_plan
+    elif uses_public_turn_embedded_resolution:
+        plan = _fallback_action_plan(req.action_type, req.action_prompt)
+    else:
+        plan = _ai_action_plan(req.action_type, req.action_prompt, req.config)
     ability = str(plan["ability_used"])
     dc = int(plan["dc"])
     time_spent_min = int(plan["time_spent_min"])
     requires_check = bool(plan["requires_check"])
     check_task = str(plan["check_task"])
+    resolution_rule = req.resolution_rule
+    target_role_id = req.target_role_id
+    target_name = req.target_name
+    target_actor_kind = req.target_actor_kind
+    target_ability_used = req.target_ability_used
+    target_ability_modifier = req.target_ability_modifier
+    if req.source_context == "public_turn" and resolution_rule == "static_dc":
+        opposed = _build_public_turn_opposed_plan(
+            save,
+            actor_role_id=actor_role_id,
+            action_type=req.action_type,
+            action_prompt=req.action_prompt,
+        )
+        if opposed is not None:
+            resolution_rule = "opposed_actor"
+            target_role_id = str(opposed.get("target_role_id") or "") or None
+            target_name = str(opposed.get("target_name") or "") or None
+            actor_kind_value = str(opposed.get("target_actor_kind") or "").strip()
+            if actor_kind_value in {"player", "npc"}:
+                target_actor_kind = actor_kind_value  # type: ignore[assignment]
+            target_ability_value = str(opposed.get("target_ability_used") or "").strip()
+            if target_ability_value in {"strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"}:
+                target_ability_used = target_ability_value  # type: ignore[assignment]
+            if opposed.get("target_ability_modifier") is not None:
+                target_ability_modifier = int(opposed["target_ability_modifier"])
+            ability = str(opposed.get("ability_used") or ability)
+            dc = int(opposed.get("dc") or dc)
+            time_spent_min = int(opposed.get("time_spent_min") or time_spent_min)
+            requires_check = bool(opposed.get("requires_check"))
+            check_task = str(opposed.get("check_task") or check_task)
+    if resolution_rule == "opposed_actor" and target_role_id:
+        requires_check = True
 
     dice_roll: int | None = None
     total_score: int | None = None
+    target_dice_roll: int | None = None
+    target_total_score: int | None = None
     critical = "none"
     success = True
+    contested_success: bool | None = None
     applied_effects: list[str] = []
     ability_modifier = _ability_modifier(profile, ability)
 
@@ -5461,32 +5841,70 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
             dice_roll = req.forced_dice_roll
         elif actor_kind == "npc" or req.allow_backend_roll:
             dice_roll = random.randint(1, 20)
+        elif req.source_context == "public_turn":
+            raise ValueError("PUBLIC_TURN_PLAYER_CHECK_REQUIRED")
         else:
             raise ValueError("PLAYER_DICE_ROLL_REQUIRED")
         total_score = dice_roll + ability_modifier
-        if dice_roll == 1:
-            critical = "critical_failure"
-            success = False
-        elif dice_roll == 20:
-            critical = "critical_success"
-            success = True
+        if resolution_rule == "opposed_actor" and target_role_id:
+            _, target_profile = _get_actor_profile(save, target_role_id)
+            resolved_target_ability = target_ability_used or "strength"
+            if target_ability_modifier is None:
+                target_ability_modifier = _ability_modifier(target_profile, resolved_target_ability)
+            if req.forced_target_dice_roll is not None:
+                target_dice_roll = req.forced_target_dice_roll
+            else:
+                target_dice_roll = random.randint(1, 20)
+            target_total_score = target_dice_roll + int(target_ability_modifier)
+            target_name = target_name or target_profile.name
+            target_actor_kind = target_actor_kind or _actor_kind(save, target_role_id)
+            target_ability_used = resolved_target_ability  # type: ignore[assignment]
+            if dice_roll == 1:
+                critical = "critical_failure"
+                success = False
+            elif dice_roll == 20:
+                critical = "critical_success"
+                success = True
+            elif target_dice_roll == 20:
+                success = False
+            elif target_dice_roll == 1:
+                success = True
+            else:
+                success = total_score >= target_total_score
+            contested_success = success
         else:
-            success = total_score >= dc
+            if dice_roll == 1:
+                critical = "critical_failure"
+                success = False
+            elif dice_roll == 20:
+                critical = "critical_success"
+                success = True
+            else:
+                success = total_score >= dc
 
     if not success:
-        fail_gap = max(1, dc - (total_score if total_score is not None else dc))
+        if resolution_rule == "opposed_actor" and target_total_score is not None:
+            fail_gap = max(1, target_total_score - (total_score if total_score is not None else target_total_score))
+        else:
+            fail_gap = max(1, dc - (total_score if total_score is not None else dc))
         rule_key = _ACTION_PENALTY_RULES.get(req.action_type, "hit_points.current")
         applied_effects.extend(_apply_penalty(profile, rule_key, fail_gap))
 
     process_text = _build_action_process_text(
         actor_name=profile.name,
         check_task=check_task,
+        resolution_rule=resolution_rule,
         ability_used=ability,
         ability_modifier=ability_modifier,
         dc=dc,
         requires_check=requires_check,
         dice_roll=dice_roll,
         total_score=total_score,
+        target_name=target_name,
+        target_ability_used=target_ability_used,
+        target_ability_modifier=target_ability_modifier,
+        target_dice_roll=target_dice_roll,
+        target_total_score=target_total_score,
         success=success,
         critical=critical,
     )
@@ -5497,7 +5915,7 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
         and req.planned_time_spent_min is not None
         and req.planned_requires_check is not None
     )
-    if uses_planned_embedded_resolution:
+    if uses_public_turn_embedded_resolution:
         resolution_text = _fallback_action_resolution_text(
             actor_name=profile.name,
             action_type=req.action_type,
@@ -5518,20 +5936,22 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
             critical=critical,
             requires_check=requires_check,
         )
-    narrative = process_text if process_text == resolution_text else f"{process_text}\n{resolution_text}".strip()
+    if uses_public_turn_embedded_resolution:
+        narrative = resolution_text.strip() or process_text
+    else:
+        narrative = process_text if process_text == resolution_text else f"{process_text}\n{resolution_text}".strip()
     scene_events: list[SceneEvent] = []
 
     relation_tag = _suggest_relation_tag(req, success, critical)
-    if relation_tag is not None and "npc_id=" in req.action_prompt:
+    applied_relation_target_id = req.target_role_id or _extract_target_role_id(req.action_prompt)
+    if relation_tag is not None and applied_relation_target_id:
         try:
-            npc_id = req.action_prompt.split("npc_id=", 1)[1].split(";", 1)[0].strip()
-            if npc_id:
-                role = next((r for r in save.role_pool if r.role_id == npc_id), None)
-                if role is not None:
-                    _upsert_npc_player_relation(role, save.player_static_data.player_id, relation_tag, "行动检定自动更新关系")
-                    role.attitude_changes.append(f"{_utc_now()} action->{relation_tag}")
-                    if len(role.attitude_changes) > 50:
-                        role.attitude_changes = role.attitude_changes[-50:]
+            role = next((r for r in save.role_pool if r.role_id == applied_relation_target_id), None)
+            if role is not None:
+                _upsert_npc_player_relation(role, save.player_static_data.player_id, relation_tag, "行动检定自动更新关系")
+                role.attitude_changes.append(f"{_utc_now()} action->{relation_tag}")
+                if len(role.attitude_changes) > 50:
+                    role.attitude_changes = role.attitude_changes[-50:]
         except Exception:
             pass
 
@@ -5596,6 +6016,8 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
         actor_kind=actor_kind,  # type: ignore[arg-type]
         action_type=req.action_type,
         check_mode=req.check_mode,
+        source_context=req.source_context,
+        resolution_rule=resolution_rule,  # type: ignore[arg-type]
         requires_check=requires_check,
         ability_used=ability,  # type: ignore[arg-type]
         ability_modifier=ability_modifier,
@@ -5603,8 +6025,16 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
         check_task=check_task,
         source_label=req.source_label,
         threatened_consequence=req.threatened_consequence,
+        target_role_id=target_role_id,
+        target_name=target_name,
+        target_actor_kind=target_actor_kind,
+        target_ability_used=target_ability_used,
+        target_ability_modifier=target_ability_modifier,
         dice_roll=dice_roll,
         total_score=total_score,
+        target_dice_roll=target_dice_roll,
+        target_total_score=target_total_score,
+        contested_success=contested_success,
         success=success,
         critical=critical,  # type: ignore[arg-type]
         time_spent_min=time_spent_min,

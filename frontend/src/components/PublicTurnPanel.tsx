@@ -1,7 +1,6 @@
-import type { PublicTurnImpact, PublicTurnState } from '../types/app';
+import type { PublicTurnState } from '../types/app';
 import { PublicTurnActionComposer } from './PublicTurnActionComposer';
 import { PublicTurnControlBar } from './PublicTurnControlBar';
-import { PublicTurnImpactList } from './PublicTurnImpactList';
 
 type Props = {
   state: PublicTurnState;
@@ -11,7 +10,6 @@ type Props = {
   speechValue: string;
   busy: boolean;
   godMode: boolean;
-  impacts: PublicTurnImpact[];
   onActionChange: (value: string) => void;
   onSpeechChange: (value: string) => void;
   onStartNextRound: () => void;
@@ -28,7 +26,6 @@ export function PublicTurnPanel({
   speechValue,
   busy,
   godMode,
-  impacts,
   onActionChange,
   onSpeechChange,
   onStartNextRound,
@@ -93,8 +90,6 @@ export function PublicTurnPanel({
           <p className="hint">当前阶段不接受玩家输入，请等待本轮推进或反应检定。</p>
         </section>
       )}
-
-      <PublicTurnImpactList impacts={impacts} />
     </>
   );
 }

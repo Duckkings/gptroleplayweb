@@ -217,6 +217,17 @@ def _actor_check(
     *,
     action_type: str,
     action_prompt: str,
+    resolution_rule: str = "static_dc",
+    target_role_id: str | None = None,
+    target_name: str | None = None,
+    target_actor_kind: str | None = None,
+    target_ability_used: str | None = None,
+    target_ability_modifier: int | None = None,
+    planned_ability_used: str | None = None,
+    planned_dc: int | None = None,
+    planned_time_spent_min: int | None = None,
+    planned_requires_check: bool | None = None,
+    planned_check_task: str | None = None,
     config: ChatConfig | None,
 ) -> ActionCheckResponse | None:
     try:
@@ -227,7 +238,19 @@ def _actor_check(
                 action_type=action_type,  # type: ignore[arg-type]
                 action_prompt=action_prompt,
                 allow_backend_roll=True,
+                source_context="public_turn",
+                resolution_rule=resolution_rule,  # type: ignore[arg-type]
+                target_role_id=target_role_id,
+                target_name=target_name,
+                target_actor_kind=target_actor_kind,  # type: ignore[arg-type]
+                target_ability_used=target_ability_used,  # type: ignore[arg-type]
+                target_ability_modifier=target_ability_modifier,
                 resolution_context="embedded",
+                planned_ability_used=planned_ability_used,  # type: ignore[arg-type]
+                planned_dc=planned_dc,
+                planned_time_spent_min=planned_time_spent_min,
+                planned_requires_check=planned_requires_check,
+                planned_check_task=planned_check_task,
                 config=config,
             )
         )

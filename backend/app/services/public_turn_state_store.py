@@ -29,6 +29,9 @@ def get_public_turn_state_in_save(save: SaveFile) -> PublicTurnState:
     if getattr(context, "public_turn_state", None) is None:
         context.public_turn_state = PublicTurnState()
         context.version = "0.2.0"
+    round_state = context.public_turn_state.current_round
+    if round_state is not None and round_state.phase == PublicTurnPhase.SITUATION_ADVANCEMENT:
+        round_state.phase = PublicTurnPhase.GM_PUSH
     context.updated_at = world._utc_now()
     return context.public_turn_state
 
@@ -60,8 +63,11 @@ def sync_pending_public_turn_in_save(save: SaveFile, session_id: str) -> PublicT
         return state
     if state.current_round is None or state.current_round.round_id != pending.public_round_id:
         return state
-    state.current_round.pending_reaction_check_id = pending.pending_reaction.reaction_id
-    state.current_round.phase = PublicTurnPhase.AWAITING_PLAYER_REACTION
+    if pending.status == "awaiting_opposed":
+        state.current_round.phase = PublicTurnPhase.AWAITING_PLAYER_OPPOSED
+    elif pending.pending_reaction is not None:
+        state.current_round.pending_reaction_check_id = pending.pending_reaction.reaction_id
+        state.current_round.phase = PublicTurnPhase.AWAITING_PLAYER_REACTION
     state.awaiting_player_entry = False
     state.updated_at = world._utc_now()
     return save_public_turn_state_in_save(save, state)
