@@ -447,6 +447,7 @@ class PendingTurnContinueResponse(BaseModel):
     main_turn_summary: "MainTurnSummary | None" = None
     current_zone_metric: "ZoneMetricEntry | None" = None
     pending_reaction: PlayerReactionCheck | None = None
+    public_interaction_prompt: "PublicTurnInteractionPrompt | None" = None
     public_opposed_prompt: "PublicTurnOpposedPrompt | None" = None
     reaction_result: "ActionCheckResponse | None" = None
     player_action_check_result: "ActionCheckResponse | None" = None
@@ -649,6 +650,7 @@ class PublicTurnPhase(str, Enum):
     NORMAL_ADVANCEMENT = "normal_advancement"
     GM_PUSH = "gm_push"
     SITUATION_ADVANCEMENT = "situation_advancement"
+    AWAITING_PLAYER_INTERACTION = "awaiting_player_interaction"
     AWAITING_PLAYER_REACTION = "awaiting_player_reaction"
     AWAITING_PLAYER_OPPOSED = "awaiting_player_opposed"
 
@@ -669,8 +671,14 @@ class PublicTurnActorType(str, Enum):
     PLAYER = "player"
     NPC = "npc"
     TEAM = "team"
+    ENCOUNTER_TEMP_NPC = "encounter_temp_npc"
     HIDDEN_NPC = "hidden_npc"
     ENVIRONMENT = "environment"
+
+
+class PublicTurnWorldImpactType(str, Enum):
+    NON_WORLD = "non_world"
+    WORLD = "world"
 
 
 class PublicTurnActionSubmission(BaseModel):
@@ -681,9 +689,16 @@ class PublicTurnActionSubmission(BaseModel):
     forced_first: bool = False
 
 
+class PublicTurnInteractionResponseSubmission(BaseModel):
+    prompt_id: str = Field(..., min_length=1)
+    action_text: str = Field(default="", min_length=0)
+    speech_text: str = Field(default="", min_length=0)
+    response_kind: Literal["explicit_response", "no_action"] = "explicit_response"
+
+
 class InitiativeDeclaration(BaseModel):
     actor_id: str = Field(..., min_length=1)
-    actor_type: Literal["player", "npc", "team", "hidden_npc"] = "npc"
+    actor_type: Literal["player", "npc", "team", "encounter_temp_npc", "hidden_npc"] = "npc"
     actor_name: str = Field(..., min_length=1)
     declared_action: str = Field(..., min_length=1)
     dex_modifier: int = 0
@@ -700,6 +715,13 @@ class PublicTurnRelationDelta(BaseModel):
     before_tag: str = Field(default="neutral", min_length=1)
     after_tag: str = Field(default="neutral", min_length=1)
     relation_delta: int = 0
+    reaction_tone: Literal["supportive", "approving", "neutral", "concerned", "warning", "hostile"] = "neutral"
+    reaction_focus_actor_id: str | None = None
+    reaction_focus_actor_name: str | None = None
+    reaction_speech_target_id: str | None = None
+    reaction_speech_target_name: str | None = None
+    reaction_action: str = Field(default="", min_length=0)
+    reaction_speech: str = Field(default="", min_length=0)
     reaction_text: str = Field(default="", min_length=0)
 
 
@@ -712,6 +734,13 @@ class PublicTurnTeamAffinityDelta(BaseModel):
     trust_before: int = 0
     trust_after: int = 0
     trust_delta: int = 0
+    reaction_tone: Literal["supportive", "approving", "neutral", "concerned", "warning", "hostile"] = "neutral"
+    reaction_focus_actor_id: str | None = None
+    reaction_focus_actor_name: str | None = None
+    reaction_speech_target_id: str | None = None
+    reaction_speech_target_name: str | None = None
+    reaction_action: str = Field(default="", min_length=0)
+    reaction_speech: str = Field(default="", min_length=0)
     reaction_text: str = Field(default="", min_length=0)
 
 
@@ -766,9 +795,20 @@ class PublicTurnSettlementCheck(BaseModel):
     outcome_text: str = Field(default="", min_length=0)
 
 
+class PublicTurnGmPushResult(BaseModel):
+    roll_d6: int = Field(default=1, ge=1, le=6)
+    outcome_kind: Literal["none", "environment_change", "extra_npc_intervention"] = "none"
+    outcome_label: str = Field(default="", min_length=0)
+    gm_environment_text: str = Field(default="", min_length=0)
+    environment_change_text: str = Field(default="", min_length=0)
+    spawned_npc_role_id: str | None = None
+    spawned_npc_name: str | None = None
+
+
 class PublicTurnSettlementEntry(BaseModel):
     entry_id: str = Field(..., min_length=1)
     round_id: str = Field(..., min_length=1)
+    entry_kind: Literal["actor", "gm_push"] = "actor"
     phase: PublicTurnPhase = PublicTurnPhase.IDLE
     order_index: int = Field(default=0, ge=0)
     actor_id: str = Field(..., min_length=1)
@@ -777,11 +817,32 @@ class PublicTurnSettlementEntry(BaseModel):
     action_summary: str = Field(default="", min_length=0)
     speech_text: str = Field(default="", min_length=0)
     narrative_entry_id: str | None = None
+    action_target_actor_id: str | None = None
+    action_target_name: str | None = None
+    action_target_kind: PublicTurnActorType | None = None
+    speech_target_actor_id: str | None = None
+    speech_target_name: str | None = None
+    speech_target_kind: PublicTurnActorType | None = None
+    source_world_impact_type: PublicTurnWorldImpactType = PublicTurnWorldImpactType.NON_WORLD
+    target_response_world_impact_type: PublicTurnWorldImpactType = PublicTurnWorldImpactType.NON_WORLD
+    interaction_exchange_kind: Literal["non_world_exchange", "world_exchange", "alternated_exchange"] = "world_exchange"
+    alternation_depth: int = Field(default=0, ge=0, le=1)
+    target_response_kind: Literal["explicit_response", "no_action"] = "explicit_response"
+    interaction_target_name: str | None = None
+    interaction_resolution: Literal[
+        "non_interactive",
+        "accepted",
+        "ambiguous_non_opposed",
+        "rejected_opposed",
+        "attack_flow",
+    ] = "non_interactive"
     opposed_target_name: str | None = None
     opposed_target_action: str | None = None
     opposed_target_speech: str | None = None
+    opposed_target_speech_target_name: str | None = None
     check: PublicTurnSettlementCheck | None = None
     gm_resolution_summary: str = Field(default="", min_length=0)
+    gm_push_result: PublicTurnGmPushResult | None = None
     situation_delta: int = 0
     zone_reputation_delta: int = 0
     relation_deltas: list[PublicTurnRelationDelta] = Field(default_factory=list)
@@ -813,7 +874,7 @@ class PublicTurnNarrativeEntry(BaseModel):
 
 
 class PublicTurnSegmentBoundary(BaseModel):
-    boundary_kind: Literal["player_turn", "player_reaction", "player_opposed", "round_end"] = "round_end"
+    boundary_kind: Literal["player_turn", "player_interaction", "player_reaction", "player_opposed", "round_end"] = "round_end"
     phase: PublicTurnPhase = PublicTurnPhase.IDLE
     pause_source_actor_id: str | None = None
     pause_source_actor_name: str | None = None
@@ -828,9 +889,30 @@ class PublicTurnSegmentActorDirective(BaseModel):
     action_summary: str = Field(default="", min_length=0)
     speech_text: str = Field(default="", min_length=0)
     action_prompt: str = Field(default="", min_length=0)
+    action_target_actor_id: str | None = None
+    action_target_name: str | None = None
+    action_target_kind: PublicTurnActorType | None = None
+    speech_target_actor_id: str | None = None
+    speech_target_name: str | None = None
+    speech_target_kind: PublicTurnActorType | None = None
+    speech_target_label: str = Field(default="", min_length=0)
+    world_impact_type: PublicTurnWorldImpactType = PublicTurnWorldImpactType.NON_WORLD
+    alternation_depth: int = Field(default=0, ge=0, le=1)
     target_actor_id: str | None = None
     target_name: str | None = None
     target_actor_kind: Literal["player", "npc"] | None = None
+    interaction_target_actor_id: str | None = None
+    interaction_target_name: str | None = None
+    interaction_target_kind: PublicTurnActorType | None = None
+    interaction_kind: str = Field(default="", min_length=0)
+    interaction_requires_response: bool = False
+    target_response_action_summary: str = Field(default="", min_length=0)
+    target_response_speech_text: str = Field(default="", min_length=0)
+    target_response_speech_target_name: str | None = None
+    target_response_world_impact_type: PublicTurnWorldImpactType = PublicTurnWorldImpactType.NON_WORLD
+    interaction_exchange_kind: Literal["non_world_exchange", "world_exchange", "alternated_exchange"] = "world_exchange"
+    consent_state: Literal["accepted", "rejected", "ambiguous", "not_applicable"] = "not_applicable"
+    resolution_mode: Literal["static_dc", "opposed_actor", "attack_flow", "none"] = "none"
     resolution_rule: Literal["static_dc", "opposed_actor"] = "static_dc"
     planned_requires_check: bool = False
     planned_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
@@ -841,7 +923,7 @@ class PublicTurnSegmentActorDirective(BaseModel):
     specific_threat: str = Field(default="", min_length=0)
     stakes_summary: str = Field(default="", min_length=0)
     situation_delta_hint: int = 0
-    pause_kind: Literal["none", "player_reaction", "player_opposed"] = "none"
+    pause_kind: Literal["none", "player_interaction", "player_reaction", "player_opposed"] = "none"
 
 
 class PublicTurnSegmentPlan(BaseModel):
@@ -860,10 +942,13 @@ class PublicTurnNarrationInputItem(BaseModel):
     actor_type: PublicTurnActorType = PublicTurnActorType.NPC
     action_summary: str = Field(default="", min_length=0)
     speech_text: str = Field(default="", min_length=0)
+    action_target_name: str | None = None
+    speech_target_name: str | None = None
     gm_resolution_summary: str = Field(default="", min_length=0)
     opposed_target_name: str | None = None
     opposed_target_action: str | None = None
     opposed_target_speech: str | None = None
+    opposed_target_speech_target_name: str | None = None
 
 
 class PublicTurnNarrationFragmentResult(BaseModel):
@@ -885,9 +970,38 @@ class PublicTurnOpposedPrompt(BaseModel):
     source_actor_name: str = Field(..., min_length=1)
     source_action_summary: str = Field(default="", min_length=0)
     source_speech_text: str = Field(default="", min_length=0)
+    source_interaction_kind: str = Field(default="", min_length=0)
+    source_action_target_name: str | None = None
+    source_speech_target_name: str | None = None
     target_actor_id: str = Field(..., min_length=1)
     target_actor_name: str = Field(..., min_length=1)
     stakes_summary: str = Field(default="", min_length=0)
+
+
+class PublicTurnInteractionPrompt(BaseModel):
+    prompt_id: str = Field(..., min_length=1)
+    round_id: str = Field(..., min_length=1)
+    phase: PublicTurnPhase = PublicTurnPhase.IDLE
+    source_actor_id: str = Field(..., min_length=1)
+    source_actor_name: str = Field(..., min_length=1)
+    source_action_type: Literal["attack", "check", "item_use"] = "check"
+    source_action_summary: str = Field(default="", min_length=0)
+    source_speech_text: str = Field(default="", min_length=0)
+    source_action_target_name: str | None = None
+    source_speech_target_name: str | None = None
+    source_action_prompt: str = Field(default="", min_length=0)
+    source_world_impact_type: PublicTurnWorldImpactType = PublicTurnWorldImpactType.NON_WORLD
+    source_planned_requires_check: bool = False
+    source_planned_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
+    source_planned_dc: int | None = Field(default=None, ge=5, le=30)
+    source_planned_check_task: str | None = None
+    source_interaction_kind: str = Field(default="", min_length=0)
+    target_actor_id: str = Field(..., min_length=1)
+    target_actor_name: str = Field(..., min_length=1)
+    target_actor_kind: PublicTurnActorType = PublicTurnActorType.PLAYER
+    alternation_depth: int = Field(default=0, ge=0, le=1)
+    interaction_mode: Literal["initial", "alternated"] = "initial"
+    suggested_target_label: str = Field(default="", min_length=0)
 
 
 class PublicTurnRound(BaseModel):
@@ -904,11 +1018,13 @@ class PublicTurnRound(BaseModel):
     environment_risk_level: EnvironmentRiskLevel = EnvironmentRiskLevel.STABLE
     situation_dc: int = 10
     pending_reaction_check_id: str | None = None
+    pending_interaction_prompt: PublicTurnInteractionPrompt | None = None
     current_actor_id: str | None = None
     awaiting_player_action: bool = False
     awaiting_player_action_phase: PublicTurnPhase | None = None
     gm_push_summary: str = Field(default="", min_length=0)
     gm_push_scene_event_id: str | None = None
+    gm_push_result: PublicTurnGmPushResult | None = None
     accumulated_narration: str = Field(default="", min_length=0)
     narrative_entries: list[PublicTurnNarrativeEntry] = Field(default_factory=list)
     narrative_status: PublicTurnRoundNarrationStatus = PublicTurnRoundNarrationStatus.EMPTY
@@ -2737,6 +2853,7 @@ class PublicTurnPlayerActionCheck(BaseModel):
 class PublicTurnContinueRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     action_submission: PublicTurnActionSubmission | None = None
+    player_interaction_response: PublicTurnInteractionResponseSubmission | None = None
     player_action_check: PublicTurnPlayerActionCheck | None = None
     config: ChatConfig | None = None
 
@@ -2798,6 +2915,7 @@ class PublicTurnPresentation(BaseModel):
     phase: PublicTurnPhase = PublicTurnPhase.IDLE
     initiative_order: list[PublicTurnInitiativeEntry] = Field(default_factory=list)
     settlement_entries: list[PublicTurnSettlementEntry] = Field(default_factory=list)
+    gm_push_result: PublicTurnGmPushResult | None = None
     narrative_entries: list[PublicTurnNarrativeEntry] = Field(default_factory=list)
     accumulated_narration: str = Field(default="", min_length=0)
     narrative_status: PublicTurnRoundNarrationStatus = PublicTurnRoundNarrationStatus.EMPTY
@@ -2812,6 +2930,7 @@ class PublicTurnResponse(BaseModel):
     narration: str = Field(default="", min_length=0)
     scene_events: list[SceneEvent] = Field(default_factory=list)
     reaction_check: PlayerReactionCheck | None = None
+    public_interaction_prompt: PublicTurnInteractionPrompt | None = None
     public_opposed_prompt: PublicTurnOpposedPrompt | None = None
     round_completed: bool = False
     awaiting_entry: bool = False

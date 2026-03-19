@@ -14,12 +14,13 @@ type Props = {
 };
 
 const PHASE_LABELS: Record<PublicTurnPhase, string> = {
-  idle: '待机',
+  idle: '待命',
   initiative_declaration: '抢先声明',
   initiative_execution: '抢先执行',
   normal_advancement: '常规推进',
-  gm_push: 'GM推动',
-  situation_advancement: '旧事态推进',
+  gm_push: 'GM 推动',
+  situation_advancement: '局势推进',
+  awaiting_player_interaction: '等待交互回应',
   awaiting_player_reaction: '等待反应检定',
   awaiting_player_opposed: '等待对抗回应',
 };
@@ -27,7 +28,7 @@ const PHASE_LABELS: Record<PublicTurnPhase, string> = {
 const RISK_LABELS: Record<EnvironmentRiskLevel, string> = {
   stable: '稳定',
   risky: '危险',
-  collapse: '崩塌',
+  collapse: '崩坏',
 };
 
 export function PublicTurnControlBar({

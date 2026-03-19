@@ -197,3 +197,78 @@
 - `source_context="public_turn"` plus `resolution_context="embedded"` now guarantees that:
   - no extra `_ai_action_plan()` call is made inside `action_check()`
   - no extra `_ai_action_resolution_text()` call is made inside `action_check()`
+
+## Public Turn AI Contract Revision (2026-03-20)
+
+- Public-turn actor execution no longer uses fallback action / speech / reaction text when the model omits fields.
+- The public-turn actor contract is now:
+  - one actor action call
+  - partial payload allowed
+  - empty fields preserved as empty strings
+  - fully empty actor output allowed
+- Public-turn interaction target auto-response follows the same rule:
+  - AI output only
+  - no fallback response text
+  - empty response is treated as empty consent input
+- Public-turn continuous narration is no longer an AI protocol responsibility.
+- AI still participates in two places:
+  - actor / interaction action generation
+  - single GM push environment / atmosphere description at round end
+- Round-end GM push AI output is descriptive only.
+- The GM push outcome itself is backend-deterministic through `1d6`:
+  - `1-4` none
+  - `5` environment change
+  - `6` extra persistent scene NPC intervention
+- `PublicTurnEntryType.INITIATIVE` no longer relies on hostile prompt wording to decide which actors enter initiative declaration generation.
+
+## Public Turn Reaction AI Contract Revision (2026-03-20 v3)
+
+- Public-turn post-player reactions are now AI-only on the public-turn path.
+- NPC reaction contract:
+  - input: player action text, settlement summary, NPC identity/context, relation delta hint
+  - output JSON: `reaction_action`, `reaction_speech`
+- Team reaction contract:
+  - input: player action text, settlement summary, teammate identity/context
+  - output JSON: `reaction_action`, `reaction_speech`, `affinity_delta`, `trust_delta`
+- `reaction_action` is constrained to expressive-only output and is sanitized server-side; illegal mechanical verbs are dropped.
+- No fallback sentence generator is used when these reaction calls return empty output.
+- Empty reaction text is valid and must not block the rest of settlement or narration generation.
+## 2026-03-20 Public-Turn AI Contract Addendum
+
+- Public-turn actor action payloads now treat `target_label` as the action target only.
+- New optional actor payload field:
+  - `speech_target_label`
+- Public-turn actor prompts must allow action target and speech addressee to diverge.
+- Public-turn player-follow-up reaction prompts now require conflict anchoring context:
+  - player action target
+  - current primary aggressor
+  - current primary target
+  - prior settlement excerpt
+  - scene conflict summary
+- Public-turn NPC reaction JSON now supports:
+  - `reaction_action`
+  - `reaction_speech`
+  - `reaction_tone`
+  - `reaction_focus_target_name`
+  - `reaction_speech_target_name`
+  - `reaction_scope`
+- Public-turn team reaction JSON now supports the same fields plus `affinity_delta` and `trust_delta`.
+- Empty reaction output remains valid and must not trigger fallback text generation.
+## 2026-03-20 Public-Turn Interaction AI Contract v7
+
+- Public-turn interaction prompts no longer include a risk / stakes parameter.
+- Public-turn actor action payload must now distinguish:
+  - `target_label` for the action target
+  - `speech_target_label` for the speech addressee
+  - `world_impact_type` for `non_world | world`
+- `speech_target_label` may differ from the action target, but it must not affect routing.
+- Player interaction responses now use a dedicated lightweight classifier that returns:
+  - `world_impact_type`
+  - `target_label`
+  - `speech_target_label`
+- Player `response_kind="no_action"` bypasses AI classification and is forced to:
+  - empty action
+  - empty speech
+  - `world_impact_type=non_world`
+- Alternation is only legal when a target-side `world` response points back at the original source actor.
+- If AI produces a reverse `world` response aimed at a third party, runtime must not open a new interaction branch from that payload.

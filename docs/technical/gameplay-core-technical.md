@@ -200,3 +200,145 @@
   - `scene_event`
   - `impact`
 - Player submissions and opposed resumes are folded into the same segment narration flow by seeding deterministic settlements before the next AI segment or `gm_push`.
+- Public-turn actor typing now accepts `encounter_temp_npc` end-to-end in initiative declarations, initiative order, settlements, and frontend state typing.
+
+## Public Turn Interaction Technical Note (2026-03-19)
+
+- New phase:
+  - `awaiting_player_interaction`
+- New backend / frontend structures:
+  - `PublicTurnInteractionPrompt`
+  - `PublicTurnInteractionResponseSubmission`
+- `PublicTurnRound` now stores `pending_interaction_prompt` so interaction pauses survive save sync and restore without using `PendingTurnState`.
+- `PublicTurnResponse` now carries `public_interaction_prompt`.
+- `PublicTurnContinueRequest` now accepts `player_interaction_response`.
+- `PublicTurnSegmentActorDirective` now carries structured interaction metadata:
+  - `interaction_target_actor_id`
+  - `interaction_target_name`
+  - `interaction_target_kind`
+  - `interaction_kind`
+  - `interaction_requires_response`
+  - `target_response_action_summary`
+  - `target_response_speech_text`
+  - `consent_state`
+  - `resolution_mode`
+- Public-turn target resolution is now structured-first:
+  - explicit target role id in prompt
+  - structured `target_label`
+  - limited text fallback
+  - no automatic player lock merely because the prompt text mentions the player
+- Directed non-attack interactions now use deterministic consent classification:
+  - `accepted`
+  - `rejected`
+  - `ambiguous`
+  - `not_applicable`
+- Resolution routing is now:
+  - `attack` -> existing attack / reaction flow
+  - targeted non-attack + `rejected` -> `opposed_actor`
+  - targeted non-attack + `accepted|ambiguous` -> `static_dc` or no-roll settlement
+- `PublicTurnSettlementEntry` now records:
+  - `interaction_target_name`
+  - `interaction_resolution`
+  - target-side response action / speech for both non-opposed and opposed interaction settlements
+- Stream routes now emit `interaction_required` when a player-targeted interaction pause is reached.
+- Blocking gameplay modals now support minimize / restore in the frontend while preserving state; minimized workflows still keep chat submission locked.
+
+## Public Turn Settlement And GM Push Technical Note (2026-03-20)
+
+- Public-turn presentation no longer depends on AI stitched narration output.
+- `PublicTurnPresentation.round_narration`, `accumulated_narration`, and `narrative_entries` are now rebuilt deterministically from `settlement_entries`.
+- The deterministic formatter uses settlement order and only includes visible actor content:
+  - actor name
+  - action summary
+  - speech text
+  - opposed / interaction target response text
+- Actor settlements no longer surface GM summary text; `gm_resolution_summary` stays empty on actor entries for compatibility.
+- `PublicTurnSettlementEntry` now distinguishes:
+  - `entry_kind="actor"`
+  - `entry_kind="gm_push"`
+- `PublicTurnGmPushResult` is attached to:
+  - `PublicTurnSettlementEntry.gm_push_result`
+  - `PublicTurnRound.gm_push_result`
+  - `PublicTurnPresentation.gm_push_result`
+- Round-end GM push is now a dedicated backend step:
+  1. aggregate impacts
+  2. roll backend `1d6`
+  3. classify outcome as `none | environment_change | extra_npc_intervention`
+  4. call AI once for environment / atmosphere text
+  5. append one GM settlement card
+- `d6=5` raises the round environment risk and emits `public_turn_environment_update`.
+- `d6=6` spawns a persistent scene NPC, appends its immediate same-round settlement, and defers its normal initiative participation to later rounds.
+- `PublicTurnEntryType.INITIATIVE` now uses full initiative candidate declarations instead of hostile-text filtering, so the player is not auto-first unless `god_override` forces it.
+- Public-turn actor planning / interaction response paths no longer call NPC fallback output helpers.
+- Public-turn AI payload normalization now allows partial output; missing fields remain empty instead of causing fallback prose generation.
+
+## Public Turn Reaction Ownership Technical Note (2026-03-20 v3)
+
+- Player-action reactions are now a dedicated post-settlement layer and no longer reused by non-player actor turns.
+- `PublicTurnRelationDelta` now carries:
+  - `reaction_action`
+  - `reaction_speech`
+  - compatibility `reaction_text`
+- `PublicTurnTeamAffinityDelta` now carries:
+  - `reaction_action`
+  - `reaction_speech`
+  - compatibility `reaction_text`
+- Only `resolve_player_submission(...)` may populate:
+  - `relation_deltas`
+  - `team_affinity_deltas`
+- `_finalize_ai_actor_turn(...)` now leaves both lists empty for non-player settlements.
+- Zone reputation is now actor-gated:
+  - allowed for `player`
+  - allowed for `team`
+  - forced to `0` for all other actor kinds
+- Deterministic narration formatting now treats player settlements specially by appending AI NPC/team reaction fragments after the player action/speech.
+- Stream emission still uses settlement-order fragments, but now falls back to direct settlement formatting if a compatible `narrative_entry` is not already present in the response payload.
+## 2026-03-20 Public-Turn Target / Addressee / Contest Routing
+
+- Public-turn actor directives and settlements now distinguish:
+  - action target
+  - speech target
+- Public-turn targeted actor actions no longer use `attack -> player_reaction` as the primary path.
+- New routing rule:
+  - role-to-role targeted action -> interaction assessment
+  - player target -> pause for player interaction response
+  - non-player target -> AI target response
+  - source/target actions -> contest classification -> `opposed_actor` or `static_dc` / `none`
+- `player_reaction` remains on the public-turn path only for non-actor hazards such as environment or GM push consequences.
+- Player post-action reaction payloads now carry:
+  - `reaction_tone`
+  - `reaction_focus_actor_name`
+  - `reaction_speech_target_name`
+- Server-side tone clamps prevent warning / hostile reaction text from yielding large positive relation or affinity deltas.
+- Deterministic narration formatter now emits target-aware and addressee-aware fragments for settlements and pause previews.
+## 2026-03-20 Public Turn Interaction v7
+
+- `PublicTurnInteractionPrompt` no longer carries `stakes_summary`.
+- Public-turn interaction routing now has a hard invariant:
+  - `target_actor_*` in the prompt must match the resolved `action_target_*`
+  - if planner output conflicts with the resolved action target, runtime ignores the planner pause suggestion
+- `speech_target_*` is now presentation-only:
+  - used by settlement / narration formatting
+  - never used to select the responding actor
+- Public-turn interaction now records world-impact classification:
+  - `source_world_impact_type`
+  - `target_response_world_impact_type`
+  - `interaction_exchange_kind`
+  - `alternation_depth`
+  - `target_response_kind`
+- `non_world_exchange` never emits:
+  - action check
+  - opposed prompt
+- Alternation flow is supported once per interaction:
+  - initial `non_world` source action
+  - target-side `world` response aimed at original source
+  - source/target swap
+  - no second alternation
+- Player interaction submission now supports:
+  - `response_kind="explicit_response"`
+  - `response_kind="no_action"`
+- `no_action` is resolved backend-side as:
+  - empty action/speech
+  - `world_impact_type=non_world`
+  - valid terminal interaction response
+- Runtime no longer clears the pending interaction prompt before validating / resolving the player's response, so invalid reverse targeting does not destroy the pending pause state.

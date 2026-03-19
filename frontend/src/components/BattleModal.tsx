@@ -9,6 +9,7 @@ type Props = {
   battle: BattleSandboxState | null;
   busy?: boolean;
   onClose: () => void;
+  onMinimize?: () => void;
   onAction: (payload: {
     action_kind: 'attack' | 'defend' | 'move' | 'disengage' | 'escape' | 'use_item' | 'observe' | 'end_turn';
     target_combatant_id?: string | null;
@@ -20,7 +21,7 @@ type Props = {
   onEndBattle: () => void;
 };
 
-export function BattleModal({ open, battle, busy = false, onClose, onAction, onContinueAi, onSetAiPacing, onEndBattle }: Props) {
+export function BattleModal({ open, battle, busy = false, onClose, onMinimize, onAction, onContinueAi, onSetAiPacing, onEndBattle }: Props) {
   if (!open || !battle) return null;
   const activeId = battle.combat_state.active_combatant_id;
   const activeCombatant = battle.combat_state.combatants.find((item) => item.combatant_id === activeId) ?? null;
@@ -32,16 +33,19 @@ export function BattleModal({ open, battle, busy = false, onClose, onAction, onC
           <div>
             <h3>战斗测试</h3>
             <p>
-              战场：{battle.battlefield.zone_name || '未知大区块'} / {battle.battlefield.sub_zone_name || '未知子区块'}
+              战场: {battle.battlefield.zone_name || '未知大区块'} / {battle.battlefield.sub_zone_name || '未知子区块'}
             </p>
             <p>
-              回合 {battle.combat_state.round} | 当前行动者：{activeCombatant?.display_name ?? '未知'} | 战场掌控度：{battle.combat_state.momentum_value}
+              回合 {battle.combat_state.round} | 当前行动者: {activeCombatant?.display_name ?? '未知'} | 战场掌控度: {battle.combat_state.momentum_value}
             </p>
-            <p>
-              状态：{battle.status} | AI 速度：{battle.ui_flags.ai_pacing === 'step' ? '逐单位暂停' : '自动连走'}
-            </p>
+            <p>状态: {battle.status} | AI 速度: {battle.ui_flags.ai_pacing === 'step' ? '逐单位暂停' : '自动连走'}</p>
           </div>
           <div className="actions">
+            {onMinimize ? (
+              <button onClick={onMinimize} disabled={busy}>
+                暂时关闭
+              </button>
+            ) : null}
             <button onClick={onClose} disabled={busy || (battle.status !== 'ended' && battle.status !== 'cancelled')}>
               收起
             </button>
@@ -91,23 +95,18 @@ export function BattleModal({ open, battle, busy = false, onClose, onAction, onC
             >
               自动连走
             </button>
-            <button
-              onClick={() => onContinueAi(battle.ui_flags.ai_pacing)}
-              disabled={busy || battle.status !== 'awaiting_ai_continue'}
-            >
+            <button onClick={() => onContinueAi(battle.ui_flags.ai_pacing)} disabled={busy || battle.status !== 'awaiting_ai_continue'}>
               继续 AI 行动
             </button>
           </div>
         </section>
 
-        {battle.status === 'awaiting_player_action' && (
-          <BattleActionPanel battle={battle} busy={busy} onAction={onAction} />
-        )}
+        {battle.status === 'awaiting_player_action' && <BattleActionPanel battle={battle} busy={busy} onAction={onAction} />}
         {battle.status === 'awaiting_player_roll' && (
           <section className="battle-panel">
             <h4>等待掷骰</h4>
             <p>
-              当前检定：{battle.pending_roll?.action_name || battle.pending_roll?.roll_kind || '未知'} / {battle.pending_roll?.check_task || '未知'}
+              当前检定: {battle.pending_roll?.action_name || battle.pending_roll?.roll_kind || '未知'} / {battle.pending_roll?.check_task || '未知'}
             </p>
             <p className="hint">请在弹出的骰子框里掷骰后继续。</p>
           </section>
@@ -115,7 +114,7 @@ export function BattleModal({ open, battle, busy = false, onClose, onAction, onC
         {battle.status === 'ended' && (
           <section className="battle-panel">
             <h4>战斗结束</h4>
-            <p>结果：{battle.combat_state.winner_side ?? '未知'}</p>
+            <p>结果: {battle.combat_state.winner_side ?? '未知'}</p>
           </section>
         )}
       </div>

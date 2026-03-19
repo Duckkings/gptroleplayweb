@@ -10,6 +10,7 @@ from app.models.schemas import (
     PublicTurnActionSubmission,
     PublicTurnContinueRequest,
     PublicTurnEntryRequest,
+    PublicTurnNarrativeEntry,
     PublicTurnOpposedPlanRequest,
     PublicTurnOpposedPlanResponse,
     PublicTurnOpposedResolveRequest,
@@ -18,6 +19,7 @@ from app.models.schemas import (
     PublicTurnResponse,
     PublicTurnStateResponse,
 )
+from app.services.public_turn_narration_formatter import build_settlement_fragment
 from app.services import reaction_check_service
 from app.services import world_service as world
 from app.services.pending_turn_service import clear_pending_turn, load_pending_turn, save_pending_turn
@@ -57,6 +59,7 @@ def _to_response(session_id: str, result: PublicTurnRunResult, save) -> PublicTu
         narration=result.narration,
         scene_events=result.scene_events,
         reaction_check=result.reaction_check,
+        public_interaction_prompt=result.public_interaction_prompt,
         public_opposed_prompt=result.public_opposed_prompt,
         round_completed=result.round_completed,
         awaiting_entry=state.awaiting_player_entry,
@@ -172,6 +175,21 @@ async def _emit_public_turn_step(
     for settlement in result.settlement_entries:
         await emit("settlement_entry", settlement.model_dump(mode="json"))
         narrative_entry = narrative_by_settlement.get(settlement.entry_id)
+        if narrative_entry is None:
+            fragment = build_settlement_fragment(settlement)
+            if fragment:
+                narrative_entry = PublicTurnNarrativeEntry(
+                    narrative_entry_id=settlement.narrative_entry_id or f"{settlement.entry_id}_narr",
+                    round_id=settlement.round_id,
+                    settlement_entry_id=settlement.entry_id,
+                    phase=settlement.phase,
+                    order_index=settlement.order_index,
+                    actor_id=settlement.actor_id,
+                    actor_name=settlement.actor_name,
+                    actor_type=settlement.actor_type,
+                    text=fragment,
+                    status="ready",
+                )
         if narrative_entry is not None and narrative_entry.narrative_entry_id not in emitted_narrative_ids:
             emitted_narrative_ids.add(narrative_entry.narrative_entry_id)
             await emit("narrative_fragment_started", narrative_entry.model_dump(mode="json"))
@@ -199,6 +217,8 @@ async def _emit_public_turn_step(
         await emit("scene_event", event.model_dump(mode="json"))
     for impact in result.impacts:
         await emit("impact", impact.model_dump(mode="json"))
+    if result.public_interaction_prompt is not None:
+        await emit("interaction_required", result.public_interaction_prompt.model_dump(mode="json"))
     if result.presentation.phase == PublicTurnPhase.GM_PUSH and result.round_completed:
         await emit("gm_push", {"round_id": result.presentation.round_id, "round_number": result.presentation.round_number})
 
@@ -237,6 +257,7 @@ def _merge_step_results(results: list[PublicTurnRunResult]) -> PublicTurnRunResu
     impacts = []
     settlements = []
     reaction_check = None
+    public_interaction_prompt = None
     public_opposed_prompt = None
     player_action_check_result = None
     archived_sub_zone_turn_id = None
@@ -245,6 +266,7 @@ def _merge_step_results(results: list[PublicTurnRunResult]) -> PublicTurnRunResu
         impacts.extend(item.impacts)
         settlements.extend(item.settlement_entries)
         reaction_check = item.reaction_check or reaction_check
+        public_interaction_prompt = item.public_interaction_prompt or public_interaction_prompt
         public_opposed_prompt = item.public_opposed_prompt or public_opposed_prompt
         player_action_check_result = item.player_action_check_result or player_action_check_result
         archived_sub_zone_turn_id = item.archived_sub_zone_turn_id or archived_sub_zone_turn_id
@@ -258,6 +280,7 @@ def _merge_step_results(results: list[PublicTurnRunResult]) -> PublicTurnRunResu
         round_completed=last.round_completed,
         archived_sub_zone_turn_id=archived_sub_zone_turn_id,
         reaction_check=reaction_check,
+        public_interaction_prompt=public_interaction_prompt,
         public_opposed_prompt=public_opposed_prompt,
         player_action_check_result=player_action_check_result,
     )
@@ -280,6 +303,7 @@ def run_public_turn_entry_once(payload: PublicTurnEntryRequest) -> PublicTurnRes
     if (
         str(payload.player_action or "").strip()
         and result.reaction_check is None
+        and result.public_interaction_prompt is None
         and result.public_opposed_prompt is None
         and not result.round_completed
     ):
@@ -296,6 +320,7 @@ def run_public_turn_entry_once(payload: PublicTurnEntryRequest) -> PublicTurnRes
                 source_phase=round_state.awaiting_player_action_phase or round_state.phase,
                 forced_first=payload.entry_type.value == "god_override",
             ),
+            interaction_response=None,
             action_check=None,
             config=payload.config,
         )
@@ -337,6 +362,7 @@ def run_public_turn_continue_once(payload: PublicTurnContinueRequest) -> PublicT
     result = continue_round_in_save(
         save,
         submission=payload.action_submission,
+        interaction_response=payload.player_interaction_response,
         action_check=payload.player_action_check,
         config=payload.config,
     )
@@ -490,6 +516,7 @@ async def run_public_turn_entry_stream(
     if (
         str(payload.player_action or "").strip()
         and merged.reaction_check is None
+        and merged.public_interaction_prompt is None
         and merged.public_opposed_prompt is None
         and not merged.round_completed
     ):
@@ -506,6 +533,7 @@ async def run_public_turn_entry_stream(
             for step in iter_round_continue_steps_in_save(
                 save,
                 submission=submission,
+                interaction_response=None,
                 action_check=None,
                 config=payload.config,
             ):
@@ -565,6 +593,7 @@ async def run_public_turn_continue_stream(
     for step in iter_round_continue_steps_in_save(
         save,
         submission=payload.action_submission,
+        interaction_response=payload.player_interaction_response,
         action_check=payload.player_action_check,
         config=payload.config,
     ):

@@ -5,10 +5,11 @@ type Props = {
   roleCards?: NpcRoleCard[];
   busy?: boolean;
   onContinue: () => void;
+  onMinimize?: () => void;
 };
 
 const TREND_LABEL: Record<EncounterEntry['situation_trend'], string> = {
-  improving: '更稳',
+  improving: '转稳',
   stable: '持平',
   worsening: '恶化',
 };
@@ -18,14 +19,21 @@ function resolveMainNpcName(encounter: EncounterEntry, roleCards: NpcRoleCard[])
   return roleCards.find((item) => item.role_id === encounter.npc_role_id)?.name ?? encounter.npc_role_id;
 }
 
-export function EncounterModal({ encounter, roleCards = [], busy = false, onContinue }: Props) {
+export function EncounterModal({ encounter, roleCards = [], busy = false, onContinue, onMinimize }: Props) {
   if (!encounter) return null;
   const mainNpcName = resolveMainNpcName(encounter, roleCards);
 
   return (
     <div className="modal-mask">
       <div className="modal-card modal-wide">
-        <h3>遭遇事件</h3>
+        <div className="modal-header-actions">
+          <h3>遭遇事件</h3>
+          {onMinimize ? (
+            <button type="button" onClick={onMinimize} disabled={busy}>
+              暂时关闭
+            </button>
+          ) : null}
+        </div>
         <strong>{encounter.title}</strong>
         <p>{encounter.description}</p>
         <p>

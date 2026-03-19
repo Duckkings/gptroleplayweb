@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react';
+
 import type { BattleStartRequest } from '../types/app';
 
 type Props = {
   open: boolean;
+  minimized?: boolean;
   busy?: boolean;
   currentZoneName: string;
   currentSubZoneName: string;
@@ -11,14 +13,16 @@ type Props = {
   reputationScore?: number | null;
   onClose: () => void;
   onConfirm: (payload: BattleStartRequest) => void;
+  onMinimize?: () => void;
   sessionId: string;
   configPayload: BattleStartRequest['config'];
 };
 
-const TEMPLATE_GROUPS = ['流氓小队', '暴徒小队', '野狗群', '持刀混混', '失控卫兵'];
+const TEMPLATE_GROUPS = ['流民小队', '暴徒小队', '野狗群', '持刀混混', '失控卫兵'];
 
 export function BattleStartDialog({
   open,
+  minimized = false,
   busy = false,
   currentZoneName,
   currentSubZoneName,
@@ -27,6 +31,7 @@ export function BattleStartDialog({
   reputationScore,
   onClose,
   onConfirm,
+  onMinimize,
   sessionId,
   configPayload,
 }: Props) {
@@ -45,21 +50,28 @@ export function BattleStartDialog({
     setAiPacing('step');
   }, [open]);
 
-  if (!open) return null;
+  if (!open || minimized) return null;
 
   return (
     <div className="modal-mask">
       <div className="modal-card battle-start-dialog">
-        <h3>开始战斗测试</h3>
-        <p>战场会使用你当前所在的子区块，并在完全沙盒里运行，不写回正式玩法状态。</p>
+        <div className="modal-header-actions">
+          <h3>开始战斗测试</h3>
+          {onMinimize ? (
+            <button type="button" onClick={onMinimize} disabled={busy}>
+              暂时关闭
+            </button>
+          ) : null}
+        </div>
+        <p>战场会使用你当前所在的子区块，并在完整沙盒里运行，不写回正式玩法状态。</p>
 
         <div className="battle-start-summary">
           <p>
-            当前战场：{currentZoneName} / {currentSubZoneName}
+            当前战场: {currentZoneName} / {currentSubZoneName}
           </p>
-          <p>子区块摘要：{subZoneDescription || '无'}</p>
+          <p>子区块摘要: {subZoneDescription || '无'}</p>
           <p>
-            区域危险：{typeof dangerScore === 'number' ? dangerScore : '-'} | 区域名声：{typeof reputationScore === 'number' ? reputationScore : '-'}
+            区域危险: {typeof dangerScore === 'number' ? dangerScore : '-'} | 区域名声: {typeof reputationScore === 'number' ? reputationScore : '-'}
           </p>
         </div>
 

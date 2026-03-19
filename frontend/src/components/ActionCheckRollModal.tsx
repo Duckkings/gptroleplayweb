@@ -1,4 +1,5 @@
 import type { CSSProperties } from 'react';
+
 import type { ActionCheckPlan, ActionCheckResult } from '../types/app';
 
 type Phase = 'ready' | 'rolling' | 'resolving' | 'resolved' | 'error';
@@ -25,6 +26,7 @@ type Props = {
   failureHint?: string;
   onTrigger: () => void;
   onClose: () => void;
+  onMinimize?: () => void;
 };
 
 function describeCritical(critical: ActionCheckResult['critical']): string {
@@ -54,6 +56,7 @@ export function ActionCheckRollModal({
   failureHint,
   onTrigger,
   onClose,
+  onMinimize,
 }: Props) {
   if (!open) return null;
 
@@ -83,31 +86,36 @@ export function ActionCheckRollModal({
         role="dialog"
         aria-modal="true"
       >
-        <div className="roll-modal-header">
+        <div className="roll-modal-header modal-header-actions">
           <div>
             <h3>{title ?? '检定掷骰'}</h3>
             <p>{subtitle ?? '点击下方骰子，掷出本次 d20。'}</p>
           </div>
+          {onMinimize ? (
+            <button type="button" onClick={onMinimize} disabled={phase === 'rolling' || phase === 'resolving'}>
+              暂时关闭
+            </button>
+          ) : null}
         </div>
 
         {plan && (
           <section className="roll-result-card">
-            {planSourceLabel && <p>来源：{planSourceLabel}</p>}
-            <p>执行者：{plan.actor_name}</p>
-            <p>检定目标：{plan.check_task || '判断当前行动是否顺利完成'}</p>
-            {planThreatenedConsequence && <p>风险：{planThreatenedConsequence}</p>}
+            {planSourceLabel && <p>来源: {planSourceLabel}</p>}
+            <p>执行者: {plan.actor_name}</p>
+            <p>检定目标: {plan.check_task || '判断当前行动是否顺利完成'}</p>
+            {planThreatenedConsequence && <p>风险: {planThreatenedConsequence}</p>}
             <p>
-              属性：{plan.ability_used} | 调整值：{formatModifier(plan.ability_modifier)}
+              属性: {plan.ability_used} | 调整值: {formatModifier(plan.ability_modifier)}
             </p>
             {isOpposed ? (
               <p>
-                对抗目标：{plan.target_name || '未知目标'} | 对方修正：{formatModifier(plan.target_ability_modifier)}
+                对抗目标: {plan.target_name || '未知目标'} | 对方修正: {formatModifier(plan.target_ability_modifier)}
               </p>
             ) : (
-              <p>DC：{plan.dc}</p>
+              <p>DC: {plan.dc}</p>
             )}
-            {successHint && <p>成功后果：{successHint}</p>}
-            {failureHint && <p>失败后果：{failureHint}</p>}
+            {successHint && <p>成功后果: {successHint}</p>}
+            {failureHint && <p>失败后果: {failureHint}</p>}
           </section>
         )}
 
@@ -129,22 +137,22 @@ export function ActionCheckRollModal({
 
         {phase === 'ready' && <p className="roll-modal-caption">点击骰子开始检定。</p>}
         {phase === 'rolling' && <p className="roll-modal-caption">骰子滚动中...</p>}
-        {phase === 'resolving' && <p className="roll-modal-caption">点数锁定为 {rollValue ?? '?'}，正在结算...</p>}
+        {phase === 'resolving' && <p className="roll-modal-caption">点数锁定中 {rollValue ?? '?'}，正在结算...</p>}
         {phase === 'error' && <p className="error">{errorMessage}</p>}
 
         {phase === 'resolved' && result && (
           <section className={`roll-result-card ${result.success ? 'is-success' : 'is-failure'}`}>
             <p>
-              结果：{result.success ? '成功' : '失败'} | {describeCritical(result.critical)}
+              结果: {result.success ? '成功' : '失败'} | {describeCritical(result.critical)}
             </p>
             {result.requires_check ? (
               isOpposed ? (
                 <div className="scene-event-kv-grid">
                   <p>
-                    我方：d20({result.dice_roll ?? rollValue ?? '-'}) {formatModifier(result.ability_modifier)} = {result.total_score ?? '-'}
+                    我方: d20({result.dice_roll ?? rollValue ?? '-'}) {formatModifier(result.ability_modifier)} = {result.total_score ?? '-'}
                   </p>
                   <p>
-                    对方：{result.target_name || '目标'} d20({result.target_dice_roll ?? '-'}) {formatModifier(result.target_ability_modifier)} ={' '}
+                    对方: {result.target_name || '目标'} d20({result.target_dice_roll ?? '-'}) {formatModifier(result.target_ability_modifier)} ={' '}
                     {result.target_total_score ?? '-'}
                   </p>
                 </div>

@@ -733,3 +733,104 @@ class PublicTurnResponse(BaseModel):
 - Stream execution now emits after each resolved segment instead of replaying only after the full request finishes.
 - Embedded public-turn checks no longer re-enter `_ai_action_plan()` or `_ai_action_resolution_text()`.
 - Player settlements and opposed-resume settlements are seeded into the same running narration flow before later AI settlements or `gm_push`.
+
+## 20. Interaction And Opposed Revision Note (2026-03-19)
+
+- Public-turn "opposed" is no longer defined by action keywords alone.
+- The new rule is:
+  - actor A first outputs a directed interaction against actor B
+  - actor B then outputs a response action
+  - only an explicit unwilling / resisting / blocking / break-free response upgrades the exchange to `opposed_actor`
+- If the target accepts or the response is ambiguous, the exchange stays non-opposed and resolves as normal `static_dc` or direct settlement.
+- `attack` is not part of this redesign and still stays on the existing attack / reaction path.
+- Player-targeted non-attack interactions now pause at `awaiting_player_interaction` before any opposed roll UI appears.
+- Backend state now stores `pending_interaction_prompt`, `interaction_resolution`, and structured interaction target fields so target resolution is not inferred from "the prompt mentions the player".
+- Public-turn modals now support temporary minimize / restore:
+  - quest
+  - encounter
+  - public-turn action roll
+  - public-turn interaction
+  - public-turn opposed
+  - reaction roll
+  - battle start
+  - battle modal
+  - battle roll
+- While a blocking gameplay modal is minimized, the player may inspect the main chat and current scene, but main-flow chat submission remains locked until the modal is restored and resolved.
+
+## 21. Settlement And GM Push Revision Note (2026-03-20)
+
+- Public-turn round narration is no longer AI-stitched prose.
+- The displayed narration now comes from deterministic settlement-order concatenation:
+  - actor name
+  - action summary
+  - speech text
+  - target-side response text when present
+- Non-GM actor settlements no longer carry a GM description block.
+- Actor-side `gm_resolution_summary` is compatibility-only and must stay empty on actor settlements.
+- Each round now ends with exactly one GM push settlement:
+  - `entry_kind="gm_push"`
+  - single AI environment / atmosphere description
+  - backend `1d6` push result shown in the settlement card
+- GM push `1d6` outcomes are:
+  - `1-4`: no extra event
+  - `5`: environment change
+  - `6`: extra persistent scene NPC intervention
+- On `6`, the spawned scene NPC immediately performs one same-round action, then joins later rounds through normal public-turn candidate selection.
+- `优先行动` no longer forces the player to act first by default.
+- Priority action now builds initiative declarations from the full in-scene candidate set, so player / NPC / team / encounter temporary NPC all roll and sort together unless `god_override` explicitly forces first place.
+- Public-turn actor action / reaction / interaction resolution no longer uses NPC fallback output.
+- Missing AI fields are allowed to stay empty.
+- Entirely empty actor output still produces an actor settlement card, but it does not produce a narration fragment and resolves as "本回合无可见行动".
+
+## 22. Reaction Scope And Reputation Ownership Note (2026-03-20 v3)
+
+- `NPC反应 / 队友反应` is now a player-action-only settlement layer.
+- Only a player-submitted action may trigger:
+  - `relation_deltas`
+  - `team_affinity_deltas`
+  - AI public reaction text
+- Non-player actor settlements no longer emit attitude-reaction blocks.
+- Teammates no longer gain or lose affinity / trust from their own actor turns.
+- Zone reputation now belongs strictly to the player side:
+  - `player` actions may change zone reputation
+  - `team` actions may change zone reputation
+  - `npc / hidden_npc / encounter_temp_npc / environment` may not change zone reputation directly
+- NPC-side public-turn consequences are now limited to:
+  - `situation_delta`
+  - `environment_shift`
+  - hp / opposed / interaction consequences
+- Player settlement narration now includes AI NPC/team reactions in the same deterministic fragment.
+- Stream output continues to emit settlement-bound narration deltas, so the player can read the finished player-action fragment before later pause UI is handled.
+## 2026-03-20 Targeting And Contest Addendum
+
+- Public-turn actor actions now model `action target` and `speech addressee` as separate structured fields.
+- Any role-to-role targeted action in public turn must go through `interaction assessment` before final resolution.
+- If the target is the player, the runtime pauses for player response input first; it no longer jumps directly to `player_reaction` for actor-targeted hostility.
+- `player_reaction` is now reserved for environment / world push / non-actor hazards on the public-turn path.
+- NPC-to-NPC and team-to-NPC targeted actions use the same flow: source action, target response, then contest classification.
+- Player post-action NPC/team reactions remain allowed for all visible actors, but they must be anchored to the active conflict and carry `reaction_tone`, `reaction_focus_actor_name`, and `reaction_speech_target_name`.
+- Warning / hostile reaction text cannot produce large positive relation or affinity deltas; server-side tone clamps enforce coherence.
+- Deterministic narration now renders action target and speech addressee explicitly, and pause previews use the same formatter before modal interruption.
+## 2026-03-20 v7 Interaction Routing / No-Action Update
+
+- `PublicTurnInteractionPrompt` no longer exposes `stakes_summary`.
+- Public-turn interaction now uses a single real target:
+  - `action_target`
+  - prompt `target_actor_*`
+  - response target
+  must all be the same actor
+- `speech_target` is narration-only metadata and does not participate in routing.
+- Public-turn interaction adds `world_impact_type = non_world | world`.
+- Resolution rules:
+  - `non_world -> non_world`: no DC, no opposed
+  - `non_world -> world` aimed back at the source: one alternated interaction
+  - `world -> *`: normal interaction / opposed routing
+- Alternation rules:
+  - maximum depth `1`
+  - reverse world-impact action must target the original source actor
+  - third-party reverse targeting is invalid
+- Interaction modal no longer allows cancel.
+- New player interaction response:
+  - `response_kind = "no_action"`
+  - counts as a valid `non_world` response
+  - guarantees the round can continue instead of remaining stuck in `awaiting_player_interaction`

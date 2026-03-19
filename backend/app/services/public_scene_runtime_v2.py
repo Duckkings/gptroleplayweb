@@ -428,6 +428,7 @@ def _ai_actor_action(
     gm_summary: str,
     scene_context: dict[str, object] | None,
     incoming_interaction: dict[str, str] | None,
+    allow_partial: bool = False,
     config: ChatConfig | None,
 ) -> dict[str, object] | None:
     legacy = _legacy()
@@ -488,6 +489,8 @@ def _ai_actor_action(
         "risk_location": str(parsed.get("risk_location") or "")[:80],
         "specific_threat": str(parsed.get("specific_threat") or "")[:180],
         "target_label": str(parsed.get("target_label") or "")[:80],
+        "speech_target_label": str(parsed.get("speech_target_label") or "")[:80],
+        "world_impact_type": str(parsed.get("world_impact_type") or "")[:20],
         "needs_check": bool(parsed.get("needs_check")),
         "action_type": str(parsed.get("action_type") or "check").strip().lower(),
         "action_prompt": str(parsed.get("action_prompt") or "")[:200],
@@ -498,9 +501,11 @@ def _ai_actor_action(
     if str(payload["action_type"]) not in {"check", "attack", "item_use"}:
         payload["action_type"] = "check"
     required_text = ["external_action_narration", "speech_line", "visible_intent", "risk_source", "risk_object", "risk_location", "specific_threat"]
-    if any(not str(payload.get(key) or "").strip() for key in required_text):
+    if not allow_partial and any(not str(payload.get(key) or "").strip() for key in required_text):
         return None
-    if legacy._looks_too_vague(str(payload["external_action_narration"])) or legacy._looks_too_vague(str(payload["specific_threat"])):
+    if not allow_partial and (
+        legacy._looks_too_vague(str(payload["external_action_narration"])) or legacy._looks_too_vague(str(payload["specific_threat"]))
+    ):
         return None
     if not str(payload["action_prompt"]):
         payload["action_prompt"] = f"actor={actor.get('name')}; target={payload['target_label']}; threat={payload['specific_threat']}; intent={payload['visible_intent']}"

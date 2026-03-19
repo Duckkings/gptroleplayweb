@@ -415,3 +415,55 @@ AI GM的推理输入建议包含：
 - 冲突自然生成
 - AI GM可控节奏
 - 玩家互动感强
+
+## 2026-03-20 结算与推动修订
+
+- 连续描述不再由单独的 AI narration 阶段拼接。
+- 公开回合的连续描述直接以结算区顺序为准，按角色卡依次串接：
+  - 角色行为
+  - 角色发言
+  - 目标方回应
+- 普通角色卡不再显示 GM 描述模块。
+- 每轮末尾只有一个 GM 模块，用于：
+  - 描述环境和气氛
+  - 掷 `1d6` 推动事态
+- GM 模块的 `1d6` 规则固定为：
+  - `1-4`：无额外事件
+  - `5`：环境变动
+  - `6`：额外 NPC 介入
+- `6` 结果下，额外 NPC 会先被生成，再立即执行一个同回合特殊行动；从下一公开回合开始，它作为在场 NPC 参与常规公开回合。
+- `优先行动` 的定义改为“抢先声明并参与共同先攻”，而不是“玩家直接拿到第一位”。
+- 玩家点击 `优先行动` 后，玩家与在场角色一起掷先攻并排序，后续仍按完整顺序执行，不允许跳过 NPC 回合。
+- 公开回合路径里的 NPC 行为、语言、反应不再使用 fallback 文案；AI 没给内容时允许为空。
+
+## 2026-03-20 反应与声望归属修订
+
+- `NPC反应 / 队友反应` 只在玩家行为后结算，用于描述其他角色如何看待并回应玩家这次行动。
+- 队友或 NPC 自己完成行动后，不会再触发“对自己/对玩家的态度反应”模块。
+- 公开回合里的反应文本采用：
+  - 表达性动作
+  - 简短台词
+- 其中动作只用于增强表现，不得产生新的机械影响。
+- 地区声望只由玩家与玩家队伍的公开行动驱动。
+- 普通 NPC、hidden NPC、encounter temp NPC 的行动只影响局势与环境，不直接改地区声望。
+- 玩家结算片段会把 NPC/队友的 AI 反应一起接到主描述里，并在后续暂停前就展示给玩家。
+## 2026-03-20 对抗与目标补充
+
+- 公开回合中的“对抗”不再按 `attack -> player_reaction` 这种捷径分流。
+- 统一规则改为：只要是角色对角色的定向行为，就先有双方行为，再判断是否构成对抗。
+- 目标为玩家时，先弹出玩家回应窗口；玩家写出回应行为后，再由系统判断是否升级为 opposed。
+- 目标不是玩家时，由目标角色先生成回应，再判定 opposed / non-opposed。
+- 行为目标和说话对象是两个独立结构化字段，可以不同。
+- 主描述必须把“谁对谁做了什么”和“这句话是对谁说的”都写清楚。
+- 玩家行动后的在场者 reaction 允许全场参与，但 reaction 必须围绕当前主冲突，而不是脱离事件单独填充一句。
+## 2026-03-20 Public-Turn Interaction Design Reference
+
+- Detailed interaction rules now live in:
+  - [publicturninteractiondesign.md](/c:/Project/gptroleplayweb/docs/design/gamedesign/publicturninteractiondesign.md)
+- This includes:
+  - target unification
+  - speech-target narration rules
+  - world-impact classification
+  - alternated interaction flow
+  - player `no_action` interaction response
+- `publicturndesign.md` remains the overview document for the full public-turn system.

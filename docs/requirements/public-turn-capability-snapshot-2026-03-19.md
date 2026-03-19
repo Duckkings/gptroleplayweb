@@ -1,38 +1,24 @@
 # Public Turn Capability Snapshot (2026-03-19)
 
-## Implemented
+## Added
 
-- Public turn now uses Scheme A for AI-only progression:
-  - one batch planner call per AI-only segment
-  - deterministic backend settlement for checks / opposed / impacts
-  - one batch narrator call per AI-only segment
-- Public-turn stream routes now emit per resolved segment instead of replaying only after the full request finishes.
-- Embedded public-turn `action_check()` no longer falls back into `_ai_action_plan()` or `_ai_action_resolution_text()`.
-- Player-originated settlements and opposed-resume settlements are seeded into the same running narration flow before later AI settlements or `gm_push`.
-- Existing split presentation remains intact:
-  - `initiative_order`
-  - `settlement_entries`
-  - `narrative_entries`
-  - `accumulated_narration`
+- player-targeted non-attack interactions now pause at `awaiting_player_interaction`
+- player response text is collected before deciding whether the exchange becomes opposed
+- deterministic consent routing:
+  - `rejected` -> opposed
+  - `accepted` -> non-opposed
+  - `ambiguous` -> non-opposed by default
+- AI target actors now generate a lightweight response before non-player interaction resolution is classified
+- structured interaction target metadata is stored in directive / round / settlement payloads
+- modal minimize / restore is available for blocking gameplay modals while keeping main chat submission locked
 
-## Compatibility
+## Fixed
 
-- Public routes are unchanged:
-  - `/api/v1/public-turn/entry`
-  - `/api/v1/public-turn/entry/stream`
-  - `/api/v1/public-turn/continue`
-  - `/api/v1/public-turn/continue/stream`
-  - `/api/v1/public-turn/reaction-check`
-  - `/api/v1/public-turn/reaction-check/stream`
-  - `/api/v1/public-turn/opposed-check`
-  - `/api/v1/public-turn/opposed-check/stream`
-- No new save shard was introduced.
-- Existing public-turn presentation fields remain the persisted contract.
+- public-turn target resolution no longer locks onto the player just because the action text mentions the player
+- ally-help and similar cooperative interactions no longer auto-upgrade into opposed checks without a rejecting target response
+- public-turn interaction state now restores from saved round state without relying on pending-turn staging
 
-## Verification
+## Verified
 
-- `python -m py_compile backend/app/services/public_turn_runtime.py backend/app/services/public_turn_segment_service.py backend/app/services/public_turn_narration_service.py backend/app/services/public_turn_service.py backend/app/services/public_scene_service.py backend/app/services/world_service.py backend/app/models/schemas.py`
-- `python -m compileall backend/app`
-- `PYTHONPATH=backend python -m unittest backend.tests.test_public_turn_runtime`
-- `npx tsc -b`
+- `python -m unittest backend.tests.test_public_turn_runtime`
 - `npm run build`

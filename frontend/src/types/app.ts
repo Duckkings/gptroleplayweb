@@ -153,6 +153,7 @@ export type PendingTurnContinueResponse = {
   main_turn_summary?: MainTurnSummary | null;
   current_zone_metric?: ZoneMetricEntry | null;
   pending_reaction?: PlayerReactionCheck | null;
+  public_interaction_prompt?: PublicTurnInteractionPrompt | null;
   public_opposed_prompt?: PublicTurnOpposedPrompt | null;
   reaction_result?: ActionCheckResult | null;
   player_action_check_result?: ActionCheckResult | null;
@@ -169,6 +170,7 @@ export type PublicTurnPhase =
   | 'normal_advancement'
   | 'gm_push'
   | 'situation_advancement'
+  | 'awaiting_player_interaction'
   | 'awaiting_player_reaction'
   | 'awaiting_player_opposed';
 
@@ -176,7 +178,8 @@ export type EnvironmentRiskLevel = 'stable' | 'risky' | 'collapse';
 
 export type PublicTurnEntryType = 'next_round' | 'initiative' | 'god_override';
 
-export type PublicTurnActorType = 'player' | 'npc' | 'team' | 'hidden_npc' | 'environment';
+export type PublicTurnActorType = 'player' | 'npc' | 'team' | 'encounter_temp_npc' | 'hidden_npc' | 'environment';
+export type PublicTurnWorldImpactType = 'non_world' | 'world';
 
 export type PublicTurnActionSubmission = {
   actor_id: string;
@@ -184,6 +187,13 @@ export type PublicTurnActionSubmission = {
   speech_text: string;
   source_phase: PublicTurnPhase;
   forced_first?: boolean;
+};
+
+export type PublicTurnInteractionResponseSubmission = {
+  prompt_id: string;
+  action_text: string;
+  speech_text: string;
+  response_kind: 'explicit_response' | 'no_action';
 };
 
 export type PublicTurnPlayerActionCheck = {
@@ -222,6 +232,13 @@ export type PublicTurnRelationDelta = {
   before_tag: string;
   after_tag: string;
   relation_delta: number;
+  reaction_tone: 'supportive' | 'approving' | 'neutral' | 'concerned' | 'warning' | 'hostile';
+  reaction_focus_actor_id?: string | null;
+  reaction_focus_actor_name?: string | null;
+  reaction_speech_target_id?: string | null;
+  reaction_speech_target_name?: string | null;
+  reaction_action: string;
+  reaction_speech: string;
   reaction_text: string;
 };
 
@@ -234,6 +251,13 @@ export type PublicTurnTeamAffinityDelta = {
   trust_before: number;
   trust_after: number;
   trust_delta: number;
+  reaction_tone: 'supportive' | 'approving' | 'neutral' | 'concerned' | 'warning' | 'hostile';
+  reaction_focus_actor_id?: string | null;
+  reaction_focus_actor_name?: string | null;
+  reaction_speech_target_id?: string | null;
+  reaction_speech_target_name?: string | null;
+  reaction_action: string;
+  reaction_speech: string;
   reaction_text: string;
 };
 
@@ -288,9 +312,20 @@ export type PublicTurnSettlementCheck = {
   outcome_text: string;
 };
 
+export type PublicTurnGmPushResult = {
+  roll_d6: number;
+  outcome_kind: 'none' | 'environment_change' | 'extra_npc_intervention';
+  outcome_label: string;
+  gm_environment_text: string;
+  environment_change_text: string;
+  spawned_npc_role_id?: string | null;
+  spawned_npc_name?: string | null;
+};
+
 export type PublicTurnSettlementEntry = {
   entry_id: string;
   round_id: string;
+  entry_kind: 'actor' | 'gm_push';
   phase: PublicTurnPhase;
   order_index: number;
   actor_id: string;
@@ -299,11 +334,26 @@ export type PublicTurnSettlementEntry = {
   action_summary: string;
   speech_text: string;
   narrative_entry_id?: string | null;
+  action_target_actor_id?: string | null;
+  action_target_name?: string | null;
+  action_target_kind?: PublicTurnActorType | null;
+  speech_target_actor_id?: string | null;
+  speech_target_name?: string | null;
+  speech_target_kind?: PublicTurnActorType | null;
+  source_world_impact_type: PublicTurnWorldImpactType;
+  target_response_world_impact_type: PublicTurnWorldImpactType;
+  interaction_exchange_kind: 'non_world_exchange' | 'world_exchange' | 'alternated_exchange';
+  alternation_depth: number;
+  target_response_kind: 'explicit_response' | 'no_action';
+  interaction_target_name?: string | null;
+  interaction_resolution: 'non_interactive' | 'accepted' | 'ambiguous_non_opposed' | 'rejected_opposed' | 'attack_flow';
   opposed_target_name?: string | null;
   opposed_target_action?: string | null;
   opposed_target_speech?: string | null;
+  opposed_target_speech_target_name?: string | null;
   check?: PublicTurnSettlementCheck | null;
   gm_resolution_summary: string;
+  gm_push_result?: PublicTurnGmPushResult | null;
   situation_delta: number;
   zone_reputation_delta: number;
   relation_deltas: PublicTurnRelationDelta[];
@@ -335,9 +385,38 @@ export type PublicTurnOpposedPrompt = {
   source_actor_name: string;
   source_action_summary: string;
   source_speech_text: string;
+  source_interaction_kind: string;
+  source_action_target_name?: string | null;
+  source_speech_target_name?: string | null;
   target_actor_id: string;
   target_actor_name: string;
   stakes_summary: string;
+};
+
+export type PublicTurnInteractionPrompt = {
+  prompt_id: string;
+  round_id: string;
+  phase: PublicTurnPhase;
+  source_actor_id: string;
+  source_actor_name: string;
+  source_action_type: 'attack' | 'check' | 'item_use';
+  source_action_summary: string;
+  source_speech_text: string;
+  source_action_target_name?: string | null;
+  source_speech_target_name?: string | null;
+  source_action_prompt: string;
+  source_world_impact_type: PublicTurnWorldImpactType;
+  source_planned_requires_check: boolean;
+  source_planned_ability_used?: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma' | null;
+  source_planned_dc?: number | null;
+  source_planned_check_task?: string | null;
+  source_interaction_kind: string;
+  target_actor_id: string;
+  target_actor_name: string;
+  target_actor_kind: PublicTurnActorType;
+  alternation_depth: number;
+  interaction_mode: 'initial' | 'alternated';
+  suggested_target_label: string;
 };
 
 export type PublicTurnOpposedPlanResponse = {
@@ -376,11 +455,13 @@ export type PublicTurnRound = {
   environment_risk_level: EnvironmentRiskLevel;
   situation_dc: number;
   pending_reaction_check_id?: string | null;
+  pending_interaction_prompt?: PublicTurnInteractionPrompt | null;
   current_actor_id?: string | null;
   awaiting_player_action: boolean;
   awaiting_player_action_phase?: PublicTurnPhase | null;
   gm_push_summary: string;
   gm_push_scene_event_id?: string | null;
+  gm_push_result?: PublicTurnGmPushResult | null;
   accumulated_narration: string;
   narrative_entries: PublicTurnNarrativeEntry[];
   narrative_status: PublicTurnRoundNarrationStatus;
@@ -413,6 +494,7 @@ export type PublicTurnPresentation = {
   phase: PublicTurnPhase;
   initiative_order: PublicTurnInitiativeEntry[];
   settlement_entries: PublicTurnSettlementEntry[];
+  gm_push_result?: PublicTurnGmPushResult | null;
   narrative_entries: PublicTurnNarrativeEntry[];
   accumulated_narration: string;
   narrative_status: PublicTurnRoundNarrationStatus;
@@ -427,6 +509,7 @@ export type PublicTurnResponse = {
   narration: string;
   scene_events: SceneEvent[];
   reaction_check?: PlayerReactionCheck | null;
+  public_interaction_prompt?: PublicTurnInteractionPrompt | null;
   public_opposed_prompt?: PublicTurnOpposedPrompt | null;
   round_completed: boolean;
   awaiting_entry: boolean;

@@ -183,3 +183,73 @@
   - `accumulated_narration`
   - `gm_push_summary`
   - `round_narration` as compatibility mirror of accumulated narration
+
+## Public Turn GM Push Persistence Note (2026-03-20)
+
+- No new save shard was introduced for the GM push / deterministic narration revision.
+- The updated data remains persisted inside `AreaSubZone.chat_context.public_turn_state`.
+- `PublicTurnSettlementEntry` now persists:
+  - `entry_kind`
+  - `gm_push_result`
+- `PublicTurnRound` now persists:
+  - `gm_push_result`
+- Persisted actor settlement constraints:
+  - actor entries keep `gm_resolution_summary=""`
+  - empty actor output is still stored as a valid settlement entry
+- Persisted GM settlement constraints:
+  - exactly one GM push settlement is appended at round end
+  - the GM entry carries the round `1d6` outcome and optional spawned NPC metadata
+- The deterministic narration cache is now derived from stored settlements rather than from a separate AI narration artifact.
+
+## Public Turn Reaction Persistence Note (2026-03-20 v3)
+
+- Player-side public reactions are persisted inside the same settlement/impact payloads; no new shard was added.
+- `PublicTurnRelationDelta` persisted fields now include:
+  - `reaction_action`
+  - `reaction_speech`
+  - `reaction_text` compatibility mirror
+- `PublicTurnTeamAffinityDelta` persisted fields now include:
+  - `reaction_action`
+  - `reaction_speech`
+  - `reaction_text` compatibility mirror
+- Non-player settlements should persist empty:
+  - `relation_deltas`
+  - `team_affinity_deltas`
+- `zone_reputation_delta` in persisted public-turn impacts now reflects player-side ownership only and should remain `0` for non-player non-team actor entries.
+## 2026-03-20 Public-Turn Save Shape Addendum
+
+- `PublicTurnSettlementEntry` now persists explicit target/addressee fields:
+  - `action_target_actor_id`
+  - `action_target_name`
+  - `action_target_kind`
+  - `speech_target_actor_id`
+  - `speech_target_name`
+  - `speech_target_kind`
+  - `opposed_target_speech_target_name`
+- `PublicTurnInteractionPrompt` and `PublicTurnOpposedPrompt` now persist:
+  - `source_action_target_name`
+  - `source_speech_target_name`
+- `PublicTurnRelationDelta` and `PublicTurnTeamAffinityDelta` now persist:
+  - `reaction_tone`
+  - `reaction_focus_actor_id`
+  - `reaction_focus_actor_name`
+  - `reaction_speech_target_id`
+  - `reaction_speech_target_name`
+- `reaction_text` remains as a compatibility mirror, but new readers should prefer structured reaction fields.
+## 2026-03-20 Public-Turn Interaction Persistence v7
+
+- Public-turn interaction save payloads no longer persist `stakes_summary` on `PublicTurnInteractionPrompt`.
+- Persisted interaction prompt fields now include:
+  - `source_world_impact_type`
+  - `alternation_depth`
+  - `interaction_mode`
+- Persisted settlement fields now include:
+  - `source_world_impact_type`
+  - `target_response_world_impact_type`
+  - `interaction_exchange_kind`
+  - `alternation_depth`
+  - `target_response_kind`
+- Persisted target semantics are now locked:
+  - prompt `target_actor_*` is the real action target / responding actor
+  - `speech_target_*` is auxiliary narration metadata only
+- `response_kind="no_action"` persists as a normal resolved interaction outcome rather than a canceled / interrupted state.

@@ -1,4 +1,5 @@
 import type { CSSProperties } from 'react';
+
 import type { ActionCheckResult, PublicTurnOpposedPlanResponse, PublicTurnOpposedPrompt } from '../types/app';
 
 type Phase = 'ready' | 'rolling' | 'resolving' | 'resolved' | 'error';
@@ -25,6 +26,7 @@ type Props = {
   onPlan: () => void;
   onTrigger: () => void;
   onClose: () => void;
+  onMinimize?: () => void;
 };
 
 function formatModifier(value: number | null | undefined): string {
@@ -54,6 +56,7 @@ export function PublicTurnOpposedModal({
   onPlan,
   onTrigger,
   onClose,
+  onMinimize,
 }: Props) {
   if (!open || !prompt) return null;
 
@@ -76,11 +79,16 @@ export function PublicTurnOpposedModal({
         role="dialog"
         aria-modal="true"
       >
-        <div className="roll-modal-header">
+        <div className="roll-modal-header modal-header-actions">
           <div>
             <h3>公开回合对抗</h3>
-            <p>先确认对方动作与自己的回应，再投出这次对抗的 d20。</p>
+            <p>先确认双方行为，再掷出这次对抗的 d20。</p>
           </div>
+          {onMinimize ? (
+            <button type="button" onClick={onMinimize} disabled={phase === 'rolling' || phase === 'resolving'}>
+              暂时关闭
+            </button>
+          ) : null}
         </div>
 
         <section className="roll-result-card">
@@ -88,7 +96,10 @@ export function PublicTurnOpposedModal({
           <p>目标: {prompt.target_actor_name}</p>
           <p>对方行为: {prompt.source_action_summary}</p>
           {prompt.source_speech_text ? <p>对方语言: {prompt.source_speech_text}</p> : null}
-          <p>风险: {prompt.stakes_summary}</p>
+          {prompt.source_speech_target_name && prompt.source_speech_target_name !== prompt.target_actor_name ? (
+            <p>说话对象: {prompt.source_speech_target_name}</p>
+          ) : null}
+          <p>对抗焦点: {prompt.stakes_summary}</p>
         </section>
 
         <section className="chat-interactions">
@@ -186,17 +197,13 @@ export function PublicTurnOpposedModal({
           </section>
         ) : null}
 
-        <div className="actions">
-          {phase === 'resolved' || phase === 'error' ? (
+        {(phase === 'resolved' || phase === 'error') && (
+          <div className="actions">
             <button type="button" onClick={onClose}>
               {phase === 'resolved' ? '继续' : '关闭'}
             </button>
-          ) : (
-            <button type="button" onClick={onClose}>
-              取消
-            </button>
-          )}
-        </div>
+          </div>
+        )}
       </div>
     </div>
   );

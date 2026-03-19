@@ -46,12 +46,14 @@
   PendingTurnContinueResponse,
   PlayerReactionCheck,
   PublicTurnOpposedPlanResponse,
+  PublicTurnInteractionPrompt,
   PublicTurnOpposedPrompt,
   PublicTurnPresentation,
   QuestMutationResponse,
   PublicTurnActionSubmission,
   PublicTurnEntryType,
   PublicTurnImpact,
+  PublicTurnInteractionResponseSubmission,
   PublicTurnInitiativeEntry,
   PublicTurnPlayerActionCheck,
   PublicTurnPhase,
@@ -1049,6 +1051,7 @@ export async function continuePublicTurn(
   payload: {
     session_id: string;
     action_submission?: PublicTurnActionSubmission | null;
+    player_interaction_response?: PublicTurnInteractionResponseSubmission | null;
     player_action_check?: PublicTurnPlayerActionCheck | null;
     config?: AppConfig;
   },
@@ -1139,6 +1142,7 @@ async function consumePublicTurnStream(
     onRoundNarrationDelta: (delta: string) => void;
     onSceneEvent: (event: SceneEvent) => void;
     onImpact: (impact: PublicTurnImpact) => void;
+    onInteractionRequired?: (payload: PublicTurnInteractionPrompt) => void;
     onReactionCheckRequired: (payload: {
       pending_turn_id: string;
       flow_kind: PendingTurnContinueResponse['flow_kind'];
@@ -1218,6 +1222,7 @@ async function consumePublicTurnStream(
           reply_so_far?: string;
           scene_events_so_far?: SceneEvent[];
           pending_reaction?: PlayerReactionCheck | null;
+          public_interaction_prompt?: PublicTurnInteractionPrompt | null;
           public_opposed_prompt?: PublicTurnOpposedPrompt | null;
           npc_role_id?: string | null;
           archived_sub_zone_turn_id?: string | null;
@@ -1250,6 +1255,9 @@ async function consumePublicTurnStream(
           handlers.onSceneEvent(data as unknown as SceneEvent);
         } else if (event === 'impact') {
           handlers.onImpact(data as unknown as PublicTurnImpact);
+        } else if (event === 'interaction_required') {
+          terminalEventReceived = true;
+          handlers.onInteractionRequired?.(data as unknown as PublicTurnInteractionPrompt);
         } else if (event === 'reaction_check_required') {
           terminalEventReceived = true;
           handlers.onReactionCheckRequired({
@@ -1319,6 +1327,7 @@ export async function streamContinuePublicTurn(
   payload: {
     session_id: string;
     action_submission?: PublicTurnActionSubmission | null;
+    player_interaction_response?: PublicTurnInteractionResponseSubmission | null;
     player_action_check?: PublicTurnPlayerActionCheck | null;
     config?: AppConfig;
   },
