@@ -155,6 +155,19 @@ def sanitize_reaction_tone_deltas(*, tone: str, relation_delta: int = 0, affinit
     return relation_delta, affinity_delta, trust_delta
 
 
+_ALLOWED_REACTION_TONES = {"supportive", "approving", "neutral", "concerned", "warning", "hostile"}
+
+
+def sanitize_reaction_tone(tone: str, action: str, speech: str) -> str:
+    normalized_tone = str(tone or "").strip().lower()
+    if normalized_tone in _ALLOWED_REACTION_TONES:
+        return normalized_tone
+    inferred = infer_reaction_tone(action, speech)
+    if inferred in _ALLOWED_REACTION_TONES:
+        return inferred
+    return "neutral"
+
+
 def sanitize_reaction_action(text: str) -> str:
     action = _clean(text, limit=120)
     lowered = action.lower()
@@ -344,8 +357,9 @@ def build_public_turn_team_reactions(
             reaction_focus_name = None
             reaction_speech_target_name = None
             reaction_scope = "player_action"
+        reaction_tone = sanitize_reaction_tone(str(reaction_tone), reaction_action, reaction_speech)
         _, affinity_delta, trust_delta = sanitize_reaction_tone_deltas(
-            tone=str(reaction_tone),
+            tone=reaction_tone,
             affinity_delta=int(affinity_delta),
             trust_delta=int(trust_delta),
         )
@@ -367,7 +381,7 @@ def build_public_turn_team_reactions(
             trust_before=trust_before,
             trust_after=int(member.trust),
             trust_delta=int(member.trust) - trust_before,
-            reaction_tone=str(reaction_tone),
+            reaction_tone=reaction_tone,
             reaction_focus_actor_name=reaction_focus_name,
             reaction_speech_target_name=reaction_speech_target_name,
             reaction_action=reaction_action,
@@ -405,7 +419,7 @@ def build_public_turn_team_reactions(
                     "trust_before": trust_before,
                     "trust_after": int(member.trust),
                     "trust_delta": row.trust_delta,
-                    "reaction_tone": str(reaction_tone),
+                    "reaction_tone": reaction_tone,
                     "reaction_focus_actor_name": reaction_focus_name,
                     "reaction_speech_target_name": reaction_speech_target_name,
                     "reaction_scope": reaction_scope,
@@ -477,11 +491,12 @@ def build_public_turn_npc_reactions(
             reaction_focus_name = None
             reaction_speech_target_name = None
             reaction_scope = "player_action"
+        reaction_tone = sanitize_reaction_tone(str(reaction_tone), reaction_action, reaction_speech)
         reaction_text = compose_reaction_text(reaction_action, reaction_speech)
         delta_to_apply = relation_delta
         if index > 0 and relation_delta != 0:
             delta_to_apply = 1 if relation_delta > 0 else -1
-        delta_to_apply, _, _ = sanitize_reaction_tone_deltas(tone=str(reaction_tone), relation_delta=int(delta_to_apply))
+        delta_to_apply, _, _ = sanitize_reaction_tone_deltas(tone=reaction_tone, relation_delta=int(delta_to_apply))
         applied = 0
         if delta_to_apply != 0:
             applied = public_scene_service._apply_actor_relation_delta(
@@ -500,7 +515,7 @@ def build_public_turn_npc_reactions(
             before_tag=before_tag,
             after_tag=after_tag,
             relation_delta=applied,
-            reaction_tone=str(reaction_tone),
+            reaction_tone=reaction_tone,
             reaction_focus_actor_name=reaction_focus_name,
             reaction_speech_target_name=reaction_speech_target_name,
             reaction_action=reaction_action,
@@ -520,7 +535,7 @@ def build_public_turn_npc_reactions(
                     "before_tag": before_tag,
                     "after_tag": after_tag,
                     "relation_delta": applied,
-                    "reaction_tone": str(reaction_tone),
+                    "reaction_tone": reaction_tone,
                     "reaction_focus_actor_name": reaction_focus_name,
                     "reaction_speech_target_name": reaction_speech_target_name,
                     "reaction_scope": reaction_scope,

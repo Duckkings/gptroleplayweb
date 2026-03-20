@@ -823,6 +823,48 @@ class PublicTurnRuntimeTests(unittest.TestCase):
         self.assertEqual(npc_row.reaction_tone, "warning")
         self.assertLessEqual(npc_row.relation_delta, 0)
 
+    def test_invalid_reaction_tone_is_sanitized_before_validation(self) -> None:
+        save = self._seed_public_turn_scene("sess_public_turn_invalid_reaction_tone")
+        start_round_in_save(save, entry_type=PublicTurnEntryType.NEXT_ROUND, config=None)
+
+        with (
+            patch("app.services.public_turn_runtime.resolve_ai_round", return_value=([], [], [], None, None)),
+            patch(
+                "app.services.public_turn_effects._ai_public_turn_npc_reaction",
+                return_value=("narrows his eyes", "Stop there.", "??invalid??", "Guard", save.player_static_data.name, "current_conflict"),
+            ),
+            patch(
+                "app.services.public_turn_effects._ai_public_turn_team_reaction",
+                return_value=("takes a breath", "Easy.", 1, 1, "oops", "Guard", save.player_static_data.name, "current_conflict"),
+            ),
+        ):
+            result = continue_round_in_save(
+                save,
+                submission=PublicTurnActionSubmission(
+                    actor_id=save.player_static_data.player_id,
+                    action_text="I step between the guard and the crowd.",
+                    speech_text="Everyone back off.",
+                    source_phase=PublicTurnPhase.NORMAL_ADVANCEMENT,
+                    forced_first=False,
+                ),
+                action_check=PublicTurnPlayerActionCheck(
+                    action_type="check",
+                    source_context="public_turn",
+                    resolution_rule="static_dc",
+                    planned_requires_check=True,
+                    planned_ability_used="wisdom",
+                    planned_dc=10,
+                    planned_time_spent_min=1,
+                    planned_check_task="steady the crowd",
+                    forced_dice_roll=14,
+                ),
+                config=None,
+            )
+
+        impact = result.impacts[0]
+        self.assertIn(impact.relation_deltas[0].reaction_tone, {"neutral", "concerned", "warning", "hostile", "supportive", "approving"})
+        self.assertIn(impact.team_affinity_deltas[0].reaction_tone, {"neutral", "concerned", "warning", "hostile", "supportive", "approving"})
+
     def test_build_initiative_declarations_accepts_encounter_temp_npc(self) -> None:
         save = self._seed_public_turn_scene("sess_public_turn_temp_npc_declaration")
 
