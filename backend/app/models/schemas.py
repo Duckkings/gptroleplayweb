@@ -2272,6 +2272,7 @@ class TokenUsageSources(BaseModel):
     chat: TokenUsageBucket = Field(default_factory=TokenUsageBucket)
     map_generation: TokenUsageBucket = Field(default_factory=TokenUsageBucket)
     movement_narration: TokenUsageBucket = Field(default_factory=TokenUsageBucket)
+    encounter_location_generation: TokenUsageBucket = Field(default_factory=TokenUsageBucket)
 
 
 class TokenUsageResponse(BaseModel):
