@@ -54,10 +54,11 @@ export function PublicTurnInteractionModal({
 
         <section className="roll-result-card">
           <p>发起者: {prompt.source_actor_name}</p>
-          <p>目标: {prompt.target_actor_name}</p>
+          <p>需要回应者: {prompt.target_actor_name}</p>
+          {prompt.source_action_target_name ? <p>动作对象: {prompt.source_action_target_name}</p> : null}
           <p>对方行为: {prompt.source_action_summary}</p>
           {prompt.source_speech_text ? <p>对方语言: {prompt.source_speech_text}</p> : null}
-          {prompt.source_speech_target_name && prompt.source_speech_target_name !== prompt.target_actor_name ? (
+          {prompt.source_speech_target_name ? (
             <p>说话对象: {prompt.source_speech_target_name}</p>
           ) : null}
         </section>

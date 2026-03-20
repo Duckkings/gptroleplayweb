@@ -544,6 +544,12 @@ def _run_segment_step(
                 continue
             intent = world._parse_player_intent(context_text)
             audience_context = public_scene_runtime.build_public_audience_context(save, intent)
+            scene_context = world._build_scene_context_payload(
+                save,
+                player_text=context_text,
+                gm_narration=gm_summary,
+                recent_turn_count=4,
+            )
             zone_metric = zone_metric_service.get_current_zone_metric(save, create=True)
             reputation_score = getattr(zone_metric, "reputation_score", 50)
             plan = plan_public_turn_segment(
@@ -553,6 +559,7 @@ def _run_segment_step(
                 phase=PublicTurnPhase.INITIATIVE_EXECUTION,
                 player_text=context_text,
                 gm_summary=gm_summary,
+                scene_context=scene_context,
                 audience_context=audience_context,
                 prior_narration=round_state.accumulated_narration,
                 default_boundary_kind=("player_turn" if player_next else "round_end"),
@@ -728,6 +735,12 @@ def _run_segment_step(
                 round_state.phase = PublicTurnPhase.GM_PUSH
                 scene_events.append(_phase_event(round_state, label="Enter GM push phase"))
                 continue
+            scene_context = world._build_scene_context_payload(
+                save,
+                player_text=display_text or context_text,
+                gm_narration=gm_summary,
+                recent_turn_count=4,
+            )
             zone_metric = zone_metric_service.get_current_zone_metric(save, create=True)
             reputation_score = getattr(zone_metric, "reputation_score", 50)
             plan = plan_public_turn_segment(
@@ -737,6 +750,7 @@ def _run_segment_step(
                 phase=PublicTurnPhase.NORMAL_ADVANCEMENT,
                 player_text=display_text,
                 gm_summary=gm_summary,
+                scene_context=scene_context,
                 audience_context=audience_context,
                 prior_narration=round_state.accumulated_narration,
                 default_boundary_kind="round_end",

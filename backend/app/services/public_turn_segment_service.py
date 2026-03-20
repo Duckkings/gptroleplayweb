@@ -26,22 +26,29 @@ from app.models.schemas import (
     SaveFile,
     SceneEvent,
 )
+from app.services.ai_protocol_contract_service import (
+    AI_PROVIDER_CALL_FAILED,
+    EnumContractField,
+    render_enum_pool_text,
+    require_ai_config,
+    validate_or_repair_json_payload,
+)
 from app.services.ai_adapter import build_completion_options, create_sync_client, has_ai_config
 from app.services import public_scene_runtime_v2 as public_scene_runtime
 from app.services import public_scene_service as public_scene_legacy
 from app.services import world_service as world
 from app.services.public_turn_interaction_service import (
     build_ai_interaction_response,
-    classify_contest_between_actions,
-    classify_interaction_consent,
+    derive_interaction_kind,
     infer_interaction_kind,
     infer_world_impact_type,
-    is_targeted_interaction_candidate,
+    is_direct_world_counter_response,
     public_turn_actor_type,
     resolve_interaction_target,
     resolve_speech_target,
     resolve_target_ability,
-    should_promote_speech_target_to_action_target,
+    should_require_interaction_response,
+    should_use_speech_target_as_interaction_target,
 )
 from app.services.public_turn_narration_formatter import build_settlement_fragment
 from app.services.public_turn_resolution import (
@@ -176,13 +183,8 @@ def _planned_directive_values(
         action_prompt=action_prompt,
         payload=payload,
     )
-    world_impact_type = infer_world_impact_type(
-        action_type=action_type,
-        action_summary=action_summary,
-        speech_text=speech_text,
-        explicit_value=str(payload.get("world_impact_type") or ""),
-    )
-    target = resolve_interaction_target(
+    world_impact_type = PublicTurnWorldImpactType(str(payload.get("world_impact_type") or PublicTurnWorldImpactType.NON_WORLD.value))
+    action_target = resolve_interaction_target(
         save,
         actor_role_id=actor_id,
         action_prompt=action_prompt,
@@ -193,31 +195,32 @@ def _planned_directive_values(
         actor_role_id=actor_id,
         action_prompt=action_prompt,
         speech_target_label=str(payload.get("speech_target_label") or ""),
-        fallback_target=target,
+        fallback_target=action_target,
     )
-    if should_promote_speech_target_to_action_target(
+    interaction_target = action_target
+    if should_use_speech_target_as_interaction_target(
         action_type=action_type,
-        action_summary=action_summary,
+        world_impact_type=world_impact_type,
         speech_text=speech_text,
-        action_target=target,
+        action_target=action_target,
         speech_target=speech_target,
     ):
-        target = speech_target
-    target_actor_id = target.actor_id if target is not None else None
-    target_name = target.name if target is not None else (str(target_label or "").strip() or None)
-    target_actor_kind = target.actor_kind if target is not None else None
+        interaction_target = speech_target
+    target_actor_id = action_target.actor_id if action_target is not None else None
+    target_name = action_target.name if action_target is not None else (str(target_label or "").strip() or None)
+    target_actor_kind = action_target.actor_kind if action_target is not None else None
     action_target_actor_id = target_actor_id
     action_target_name = target_name
-    action_target_kind = target.actor_type if target is not None else None
+    action_target_kind = action_target.actor_type if action_target is not None else None
     speech_target_label = str(payload.get("speech_target_label") or "").strip() or None
     speech_target_actor_id = speech_target.actor_id if speech_target is not None else None
     speech_target_name = speech_target.name if speech_target is not None else speech_target_label
     speech_target_kind = speech_target.actor_type if speech_target is not None else None
     target_ability_used = None
     target_ability_modifier = None
-    interaction_target_actor_id = target_actor_id
-    interaction_target_name = target_name
-    interaction_target_kind = target.actor_type if target is not None else None
+    interaction_target_actor_id = interaction_target.actor_id if interaction_target is not None else None
+    interaction_target_name = interaction_target.name if interaction_target is not None else None
+    interaction_target_kind = interaction_target.actor_type if interaction_target is not None else None
     interaction_kind = ""
     interaction_requires_response = False
     target_response_action_summary = ""
@@ -234,27 +237,30 @@ def _planned_directive_values(
     if pause_kind not in {"none", "player_interaction", "player_reaction", "player_opposed"}:
         pause_kind = "none"
 
-    if is_targeted_interaction_candidate(
+    if should_require_interaction_response(
         action_type=action_type,
-        action_summary=action_summary,
-        speech_text=speech_text,
-        specific_threat=specific_threat,
-        action_prompt=action_prompt,
-        target_actor_id=target_actor_id,
-        target_name=target_name,
+        world_impact_type=world_impact_type,
+        action_target=action_target,
+        speech_target=speech_target,
     ):
         interaction_requires_response = True
-        interaction_kind = infer_interaction_kind(action_summary, specific_threat, action_prompt)
-        rule = world._opposed_rule_for_prompt(action_prompt) or ("strength", "max_strength_or_dexterity")
-        if target is not None and target.actor_kind == "player":
+        interaction_kind = derive_interaction_kind(
+            action_type=action_type,
+            world_impact_type=world_impact_type,
+            action_target=action_target,
+            speech_target=speech_target,
+        )
+        rule = ("strength", "max_strength_or_dexterity")
+        if interaction_target is not None and interaction_target.actor_kind == "player":
             pause_kind = "player_interaction"
             resolution_mode = "none"
-        elif target is not None:
+        elif interaction_target is not None:
             response = build_ai_interaction_response(
                 save,
-                target=target,
+                target=interaction_target,
                 source_actor_id=actor_id,
                 source_actor_name=actor_name,
+                source_world_impact_type=world_impact_type,
                 source_action_summary=action_summary,
                 source_speech_text=speech_text,
                 gm_summary=gm_summary,
@@ -264,7 +270,7 @@ def _planned_directive_values(
             target_response_speech_text = response.speech_text
             target_response_speech_target_name = response.speech_target_name
             target_response_world_impact_type = response.world_impact_type.value
-            consent_state = classify_interaction_consent(target_response_action_summary, target_response_speech_text)
+            consent_state = response.consent_state
             if (
                 world_impact_type == PublicTurnWorldImpactType.NON_WORLD
                 and response.world_impact_type == PublicTurnWorldImpactType.WORLD
@@ -276,7 +282,7 @@ def _planned_directive_values(
                 resolution_mode = "opposed_actor"
                 planned_requires_check = True
                 planned_ability_used = str(rule[0])
-                target_ability_used, target_ability_modifier = resolve_target_ability(save, target)
+                target_ability_used, target_ability_modifier = resolve_target_ability(save, interaction_target)
                 planned_dc = max(5, min(30, 10 + int(target_ability_modifier or 0)))
                 planned_check_task = str((override or {}).get("planned_check_task") or action_prompt)
             else:
@@ -285,24 +291,29 @@ def _planned_directive_values(
                     if world_impact_type == PublicTurnWorldImpactType.NON_WORLD and response.world_impact_type == PublicTurnWorldImpactType.NON_WORLD
                     else "world_exchange"
                 )
-                contest_state = classify_contest_between_actions(
-                    action_summary,
-                    speech_text,
-                    target_response_action_summary,
-                    target_response_speech_text,
-                    interaction_kind,
-                )
+                if is_direct_world_counter_response(
+                    source_world_impact_type=world_impact_type,
+                    response_world_impact_type=response.world_impact_type,
+                    source_actor_id=actor_id,
+                    source_actor_name=actor_name,
+                    response_target_actor_id=response.action_target_actor_id,
+                    response_target_name=response.action_target_name,
+                ):
+                    contest_state = "opposed"
+                else:
+                    contest_state = response.contest_state
                 if contest_state == "opposed":
                     resolution_rule = "opposed_actor"
                     resolution_mode = "opposed_actor"
                     planned_requires_check = True
                     planned_ability_used = str(rule[0])
-                    target_ability_used, target_ability_modifier = resolve_target_ability(save, target)
+                    target_ability_used, target_ability_modifier = resolve_target_ability(save, interaction_target)
                     planned_dc = max(5, min(30, 10 + int(target_ability_modifier or 0)))
                     planned_check_task = str((override or {}).get("planned_check_task") or action_prompt)
                 else:
                     resolution_rule = "static_dc"
                     consent_state = "ambiguous" if consent_state == "not_applicable" else consent_state
+                    contest_state = "non_opposed" if contest_state == "not_applicable" else contest_state
                     if interaction_exchange_kind == "non_world_exchange":
                         planned_requires_check = False
                         resolution_mode = "none"
@@ -327,13 +338,13 @@ def _planned_directive_values(
         else:
             resolution_mode = "static_dc" if planned_requires_check else "none"
 
-    if target is None and pause_kind in {"player_interaction", "player_opposed"}:
+    if interaction_target is None and pause_kind in {"player_interaction", "player_opposed"}:
         pause_kind = "none"
-    if target is None and pause_kind == "player_reaction":
+    if interaction_target is None and pause_kind == "player_reaction":
         pause_kind = "none"
-    if target is not None and target.actor_kind != "player" and pause_kind in {"player_interaction", "player_opposed"}:
+    if interaction_target is not None and interaction_target.actor_kind != "player" and pause_kind in {"player_interaction", "player_opposed"}:
         pause_kind = "none"
-    if target is not None and target.actor_kind == "player" and interaction_requires_response:
+    if interaction_target is not None and interaction_target.actor_kind == "player" and interaction_requires_response:
         pause_kind = "player_interaction"
         resolution_mode = "none"
         interaction_exchange_kind = (
@@ -383,6 +394,7 @@ def _fallback_directive(
     phase: PublicTurnPhase,
     player_text: str,
     gm_summary: str,
+    scene_context: dict[str, object] | None,
     audience_context: dict[str, object],
     config: ChatConfig | None,
 ) -> PublicTurnSegmentActorDirective:
@@ -393,7 +405,7 @@ def _fallback_directive(
         actor,
         player_text=player_text,
         gm_summary=gm_summary,
-        scene_context=None,
+        scene_context=scene_context,
         incoming_interaction=None,
         allow_partial=True,
         config=config,
@@ -608,12 +620,13 @@ def _planner_overrides(
     fallback_directives: list[PublicTurnSegmentActorDirective],
     player_text: str,
     gm_summary: str,
+    scene_context: dict[str, object] | None,
     prior_narration: str,
     config: ChatConfig | None,
 ) -> dict[str, dict[str, object]]:
-    if not actor_rows or not has_ai_config(config):
+    if not actor_rows:
         return {}
-    assert config is not None
+    config = require_ai_config(config)
     try:
         prompt = prompt_table.render(
             "public.turn.segment_plan.user",
@@ -627,14 +640,25 @@ def _planner_overrides(
                 "target_label 表示动作目标，speech_target_label 表示说话对象，两者可以不同。"
                 "如果某个 actor 的动作直接作用到玩家身上，应该优先设置 player_interaction，而不是直接设置 player_reaction。"
                 "不要规划玩家回合之后的 actor。"
-                "player_text=$player_text; gm_summary=$gm_summary; prior_narration=$prior_narration; phase=$phase; actors_json=$actors_json"
+                "player_text=$player_text; gm_summary=$gm_summary; scene_context_json=$scene_context_json; prior_narration=$prior_narration; phase=$phase; actors_json=$actors_json"
             ),
             player_text=player_text,
             gm_summary=gm_summary,
+            scene_context_json=json.dumps(scene_context or {}, ensure_ascii=False),
             prior_narration=prior_narration[-720:],
             phase=phase.value,
             actors_json=json.dumps(_planner_prompt_payload(actor_rows, fallback_directives), ensure_ascii=False),
         )
+        prompt = (
+            f"{prompt}\nAllowed enum ids:\n"
+            f"{render_enum_pool_text((EnumContractField(field_path='actors[].action_type', allowed_ids=('check', 'attack', 'item_use')), EnumContractField(field_path='actors[].pause_kind', allowed_ids=('none', 'player_interaction', 'player_reaction', 'player_opposed'))))}\n"
+            "Use only the allowed stable ids for action_type and pause_kind.\n"
+            "speech_target_label must identify only the listener of the spoken line.\n"
+            "Do not use gaze targets, wink targets, gesture targets, or silent coordination partners as speech_target_label.\n"
+            "If an actor looks at player A but the spoken line is directed at actor B, speech_target_label must be actor B.\n"
+            "If there is no spoken addressee, return an empty speech_target_label."
+        )
+        system_prompt = prompt_table.get_text("public.turn.segment_plan.system", "Return JSON only.")
         client = create_sync_client(config, client_cls=OpenAI)
         resp = client.chat.completions.create(
             model=config.model,
@@ -659,7 +683,22 @@ def _planner_overrides(
                 getattr(usage, "prompt_tokens", 0) or 0,
                 getattr(usage, "completion_tokens", 0) or 0,
             )
-        parsed = json.loads((resp.choices[0].message.content or "").strip() or "{}")
+        raw_json = (resp.choices[0].message.content or "").strip() or "{}"
+        parsed = json.loads(raw_json)
+        parsed = validate_or_repair_json_payload(
+            parsed=parsed if isinstance(parsed, dict) else {},
+            raw_json=raw_json,
+            fields=(
+                EnumContractField(field_path="actors[].action_type", allowed_ids=("check", "attack", "item_use")),
+                EnumContractField(
+                    field_path="actors[].pause_kind",
+                    allowed_ids=("none", "player_interaction", "player_reaction", "player_opposed"),
+                ),
+            ),
+            config=config,
+            system_prompt=system_prompt,
+            original_prompt=prompt,
+        )
         overrides: dict[str, dict[str, object]] = {}
         for item in list(parsed.get("actors") or []):
             if not isinstance(item, dict):
@@ -669,8 +708,10 @@ def _planner_overrides(
                 continue
             overrides[actor_id] = item
         return overrides
-    except Exception:
-        return {}
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"{AI_PROVIDER_CALL_FAILED}: {exc}") from exc
 
 
 def plan_public_turn_segment(
@@ -681,6 +722,7 @@ def plan_public_turn_segment(
     phase: PublicTurnPhase,
     player_text: str,
     gm_summary: str,
+    scene_context: dict[str, object] | None = None,
     audience_context: dict[str, object],
     prior_narration: str,
     default_boundary_kind: str,
@@ -694,6 +736,7 @@ def plan_public_turn_segment(
             phase=phase,
             player_text=player_text,
             gm_summary=gm_summary,
+            scene_context=scene_context,
             audience_context=audience_context,
             config=config,
         )
@@ -706,6 +749,7 @@ def plan_public_turn_segment(
         fallback_directives=fallback_directives,
         player_text=player_text,
         gm_summary=gm_summary,
+        scene_context=scene_context,
         prior_narration=prior_narration,
         config=config,
     )
@@ -783,7 +827,7 @@ def resolve_public_turn_segment(
             priority_reason=str(actor.get("priority_reason") or ""),
         )
         if directive.pause_kind == "player_interaction":
-            if directive.action_target_actor_id != save.player_static_data.player_id:
+            if directive.interaction_target_actor_id != save.player_static_data.player_id:
                 continue
             public_interaction_prompt = PublicTurnInteractionPrompt(
                 prompt_id=f"{round_state.round_id}_{directive.actor_id}_interaction",
@@ -803,9 +847,9 @@ def resolve_public_turn_segment(
                 source_planned_dc=directive.planned_dc,
                 source_planned_check_task=directive.planned_check_task,
                 source_interaction_kind=directive.interaction_kind,
-                target_actor_id=directive.action_target_actor_id or save.player_static_data.player_id,
-                target_actor_name=directive.action_target_name or save.player_static_data.name,
-                target_actor_kind=directive.action_target_kind or public_turn_actor_type("player"),
+                target_actor_id=directive.interaction_target_actor_id or save.player_static_data.player_id,
+                target_actor_name=directive.interaction_target_name or save.player_static_data.name,
+                target_actor_kind=directive.interaction_target_kind or public_turn_actor_type("player"),
                 alternation_depth=directive.alternation_depth,
                 interaction_mode=("alternated" if directive.alternation_depth else "initial"),
                 suggested_target_label=directive.interaction_target_name or directive.target_name or save.player_static_data.name,
@@ -831,7 +875,7 @@ def resolve_public_turn_segment(
             )
             break
         if directive.pause_kind == "player_opposed":
-            if directive.action_target_actor_id != save.player_static_data.player_id:
+            if directive.interaction_target_actor_id != save.player_static_data.player_id:
                 continue
             public_opposed_prompt = PublicTurnOpposedPrompt(
                 check_id=f"{round_state.round_id}_{directive.actor_id}_opposed",
@@ -844,8 +888,8 @@ def resolve_public_turn_segment(
                 source_interaction_kind=directive.interaction_kind,
                 source_action_target_name=directive.action_target_name,
                 source_speech_target_name=directive.speech_target_name,
-                target_actor_id=directive.action_target_actor_id or save.player_static_data.player_id,
-                target_actor_name=directive.action_target_name or save.player_static_data.name,
+                target_actor_id=directive.interaction_target_actor_id or save.player_static_data.player_id,
+                target_actor_name=directive.interaction_target_name or save.player_static_data.name,
                 stakes_summary=directive.stakes_summary,
             )
             beats.append(

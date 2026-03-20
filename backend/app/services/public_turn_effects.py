@@ -22,6 +22,14 @@ from app.services import public_scene_service
 from app.services import team_service
 from app.services import world_service as world
 from app.services import zone_metric_service
+from app.services.ai_protocol_contract_service import (
+    AI_PROVIDER_CALL_FAILED,
+    EnumContractField,
+    render_enum_pool_text,
+    require_ai_config,
+    validate_or_repair_json_payload,
+)
+from app.services.generation_debug_log_service import current_generation_debug_log
 from app.services.ai_adapter import build_completion_options, create_sync_client, has_ai_config
 
 
@@ -157,6 +165,13 @@ def sanitize_reaction_tone_deltas(*, tone: str, relation_delta: int = 0, affinit
 
 _ALLOWED_REACTION_TONES = {"supportive", "approving", "neutral", "concerned", "warning", "hostile"}
 
+_REACTION_TONE_CONTRACT_FIELDS = (
+    EnumContractField(
+        field_path="reaction_tone",
+        allowed_ids=("supportive", "approving", "neutral", "concerned", "warning", "hostile"),
+    ),
+)
+
 
 def sanitize_reaction_tone(tone: str, action: str, speech: str) -> str:
     normalized_tone = str(tone or "").strip().lower()
@@ -194,14 +209,14 @@ def _ai_public_turn_npc_reaction(
     scene_conflict_summary: str = "",
     config: ChatConfig | None,
 ) -> tuple[str, str, str, str | None, str | None, str]:
-    if not has_ai_config(config):
-        return "", "", "neutral", None, None, "player_action"
-    assert config is not None
+    config = require_ai_config(config)
     prompt = (
         "You are generating one NPC reaction after the player acts during a public turn. "
         "Return JSON only with keys reaction_action and reaction_speech. "
         "reaction_action must be expressive only and cannot move, attack, block, grab, cast, or change any state. "
         "reaction_speech should be a short in-character line and may be empty. "
+        "reaction_tone must use one of the allowed stable ids below. "
+        f"Allowed enum ids:\n{render_enum_pool_text(_REACTION_TONE_CONTRACT_FIELDS)}\n"
         f"npc_name={role.name}; personality={getattr(role, 'personality', '')}; speaking_style={getattr(role, 'speaking_style', '')}; "
         f"background={getattr(role, 'background', '')[:120]}; player_text={json.dumps(player_text, ensure_ascii=False)}; "
         f"summary={json.dumps(summary, ensure_ascii=False)}; relation_delta_hint={relation_delta}; "
@@ -212,6 +227,7 @@ def _ai_public_turn_npc_reaction(
         f"scene_conflict_summary={json.dumps(scene_conflict_summary, ensure_ascii=False)}; "
         "Also return reaction_tone, reaction_focus_target_name, reaction_speech_target_name, reaction_scope."
     )
+    debug_log = current_generation_debug_log()
     try:
         client = create_sync_client(config, client_cls=OpenAI)
         resp = client.chat.completions.create(
@@ -231,19 +247,39 @@ def _ai_public_turn_npc_reaction(
                 int(getattr(usage, "prompt_tokens", 0) or 0),
                 int(getattr(usage, "completion_tokens", 0) or 0),
             )
-        parsed = json.loads((resp.choices[0].message.content or "").strip() or "{}")
-        if not isinstance(parsed, dict):
-            return "", "", "neutral", None, None, "player_action"
+        raw_json = (resp.choices[0].message.content or "").strip() or "{}"
+        parsed = json.loads(raw_json)
+        parsed = validate_or_repair_json_payload(
+            parsed=parsed if isinstance(parsed, dict) else {},
+            raw_json=raw_json,
+            fields=_REACTION_TONE_CONTRACT_FIELDS,
+            config=config,
+            system_prompt=str(config.gm_prompt or ""),
+            original_prompt=prompt,
+        )
+        if debug_log is not None:
+            debug_log.record(
+                "public_turn_npc_reaction_ai",
+                "validated npc reaction payload",
+                {
+                    "role_id": role.role_id,
+                    "allowed_ids": render_enum_pool_text(_REACTION_TONE_CONTRACT_FIELDS),
+                    "raw_json": raw_json,
+                    "parsed": parsed,
+                },
+            )
         return (
             sanitize_reaction_action(str(parsed.get("reaction_action") or "")),
             _clean(str(parsed.get("reaction_speech") or ""), limit=120),
-            str(parsed.get("reaction_tone") or infer_reaction_tone(str(parsed.get("reaction_action") or ""), str(parsed.get("reaction_speech") or ""))).strip().lower() or "neutral",
+            str(parsed.get("reaction_tone") or "").strip().lower(),
             _clean(str(parsed.get("reaction_focus_target_name") or ""), limit=80) or None,
             _clean(str(parsed.get("reaction_speech_target_name") or ""), limit=80) or None,
             _clean(str(parsed.get("reaction_scope") or "player_action"), limit=40) or "player_action",
         )
-    except Exception:
-        return "", "", "neutral", None, None, "player_action"
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"{AI_PROVIDER_CALL_FAILED}: {exc}") from exc
 
 
 def _ai_public_turn_team_reaction(
@@ -259,14 +295,14 @@ def _ai_public_turn_team_reaction(
     scene_conflict_summary: str = "",
     config: ChatConfig | None,
 ) -> tuple[str, str, int, int, str, str | None, str | None, str]:
-    if not has_ai_config(config):
-        return "", "", 0, 0, "neutral", None, None, "player_action"
-    assert config is not None
+    config = require_ai_config(config)
     prompt = (
         "You are generating one teammate reaction after the player's public-turn action. "
         "Return JSON only with keys reaction_action, reaction_speech, affinity_delta, trust_delta. "
         "reaction_action must be expressive only and cannot move, attack, block, grab, cast, or change any state. "
         "reaction_speech may be empty. affinity_delta and trust_delta must be integers between -3 and 3. "
+        "reaction_tone must use one of the allowed stable ids below. "
+        f"Allowed enum ids:\n{render_enum_pool_text(_REACTION_TONE_CONTRACT_FIELDS)}\n"
         f"teammate_name={role.name}; personality={getattr(role, 'personality', '')}; speaking_style={getattr(role, 'speaking_style', '')}; "
         f"background={getattr(role, 'background', '')[:120]}; cognition={getattr(role, 'cognition', '')[:120]}; "
         f"player_text={json.dumps(player_text, ensure_ascii=False)}; summary={json.dumps(summary, ensure_ascii=False)}; "
@@ -277,6 +313,7 @@ def _ai_public_turn_team_reaction(
         f"scene_conflict_summary={json.dumps(scene_conflict_summary, ensure_ascii=False)}; "
         "Also return reaction_tone, reaction_focus_target_name, reaction_speech_target_name, reaction_scope."
     )
+    debug_log = current_generation_debug_log()
     try:
         client = create_sync_client(config, client_cls=OpenAI)
         resp = client.chat.completions.create(
@@ -296,21 +333,41 @@ def _ai_public_turn_team_reaction(
                 int(getattr(usage, "prompt_tokens", 0) or 0),
                 int(getattr(usage, "completion_tokens", 0) or 0),
             )
-        parsed = json.loads((resp.choices[0].message.content or "").strip() or "{}")
-        if not isinstance(parsed, dict):
-            return "", "", 0, 0, "neutral", None, None, "player_action"
+        raw_json = (resp.choices[0].message.content or "").strip() or "{}"
+        parsed = json.loads(raw_json)
+        parsed = validate_or_repair_json_payload(
+            parsed=parsed if isinstance(parsed, dict) else {},
+            raw_json=raw_json,
+            fields=_REACTION_TONE_CONTRACT_FIELDS,
+            config=config,
+            system_prompt=str(config.gm_prompt or ""),
+            original_prompt=prompt,
+        )
+        if debug_log is not None:
+            debug_log.record(
+                "public_turn_team_reaction_ai",
+                "validated teammate reaction payload",
+                {
+                    "role_id": role.role_id,
+                    "allowed_ids": render_enum_pool_text(_REACTION_TONE_CONTRACT_FIELDS),
+                    "raw_json": raw_json,
+                    "parsed": parsed,
+                },
+            )
         return (
             sanitize_reaction_action(str(parsed.get("reaction_action") or "")),
             _clean(str(parsed.get("reaction_speech") or ""), limit=120),
             clamp(int(parsed.get("affinity_delta") or 0), -3, 3),
             clamp(int(parsed.get("trust_delta") or 0), -3, 3),
-            str(parsed.get("reaction_tone") or infer_reaction_tone(str(parsed.get("reaction_action") or ""), str(parsed.get("reaction_speech") or ""))).strip().lower() or "neutral",
+            str(parsed.get("reaction_tone") or "").strip().lower(),
             _clean(str(parsed.get("reaction_focus_target_name") or ""), limit=80) or None,
             _clean(str(parsed.get("reaction_speech_target_name") or ""), limit=80) or None,
             _clean(str(parsed.get("reaction_scope") or "player_action"), limit=40) or "player_action",
         )
-    except Exception:
-        return "", "", 0, 0, "neutral", None, None, "player_action"
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"{AI_PROVIDER_CALL_FAILED}: {exc}") from exc
 
 
 def build_public_turn_team_reactions(
@@ -349,15 +406,14 @@ def build_public_turn_team_reactions(
             scene_conflict_summary=scene_conflict_summary,
             config=config,
         )
-        if isinstance(ai_result, tuple) and len(ai_result) >= 8:
-            reaction_action, reaction_speech, affinity_delta, trust_delta, reaction_tone, reaction_focus_name, reaction_speech_target_name, reaction_scope = ai_result[:8]
-        else:
-            reaction_action, reaction_speech, affinity_delta, trust_delta = ai_result[:4]
-            reaction_tone = infer_reaction_tone(reaction_action, reaction_speech)
-            reaction_focus_name = None
-            reaction_speech_target_name = None
-            reaction_scope = "player_action"
-        reaction_tone = sanitize_reaction_tone(str(reaction_tone), reaction_action, reaction_speech)
+        reaction_action = str(ai_result[0] or "") if len(ai_result) > 0 else ""
+        reaction_speech = str(ai_result[1] or "") if len(ai_result) > 1 else ""
+        affinity_delta = int(ai_result[2] or 0) if len(ai_result) > 2 else 0
+        trust_delta = int(ai_result[3] or 0) if len(ai_result) > 3 else 0
+        reaction_tone = str(ai_result[4] or "neutral") if len(ai_result) > 4 else "neutral"
+        reaction_focus_name = str(ai_result[5] or "") if len(ai_result) > 5 else None
+        reaction_speech_target_name = str(ai_result[6] or "") if len(ai_result) > 6 else None
+        reaction_scope = str(ai_result[7] or "single") if len(ai_result) > 7 else "single"
         _, affinity_delta, trust_delta = sanitize_reaction_tone_deltas(
             tone=reaction_tone,
             affinity_delta=int(affinity_delta),
@@ -483,15 +539,12 @@ def build_public_turn_npc_reactions(
             scene_conflict_summary=scene_conflict_summary,
             config=config,
         )
-        if isinstance(ai_result, tuple) and len(ai_result) >= 6:
-            reaction_action, reaction_speech, reaction_tone, reaction_focus_name, reaction_speech_target_name, reaction_scope = ai_result[:6]
-        else:
-            reaction_action, reaction_speech = ai_result[:2]
-            reaction_tone = infer_reaction_tone(reaction_action, reaction_speech)
-            reaction_focus_name = None
-            reaction_speech_target_name = None
-            reaction_scope = "player_action"
-        reaction_tone = sanitize_reaction_tone(str(reaction_tone), reaction_action, reaction_speech)
+        reaction_action = str(ai_result[0] or "") if len(ai_result) > 0 else ""
+        reaction_speech = str(ai_result[1] or "") if len(ai_result) > 1 else ""
+        reaction_tone = str(ai_result[2] or "neutral") if len(ai_result) > 2 else "neutral"
+        reaction_focus_name = str(ai_result[3] or "") if len(ai_result) > 3 else None
+        reaction_speech_target_name = str(ai_result[4] or "") if len(ai_result) > 4 else None
+        reaction_scope = str(ai_result[5] or "single") if len(ai_result) > 5 else "single"
         reaction_text = compose_reaction_text(reaction_action, reaction_speech)
         delta_to_apply = relation_delta
         if index > 0 and relation_delta != 0:

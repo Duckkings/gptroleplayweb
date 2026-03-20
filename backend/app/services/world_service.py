@@ -107,7 +107,15 @@ from app.models.schemas import (
     Zone,
     ZoneSubZoneSeed,
 )
-from app.services.ai_adapter import build_completion_options, create_sync_client
+from app.services.ai_adapter import build_completion_options, create_sync_client, has_ai_config
+from app.services.ai_protocol_contract_service import (
+    AI_PROVIDER_CALL_FAILED,
+    EnumContractField,
+    allow_protocol_repair,
+    render_enum_pool_text,
+    require_ai_config,
+    validate_or_repair_json_payload,
+)
 from app.services.consistency_service import (
     build_npc_knowledge_snapshot,
     bump_world_revision,
@@ -121,6 +129,7 @@ from app.services.item_instance_service import (
     ensure_item_system,
     get_owner_instance,
     get_owner_instance_by_ref,
+    refresh_item_system_projection,
     remove_item_instance,
     resolve_owner_instances,
 )
@@ -2029,8 +2038,6 @@ def _consume_inventory_item_from_profile(
             item.quantity -= 1
             if item.uses_max is not None:
                 item.uses_left = item.uses_max
-        elif item.uses_left == 0 and item.quantity <= 1:
-            profile.dnd5e_sheet.backpack.items = [entry for entry in profile.dnd5e_sheet.backpack.items if entry.item_id != item.item_id]
         return item
     if item.quantity < amount:
         raise ValueError("ITEM_QUANTITY_INSUFFICIENT")
@@ -2325,10 +2332,8 @@ def inventory_consume(payload: InventoryConsumeRequest) -> InventoryMutationResp
         instance.uses_left -= payload.amount
         if instance.uses_left == 0 and instance.quantity > 1:
             instance.quantity -= 1
-            instance.uses_left = instance.uses_max
-        elif instance.uses_left == 0 and instance.quantity <= 1:
-            remove_item_instance(save, instance.item_instance_id)
-            instance = None  # type: ignore[assignment]
+            if instance.uses_max is not None:
+                instance.uses_left = instance.uses_max
     else:
         if instance.quantity < payload.amount:
             raise ValueError("ITEM_QUANTITY_INSUFFICIENT")
@@ -2336,7 +2341,7 @@ def inventory_consume(payload: InventoryConsumeRequest) -> InventoryMutationResp
         if instance.quantity <= 0:
             remove_item_instance(save, instance.item_instance_id)
             instance = None  # type: ignore[assignment]
-    ensure_item_system(save)
+    refresh_item_system_projection(save)
     updated_item = next((entry for entry in profile.dnd5e_sheet.backpack.items if entry.item_id == payload.item_id), None)
     _recompute_player_derived(profile)
     if role is not None:
@@ -2417,13 +2422,19 @@ def inventory_interact(payload: InventoryInteractRequest) -> InventoryInteractRe
             instance = get_owner_instance_by_ref(save, owner_kind=owner_kind, owner_id=owner_id, item_ref=payload.item_id)
             if instance.uses_left is not None:
                 instance.uses_left = max(0, instance.uses_left - 1)
-                if instance.uses_left == 0 and instance.quantity <= 1:
+                if instance.uses_left == 0 and instance.quantity > 1:
+                    instance.quantity -= 1
+                    if instance.uses_max is not None:
+                        instance.uses_left = instance.uses_max
+                elif instance.uses_left == 0 and instance.quantity <= 1:
+                    instance.uses_left = 0
+                if instance.quantity <= 0:
                     remove_item_instance(save, instance.item_instance_id)
             elif instance.quantity > 0:
                 instance.quantity = max(0, instance.quantity - 1)
                 if instance.quantity == 0:
                     remove_item_instance(save, instance.item_instance_id)
-            ensure_item_system(save)
+            refresh_item_system_projection(save)
             item = next((entry for entry in profile.dnd5e_sheet.backpack.items if entry.item_id == payload.item_id), item)
         if payload.action_check is not None and save.area_snapshot.clock is not None:
             save.area_snapshot.clock = _advance_clock(save.area_snapshot.clock, time_spent_min)
@@ -4407,10 +4418,7 @@ def _fallback_npc_reply_parts(
 
 
 def _public_behavior_triggered(action_text: str, speech_text: str, raw_text: str) -> bool:
-    if speech_text.strip():
-        return True
-    merged = f"{action_text}\n{raw_text}".strip()
-    return _contains_any_token(merged, ["奔跑", "大喊", "砸", "挥舞", "冲向", "推开", "攻击", "打碎", "翻找"])
+    return bool(str(action_text or "").strip() or str(speech_text or "").strip() or str(raw_text or "").strip())
 
 
 def _new_scene_event(
@@ -4487,55 +4495,63 @@ def _generate_targeted_public_npc_reply(
     knowledge = build_npc_knowledge_snapshot(save, role.role_id)
     gm_summary = str((scene_context or {}).get("gm_narration") or "").strip()
     scene_context_json = json.dumps(scene_context or {}, ensure_ascii=False)
-    if config is not None:
-        api_key = (config.openai_api_key or "").strip()
-        model = (config.model or "").strip()
-        if api_key and model:
-            try:
-                client = create_sync_client(config, client_cls=OpenAI)
-                world_time_text, _ = _world_time_payload(save.area_snapshot.clock)
-                prompt = prompt_table.render(
-                    PromptKeys.NPC_PUBLIC_TARGETED_USER,
-                    "你要扮演公开区域里被玩家喊话的NPC，只输出 JSON。",
-                    roleplay_brief=_build_npc_roleplay_brief(role),
-                    scene_summary=gm_summary or "公开区域中的即时互动",
-                    world_time_text=world_time_text,
-                    conversation_state=_npc_conversation_state_summary(role),
-                    knowledge_rules="\n".join(f"- {item}" for item in knowledge.response_rules),
-                    player_text=player_text,
-                    context=_build_npc_prompt_context(role, save.area_snapshot.clock, recent_count=8, save=save),
-                    scene_context_json=scene_context_json,
-                )
-                resp = client.chat.completions.create(
-                    model=model,
-                    **build_completion_options(config),
-                    response_format={"type": "json_object"},
-                    messages=[
-                        {"role": "system", "content": config.gm_prompt},
-                        {"role": "user", "content": prompt},
-                    ],
-                )
-                parsed = _extract_json_content((resp.choices[0].message.content or "").strip())
-                action = str(parsed.get("action_reaction") or "").strip()
-                speech = str(parsed.get("speech_reply") or "").strip()
-                relation_tag = str(parsed.get("relation_tag") or "met").strip().lower()
-                if relation_tag not in {"ally", "friendly", "met", "neutral", "wary", "hostile"}:
-                    relation_tag = "met"
-                action, speech = _normalize_npc_reply_parts(
-                    role,
-                    "",
-                    player_text,
-                    None,
-                    action,
-                    speech,
-                    allow_action_repair=False,
-                    allow_speech_repair=False,
-                )
-                if action or speech:
-                    return action, speech, relation_tag
-            except Exception:
-                pass
-    return _fallback_targeted_public_npc_reply(role, player_text, scene_context)
+    config = require_ai_config(config)
+    try:
+        client = create_sync_client(config, client_cls=OpenAI)
+        world_time_text, _ = _world_time_payload(save.area_snapshot.clock)
+        prompt = prompt_table.render(
+            PromptKeys.NPC_PUBLIC_TARGETED_USER,
+            "你要扮演公开区域里被玩家喊话的NPC，只输出 JSON。",
+            roleplay_brief=_build_npc_roleplay_brief(role),
+            scene_summary=gm_summary or "公开区域中的即时互动",
+            world_time_text=world_time_text,
+            conversation_state=_npc_conversation_state_summary(role),
+            knowledge_rules="\n".join(f"- {item}" for item in knowledge.response_rules),
+            player_text=player_text,
+            context=_build_npc_prompt_context(role, save.area_snapshot.clock, recent_count=8, save=save),
+            scene_context_json=scene_context_json,
+        )
+        prompt = f"{prompt}\nAllowed enum ids:\n{render_enum_pool_text(_RELATION_TAG_CONTRACT_FIELDS)}"
+        resp = client.chat.completions.create(
+            model=config.model,
+            **build_completion_options(config),
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": config.gm_prompt},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        raw_json = (resp.choices[0].message.content or "").strip() or "{}"
+        parsed = _extract_json_content(raw_json)
+        with allow_protocol_repair():
+            parsed = validate_or_repair_json_payload(
+                parsed=parsed,
+                raw_json=raw_json,
+                fields=_RELATION_TAG_CONTRACT_FIELDS,
+                config=config,
+                system_prompt=config.gm_prompt,
+                original_prompt=prompt,
+            )
+        action = str(parsed.get("action_reaction") or "").strip()
+        speech = str(parsed.get("speech_reply") or "").strip()
+        relation_tag = str(parsed.get("relation_tag") or "").strip().lower()
+        action, speech = _normalize_npc_reply_parts(
+            role,
+            "",
+            player_text,
+            None,
+            action,
+            speech,
+            allow_action_repair=False,
+            allow_speech_repair=False,
+        )
+        if action or speech:
+            return action, speech, relation_tag
+        raise ValueError("AI_PROTOCOL_REPAIR_FAILED")
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"{AI_PROVIDER_CALL_FAILED}: {exc}") from exc
 
 
 def _generate_bystander_public_reactions(
@@ -4548,46 +4564,50 @@ def _generate_bystander_public_reactions(
     created: list[tuple[NpcRoleCard, str, str]] = []
     gm_summary = str((scene_context or {}).get("gm_narration") or "").strip()
     scene_context_json = json.dumps(scene_context or {}, ensure_ascii=False)
+    config = require_ai_config(config)
     for role in roles[:2]:
-        action_reaction = ""
-        speech_reply = ""
-        relation_tag = "met"
-        if config is not None:
-            api_key = (config.openai_api_key or "").strip()
-            model = (config.model or "").strip()
-            if api_key and model:
-                try:
-                    client = create_sync_client(config, client_cls=OpenAI)
-                    prompt = prompt_table.render(
-                        PromptKeys.NPC_PUBLIC_BYSTANDER_USER,
-                        "你要扮演公开区域中的旁观NPC，只输出 JSON。",
-                        roleplay_brief=_build_npc_roleplay_brief(role),
-                        scene_summary=gm_summary or "公开区域中的即时互动",
-                        player_text=player_text,
-                        gm_summary=gm_summary,
-                        scene_context_json=scene_context_json,
-                    )
-                    resp = client.chat.completions.create(
-                        model=model,
-                        **build_completion_options(config),
-                        response_format={"type": "json_object"},
-                        messages=[
-                            {"role": "system", "content": config.gm_prompt},
-                            {"role": "user", "content": prompt},
-                        ],
-                    )
-                    parsed = _extract_json_content((resp.choices[0].message.content or "").strip())
-                    action_reaction = _trim_npc_text(str(parsed.get("action_reaction") or "").strip(), 160)
-                    speech_reply = _trim_npc_text(str(parsed.get("speech_reply") or "").strip(), 120)
-                    relation_tag = str(parsed.get("relation_tag") or "met").strip().lower()
-                except Exception:
-                    action_reaction = ""
-                    speech_reply = ""
+        try:
+            client = create_sync_client(config, client_cls=OpenAI)
+            prompt = prompt_table.render(
+                PromptKeys.NPC_PUBLIC_BYSTANDER_USER,
+                "你要扮演公开区域中的旁观NPC，只输出 JSON。",
+                roleplay_brief=_build_npc_roleplay_brief(role),
+                scene_summary=gm_summary or "公开区域中的即时互动",
+                player_text=player_text,
+                gm_summary=gm_summary,
+                scene_context_json=scene_context_json,
+            )
+            prompt = f"{prompt}\nAllowed enum ids:\n{render_enum_pool_text(_RELATION_TAG_CONTRACT_FIELDS)}"
+            resp = client.chat.completions.create(
+                model=config.model,
+                **build_completion_options(config),
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": config.gm_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            raw_json = (resp.choices[0].message.content or "").strip() or "{}"
+            parsed = _extract_json_content(raw_json)
+            with allow_protocol_repair():
+                parsed = validate_or_repair_json_payload(
+                    parsed=parsed,
+                    raw_json=raw_json,
+                    fields=_RELATION_TAG_CONTRACT_FIELDS,
+                    config=config,
+                    system_prompt=config.gm_prompt,
+                    original_prompt=prompt,
+                )
+            action_reaction = _trim_npc_text(str(parsed.get("action_reaction") or "").strip(), 160)
+            speech_reply = _trim_npc_text(str(parsed.get("speech_reply") or "").strip(), 120)
+            relation_tag = str(parsed.get("relation_tag") or "").strip().lower()
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"{AI_PROVIDER_CALL_FAILED}: {exc}") from exc
         line = _compose_npc_reply(action_reaction, speech_reply)
         if not line:
-            line, relation_tag = _public_npc_reaction(role, player_text, gm_summary)
-        if relation_tag not in {"friendly", "met", "wary", "hostile", "neutral"}:
-            relation_tag = "met"
+            raise ValueError("AI_PROTOCOL_REPAIR_FAILED")
         created.append((role, line, relation_tag))
     return created
 
@@ -4850,12 +4870,21 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
                     {"role": "user", "content": prompt},
                 ],
             )
-            parsed = _extract_json_content((resp.choices[0].message.content or "").strip())
+            raw_json = (resp.choices[0].message.content or "").strip() or "{}"
+            parsed = _extract_json_content(raw_json)
+            with allow_protocol_repair():
+                parsed = validate_or_repair_json_payload(
+                    parsed=parsed,
+                    raw_json=raw_json,
+                    fields=_RELATION_TAG_CONTRACT_FIELDS,
+                    config=req.config,
+                    system_prompt=req.config.gm_prompt,
+                    original_prompt=prompt,
+                )
             action_reaction = str(parsed.get("action_reaction") or "").strip()
             speech_reply = str(parsed.get("speech_reply") or "").strip()
             tag = str(parsed.get("relation_tag") or "").strip().lower()
-            if tag in {"ally", "friendly", "met", "neutral", "wary", "hostile"}:
-                relation_tag = tag
+            relation_tag = tag
             forbidden_role_names = [
                 item.name
                 for item in save.role_pool
@@ -5093,6 +5122,20 @@ def _default_check_task(action_type: str, action_prompt: str) -> str:
     return "判断这次行动是否顺利完成"
 
 
+_ABILITY_USED_CONTRACT_FIELDS = (
+    EnumContractField(
+        field_path="ability_used",
+        allowed_ids=("strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"),
+    ),
+)
+_RELATION_TAG_CONTRACT_FIELDS = (
+    EnumContractField(
+        field_path="relation_tag",
+        allowed_ids=("ally", "friendly", "met", "neutral", "wary", "hostile"),
+    ),
+)
+
+
 def _normalize_action_plan(
     action_type: str,
     action_prompt: str,
@@ -5149,8 +5192,12 @@ def _fallback_action_plan(action_type: str, action_prompt: str) -> dict[str, int
     )
 
 
-_OPPOSED_STRENGTH_TOKENS = ("抱起", "摔", "推开", "按住", "压制", "拖走", "拉拽", "擒抱", "grapple", "slam", "shove", "restrain", "drag", "tackle")
-_OPPOSED_DEXTERITY_TOKENS = ("抢夺", "缴械", "夺下", "抢走", "disarm", "snatch")
+_PUBLIC_TURN_RESOLUTION_RULE_FIELDS = (
+    EnumContractField(
+        field_path="resolution_rule",
+        allowed_ids=("static_dc", "opposed_actor"),
+    ),
+)
 
 
 def _current_team_roles(save: SaveFile) -> list[NpcRoleCard]:
@@ -5180,11 +5227,63 @@ def _extract_prompt_value(action_prompt: str, marker: str) -> str:
 
 
 def _opposed_rule_for_prompt(action_prompt: str) -> tuple[str, str] | None:
-    lowered = (action_prompt or "").lower()
-    if any(token.lower() in lowered for token in _OPPOSED_STRENGTH_TOKENS):
+    if _extract_target_role_id(action_prompt):
         return "strength", "max_strength_or_dexterity"
-    if any(token.lower() in lowered for token in _OPPOSED_DEXTERITY_TOKENS):
-        return "dexterity", "max_strength_or_dexterity"
+    if _extract_prompt_value(action_prompt, "target=").strip():
+        return "strength", "max_strength_or_dexterity"
+    return None
+
+
+def _ai_public_turn_resolution_rule(
+    *,
+    action_type: str,
+    action_prompt: str,
+    target_name: str,
+    config: ChatConfig | None,
+) -> str | None:
+    if not has_ai_config(config):
+        return None
+    config = require_ai_config(config)
+    prompt = prompt_table.render(
+        "public.turn.action_resolution.user",
+        (
+            "Decide whether this public-turn action should resolve as static_dc or opposed_actor against the named target. "
+            "Return JSON only with resolution_rule. "
+            f"Allowed enum ids:\n{render_enum_pool_text(_PUBLIC_TURN_RESOLUTION_RULE_FIELDS)}\n"
+            "Use opposed_actor only when the action directly contests, restrains, attacks, blocks, grabs, or forcefully prevents the target. "
+            "Use static_dc for observation, persuasion, performance, indirect manipulation, or actions that do not directly collide with the target's immediate resistance. "
+            "action_type=$action_type; target_name=$target_name; action_prompt=$action_prompt"
+        ),
+        action_type=action_type,
+        target_name=target_name,
+        action_prompt=action_prompt[:240],
+    )
+    try:
+        client = create_sync_client(config, client_cls=OpenAI)
+        resp = client.chat.completions.create(
+            model=config.model,
+            **build_completion_options(config),
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": prompt_table.get_text("public.turn.action_resolution.system", "Return JSON only.")},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        raw_json = (resp.choices[0].message.content or "").strip() or "{}"
+        parsed = _extract_json_content(raw_json)
+        parsed = validate_or_repair_json_payload(
+            parsed=parsed,
+            raw_json=raw_json,
+            fields=_PUBLIC_TURN_RESOLUTION_RULE_FIELDS,
+            config=config,
+            system_prompt=prompt_table.get_text("public.turn.action_resolution.system", "Return JSON only."),
+            original_prompt=prompt,
+        )
+        resolution_rule = str(parsed.get("resolution_rule") or "").strip().lower()
+        if resolution_rule in {"static_dc", "opposed_actor"}:
+            return resolution_rule
+    except Exception:
+        return None
     return None
 
 
@@ -5306,7 +5405,7 @@ def _resolve_public_turn_opposed_actor_target(
                 "actor_kind": "player",
             }
 
-    if len(candidates) == 1 and _opposed_rule_for_prompt(action_prompt) is not None:
+    if len(candidates) == 1 and _extract_prompt_value(action_prompt, "target=").strip():
         return candidates[0]
     return None
 
@@ -5333,10 +5432,10 @@ def _build_public_turn_opposed_plan(
     actor_role_id: str,
     action_type: str,
     action_prompt: str,
+    planned_ability_used: str = "strength",
+    planned_requires_check: bool = True,
+    config: ChatConfig | None = None,
 ) -> dict[str, int | bool | str] | None:
-    rule = _opposed_rule_for_prompt(action_prompt)
-    if rule is None:
-        return None
     target = _resolve_public_turn_opposed_actor_target(
         save,
         action_prompt,
@@ -5350,12 +5449,28 @@ def _build_public_turn_opposed_plan(
     target_actor_kind = "player" if str(target.get("actor_kind") or "") == "player" else "npc"
     if not target_role_id or not target_name:
         return None
+    should_be_opposed = str(action_type or "").strip().lower() == "attack"
+    if not should_be_opposed and planned_requires_check:
+        hinted_rule = _ai_public_turn_resolution_rule(
+            action_type=action_type,
+            action_prompt=action_prompt,
+            target_name=target_name,
+            config=config,
+        )
+        if hinted_rule is not None:
+            should_be_opposed = hinted_rule == "opposed_actor"
+        elif not has_ai_config(config):
+            should_be_opposed = True
+    if not should_be_opposed:
+        return None
     _, target_profile = _get_actor_profile(save, target_role_id)
     actor_id, actor_profile = _get_actor_profile(save, actor_role_id)
     if actor_id != actor_role_id:
         actor_role_id = actor_id
-    actor_ability = rule[0]
-    target_ability, target_modifier = _choose_opposed_target_ability(target_profile, rule[1])
+    actor_ability = str(planned_ability_used or "strength").strip().lower() or "strength"
+    if actor_ability not in {"strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"}:
+        actor_ability = "strength"
+    target_ability, target_modifier = _choose_opposed_target_ability(target_profile, "max_strength_or_dexterity")
     return {
         "ability_used": actor_ability,
         "dc": max(5, min(30, 10 + int(target_modifier))),
@@ -5389,12 +5504,14 @@ def plan_public_turn_opposed_exchange(req: PublicTurnOpposedPlanRequest) -> Publ
         )
         if str(part or "").strip()
     )
-    rule = _opposed_rule_for_prompt(combined_prompt) or _opposed_rule_for_prompt(req.source_action_summary)
-    source_ability = (rule[0] if rule is not None else "strength")
-    target_ability, target_modifier = _choose_opposed_target_ability(
-        target_profile,
-        (rule[1] if rule is not None else "max_strength_or_dexterity"),
-    )
+    if has_ai_config(req.config):
+        source_plan = _ai_action_plan("check", combined_prompt or req.source_action_summary, req.config)
+        source_ability = str(source_plan.get("ability_used") or "strength").strip().lower() or "strength"
+    else:
+        source_ability = "strength"
+    if source_ability not in {"strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"}:
+        source_ability = "strength"
+    target_ability, target_modifier = _choose_opposed_target_ability(target_profile, "max_strength_or_dexterity")
     source_modifier = _ability_modifier(source_profile, source_ability)
     task_seed = _humanize_action_prompt(req.source_action_summary) or _humanize_action_prompt(combined_prompt) or "当前对抗"
     return PublicTurnOpposedPlanResponse(
@@ -5423,12 +5540,7 @@ def _ai_action_plan(
     action_prompt: str,
     config: ChatConfig | None,
 ) -> dict[str, int | bool | str]:
-    if config is None:
-        return _fallback_action_plan(action_type, action_prompt)
-    api_key = (config.openai_api_key or "").strip()
-    model = (config.model or "").strip()
-    if not api_key or not model:
-        return _fallback_action_plan(action_type, action_prompt)
+    config = require_ai_config(config)
 
     try:
         default_prompt = (
@@ -5447,9 +5559,13 @@ def _ai_action_plan(
             action_type=action_type,
             action_prompt=action_prompt,
         )
+        prompt = (
+            f"{prompt}\nAllowed enum ids:\n{render_enum_pool_text(_ABILITY_USED_CONTRACT_FIELDS)}\n"
+            "Use only the allowed stable ids for ability_used."
+        )
         client = create_sync_client(config, client_cls=OpenAI)
         resp = client.chat.completions.create(
-            model=model,
+            model=config.model,
             **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
@@ -5457,11 +5573,22 @@ def _ai_action_plan(
                 {"role": "user", "content": prompt},
             ],
         )
-        content = (resp.choices[0].message.content or "").strip()
+        content = (resp.choices[0].message.content or "").strip() or "{}"
         parsed = _extract_json_content(content)
+        with allow_protocol_repair():
+            parsed = validate_or_repair_json_payload(
+                parsed=parsed,
+                raw_json=content,
+                fields=_ABILITY_USED_CONTRACT_FIELDS,
+                config=config,
+                system_prompt=prompt_table.get_text("action.plan.system", "你只输出JSON。"),
+                original_prompt=prompt,
+            )
         return _normalize_action_plan(action_type, action_prompt, parsed)
-    except Exception:
-        return _fallback_action_plan(action_type, action_prompt)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"{AI_PROVIDER_CALL_FAILED}: {exc}") from exc
 
 
 def _planned_action_plan(req: ActionCheckRequest) -> dict[str, int | bool | str] | None:
@@ -5504,6 +5631,9 @@ def plan_action_check(req: ActionCheckPlanRequest) -> ActionCheckPlanResponse:
             actor_role_id=actor_role_id,
             action_type=req.action_type,
             action_prompt=req.action_prompt,
+            planned_ability_used=str(plan.get("ability_used") or "strength"),
+            planned_requires_check=bool(plan.get("requires_check")),
+            config=req.config,
         )
         if opposed is not None:
             plan = opposed
@@ -5809,6 +5939,9 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
             actor_role_id=actor_role_id,
             action_type=req.action_type,
             action_prompt=req.action_prompt,
+            planned_ability_used=ability,
+            planned_requires_check=requires_check,
+            config=req.config,
         )
         if opposed is not None:
             resolution_rule = "opposed_actor"
@@ -6314,7 +6447,7 @@ def discover_interactions(req: AreaDiscoverInteractionsRequest) -> AreaDiscoverI
     )
     save_current(save)
     refreshed_target = next((s for s in snap.sub_zones if s.sub_zone_id == req.sub_zone_id), target)
-    return AreaDiscoverInteractionsResponse(ok=True, generated_mode="instant", new_interactions=list(refreshed_target.key_interactions))
+    return AreaDiscoverInteractionsResponse(ok=True, generated_mode="instant", new_interactions=list(deduped))
 
 
 def discover_interactions_in_save(req: AreaDiscoverInteractionsRequest) -> AreaDiscoverInteractionsResponse:

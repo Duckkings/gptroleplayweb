@@ -140,7 +140,7 @@ function renderActorEntry(entry: PublicTurnSettlementEntry) {
       <div className="scene-event-block">
         <span>Action</span>
         <p>{entry.action_summary || 'No visible action this turn.'}</p>
-        {entry.action_target_name ? <p>Target: {entry.action_target_name}</p> : null}
+        {entry.action_target_name ? <p>Action Target: {entry.action_target_name}</p> : null}
         {entry.interaction_exchange_kind === 'alternated_exchange' ? <p>Exchange: Alternated interaction</p> : null}
       </div>
       {entry.speech_text.trim() && (

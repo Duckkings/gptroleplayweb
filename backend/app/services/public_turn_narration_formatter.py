@@ -125,6 +125,23 @@ def format_pause_preview_fragment(item: PublicTurnNarrationInputItem) -> str:
     return " ".join(part for part in parts if part).strip()
 
 
+def _format_opposed_check_fragment(entry: PublicTurnSettlementEntry) -> str:
+    check = entry.check
+    if check is None or check.resolution_rule != "opposed_actor":
+        return ""
+    actor_name = _clean(entry.actor_name)
+    target_name = _clean(check.target_name or entry.opposed_target_name or "对方")
+    if not actor_name:
+        return ""
+    if check.success:
+        if check.critical == "critical_success":
+            return f"正面对抗的结果立刻分了出来，{actor_name}当场压过了{target_name}。"
+        return f"这次正面对抗里，{actor_name}压过了{target_name}的回应。"
+    if check.critical == "critical_failure":
+        return f"这次正面对抗里，{actor_name}明显慢了一拍，被{target_name}当场顶了回去。"
+    return f"这次正面对抗里，{actor_name}没能压过{target_name}的回应。"
+
+
 def build_settlement_fragment(entry: PublicTurnSettlementEntry) -> str:
     if entry.entry_kind == "gm_push":
         parts: list[str] = []
@@ -158,6 +175,13 @@ def build_settlement_fragment(entry: PublicTurnSettlementEntry) -> str:
             entry.target_response_kind,
         )
     )
+    resolution_fragment = _clean(entry.gm_resolution_summary)
+    if resolution_fragment:
+        parts.append(resolution_fragment)
+    else:
+        opposed_check_fragment = _format_opposed_check_fragment(entry)
+        if opposed_check_fragment:
+            parts.append(opposed_check_fragment)
     if entry.actor_type == "player":
         for row in entry.relation_deltas:
             fragment = format_player_reaction_fragment(row)

@@ -272,3 +272,25 @@
   - `world_impact_type=non_world`
 - Alternation is only legal when a target-side `world` response points back at the original source actor.
 - If AI produces a reverse `world` response aimed at a third party, runtime must not open a new interaction branch from that payload.
+
+## 2026-03-20 Enum Contract / Repair Policy
+
+- AI control fields now follow a shared protocol contract layer.
+- Backend prompts must explicitly downlink allowed stable ids for control enums.
+- Backend no longer does semantic guesswork for illegal control enums.
+- Shared control-enum behavior is now:
+  1. parse JSON
+  2. validate enum membership only
+  3. non-public-turn flows repair once inline with the same model
+  4. second failure returns `AI_PROTOCOL_REPAIR_FAILED`
+- Public-turn is the only flow that stages first-pass enum violations into a user-visible repair state instead of repairing inline.
+- Shared error codes:
+  - `AI_CONFIG_REQUIRED`
+  - `AI_PROVIDER_CALL_FAILED`
+  - `AI_PROTOCOL_ENUM_INVALID`
+  - `AI_PROTOCOL_REPAIR_FAILED`
+- Public-turn targeted actor context is now standardized as prompt-only helper text:
+  - action target form: `{actor}对{target}的行为：...`
+  - self action form: `{actor}自己的行为：...`
+  - speech target form: `{actor}对{speech_target}说：...`
+  - untargeted speech form: `{actor}说：...`

@@ -1,11 +1,13 @@
 import unittest
 from pathlib import Path
+from pydantic import ValidationError
 from shutil import rmtree
 from unittest.mock import patch
 from uuid import uuid4
 
 from app.core.storage import storage_state
 from app.models.schemas import (
+    ActionCheckResponse,
     ActionCheckPlanRequest,
     AreaNpc,
     AreaSnapshot,
@@ -24,8 +26,13 @@ from app.models.schemas import (
     PublicTurnEntryType,
     PublicTurnInteractionPrompt,
     PublicTurnInteractionResponseSubmission,
+    PublicTurnOpposedPlanResponse,
+    PublicTurnOpposedPrompt,
     PublicTurnPhase,
     PublicTurnPlayerActionCheck,
+    PublicTurnRound,
+    PublicTurnSettlementCheck,
+    PublicTurnSettlementEntry,
     PublicTurnWorldImpactType,
     TeamMember,
 )
@@ -36,8 +43,8 @@ from app.services import reaction_check_service
 from app.services.team_service import ensure_team_state
 from app.services.public_turn_resolution import build_initiative_declarations
 from app.services.public_turn_runtime import _resolve_initiative_actor_row, continue_round_in_save, start_round_in_save
-from app.services.public_turn_resolution import resolve_ai_actor_turn
-from app.services.public_turn_state_store import get_public_turn_state_in_save
+from app.services.public_turn_resolution import resolve_ai_actor_turn, resolve_opposed_prompt_submission
+from app.services.public_turn_state_store import get_public_turn_state_in_save, save_public_turn_state_in_save
 from app.services.world_service import clear_current_save, plan_action_check, save_current
 
 
@@ -50,11 +57,76 @@ class PublicTurnRuntimeTests(unittest.TestCase):
         self._tmpdir = root
         storage_state.set_save_path(str(root / "current-save.json"))
         storage_state.set_config_path(str(root / "config.json"))
+        self._patchers = [
+            patch("app.services.public_turn_effects._ai_public_turn_npc_reaction", side_effect=self._fake_npc_reaction),
+            patch("app.services.public_turn_effects._ai_public_turn_team_reaction", side_effect=self._fake_team_reaction),
+            patch("app.services.public_scene_runtime_v2._ai_actor_action", side_effect=self._fake_actor_action),
+            patch("app.services.public_turn_segment_service._planner_overrides", return_value={}),
+            patch("app.services.world_service._ai_action_plan", side_effect=self._fake_action_plan),
+            patch(
+                "app.services.public_turn_interaction_service.classify_player_interaction_response",
+                side_effect=self._fake_interaction_response,
+            ),
+            patch(
+                "app.services.public_turn_resolution.classify_player_interaction_response",
+                side_effect=self._fake_interaction_response,
+            ),
+        ]
+        for patcher in self._patchers:
+            patcher.start()
 
     def tearDown(self) -> None:
+        for patcher in reversed(getattr(self, "_patchers", [])):
+            patcher.stop()
         storage_state.set_save_path(str(self._orig_save))
         storage_state.set_config_path(str(self._orig_config))
         rmtree(self._tmpdir, ignore_errors=True)
+
+    def _fake_npc_reaction(self, *args, **kwargs):
+        return ("皱了皱眉", "", "neutral", "", "", "single")
+
+    def _fake_team_reaction(self, *args, **kwargs):
+        return ("点了点头", "", 0, 0, "neutral", "", "", "single")
+
+    def _fake_actor_action(self, save, actor, *args, **kwargs):
+        actor_name = str(actor.get("name") or "Actor")
+        return {
+            "response_mode": "respond",
+            "action_type": "check",
+            "world_impact_type": "non_world",
+            "visible_intent": f"{actor_name} keeps watch.",
+            "external_action_narration": f"{actor_name} keeps watch.",
+            "speech_line": "",
+            "specific_threat": "",
+            "action_prompt": f"actor={actor_name}; intent=keep watch",
+            "target_label": "",
+            "speech_target_label": "",
+        }
+
+    def _fake_action_plan(self, *args, **kwargs):
+        return {
+            "ability_used": "wisdom",
+            "dc": 12,
+            "time_spent_min": 1,
+            "requires_check": True,
+            "check_task": "test task",
+        }
+
+    def _fake_interaction_response(self, *args, **kwargs):
+        action_text = str(kwargs.get("action_text") or "")
+        speech_text = str(kwargs.get("speech_text") or "")
+        source_actor_name = str(kwargs.get("source_actor_name") or "")
+        combined = f"{action_text}\n{speech_text}".lower()
+        is_world = any(token in combined for token in ("wrench", "free", "brace", "don't touch", "推开", "挣脱", "别碰我", "反抗"))
+        return InteractionResponseClassification(
+            action_text=action_text,
+            speech_text=speech_text,
+            speech_target_label=None,
+            target_label=(source_actor_name if action_text.strip() else None),
+            world_impact_type=(PublicTurnWorldImpactType.WORLD if is_world else PublicTurnWorldImpactType.NON_WORLD),
+            consent_state=("rejected" if is_world else "accepted"),
+            contest_state=("opposed" if is_world else "non_opposed"),
+        )
 
     def _seed_public_turn_scene(self, session_id: str):
         save = clear_current_save(session_id)
@@ -164,8 +236,14 @@ class PublicTurnRuntimeTests(unittest.TestCase):
 
         with (
             patch("app.services.public_turn_runtime.resolve_ai_round", return_value=([], [], [], None, None)),
-            patch("app.services.public_turn_effects._ai_public_turn_npc_reaction", return_value=("皱了皱眉", "先别乱来。")),
-            patch("app.services.public_turn_effects._ai_public_turn_team_reaction", return_value=("握紧肩带", "我跟你。", 3, 2)),
+            patch(
+                "app.services.public_turn_effects._ai_public_turn_npc_reaction",
+                return_value=("皱了皱眉", "先别乱来。", "neutral", "", "", "single"),
+            ),
+            patch(
+                "app.services.public_turn_effects._ai_public_turn_team_reaction",
+                return_value=("握紧肩带", "我跟你。", 3, 2, "supportive", "", "", "single"),
+            ),
         ):
             result = continue_round_in_save(
                 save,
@@ -252,8 +330,14 @@ class PublicTurnRuntimeTests(unittest.TestCase):
 
         with (
             patch("app.services.public_turn_runtime.resolve_ai_round", return_value=([], [], [], pending_reaction, None)),
-            patch("app.services.public_turn_effects._ai_public_turn_npc_reaction", return_value=("压低肩膀", "别把事情闹大。")),
-            patch("app.services.public_turn_effects._ai_public_turn_team_reaction", return_value=("侧过半步", "我在这边。", 1, 1)),
+            patch(
+                "app.services.public_turn_effects._ai_public_turn_npc_reaction",
+                return_value=("压低肩膀", "别把事情闹大。", "neutral", "", "", "single"),
+            ),
+            patch(
+                "app.services.public_turn_effects._ai_public_turn_team_reaction",
+                return_value=("侧过半步", "我在这边。", 1, 1, "supportive", "", "", "single"),
+            ),
         ):
             result = continue_round_in_save(
                 save,
@@ -372,6 +456,66 @@ class PublicTurnRuntimeTests(unittest.TestCase):
         self.assertIsNone(segment.public_opposed_prompt)
         self.assertGreaterEqual(len(segment.beats), 1)
         self.assertEqual(segment.beats[0].settlement.interaction_target_name, "艾琳")  # type: ignore[union-attr]
+
+    def test_public_turn_prompt_keeps_object_action_target_when_player_is_only_speech_target(self) -> None:
+        save = self._seed_public_turn_scene("sess_public_turn_prompt_object_target")
+        start_round_in_save(save, entry_type=PublicTurnEntryType.NEXT_ROUND, config=None)
+        state = get_public_turn_state_in_save(save)
+        round_state = state.current_round
+        assert round_state is not None
+        actor_rows = [
+            {
+                "actor_id": "npc_guard",
+                "name": "Guard",
+                "actor_type": "npc",
+                "role": next(item for item in save.role_pool if item.role_id == "npc_guard"),
+                "priority_reason": "test",
+            }
+        ]
+        with patch(
+            "app.services.public_turn_segment_service.public_scene_runtime._ai_actor_action",
+            return_value={
+                "external_action_narration": "Guard jumps onto the desk and steadies the smoking relay core.",
+                "speech_line": "Stay back and don't touch it.",
+                "visible_intent": "Guard stabilizes the smoking relay core.",
+                "specific_threat": "The relay core could rupture if anyone interferes.",
+                "target_label": "smoking relay core",
+                "speech_target_label": save.player_static_data.name,
+                "action_type": "check",
+                "action_prompt": "actor=Guard; intent=stabilize the smoking relay core while warning the player",
+                "situation_delta_hint": 1,
+            },
+        ), patch("app.services.public_turn_segment_service._planner_overrides", return_value={}):
+            plan = plan_public_turn_segment(
+                save,
+                round_state=round_state,
+                actor_rows=actor_rows,
+                phase=PublicTurnPhase.NORMAL_ADVANCEMENT,
+                player_text="I watch the guard handle the device.",
+                gm_summary="The relay core is spitting sparks across the desk.",
+                audience_context={},
+                prior_narration="",
+                default_boundary_kind="round_end",
+                config=None,
+            )
+            segment = resolve_public_turn_segment(
+                save,
+                round_state=round_state,
+                actor_lookup={row["actor_id"]: row for row in actor_rows},
+                plan=plan,
+                context_text="I watch the guard handle the device.",
+                reputation_score=50,
+                config=None,
+            )
+
+        self.assertIsNotNone(segment.public_interaction_prompt)
+        self.assertIsNone(segment.public_opposed_prompt)
+        prompt = segment.public_interaction_prompt
+        assert prompt is not None
+        self.assertEqual(prompt.target_actor_id, save.player_static_data.player_id)
+        self.assertEqual(prompt.target_actor_name, save.player_static_data.name)
+        self.assertEqual(prompt.source_action_target_name, "smoking relay core")
+        self.assertEqual(prompt.source_speech_target_name, save.player_static_data.name)
 
     def disabled_public_turn_player_interaction_acceptance_stays_non_opposed(self) -> None:
         save = self._seed_public_turn_scene("sess_public_turn_interaction_accept")
@@ -559,6 +703,64 @@ class PublicTurnRuntimeTests(unittest.TestCase):
         self.assertEqual(result.public_opposed_prompt.target_actor_id, save.player_static_data.player_id)  # type: ignore[union-attr]
         self.assertEqual(result.presentation.phase, PublicTurnPhase.AWAITING_PLAYER_OPPOSED)
 
+    def test_public_turn_player_interaction_direct_attack_against_actor_escalates_to_opposed(self) -> None:
+        save = self._seed_public_turn_scene("sess_public_turn_interaction_direct_attack_v2")
+        start_round_in_save(save, entry_type=PublicTurnEntryType.NEXT_ROUND, config=None)
+        state = get_public_turn_state_in_save(save)
+        round_state = state.current_round
+        assert round_state is not None
+        round_state.phase = PublicTurnPhase.AWAITING_PLAYER_INTERACTION
+        round_state.awaiting_player_action_phase = PublicTurnPhase.INITIATIVE_EXECUTION
+        round_state.pending_interaction_prompt = PublicTurnInteractionPrompt(
+            prompt_id="prompt_direct_attack_v2",
+            round_id=round_state.round_id,
+            phase=PublicTurnPhase.INITIATIVE_EXECUTION,
+            source_actor_id="npc_guard",
+            source_actor_name="Guard",
+            source_action_type="check",
+            source_action_summary="The guard sweeps the lantern off the desk and lunges to seize the ledger before you can react.",
+            source_speech_text="Try me.",
+            source_action_prompt="actor=guard; target=player; intent=seize the ledger under threat",
+            source_world_impact_type=PublicTurnWorldImpactType.WORLD,
+            source_planned_requires_check=True,
+            source_planned_ability_used="wisdom",
+            source_planned_dc=12,
+            source_planned_check_task="Force control of the ledger",
+            source_interaction_kind="targeted_interaction",
+            target_actor_id=save.player_static_data.player_id,
+            target_actor_name=save.player_static_data.name,
+            target_actor_kind=PublicTurnActorType.PLAYER,
+            suggested_target_label=save.player_static_data.name,
+        )
+
+        with patch(
+            "app.services.public_turn_resolution.classify_player_interaction_response",
+            return_value=InteractionResponseClassification(
+                action_text="I keep firing magic missiles at him.",
+                speech_text="Die.",
+                speech_target_label=None,
+                target_label="Guard",
+                world_impact_type=PublicTurnWorldImpactType.WORLD,
+            ),
+        ):
+            result = continue_round_in_save(
+                save,
+                submission=None,
+                interaction_response=PublicTurnInteractionResponseSubmission(
+                    prompt_id="prompt_direct_attack_v2",
+                    action_text="I keep firing magic missiles at him.",
+                    speech_text="Die.",
+                    response_kind="explicit_response",
+                ),
+                action_check=None,
+                config=None,
+            )
+
+        self.assertIsNotNone(result.public_opposed_prompt)
+        self.assertEqual(result.public_opposed_prompt.source_actor_id, "npc_guard")  # type: ignore[union-attr]
+        self.assertEqual(result.public_opposed_prompt.target_actor_id, save.player_static_data.player_id)  # type: ignore[union-attr]
+        self.assertEqual(result.presentation.phase, PublicTurnPhase.AWAITING_PLAYER_OPPOSED)
+
     def test_public_turn_player_interaction_no_action_keeps_round_moving(self) -> None:
         save = self._seed_public_turn_scene("sess_public_turn_interaction_no_action")
         start_round_in_save(save, entry_type=PublicTurnEntryType.NEXT_ROUND, config=None)
@@ -607,6 +809,146 @@ class PublicTurnRuntimeTests(unittest.TestCase):
         current_round = get_public_turn_state_in_save(save).current_round
         assert current_round is not None
         self.assertIsNone(current_round.pending_interaction_prompt)
+
+    def test_public_turn_interaction_submission_preserves_non_player_action_target(self) -> None:
+        save = self._seed_public_turn_scene("sess_public_turn_interaction_object_target")
+        start_round_in_save(save, entry_type=PublicTurnEntryType.NEXT_ROUND, config=None)
+        state = get_public_turn_state_in_save(save)
+        round_state = state.current_round
+        assert round_state is not None
+        round_state.phase = PublicTurnPhase.AWAITING_PLAYER_INTERACTION
+        round_state.awaiting_player_action_phase = PublicTurnPhase.NORMAL_ADVANCEMENT
+        round_state.pending_interaction_prompt = PublicTurnInteractionPrompt(
+            prompt_id="prompt_object_target",
+            round_id=round_state.round_id,
+            phase=PublicTurnPhase.NORMAL_ADVANCEMENT,
+            source_actor_id="npc_guard",
+            source_actor_name="Guard",
+            source_action_type="check",
+            source_action_summary="Guard braces over the smoking relay core and tightens the loose housing.",
+            source_speech_text="Stay back.",
+            source_action_target_name="smoking relay core",
+            source_speech_target_name=save.player_static_data.name,
+            source_action_prompt="actor=Guard; intent=stabilize the smoking relay core while warning the player",
+            source_world_impact_type=PublicTurnWorldImpactType.NON_WORLD,
+            source_planned_requires_check=False,
+            source_interaction_kind="targeted_interaction",
+            target_actor_id=save.player_static_data.player_id,
+            target_actor_name=save.player_static_data.name,
+            target_actor_kind=PublicTurnActorType.PLAYER,
+            suggested_target_label=save.player_static_data.name,
+        )
+
+        result = continue_round_in_save(
+            save,
+            submission=None,
+            interaction_response=PublicTurnInteractionResponseSubmission(
+                prompt_id="prompt_object_target",
+                action_text="",
+                speech_text="",
+                response_kind="no_action",
+            ),
+            action_check=None,
+            config=None,
+        )
+
+        self.assertGreaterEqual(len(result.settlement_entries), 1)
+        settlement = result.settlement_entries[0]
+        self.assertEqual(settlement.action_target_name, "smoking relay core")
+        self.assertIsNone(settlement.action_target_actor_id)
+        self.assertEqual(settlement.interaction_target_name, save.player_static_data.name)
+        self.assertEqual(settlement.target_response_kind, "no_action")
+
+    def test_public_turn_interaction_no_action_pauses_for_player_initiative_slot_when_player_is_next(self) -> None:
+        save = self._seed_public_turn_scene("sess_public_turn_interaction_no_action_player_next")
+        state = get_public_turn_state_in_save(save)
+        round_state = PublicTurnRound(
+            round_id="ptround_player_next",
+            round_number=1,
+            phase=PublicTurnPhase.AWAITING_PLAYER_INTERACTION,
+            initiative_declarations=[
+                InitiativeDeclaration(
+                    actor_id="npc_guard",
+                    actor_name="Guard",
+                    actor_type="npc",
+                    declared_action="Guard cuts in first.",
+                    dex_modifier=1,
+                    roll_d20=20,
+                    total_initiative=21,
+                ),
+                InitiativeDeclaration(
+                    actor_id=save.player_static_data.player_id,
+                    actor_name=save.player_static_data.name,
+                    actor_type="player",
+                    declared_action="Take initiative",
+                    dex_modifier=0,
+                    roll_d20=19,
+                    total_initiative=19,
+                ),
+                InitiativeDeclaration(
+                    actor_id="npc_bram",
+                    actor_name="Bram",
+                    actor_type="team",
+                    declared_action="Bram covers the player.",
+                    dex_modifier=3,
+                    roll_d20=13,
+                    total_initiative=16,
+                ),
+            ],
+            awaiting_player_action_phase=PublicTurnPhase.INITIATIVE_EXECUTION,
+            pending_interaction_prompt=PublicTurnInteractionPrompt(
+                prompt_id="prompt_no_action_player_next",
+                round_id="ptround_player_next",
+                phase=PublicTurnPhase.INITIATIVE_EXECUTION,
+                source_actor_id="npc_guard",
+                source_actor_name="Guard",
+                source_action_type="check",
+                source_action_summary="Guard blocks your path and orders you to stay put.",
+                source_speech_text="Don't move.",
+                source_action_prompt="actor=Guard; target=player; intent=block player",
+                source_world_impact_type=PublicTurnWorldImpactType.NON_WORLD,
+                source_planned_requires_check=False,
+                source_interaction_kind="block",
+                target_actor_id=save.player_static_data.player_id,
+                target_actor_name=save.player_static_data.name,
+                target_actor_kind=PublicTurnActorType.PLAYER,
+                suggested_target_label=save.player_static_data.name,
+            ),
+        )
+        state.current_round = round_state
+        state.awaiting_player_entry = False
+        save_public_turn_state_in_save(save, state)
+
+        result = continue_round_in_save(
+            save,
+            submission=None,
+            interaction_response=PublicTurnInteractionResponseSubmission(
+                prompt_id="prompt_no_action_player_next",
+                action_text="",
+                speech_text="",
+                response_kind="no_action",
+            ),
+            action_check=None,
+            config=None,
+        )
+
+        self.assertFalse(result.round_completed)
+        self.assertIsNone(result.public_interaction_prompt)
+        self.assertIsNone(result.public_opposed_prompt)
+        self.assertEqual(result.presentation.phase, PublicTurnPhase.INITIATIVE_EXECUTION)
+        self.assertEqual(len(result.presentation.settlement_entries), 1)
+        self.assertEqual(result.presentation.settlement_entries[0].actor_id, "npc_guard")
+        self.assertEqual(result.presentation.settlement_entries[0].target_response_kind, "no_action")
+
+        current_round = get_public_turn_state_in_save(save).current_round
+        assert current_round is not None
+        self.assertEqual(current_round.phase, PublicTurnPhase.INITIATIVE_EXECUTION)
+        self.assertTrue(current_round.awaiting_player_action)
+        self.assertEqual(current_round.current_actor_id, save.player_static_data.player_id)
+        self.assertEqual(current_round.awaiting_player_action_phase, PublicTurnPhase.INITIATIVE_EXECUTION)
+        self.assertEqual(current_round.executed_actor_ids, ["npc_guard"])
+        self.assertIsNone(current_round.pending_interaction_prompt)
+        self.assertNotIn("npc_bram", current_round.executed_actor_ids)
 
     def test_public_turn_invalid_alternation_target_keeps_pending_prompt(self) -> None:
         save = self._seed_public_turn_scene("sess_public_turn_interaction_invalid_reverse")
@@ -823,7 +1165,7 @@ class PublicTurnRuntimeTests(unittest.TestCase):
         self.assertEqual(npc_row.reaction_tone, "warning")
         self.assertLessEqual(npc_row.relation_delta, 0)
 
-    def test_invalid_reaction_tone_is_sanitized_before_validation(self) -> None:
+    def test_invalid_reaction_tone_is_rejected_without_silent_sanitization(self) -> None:
         save = self._seed_public_turn_scene("sess_public_turn_invalid_reaction_tone")
         start_round_in_save(save, entry_type=PublicTurnEntryType.NEXT_ROUND, config=None)
 
@@ -838,32 +1180,29 @@ class PublicTurnRuntimeTests(unittest.TestCase):
                 return_value=("takes a breath", "Easy.", 1, 1, "oops", "Guard", save.player_static_data.name, "current_conflict"),
             ),
         ):
-            result = continue_round_in_save(
-                save,
-                submission=PublicTurnActionSubmission(
-                    actor_id=save.player_static_data.player_id,
-                    action_text="I step between the guard and the crowd.",
-                    speech_text="Everyone back off.",
-                    source_phase=PublicTurnPhase.NORMAL_ADVANCEMENT,
-                    forced_first=False,
-                ),
-                action_check=PublicTurnPlayerActionCheck(
-                    action_type="check",
-                    source_context="public_turn",
-                    resolution_rule="static_dc",
-                    planned_requires_check=True,
-                    planned_ability_used="wisdom",
-                    planned_dc=10,
-                    planned_time_spent_min=1,
-                    planned_check_task="steady the crowd",
-                    forced_dice_roll=14,
-                ),
-                config=None,
-            )
-
-        impact = result.impacts[0]
-        self.assertIn(impact.relation_deltas[0].reaction_tone, {"neutral", "concerned", "warning", "hostile", "supportive", "approving"})
-        self.assertIn(impact.team_affinity_deltas[0].reaction_tone, {"neutral", "concerned", "warning", "hostile", "supportive", "approving"})
+            with self.assertRaises(ValidationError):
+                continue_round_in_save(
+                    save,
+                    submission=PublicTurnActionSubmission(
+                        actor_id=save.player_static_data.player_id,
+                        action_text="I step between the guard and the crowd.",
+                        speech_text="Everyone back off.",
+                        source_phase=PublicTurnPhase.NORMAL_ADVANCEMENT,
+                        forced_first=False,
+                    ),
+                    action_check=PublicTurnPlayerActionCheck(
+                        action_type="check",
+                        source_context="public_turn",
+                        resolution_rule="static_dc",
+                        planned_requires_check=True,
+                        planned_ability_used="wisdom",
+                        planned_dc=10,
+                        planned_time_spent_min=1,
+                        planned_check_task="steady the crowd",
+                        forced_dice_roll=14,
+                    ),
+                    config=None,
+                )
 
     def test_build_initiative_declarations_accepts_encounter_temp_npc(self) -> None:
         save = self._seed_public_turn_scene("sess_public_turn_temp_npc_declaration")
@@ -932,6 +1271,77 @@ class PublicTurnRuntimeTests(unittest.TestCase):
         self.assertEqual(row.get("actor_type"), "encounter_temp_npc")
         self.assertEqual(row.get("actor_id"), "encnpc_1")
         self.assertIsNotNone(row.get("temp_npc"))
+
+    def test_plan_public_turn_segment_forwards_scene_context_to_actor_planning(self) -> None:
+        save = self._seed_public_turn_scene("sess_public_turn_segment_context")
+        start_round_in_save(save, entry_type=PublicTurnEntryType.NEXT_ROUND, config=None)
+        state = get_public_turn_state_in_save(save)
+        round_state = state.current_round
+        assert round_state is not None
+        actor_rows = [
+            {
+                "actor_id": "npc_guard",
+                "name": "瀹堝崼",
+                "actor_type": "npc",
+                "role": next(item for item in save.role_pool if item.role_id == "npc_guard"),
+                "priority_reason": "test",
+            }
+        ]
+        scene_context = {
+            "active_encounter": {
+                "encounter_id": "enc_public_turn_context",
+                "title": "Library Surge",
+                "scene_summary": "The relic energy surge is flooding the public hall.",
+            },
+            "sub_zone_recent_turns": [
+                {
+                    "gm_narration": "The public hall is collapsing into chaos.",
+                }
+            ],
+        }
+
+        captured_scene_contexts: list[dict[str, object] | None] = []
+
+        def _capture_actor_action(save, actor, *args, **kwargs):
+            captured_scene_contexts.append(kwargs.get("scene_context"))
+            actor_name = str(actor.get("name") or "Actor")
+            return {
+                "response_mode": "respond",
+                "action_type": "check",
+                "world_impact_type": "world",
+                "visible_intent": f"{actor_name} moves to contain the surge.",
+                "external_action_narration": f"{actor_name} moves to contain the surge.",
+                "speech_line": "",
+                "specific_threat": "The relic energy surge is still spreading across the hall.",
+                "action_prompt": f"actor={actor_name}; intent=contain the surge",
+                "target_label": "relic surge",
+                "speech_target_label": "",
+            }
+
+        with patch(
+            "app.services.public_turn_segment_service.public_scene_runtime._ai_actor_action",
+            side_effect=_capture_actor_action,
+        ):
+            plan_public_turn_segment(
+                save,
+                round_state=round_state,
+                actor_rows=actor_rows,
+                phase=PublicTurnPhase.NORMAL_ADVANCEMENT,
+                player_text="I stabilize the nearest bystanders and make room to respond.",
+                gm_summary="The public hall is collapsing into chaos.",
+                scene_context=scene_context,
+                audience_context={},
+                prior_narration="",
+                default_boundary_kind="round_end",
+                config=None,
+            )
+
+        self.assertTrue(captured_scene_contexts)
+        scene_context = captured_scene_contexts[0]
+        self.assertIsNotNone(scene_context)
+        assert scene_context is not None
+        self.assertEqual(scene_context["active_encounter"]["encounter_id"], "enc_public_turn_context")
+        self.assertEqual(scene_context["active_encounter"]["title"], "Library Surge")
 
     def test_priority_action_declarations_are_not_player_only(self) -> None:
         save = self._seed_public_turn_scene("sess_public_turn_priority_mix")
@@ -1047,6 +1457,76 @@ class PublicTurnRuntimeTests(unittest.TestCase):
         self.assertEqual(settlement.zone_reputation_delta, 1)
         self.assertEqual(settlement.team_affinity_deltas, [])
 
+    def test_multiple_team_actor_turns_each_can_change_reputation(self) -> None:
+        save = self._seed_public_turn_scene("sess_public_turn_multiple_team_reputation_scope")
+        start_round_in_save(save, entry_type=PublicTurnEntryType.NEXT_ROUND, config=None)
+        state = get_public_turn_state_in_save(save)
+        round_state = state.current_round
+        assert round_state is not None
+        role = next(item for item in save.role_pool if item.role_id == "npc_bram")
+        actor_one = {
+            "actor_id": "npc_bram",
+            "name": "布莱姆",
+            "actor_type": "team",
+            "priority_reason": "test",
+            "role": role,
+        }
+        actor_two = {
+            "actor_id": "npc_bram_second",
+            "name": "布莱姆二号",
+            "actor_type": "team",
+            "priority_reason": "test",
+            "role": role,
+        }
+
+        with (
+            patch(
+                "app.services.public_turn_resolution.public_scene_runtime._ai_actor_action",
+                return_value={
+                    "external_action_narration": "布莱姆稳住了正在扩散的骚动。",
+                    "speech_line": "都站稳。",
+                    "visible_intent": "替队伍稳住公开场面。",
+                    "specific_threat": "围观者的恐慌还在蔓延。",
+                    "target_label": "",
+                    "action_type": "check",
+                    "action_prompt": "布莱姆稳住人群",
+                    "situation_delta_hint": 4,
+                },
+            ),
+            patch("app.services.public_turn_resolution.public_scene_runtime.should_force_public_action_check", return_value=False),
+        ):
+            _, impact_one, settlement_one, _, _ = resolve_ai_actor_turn(
+                save,
+                actor=actor_one,
+                player_text="玩家继续稳住场面。",
+                gm_summary="公开回合继续。",
+                round_state=round_state,
+                scene_context={},
+                audience_context={},
+                reputation_score=50,
+                config=None,
+            )
+            _, impact_two, settlement_two, _, _ = resolve_ai_actor_turn(
+                save,
+                actor=actor_two,
+                player_text="玩家继续稳住场面。",
+                gm_summary="公开回合继续。",
+                round_state=round_state,
+                scene_context={},
+                audience_context={},
+                reputation_score=50,
+                config=None,
+            )
+
+        assert impact_one is not None
+        assert impact_two is not None
+        assert settlement_one is not None
+        assert settlement_two is not None
+        self.assertEqual(impact_one.zone_reputation_delta, 1)
+        self.assertEqual(impact_two.zone_reputation_delta, 1)
+        self.assertEqual(settlement_one.zone_reputation_delta, 1)
+        self.assertEqual(settlement_two.zone_reputation_delta, 1)
+
     def test_player_settlement_omits_gm_resolution_summary(self) -> None:
         save = self._seed_public_turn_scene("sess_public_turn_no_actor_gm_summary")
         start_round_in_save(save, entry_type=PublicTurnEntryType.NEXT_ROUND, config=None)
@@ -1076,6 +1556,191 @@ class PublicTurnRuntimeTests(unittest.TestCase):
             )
 
         self.assertEqual(result.presentation.settlement_entries[0].gm_resolution_summary, "")
+
+    def test_build_settlement_fragment_includes_opposed_result_outcome(self) -> None:
+        settlement = PublicTurnSettlementEntry(
+            entry_id="ptround_test_1",
+            round_id="ptround_test",
+            phase=PublicTurnPhase.INITIATIVE_EXECUTION,
+            order_index=0,
+            actor_id="npc_guard",
+            actor_name="Guard",
+            actor_type=PublicTurnActorType.NPC,
+            action_summary="Guard lunges forward and tries to wrench the player aside.",
+            speech_text="Move.",
+            opposed_target_name="Player",
+            opposed_target_action="Player braces in place and knocks the guard's arm aside.",
+            interaction_resolution="rejected_opposed",
+            check=PublicTurnSettlementCheck(
+                resolution_rule="opposed_actor",
+                ability_used="strength",
+                ability_modifier=1,
+                dice_roll=11,
+                total_score=12,
+                dc=12,
+                target_name="Player",
+                target_ability_used="dexterity",
+                target_ability_modifier=2,
+                target_dice_roll=15,
+                target_total_score=17,
+                success=False,
+                critical="none",
+                comparison_text="Guard d20(11) +1 = 12; Player d20(15) +2 = 17.",
+                outcome_text="Failure",
+            ),
+            situation_delta=0,
+            zone_reputation_delta=0,
+            relation_deltas=[],
+            team_affinity_deltas=[],
+            hp_changes=[],
+            environment_shift=0,
+        )
+
+        narration = build_settlement_fragment(settlement)
+
+        self.assertIn("Player braces in place", narration)
+        self.assertIn("没能压过Player的回应", narration)
+
+    def test_build_settlement_fragment_prefers_gm_resolution_summary_for_opposed_result(self) -> None:
+        settlement = PublicTurnSettlementEntry(
+            entry_id="ptround_test_summary_1",
+            round_id="ptround_test_summary",
+            phase=PublicTurnPhase.INITIATIVE_EXECUTION,
+            order_index=0,
+            actor_id="npc_guard",
+            actor_name="Guard",
+            actor_type=PublicTurnActorType.NPC,
+            action_summary="Guard lunges forward and tries to wrench the player aside.",
+            speech_text="Move.",
+            opposed_target_name="Player",
+            opposed_target_action="Player braces in place and knocks the guard's arm aside.",
+            interaction_resolution="rejected_opposed",
+            check=PublicTurnSettlementCheck(
+                resolution_rule="opposed_actor",
+                ability_used="strength",
+                ability_modifier=1,
+                dice_roll=11,
+                total_score=12,
+                dc=12,
+                target_name="Player",
+                target_ability_used="dexterity",
+                target_ability_modifier=2,
+                target_dice_roll=15,
+                target_total_score=17,
+                success=False,
+                critical="none",
+                comparison_text="Guard d20(11) +1 = 12; Player d20(15) +2 = 17.",
+                outcome_text="Failure",
+            ),
+            gm_resolution_summary="Player plants in place, jars the guard's shoulder aside, and the whole shove loses momentum on impact.",
+            situation_delta=0,
+            zone_reputation_delta=0,
+            relation_deltas=[],
+            team_affinity_deltas=[],
+            hp_changes=[],
+            environment_shift=0,
+        )
+
+        narration = build_settlement_fragment(settlement)
+
+        self.assertIn("Player plants in place, jars the guard's shoulder aside", narration)
+        self.assertNotIn("没能压过Player的回应", narration)
+
+    def test_resolve_opposed_prompt_submission_generates_resolution_summary(self) -> None:
+        save = self._seed_public_turn_scene("sess_public_turn_opposed_resolution_summary")
+        start_round_in_save(save, entry_type=PublicTurnEntryType.NEXT_ROUND, config=None)
+        state = get_public_turn_state_in_save(save)
+        round_state = state.current_round
+        assert round_state is not None
+        prompt = PublicTurnOpposedPrompt(
+            check_id=f"{round_state.round_id}_npc_guard_opposed",
+            round_id=round_state.round_id,
+            phase=PublicTurnPhase.INITIATIVE_EXECUTION,
+            source_actor_id="npc_guard",
+            source_actor_name="Guard",
+            source_action_summary="Guard lunges to wrench the player aside and force a path open.",
+            source_speech_text="Move.",
+            source_interaction_kind="block",
+            source_action_target_name=save.player_static_data.name,
+            source_speech_target_name=save.player_static_data.name,
+            target_actor_id=save.player_static_data.player_id,
+            target_actor_name=save.player_static_data.name,
+            stakes_summary="If the guard forces through, the player loses the doorway.",
+        )
+        plan = PublicTurnOpposedPlanResponse(
+            session_id=save.session_id,
+            round_id=round_state.round_id,
+            check_id=prompt.check_id,
+            source_actor_id=prompt.source_actor_id,
+            source_actor_name=prompt.source_actor_name,
+            source_action_summary=prompt.source_action_summary,
+            source_speech_text=prompt.source_speech_text,
+            source_ability_used="strength",
+            source_ability_modifier=1,
+            target_actor_id=prompt.target_actor_id,
+            target_actor_name=prompt.target_actor_name,
+            target_action_summary="Player plants in place and knocks the guard's arm away.",
+            target_speech_text="Not happening.",
+            target_ability_used="dexterity",
+            target_ability_modifier=2,
+            check_task="force through the doorway",
+            stakes_summary=prompt.stakes_summary,
+        )
+        action_result = ActionCheckResponse(
+            session_id=save.session_id,
+            actor_role_id=prompt.source_actor_id,
+            actor_name=prompt.source_actor_name,
+            actor_kind="npc",
+            action_type="check",
+            check_mode="action",
+            source_context="public_turn",
+            resolution_rule="opposed_actor",
+            requires_check=True,
+            ability_used="strength",
+            ability_modifier=1,
+            dc=12,
+            check_task="force through the doorway",
+            target_role_id=prompt.target_actor_id,
+            target_name=prompt.target_actor_name,
+            target_actor_kind="player",
+            target_ability_used="dexterity",
+            target_ability_modifier=2,
+            dice_roll=11,
+            total_score=12,
+            target_dice_roll=15,
+            target_total_score=17,
+            contested_success=False,
+            success=False,
+            critical="none",
+            time_spent_min=1,
+            narrative="Guard tries to force the player back but loses the clash.",
+            applied_effects=[],
+            relation_tag_suggestion=None,
+            scene_events=[],
+            state_sync=None,
+            post_checks=None,
+        )
+
+        with (
+            patch("app.services.public_turn_resolution.world.plan_public_turn_opposed_exchange", return_value=plan),
+            patch("app.services.public_turn_resolution.world.action_check", return_value=action_result),
+        ):
+            _, impact, settlement, resolved = resolve_opposed_prompt_submission(
+                save,
+                session_id=save.session_id,
+                prompt=prompt,
+                target_action_summary=plan.target_action_summary,
+                target_speech_text=plan.target_speech_text,
+                forced_dice_roll=15,
+                round_state=round_state,
+                config=None,
+            )
+
+        self.assertIs(resolved, action_result)
+        self.assertIsNotNone(impact)
+        self.assertNotEqual(settlement.gm_resolution_summary, "")
+        self.assertIn(prompt.target_actor_name, settlement.gm_resolution_summary)
+        self.assertIn(settlement.gm_resolution_summary, build_settlement_fragment(settlement))
 
     def test_gm_push_sets_roll_result_on_final_settlement(self) -> None:
         save = self._seed_public_turn_scene("sess_public_turn_gm_push_result")

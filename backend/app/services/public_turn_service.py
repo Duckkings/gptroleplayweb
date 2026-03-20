@@ -15,10 +15,14 @@ from app.models.schemas import (
     PublicTurnOpposedPlanResponse,
     PublicTurnOpposedResolveRequest,
     PublicTurnPhase,
+    PublicTurnProtocolEnumViolation,
+    PublicTurnProtocolRepairNotice,
+    PublicTurnProtocolRepairRequest,
     PublicTurnReactionCheckRequest,
     PublicTurnResponse,
     PublicTurnStateResponse,
 )
+from app.services.ai_protocol_contract_service import AI_PROTOCOL_ENUM_INVALID, AiProtocolContractError, allow_protocol_repair
 from app.services.public_turn_narration_formatter import build_settlement_fragment
 from app.services import reaction_check_service
 from app.services import world_service as world
@@ -68,6 +72,103 @@ def _to_response(session_id: str, result: PublicTurnRunResult, save) -> PublicTu
         impacts=result.impacts,
         player_action_check_result=result.player_action_check_result,
         presentation=result.presentation,
+    )
+
+
+def _public_turn_presentation_from_save(save) -> dict[str, Any] | None:
+    try:
+        state = get_public_turn_state_in_save(save)
+        round_state = state.current_round
+        if round_state is None:
+            return None
+        return {
+            "round_id": round_state.round_id,
+            "round_number": round_state.round_number,
+            "phase": round_state.phase,
+            "initiative_order": round_state.initiative_order,
+            "settlement_entries": round_state.settlement_entries,
+            "narrative_entries": round_state.narrative_entries,
+            "accumulated_narration": round_state.accumulated_narration,
+            "narrative_status": round_state.narrative_status,
+            "round_narration": round_state.round_narration,
+            "round_narration_status": round_state.round_narration_status,
+        }
+    except Exception:
+        return None
+
+
+def _protocol_notice_from_error(error: AiProtocolContractError) -> PublicTurnProtocolRepairNotice:
+    violations = [
+        PublicTurnProtocolEnumViolation(
+            field_path=item.field_path,
+            invalid_value=item.invalid_value,
+            allowed_ids=list(item.allowed_ids),
+            reason=item.reason,
+        )
+        for item in error.violations
+    ]
+    return PublicTurnProtocolRepairNotice(
+        code=error.code,
+        message="AI 首次输出协议错误，正在自动修复并续跑...",
+        violations=violations,
+    )
+
+
+def _stage_protocol_repair_checkpoint(
+    *,
+    session_id: str,
+    original_request: dict[str, Any],
+    continue_kind: str,
+    staged_save: dict[str, Any],
+    error: AiProtocolContractError,
+) -> PendingTurnContinueResponse:
+    now = world._utc_now()
+    pending_turn_id = f"pt_{uuid4().hex}"
+    save = world.SaveFile.model_validate(staged_save)
+    state = get_public_turn_state_in_save(save)
+    notice = _protocol_notice_from_error(error)
+    repair_request = PublicTurnProtocolRepairRequest(
+        session_id=session_id,
+        pending_turn_id=pending_turn_id,
+        continue_kind=continue_kind,  # type: ignore[arg-type]
+    )
+    pending_state = PendingTurnState(
+        pending_turn_id=pending_turn_id,
+        session_id=session_id,
+        flow_kind="public_turn",
+        status="awaiting_protocol_repair",
+        staged_save=staged_save,
+        original_request=original_request,
+        accumulated_reply_text="",
+        accumulated_scene_events=[],
+        accumulated_tool_events=[],
+        time_spent_min=0,
+        pending_reaction=None,
+        public_opposed_prompt=None,
+        continuation_index=0,
+        npc_role_id=None,
+        public_round_id=(state.current_round.round_id if state.current_round is not None else None),
+        public_phase_before_pause=(state.current_round.phase if state.current_round is not None else None),
+        public_turn_protocol_repair_notice=notice,
+        public_turn_protocol_repair_request=repair_request,
+        created_at=now,
+        updated_at=now,
+    )
+    save_pending_turn(pending_state)
+    return PendingTurnContinueResponse(
+        session_id=session_id,
+        pending_turn_id=pending_turn_id,
+        flow_kind="public_turn",
+        status="awaiting_protocol_repair",
+        reply_text="",
+        scene_events=[],
+        tool_events=[],
+        pending_reaction=None,
+        public_turn_state=state,
+        public_turn_presentation=_public_turn_presentation_from_save(save),
+        npc_role_id=None,
+        public_turn_protocol_repair_notice=notice,
+        public_turn_protocol_repair_request=repair_request,
     )
 
 
@@ -228,7 +329,10 @@ async def _emit_pending_response(
     result: PendingTurnContinueResponse,
     emit: EmitCallback,
 ) -> None:
-    event_name = "opposed_check_required" if result.status == "awaiting_opposed" else "reaction_check_required"
+    if result.status == "awaiting_protocol_repair":
+        event_name = "protocol_repair_required"
+    else:
+        event_name = "opposed_check_required" if result.status == "awaiting_opposed" else "reaction_check_required"
     await emit(
         event_name,
         {
@@ -244,6 +348,16 @@ async def _emit_pending_response(
             "public_turn_state": (result.public_turn_state.model_dump(mode="json") if result.public_turn_state is not None else None),
             "public_turn_presentation": (
                 result.public_turn_presentation.model_dump(mode="json") if result.public_turn_presentation is not None else None
+            ),
+            "public_turn_protocol_repair_notice": (
+                result.public_turn_protocol_repair_notice.model_dump(mode="json")
+                if result.public_turn_protocol_repair_notice is not None
+                else None
+            ),
+            "public_turn_protocol_repair_request": (
+                result.public_turn_protocol_repair_request.model_dump(mode="json")
+                if result.public_turn_protocol_repair_request is not None
+                else None
             ),
         },
     )
@@ -294,34 +408,90 @@ def run_public_turn_entry_once(payload: PublicTurnEntryRequest) -> PublicTurnRes
     save = world.get_current_save(default_session_id=payload.session_id)
     if save.session_id != payload.session_id:
         save.session_id = payload.session_id
-    result = start_round_in_save(
-        save,
-        entry_type=payload.entry_type,
-        config=payload.config,
-        player_action=payload.player_action,
-    )
-    if (
-        str(payload.player_action or "").strip()
-        and result.reaction_check is None
-        and result.public_interaction_prompt is None
-        and result.public_opposed_prompt is None
-        and not result.round_completed
-    ):
-        state = get_public_turn_state_in_save(save)
-        round_state = state.current_round
-        if round_state is None or not round_state.awaiting_player_action:
-            raise ValueError("PUBLIC_TURN_NOT_ACTIVE")
+    staged_save = save.model_dump(mode="json")
+    try:
+        result = start_round_in_save(
+            save,
+            entry_type=payload.entry_type,
+            config=payload.config,
+            player_action=payload.player_action,
+        )
+        if (
+            str(payload.player_action or "").strip()
+            and result.reaction_check is None
+            and result.public_interaction_prompt is None
+            and result.public_opposed_prompt is None
+            and not result.round_completed
+        ):
+            state = get_public_turn_state_in_save(save)
+            round_state = state.current_round
+            if round_state is None or not round_state.awaiting_player_action:
+                raise ValueError("PUBLIC_TURN_NOT_ACTIVE")
+            result = continue_round_in_save(
+                save,
+                submission=PublicTurnActionSubmission(
+                    actor_id=save.player_static_data.player_id,
+                    action_text=str(payload.player_action or "").strip(),
+                    speech_text="",
+                    source_phase=round_state.awaiting_player_action_phase or round_state.phase,
+                    forced_first=payload.entry_type.value == "god_override",
+                ),
+                interaction_response=None,
+                action_check=None,
+                config=payload.config,
+            )
+            if result.reaction_check is not None:
+                pending = _stage_reaction_checkpoint(
+                    session_id=payload.session_id,
+                    original_request=payload.model_dump(mode="json"),
+                    save=save,
+                    result=result,
+                )
+                world.save_current(save)
+                return pending
+            if result.public_opposed_prompt is not None:
+                pending = _stage_opposed_checkpoint(
+                    session_id=payload.session_id,
+                    original_request=payload.model_dump(mode="json"),
+                    save=save,
+                    result=result,
+                )
+                world.save_current(save)
+                return pending
+        if result.public_opposed_prompt is not None:
+            pending = _stage_opposed_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending
+        world.save_current(save)
+        return _to_response(payload.session_id, result, save)
+    except AiProtocolContractError as exc:
+        if exc.code == AI_PROTOCOL_ENUM_INVALID:
+            return _stage_protocol_repair_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                continue_kind="entry",
+                staged_save=staged_save,
+                error=exc,
+            )
+        raise ValueError(exc.code) from exc
+
+
+def run_public_turn_continue_once(payload: PublicTurnContinueRequest) -> PublicTurnResponse | PendingTurnContinueResponse:
+    save = world.get_current_save(default_session_id=payload.session_id)
+    if save.session_id != payload.session_id:
+        save.session_id = payload.session_id
+    staged_save = save.model_dump(mode="json")
+    try:
         result = continue_round_in_save(
             save,
-            submission=PublicTurnActionSubmission(
-                actor_id=save.player_static_data.player_id,
-                action_text=str(payload.player_action or "").strip(),
-                speech_text="",
-                source_phase=round_state.awaiting_player_action_phase or round_state.phase,
-                forced_first=payload.entry_type.value == "god_override",
-            ),
-            interaction_response=None,
-            action_check=None,
+            submission=payload.action_submission,
+            interaction_response=payload.player_interaction_response,
+            action_check=payload.player_action_check,
             config=payload.config,
         )
         if result.reaction_check is not None:
@@ -342,50 +512,18 @@ def run_public_turn_entry_once(payload: PublicTurnEntryRequest) -> PublicTurnRes
             )
             world.save_current(save)
             return pending
-    if result.public_opposed_prompt is not None:
-        pending = _stage_opposed_checkpoint(
-            session_id=payload.session_id,
-            original_request=payload.model_dump(mode="json"),
-            save=save,
-            result=result,
-        )
         world.save_current(save)
-        return pending
-    world.save_current(save)
-    return _to_response(payload.session_id, result, save)
-
-
-def run_public_turn_continue_once(payload: PublicTurnContinueRequest) -> PublicTurnResponse | PendingTurnContinueResponse:
-    save = world.get_current_save(default_session_id=payload.session_id)
-    if save.session_id != payload.session_id:
-        save.session_id = payload.session_id
-    result = continue_round_in_save(
-        save,
-        submission=payload.action_submission,
-        interaction_response=payload.player_interaction_response,
-        action_check=payload.player_action_check,
-        config=payload.config,
-    )
-    if result.reaction_check is not None:
-        pending = _stage_reaction_checkpoint(
-            session_id=payload.session_id,
-            original_request=payload.model_dump(mode="json"),
-            save=save,
-            result=result,
-        )
-        world.save_current(save)
-        return pending
-    if result.public_opposed_prompt is not None:
-        pending = _stage_opposed_checkpoint(
-            session_id=payload.session_id,
-            original_request=payload.model_dump(mode="json"),
-            save=save,
-            result=result,
-        )
-        world.save_current(save)
-        return pending
-    world.save_current(save)
-    return _to_response(payload.session_id, result, save)
+        return _to_response(payload.session_id, result, save)
+    except AiProtocolContractError as exc:
+        if exc.code == AI_PROTOCOL_ENUM_INVALID:
+            return _stage_protocol_repair_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                continue_kind="continue",
+                staged_save=staged_save,
+                error=exc,
+            )
+        raise ValueError(exc.code) from exc
 
 
 def run_public_turn_reaction_once(payload: PublicTurnReactionCheckRequest) -> PublicTurnResponse | PendingTurnContinueResponse:
@@ -408,34 +546,46 @@ def run_public_turn_reaction_once(payload: PublicTurnReactionCheckRequest) -> Pu
         content=reaction_text,
     )
     save = world.SaveFile.model_validate(pending.staged_save)
-    result = resume_round_after_reaction_in_save(
-        save,
-        phase_before_pause=pending.public_phase_before_pause,
-        reaction_text=reaction_text,
-        reaction_event=reaction_event,
-        config=payload.config,
-    )
-    clear_pending_turn(payload.session_id)
-    if result.reaction_check is not None:
-        pending_response = _stage_reaction_checkpoint(
-            session_id=payload.session_id,
-            original_request=payload.model_dump(mode="json"),
-            save=save,
-            result=result,
+    staged_save = pending.staged_save
+    try:
+        result = resume_round_after_reaction_in_save(
+            save,
+            phase_before_pause=pending.public_phase_before_pause,
+            reaction_text=reaction_text,
+            reaction_event=reaction_event,
+            config=payload.config,
         )
+        clear_pending_turn(payload.session_id)
+        if result.reaction_check is not None:
+            pending_response = _stage_reaction_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending_response
+        if result.public_opposed_prompt is not None:
+            pending_response = _stage_opposed_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending_response
         world.save_current(save)
-        return pending_response
-    if result.public_opposed_prompt is not None:
-        pending_response = _stage_opposed_checkpoint(
-            session_id=payload.session_id,
-            original_request=payload.model_dump(mode="json"),
-            save=save,
-            result=result,
-        )
-        world.save_current(save)
-        return pending_response
-    world.save_current(save)
-    return _to_response(payload.session_id, result, save)
+        return _to_response(payload.session_id, result, save)
+    except AiProtocolContractError as exc:
+        if exc.code == AI_PROTOCOL_ENUM_INVALID:
+            return _stage_protocol_repair_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                continue_kind="reaction",
+                staged_save=staged_save,
+                error=exc,
+            )
+        raise ValueError(exc.code) from exc
 
 
 def run_public_turn_opposed_once(payload: PublicTurnOpposedResolveRequest) -> PublicTurnResponse | PendingTurnContinueResponse:
@@ -448,36 +598,111 @@ def run_public_turn_opposed_once(payload: PublicTurnOpposedResolveRequest) -> Pu
     if prompt.check_id != payload.check_id:
         raise ValueError("PUBLIC_TURN_OPPOSED_MISMATCH")
     save = world.SaveFile.model_validate(pending.staged_save)
-    result = resume_round_after_opposed_in_save(
-        save,
-        phase_before_pause=pending.public_phase_before_pause,
-        prompt=prompt,
-        target_action_summary=payload.target_action_summary,
-        target_speech_text=payload.target_speech_text,
-        forced_dice_roll=payload.forced_dice_roll,
-        config=payload.config,
-    )
+    staged_save = pending.staged_save
+    try:
+        result = resume_round_after_opposed_in_save(
+            save,
+            phase_before_pause=pending.public_phase_before_pause,
+            prompt=prompt,
+            target_action_summary=payload.target_action_summary,
+            target_speech_text=payload.target_speech_text,
+            forced_dice_roll=payload.forced_dice_roll,
+            config=payload.config,
+        )
+        clear_pending_turn(payload.session_id)
+        if result.reaction_check is not None:
+            pending_response = _stage_reaction_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending_response
+        if result.public_opposed_prompt is not None:
+            pending_response = _stage_opposed_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending_response
+        world.save_current(save)
+        return _to_response(payload.session_id, result, save)
+    except AiProtocolContractError as exc:
+        if exc.code == AI_PROTOCOL_ENUM_INVALID:
+            return _stage_protocol_repair_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                continue_kind="opposed",
+                staged_save=staged_save,
+                error=exc,
+            )
+        raise ValueError(exc.code) from exc
+
+
+def run_public_turn_protocol_repair_once(
+    payload: PublicTurnProtocolRepairRequest,
+) -> PublicTurnResponse | PendingTurnContinueResponse:
+    pending = load_pending_turn(payload.session_id)
+    if pending is None or pending.flow_kind != "public_turn" or pending.status != "awaiting_protocol_repair":
+        raise ValueError("PUBLIC_TURN_PENDING_NOT_FOUND")
+    if pending.pending_turn_id != payload.pending_turn_id:
+        raise ValueError("PUBLIC_TURN_PROTOCOL_REPAIR_MISMATCH")
+    repair_request = pending.public_turn_protocol_repair_request
+    if repair_request is None:
+        raise ValueError("PUBLIC_TURN_PENDING_NOT_FOUND")
+    if payload.continue_kind != repair_request.continue_kind:
+        raise ValueError("PUBLIC_TURN_PROTOCOL_REPAIR_MISMATCH")
+    request_data = dict(pending.original_request)
+    if payload.config is not None:
+        request_data["config"] = payload.config.model_dump(mode="json")
+    world.save_current(world.SaveFile.model_validate(pending.staged_save))
     clear_pending_turn(payload.session_id)
-    if result.reaction_check is not None:
-        pending_response = _stage_reaction_checkpoint(
-            session_id=payload.session_id,
-            original_request=payload.model_dump(mode="json"),
-            save=save,
-            result=result,
-        )
-        world.save_current(save)
-        return pending_response
-    if result.public_opposed_prompt is not None:
-        pending_response = _stage_opposed_checkpoint(
-            session_id=payload.session_id,
-            original_request=payload.model_dump(mode="json"),
-            save=save,
-            result=result,
-        )
-        world.save_current(save)
-        return pending_response
-    world.save_current(save)
-    return _to_response(payload.session_id, result, save)
+    with allow_protocol_repair():
+        if repair_request.continue_kind == "entry":
+            return run_public_turn_entry_once(PublicTurnEntryRequest.model_validate(request_data))
+        if repair_request.continue_kind == "continue":
+            return run_public_turn_continue_once(PublicTurnContinueRequest.model_validate(request_data))
+        if repair_request.continue_kind == "reaction":
+            return run_public_turn_reaction_once(PublicTurnReactionCheckRequest.model_validate(request_data))
+        if repair_request.continue_kind == "opposed":
+            return run_public_turn_opposed_once(PublicTurnOpposedResolveRequest.model_validate(request_data))
+    raise ValueError("PUBLIC_TURN_PENDING_NOT_FOUND")
+
+
+async def run_public_turn_protocol_repair_stream(
+    payload: PublicTurnProtocolRepairRequest,
+    *,
+    emit: EmitCallback | None = None,
+    is_cancelled: Callable[[], Awaitable[bool]] | None = None,
+) -> PublicTurnResponse | PendingTurnContinueResponse:
+    pending = load_pending_turn(payload.session_id)
+    if pending is None or pending.flow_kind != "public_turn" or pending.status != "awaiting_protocol_repair":
+        raise ValueError("PUBLIC_TURN_PENDING_NOT_FOUND")
+    if pending.pending_turn_id != payload.pending_turn_id:
+        raise ValueError("PUBLIC_TURN_PROTOCOL_REPAIR_MISMATCH")
+    repair_request = pending.public_turn_protocol_repair_request
+    if repair_request is None:
+        raise ValueError("PUBLIC_TURN_PENDING_NOT_FOUND")
+    if payload.continue_kind != repair_request.continue_kind:
+        raise ValueError("PUBLIC_TURN_PROTOCOL_REPAIR_MISMATCH")
+    request_data = dict(pending.original_request)
+    if payload.config is not None:
+        request_data["config"] = payload.config.model_dump(mode="json")
+    world.save_current(world.SaveFile.model_validate(pending.staged_save))
+    clear_pending_turn(payload.session_id)
+    with allow_protocol_repair():
+        if repair_request.continue_kind == "entry":
+            return await run_public_turn_entry_stream(PublicTurnEntryRequest.model_validate(request_data), emit=emit, is_cancelled=is_cancelled)
+        if repair_request.continue_kind == "continue":
+            return await run_public_turn_continue_stream(PublicTurnContinueRequest.model_validate(request_data), emit=emit, is_cancelled=is_cancelled)
+        if repair_request.continue_kind == "reaction":
+            return await run_public_turn_reaction_stream(PublicTurnReactionCheckRequest.model_validate(request_data), emit=emit, is_cancelled=is_cancelled)
+        if repair_request.continue_kind == "opposed":
+            return await run_public_turn_opposed_stream(PublicTurnOpposedResolveRequest.model_validate(request_data), emit=emit, is_cancelled=is_cancelled)
+    raise ValueError("PUBLIC_TURN_PENDING_NOT_FOUND")
 
 
 async def run_public_turn_entry_stream(
@@ -491,91 +716,106 @@ async def run_public_turn_entry_stream(
     save = world.get_current_save(default_session_id=payload.session_id)
     if save.session_id != payload.session_id:
         save.session_id = payload.session_id
-    step_results: list[PublicTurnRunResult] = []
-    for step in iter_round_entry_steps_in_save(
-        save,
-        entry_type=payload.entry_type,
-        config=payload.config,
-        player_action=payload.player_action,
-    ):
-        step_results.append(step)
-        if emit is not None:
-            await _emit_public_turn_step(result=step, emit=emit)
-            await emit("turn_state", get_public_turn_state_in_save(save).model_dump(mode="json"))
-            if step.round_completed:
-                await emit(
-                    "round_completed",
-                    {
-                        "archived_sub_zone_turn_id": step.archived_sub_zone_turn_id,
-                        "phase": step.presentation.phase.value,
-                    },
+    staged_save = save.model_dump(mode="json")
+    try:
+        step_results: list[PublicTurnRunResult] = []
+        for step in iter_round_entry_steps_in_save(
+            save,
+            entry_type=payload.entry_type,
+            config=payload.config,
+            player_action=payload.player_action,
+        ):
+            step_results.append(step)
+            if emit is not None:
+                await _emit_public_turn_step(result=step, emit=emit)
+                await emit("turn_state", get_public_turn_state_in_save(save).model_dump(mode="json"))
+                if step.round_completed:
+                    await emit(
+                        "round_completed",
+                        {
+                            "archived_sub_zone_turn_id": step.archived_sub_zone_turn_id,
+                            "phase": step.presentation.phase.value,
+                        },
+                    )
+            if is_cancelled is not None and await is_cancelled():
+                raise asyncio.CancelledError()
+        merged = _merge_step_results(step_results)
+        if (
+            str(payload.player_action or "").strip()
+            and merged.reaction_check is None
+            and merged.public_interaction_prompt is None
+            and merged.public_opposed_prompt is None
+            and not merged.round_completed
+        ):
+            state = get_public_turn_state_in_save(save)
+            round_state = state.current_round
+            if round_state is not None and round_state.awaiting_player_action:
+                submission = PublicTurnActionSubmission(
+                    actor_id=save.player_static_data.player_id,
+                    action_text=str(payload.player_action or "").strip(),
+                    speech_text="",
+                    source_phase=round_state.awaiting_player_action_phase or round_state.phase,
+                    forced_first=payload.entry_type.value == "god_override",
                 )
-        if is_cancelled is not None and await is_cancelled():
-            raise asyncio.CancelledError()
-    merged = _merge_step_results(step_results)
-    if (
-        str(payload.player_action or "").strip()
-        and merged.reaction_check is None
-        and merged.public_interaction_prompt is None
-        and merged.public_opposed_prompt is None
-        and not merged.round_completed
-    ):
-        state = get_public_turn_state_in_save(save)
-        round_state = state.current_round
-        if round_state is not None and round_state.awaiting_player_action:
-            submission = PublicTurnActionSubmission(
-                actor_id=save.player_static_data.player_id,
-                action_text=str(payload.player_action or "").strip(),
-                speech_text="",
-                source_phase=round_state.awaiting_player_action_phase or round_state.phase,
-                forced_first=payload.entry_type.value == "god_override",
+                for step in iter_round_continue_steps_in_save(
+                    save,
+                    submission=submission,
+                    interaction_response=None,
+                    action_check=None,
+                    config=payload.config,
+                ):
+                    step_results.append(step)
+                    if emit is not None:
+                        await _emit_public_turn_step(result=step, emit=emit)
+                        await emit("turn_state", get_public_turn_state_in_save(save).model_dump(mode="json"))
+                        if step.round_completed:
+                            await emit(
+                                "round_completed",
+                                {
+                                    "archived_sub_zone_turn_id": step.archived_sub_zone_turn_id,
+                                    "phase": step.presentation.phase.value,
+                                },
+                            )
+                    if is_cancelled is not None and await is_cancelled():
+                        raise asyncio.CancelledError()
+                merged = _merge_step_results(step_results)
+        if merged.reaction_check is not None:
+            pending = _stage_reaction_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
             )
-            for step in iter_round_continue_steps_in_save(
-                save,
-                submission=submission,
-                interaction_response=None,
-                action_check=None,
-                config=payload.config,
-            ):
-                step_results.append(step)
-                if emit is not None:
-                    await _emit_public_turn_step(result=step, emit=emit)
-                    await emit("turn_state", get_public_turn_state_in_save(save).model_dump(mode="json"))
-                    if step.round_completed:
-                        await emit(
-                            "round_completed",
-                            {
-                                "archived_sub_zone_turn_id": step.archived_sub_zone_turn_id,
-                                "phase": step.presentation.phase.value,
-                            },
-                        )
-                if is_cancelled is not None and await is_cancelled():
-                    raise asyncio.CancelledError()
-            merged = _merge_step_results(step_results)
-    if merged.reaction_check is not None:
-        pending = _stage_reaction_checkpoint(
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending, emit=emit)
+            return pending
+        if merged.public_opposed_prompt is not None:
+            pending = _stage_opposed_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending, emit=emit)
+            return pending
+        world.save_current(save)
+        return _to_response(payload.session_id, merged, save)
+    except AiProtocolContractError as exc:
+        if exc.code != AI_PROTOCOL_ENUM_INVALID:
+            raise ValueError(exc.code) from exc
+        pending = _stage_protocol_repair_checkpoint(
             session_id=payload.session_id,
             original_request=payload.model_dump(mode="json"),
-            save=save,
-            result=merged,
+            continue_kind="entry",
+            staged_save=staged_save,
+            error=exc,
         )
-        world.save_current(save)
         if emit is not None:
             await _emit_pending_response(result=pending, emit=emit)
         return pending
-    if merged.public_opposed_prompt is not None:
-        pending = _stage_opposed_checkpoint(
-            session_id=payload.session_id,
-            original_request=payload.model_dump(mode="json"),
-            save=save,
-            result=merged,
-        )
-        world.save_current(save)
-        if emit is not None:
-            await _emit_pending_response(result=pending, emit=emit)
-        return pending
-    world.save_current(save)
-    return _to_response(payload.session_id, merged, save)
 
 
 async def run_public_turn_continue_stream(
@@ -589,53 +829,68 @@ async def run_public_turn_continue_stream(
     save = world.get_current_save(default_session_id=payload.session_id)
     if save.session_id != payload.session_id:
         save.session_id = payload.session_id
-    step_results: list[PublicTurnRunResult] = []
-    for step in iter_round_continue_steps_in_save(
-        save,
-        submission=payload.action_submission,
-        interaction_response=payload.player_interaction_response,
-        action_check=payload.player_action_check,
-        config=payload.config,
-    ):
-        step_results.append(step)
-        if emit is not None:
-            await _emit_public_turn_step(result=step, emit=emit)
-            await emit("turn_state", get_public_turn_state_in_save(save).model_dump(mode="json"))
-            if step.round_completed:
-                await emit(
-                    "round_completed",
-                    {
-                        "archived_sub_zone_turn_id": step.archived_sub_zone_turn_id,
-                        "phase": step.presentation.phase.value,
-                    },
-                )
-        if is_cancelled is not None and await is_cancelled():
-            raise asyncio.CancelledError()
-    merged = _merge_step_results(step_results)
-    if merged.reaction_check is not None:
-        pending = _stage_reaction_checkpoint(
+    staged_save = save.model_dump(mode="json")
+    try:
+        step_results: list[PublicTurnRunResult] = []
+        for step in iter_round_continue_steps_in_save(
+            save,
+            submission=payload.action_submission,
+            interaction_response=payload.player_interaction_response,
+            action_check=payload.player_action_check,
+            config=payload.config,
+        ):
+            step_results.append(step)
+            if emit is not None:
+                await _emit_public_turn_step(result=step, emit=emit)
+                await emit("turn_state", get_public_turn_state_in_save(save).model_dump(mode="json"))
+                if step.round_completed:
+                    await emit(
+                        "round_completed",
+                        {
+                            "archived_sub_zone_turn_id": step.archived_sub_zone_turn_id,
+                            "phase": step.presentation.phase.value,
+                        },
+                    )
+            if is_cancelled is not None and await is_cancelled():
+                raise asyncio.CancelledError()
+        merged = _merge_step_results(step_results)
+        if merged.reaction_check is not None:
+            pending = _stage_reaction_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending, emit=emit)
+            return pending
+        if merged.public_opposed_prompt is not None:
+            pending = _stage_opposed_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending, emit=emit)
+            return pending
+        world.save_current(save)
+        return _to_response(payload.session_id, merged, save)
+    except AiProtocolContractError as exc:
+        if exc.code != AI_PROTOCOL_ENUM_INVALID:
+            raise ValueError(exc.code) from exc
+        pending = _stage_protocol_repair_checkpoint(
             session_id=payload.session_id,
             original_request=payload.model_dump(mode="json"),
-            save=save,
-            result=merged,
+            continue_kind="continue",
+            staged_save=staged_save,
+            error=exc,
         )
-        world.save_current(save)
         if emit is not None:
             await _emit_pending_response(result=pending, emit=emit)
         return pending
-    if merged.public_opposed_prompt is not None:
-        pending = _stage_opposed_checkpoint(
-            session_id=payload.session_id,
-            original_request=payload.model_dump(mode="json"),
-            save=save,
-            result=merged,
-        )
-        world.save_current(save)
-        if emit is not None:
-            await _emit_pending_response(result=pending, emit=emit)
-        return pending
-    world.save_current(save)
-    return _to_response(payload.session_id, merged, save)
 
 
 async def run_public_turn_reaction_stream(
@@ -663,56 +918,71 @@ async def run_public_turn_reaction_stream(
         content=reaction_text,
     )
     save = world.SaveFile.model_validate(pending.staged_save)
+    staged_save = pending.staged_save
     clear_pending_turn(payload.session_id)
-    step_results: list[PublicTurnRunResult] = []
-    if emit is not None:
-        await emit("reaction_check_resumed", {"check_id": payload.check_id})
-    for step in iter_round_after_reaction_steps_in_save(
-        save,
-        phase_before_pause=pending.public_phase_before_pause,
-        reaction_text=reaction_text,
-        reaction_event=reaction_event,
-        config=payload.config,
-    ):
-        step_results.append(step)
+    try:
+        step_results: list[PublicTurnRunResult] = []
         if emit is not None:
-            await _emit_public_turn_step(result=step, emit=emit)
-            await emit("turn_state", get_public_turn_state_in_save(save).model_dump(mode="json"))
-            if step.round_completed:
-                await emit(
-                    "round_completed",
-                    {
-                        "archived_sub_zone_turn_id": step.archived_sub_zone_turn_id,
-                        "phase": step.presentation.phase.value,
-                    },
-                )
-        if is_cancelled is not None and await is_cancelled():
-            raise asyncio.CancelledError()
-    merged = _merge_step_results(step_results)
-    if merged.reaction_check is not None:
-        pending_response = _stage_reaction_checkpoint(
+            await emit("reaction_check_resumed", {"check_id": payload.check_id})
+        for step in iter_round_after_reaction_steps_in_save(
+            save,
+            phase_before_pause=pending.public_phase_before_pause,
+            reaction_text=reaction_text,
+            reaction_event=reaction_event,
+            config=payload.config,
+        ):
+            step_results.append(step)
+            if emit is not None:
+                await _emit_public_turn_step(result=step, emit=emit)
+                await emit("turn_state", get_public_turn_state_in_save(save).model_dump(mode="json"))
+                if step.round_completed:
+                    await emit(
+                        "round_completed",
+                        {
+                            "archived_sub_zone_turn_id": step.archived_sub_zone_turn_id,
+                            "phase": step.presentation.phase.value,
+                        },
+                    )
+            if is_cancelled is not None and await is_cancelled():
+                raise asyncio.CancelledError()
+        merged = _merge_step_results(step_results)
+        if merged.reaction_check is not None:
+            pending_response = _stage_reaction_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending_response, emit=emit)
+            return pending_response
+        if merged.public_opposed_prompt is not None:
+            pending_response = _stage_opposed_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending_response, emit=emit)
+            return pending_response
+        world.save_current(save)
+        return _to_response(payload.session_id, merged, save)
+    except AiProtocolContractError as exc:
+        if exc.code != AI_PROTOCOL_ENUM_INVALID:
+            raise ValueError(exc.code) from exc
+        pending_response = _stage_protocol_repair_checkpoint(
             session_id=payload.session_id,
             original_request=payload.model_dump(mode="json"),
-            save=save,
-            result=merged,
+            continue_kind="reaction",
+            staged_save=staged_save,
+            error=exc,
         )
-        world.save_current(save)
         if emit is not None:
             await _emit_pending_response(result=pending_response, emit=emit)
         return pending_response
-    if merged.public_opposed_prompt is not None:
-        pending_response = _stage_opposed_checkpoint(
-            session_id=payload.session_id,
-            original_request=payload.model_dump(mode="json"),
-            save=save,
-            result=merged,
-        )
-        world.save_current(save)
-        if emit is not None:
-            await _emit_pending_response(result=pending_response, emit=emit)
-        return pending_response
-    world.save_current(save)
-    return _to_response(payload.session_id, merged, save)
 
 
 async def run_public_turn_opposed_stream(
@@ -732,55 +1002,70 @@ async def run_public_turn_opposed_stream(
     if prompt.check_id != payload.check_id:
         raise ValueError("PUBLIC_TURN_OPPOSED_MISMATCH")
     save = world.SaveFile.model_validate(pending.staged_save)
+    staged_save = pending.staged_save
     clear_pending_turn(payload.session_id)
-    step_results: list[PublicTurnRunResult] = []
-    if emit is not None:
-        await emit("opposed_check_resolved", {"check_id": payload.check_id})
-    for step in iter_round_after_opposed_steps_in_save(
-        save,
-        phase_before_pause=pending.public_phase_before_pause,
-        prompt=prompt,
-        target_action_summary=payload.target_action_summary,
-        target_speech_text=payload.target_speech_text,
-        forced_dice_roll=payload.forced_dice_roll,
-        config=payload.config,
-    ):
-        step_results.append(step)
+    try:
+        step_results: list[PublicTurnRunResult] = []
         if emit is not None:
-            await _emit_public_turn_step(result=step, emit=emit)
-            await emit("turn_state", get_public_turn_state_in_save(save).model_dump(mode="json"))
-            if step.round_completed:
-                await emit(
-                    "round_completed",
-                    {
-                        "archived_sub_zone_turn_id": step.archived_sub_zone_turn_id,
-                        "phase": step.presentation.phase.value,
-                    },
-                )
-        if is_cancelled is not None and await is_cancelled():
-            raise asyncio.CancelledError()
-    merged = _merge_step_results(step_results)
-    if merged.reaction_check is not None:
-        pending_response = _stage_reaction_checkpoint(
+            await emit("opposed_check_resolved", {"check_id": payload.check_id})
+        for step in iter_round_after_opposed_steps_in_save(
+            save,
+            phase_before_pause=pending.public_phase_before_pause,
+            prompt=prompt,
+            target_action_summary=payload.target_action_summary,
+            target_speech_text=payload.target_speech_text,
+            forced_dice_roll=payload.forced_dice_roll,
+            config=payload.config,
+        ):
+            step_results.append(step)
+            if emit is not None:
+                await _emit_public_turn_step(result=step, emit=emit)
+                await emit("turn_state", get_public_turn_state_in_save(save).model_dump(mode="json"))
+                if step.round_completed:
+                    await emit(
+                        "round_completed",
+                        {
+                            "archived_sub_zone_turn_id": step.archived_sub_zone_turn_id,
+                            "phase": step.presentation.phase.value,
+                        },
+                    )
+            if is_cancelled is not None and await is_cancelled():
+                raise asyncio.CancelledError()
+        merged = _merge_step_results(step_results)
+        if merged.reaction_check is not None:
+            pending_response = _stage_reaction_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending_response, emit=emit)
+            return pending_response
+        if merged.public_opposed_prompt is not None:
+            pending_response = _stage_opposed_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending_response, emit=emit)
+            return pending_response
+        world.save_current(save)
+        return _to_response(payload.session_id, merged, save)
+    except AiProtocolContractError as exc:
+        if exc.code != AI_PROTOCOL_ENUM_INVALID:
+            raise ValueError(exc.code) from exc
+        pending_response = _stage_protocol_repair_checkpoint(
             session_id=payload.session_id,
             original_request=payload.model_dump(mode="json"),
-            save=save,
-            result=merged,
+            continue_kind="opposed",
+            staged_save=staged_save,
+            error=exc,
         )
-        world.save_current(save)
         if emit is not None:
             await _emit_pending_response(result=pending_response, emit=emit)
         return pending_response
-    if merged.public_opposed_prompt is not None:
-        pending_response = _stage_opposed_checkpoint(
-            session_id=payload.session_id,
-            original_request=payload.model_dump(mode="json"),
-            save=save,
-            result=merged,
-        )
-        world.save_current(save)
-        if emit is not None:
-            await _emit_pending_response(result=pending_response, emit=emit)
-        return pending_response
-    world.save_current(save)
-    return _to_response(payload.session_id, merged, save)

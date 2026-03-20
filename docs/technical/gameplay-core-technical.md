@@ -342,3 +342,24 @@
   - `world_impact_type=non_world`
   - valid terminal interaction response
 - Runtime no longer clears the pending interaction prompt before validating / resolving the player's response, so invalid reverse targeting does not destroy the pending pause state.
+## 2026-03-20 AI Required / Protocol Repair Note
+
+- AI gameplay interfaces no longer use `no-AI fallback` when `config`, `api_key`, or `model` is missing.
+- Public-turn AI control fields now use explicit enum pools in prompts and stable English ids in responses:
+  - `reaction_tone`
+  - `world_impact_type`
+  - `response_mode`
+  - `action_type`
+  - `pause_kind`
+- Public-turn first-pass enum violations no longer silently normalize on the backend.
+- Public-turn now stages `awaiting_protocol_repair` in `PendingTurnState` / `PendingTurnContinueResponse`, then exposes:
+  - `POST /api/v1/public-turn/protocol-repair`
+  - `POST /api/v1/public-turn/protocol-repair/stream`
+- Public-turn streams may now emit `protocol_repair_required`.
+- Frontend auto-continues public-turn protocol repair and shows a transient notice instead of immediately surfacing a hard error.
+- Public-turn AI inputs now include targeted helper text:
+  - `{actor}对{target}的行为：...`
+  - `{actor}自己的行为：...`
+  - `{actor}对{speech_target}说：...`
+  - `{actor}说：...`
+- Targeted helper text is prompt/debug-only and does not replace user-facing original action/speech text.

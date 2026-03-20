@@ -6,7 +6,16 @@ from openai import OpenAI
 
 from app.core.prompt_keys import PromptKeys
 from app.core.prompt_table import prompt_table
-from app.models.schemas import ChatConfig, NpcRoleCard, PublicSceneActorCandidate, PublicSceneState, SceneEvent, StoryNpcSummary
+from app.models.schemas import ChatConfig, NpcRoleCard, PublicSceneActorCandidate, PublicSceneState, PublicTurnWorldImpactType, SceneEvent, StoryNpcSummary
+from app.services.ai_protocol_contract_service import (
+    AI_PROTOCOL_REPAIR_FAILED,
+    AI_PROVIDER_CALL_FAILED,
+    EnumContractField,
+    allow_protocol_repair,
+    render_enum_pool_text,
+    require_ai_config,
+    validate_or_repair_json_payload,
+)
 from app.services.ai_adapter import build_completion_options, create_sync_client
 from app.services import zone_metric_service
 
@@ -432,12 +441,8 @@ def _ai_actor_action(
     config: ChatConfig | None,
 ) -> dict[str, object] | None:
     legacy = _legacy()
-    if config is None:
-        return None
-    api_key = (config.openai_api_key or "").strip()
+    config = require_ai_config(config)
     model = (config.model or "").strip()
-    if not api_key or not model:
-        return None
     try:
         world_time_text, _ = legacy._world_time_payload(scene_context.get("world_time") if isinstance(scene_context, dict) else None)  # type: ignore[arg-type]
     except Exception:
@@ -455,6 +460,17 @@ def _ai_actor_action(
         incoming_interaction_json=json.dumps(incoming_interaction or {}, ensure_ascii=False),
         scene_context_json=legacy._scene_context_json(scene_context),
     )
+    prompt = (
+        f"{prompt}\n"
+        "Allowed enum ids:\n"
+        f"{render_enum_pool_text((EnumContractField(field_path='response_mode', allowed_ids=('respond', 'ignore', 'none')), EnumContractField(field_path='action_type', allowed_ids=('check', 'attack', 'item_use')), EnumContractField(field_path='world_impact_type', allowed_ids=(PublicTurnWorldImpactType.NON_WORLD.value, PublicTurnWorldImpactType.WORLD.value)), EnumContractField(field_path='consent_state', allowed_ids=('accepted', 'rejected', 'ambiguous', 'not_applicable')), EnumContractField(field_path='contest_state', allowed_ids=('opposed', 'non_opposed', 'not_applicable'))))}\n"
+        "Use only the allowed stable ids for response_mode, action_type, world_impact_type, consent_state, and contest_state.\n"
+        "Also return speech_target_label for the spoken addressee only.\n"
+        "Do not use gaze targets, wink targets, gesture targets, or silent coordination partners as speech_target_label.\n"
+        "If the narration mentions looking at actor A but the spoken line is addressed to actor B, speech_target_label must be actor B.\n"
+        "If there is no spoken addressee, return an empty speech_target_label.\n"
+        "When incoming_interaction_json is not empty, also classify whether this response accepts, rejects, or ambiguously answers the incoming interaction via consent_state, and whether it creates a direct opposed exchange via contest_state."
+    )
     try:
         client = legacy.create_sync_client(config, client_cls=legacy.OpenAI)
         response = client.chat.completions.create(
@@ -466,9 +482,36 @@ def _ai_actor_action(
                 {"role": "user", "content": prompt},
             ],
         )
-        parsed = legacy._extract_json_content((response.choices[0].message.content or "").strip())
-    except Exception:
-        return None
+        raw_json = (response.choices[0].message.content or "").strip() or "{}"
+        parsed = legacy._extract_json_content(raw_json)
+        with allow_protocol_repair():
+            parsed = validate_or_repair_json_payload(
+                parsed=parsed,
+                raw_json=raw_json,
+                fields=(
+                    EnumContractField(field_path="response_mode", allowed_ids=("respond", "ignore", "none")),
+                    EnumContractField(field_path="action_type", allowed_ids=("check", "attack", "item_use")),
+                    EnumContractField(
+                        field_path="world_impact_type",
+                        allowed_ids=(PublicTurnWorldImpactType.NON_WORLD.value, PublicTurnWorldImpactType.WORLD.value),
+                    ),
+                    EnumContractField(
+                        field_path="consent_state",
+                        allowed_ids=("accepted", "rejected", "ambiguous", "not_applicable"),
+                    ),
+                    EnumContractField(
+                        field_path="contest_state",
+                        allowed_ids=("opposed", "non_opposed", "not_applicable"),
+                    ),
+                ),
+                config=config,
+                system_prompt=config.gm_prompt,
+                original_prompt=prompt,
+            )
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"{AI_PROVIDER_CALL_FAILED}: {exc}") from exc
     payload = {
         "response_mode": str(parsed.get("response_mode") or ("respond" if incoming_interaction else "none")).strip().lower(),
         "incoming_from_actor_id": str((incoming_interaction or {}).get("source_actor_id") or ""),
@@ -491,22 +534,24 @@ def _ai_actor_action(
         "target_label": str(parsed.get("target_label") or "")[:80],
         "speech_target_label": str(parsed.get("speech_target_label") or "")[:80],
         "world_impact_type": str(parsed.get("world_impact_type") or "")[:20],
+        "consent_state": str(parsed.get("consent_state") or "not_applicable")[:20],
+        "contest_state": str(parsed.get("contest_state") or "not_applicable")[:20],
         "needs_check": bool(parsed.get("needs_check")),
         "action_type": str(parsed.get("action_type") or "check").strip().lower(),
         "action_prompt": str(parsed.get("action_prompt") or "")[:200],
         "situation_delta_hint": legacy._clamp(int(parsed.get("situation_delta_hint") or 0), -8, 8),
     }
     if payload["response_mode"] not in {"respond", "ignore", "none"}:
-        return None
+        raise ValueError("AI_PROTOCOL_REPAIR_FAILED")
     if str(payload["action_type"]) not in {"check", "attack", "item_use"}:
-        payload["action_type"] = "check"
+        raise ValueError("AI_PROTOCOL_REPAIR_FAILED")
     required_text = ["external_action_narration", "speech_line", "visible_intent", "risk_source", "risk_object", "risk_location", "specific_threat"]
     if not allow_partial and any(not str(payload.get(key) or "").strip() for key in required_text):
-        return None
+        raise ValueError("AI_PROTOCOL_REPAIR_FAILED")
     if not allow_partial and (
         legacy._looks_too_vague(str(payload["external_action_narration"])) or legacy._looks_too_vague(str(payload["specific_threat"]))
     ):
-        return None
+        raise ValueError("AI_PROTOCOL_REPAIR_FAILED")
     if not str(payload["action_prompt"]):
         payload["action_prompt"] = f"actor={actor.get('name')}; target={payload['target_label']}; threat={payload['specific_threat']}; intent={payload['visible_intent']}"
     return payload
@@ -523,12 +568,10 @@ def _ai_round_resolution(
     config: ChatConfig | None,
 ) -> str | None:
     legacy = _legacy()
-    if config is None or not result_rows:
-        return None
-    api_key = (config.openai_api_key or "").strip()
+    if not result_rows:
+        raise ValueError(AI_PROTOCOL_REPAIR_FAILED)
+    config = require_ai_config(config)
     model = (config.model or "").strip()
-    if not api_key or not model:
-        return None
     prompt = prompt_table.render(
         PromptKeys.SCENE_ROUND_RESOLVE_USER,
         "",
@@ -553,10 +596,12 @@ def _ai_round_resolution(
         parsed = legacy._extract_json_content((response.choices[0].message.content or "").strip())
         text = str(parsed.get("resolution_text") or "").strip()[:720]
         if not text or legacy._looks_too_vague(text):
-            return None
+            raise ValueError(AI_PROTOCOL_REPAIR_FAILED)
         return text
-    except Exception:
-        return None
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"{AI_PROVIDER_CALL_FAILED}: {exc}") from exc
 
 
 def _compose_actor_content(payload: dict[str, object]) -> str:
@@ -626,12 +671,6 @@ def advance_public_scene_in_save(
             scene_context=scene_context,
             incoming_interaction=incoming,
             config=config,
-        ) or _fallback_actor_action(
-            save,
-            actor,
-            player_text=display_text,
-            gm_summary=gm_summary,
-            incoming_interaction=incoming,
         )
         response_mode = str(payload.get("response_mode") or "respond").strip().lower() or "respond"
         if not actor_may_speak_in_public_turn(actor, audience_context):
@@ -735,7 +774,6 @@ def advance_public_scene_in_save(
         resolution_lines.append("这一轮之后，现场压力继续扩大，玩家下一步必须立刻处理最先要出事的位置。")
     else:
         resolution_lines.append("这一轮之后，现场暂时维持僵持，没有继续恶化，但还没有真正突破。")
-    fallback_resolution_text = "\n".join(line for line in resolution_lines if line).strip()[:720]
     resolution_text = _ai_round_resolution(
         result_rows,
         player_text=display_text,
@@ -744,7 +782,7 @@ def advance_public_scene_in_save(
         predicted_situation_value=predicted_situation_value,
         direction=direction,
         config=config,
-    ) or fallback_resolution_text
+    )
     if active_encounter is not None:
         from app.services.encounter_service import apply_active_encounter_situation_delta_in_save
 

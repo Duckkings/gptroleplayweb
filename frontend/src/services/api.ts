@@ -49,6 +49,8 @@
   PublicTurnInteractionPrompt,
   PublicTurnOpposedPrompt,
   PublicTurnPresentation,
+  PublicTurnProtocolRepairNotice,
+  PublicTurnProtocolRepairRequest,
   QuestMutationResponse,
   PublicTurnActionSubmission,
   PublicTurnEntryType,
@@ -1068,6 +1070,21 @@ export async function continuePublicTurn(
   );
 }
 
+export async function continuePublicTurnProtocolRepair(
+  payload: PublicTurnProtocolRepairRequest,
+  report?: DebugReporter,
+): Promise<PublicTurnResponse | PendingTurnContinueResponse> {
+  return requestJson(
+    '/public-turn/protocol-repair',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
 export async function resolvePublicTurnReaction(
   payload: { session_id: string; check_id: string; forced_dice_roll: number; config?: AppConfig },
   report?: DebugReporter,
@@ -1132,7 +1149,12 @@ export async function resolvePublicTurnOpposedCheck(
 }
 
 async function consumePublicTurnStream(
-  endpoint: '/public-turn/entry/stream' | '/public-turn/continue/stream' | '/public-turn/reaction-check/stream' | '/public-turn/opposed-check/stream',
+  endpoint:
+    | '/public-turn/entry/stream'
+    | '/public-turn/continue/stream'
+    | '/public-turn/protocol-repair/stream'
+    | '/public-turn/reaction-check/stream'
+    | '/public-turn/opposed-check/stream',
   payload: unknown,
   handlers: {
     onPhase: (event: StreamPhaseEvent) => void;
@@ -1159,6 +1181,17 @@ async function consumePublicTurnStream(
       reply_so_far: string;
       scene_events_so_far: SceneEvent[];
       public_opposed_prompt: PublicTurnOpposedPrompt | null;
+      npc_role_id?: string | null;
+      public_turn_state?: PublicTurnState | null;
+      public_turn_presentation?: PublicTurnPresentation | null;
+    }) => void;
+    onProtocolRepairRequired?: (payload: {
+      pending_turn_id: string;
+      flow_kind: PendingTurnContinueResponse['flow_kind'];
+      reply_so_far: string;
+      scene_events_so_far: SceneEvent[];
+      public_turn_protocol_repair_notice: PublicTurnProtocolRepairNotice | null;
+      public_turn_protocol_repair_request: PublicTurnProtocolRepairRequest | null;
       npc_role_id?: string | null;
       public_turn_state?: PublicTurnState | null;
       public_turn_presentation?: PublicTurnPresentation | null;
@@ -1232,6 +1265,8 @@ async function consumePublicTurnStream(
           presentation?: PublicTurnPresentation | null;
           check_id?: string;
           entries?: PublicTurnInitiativeEntry[];
+          public_turn_protocol_repair_notice?: PublicTurnProtocolRepairNotice | null;
+          public_turn_protocol_repair_request?: PublicTurnProtocolRepairRequest | null;
         };
         if (event === 'phase') {
           handlers.onPhase({
@@ -1278,6 +1313,19 @@ async function consumePublicTurnStream(
             reply_so_far: data.reply_so_far ?? '',
             scene_events_so_far: data.scene_events_so_far ?? [],
             public_opposed_prompt: data.public_opposed_prompt ?? null,
+            npc_role_id: data.npc_role_id ?? null,
+            public_turn_state: data.public_turn_state ?? null,
+            public_turn_presentation: data.presentation ?? (data as { public_turn_presentation?: PublicTurnPresentation | null }).public_turn_presentation ?? null,
+          });
+        } else if (event === 'protocol_repair_required') {
+          terminalEventReceived = true;
+          handlers.onProtocolRepairRequired?.({
+            pending_turn_id: data.pending_turn_id ?? '',
+            flow_kind: data.flow_kind ?? 'public_turn',
+            reply_so_far: data.reply_so_far ?? '',
+            scene_events_so_far: data.scene_events_so_far ?? [],
+            public_turn_protocol_repair_notice: data.public_turn_protocol_repair_notice ?? null,
+            public_turn_protocol_repair_request: data.public_turn_protocol_repair_request ?? null,
             npc_role_id: data.npc_role_id ?? null,
             public_turn_state: data.public_turn_state ?? null,
             public_turn_presentation: data.presentation ?? (data as { public_turn_presentation?: PublicTurnPresentation | null }).public_turn_presentation ?? null,
@@ -1336,6 +1384,15 @@ export async function streamContinuePublicTurn(
   report?: DebugReporter,
 ): Promise<void> {
   return consumePublicTurnStream('/public-turn/continue/stream', payload, handlers, signal, report);
+}
+
+export async function streamContinuePublicTurnProtocolRepair(
+  payload: PublicTurnProtocolRepairRequest,
+  handlers: Parameters<typeof consumePublicTurnStream>[2],
+  signal: AbortSignal,
+  report?: DebugReporter,
+): Promise<void> {
+  return consumePublicTurnStream('/public-turn/protocol-repair/stream', payload, handlers, signal, report);
 }
 
 export async function streamResolvePublicTurnReaction(

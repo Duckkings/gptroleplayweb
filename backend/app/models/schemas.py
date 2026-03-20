@@ -297,6 +297,7 @@ class SceneEvent(BaseModel):
         "player_stabilized",
         "player_died",
         "player_revived",
+        "system_notice",
     ]
     actor_role_id: str = Field(default="", min_length=0)
     actor_name: str = Field(default="", min_length=0)
@@ -411,7 +412,7 @@ class PendingTurnState(BaseModel):
     pending_turn_id: str = Field(..., min_length=1)
     session_id: str = Field(..., min_length=1)
     flow_kind: Literal["main_chat", "encounter", "npc_chat", "map_move", "public_turn"]
-    status: Literal["awaiting_reaction", "awaiting_opposed", "cancelled", "completed"] = "awaiting_reaction"
+    status: Literal["awaiting_reaction", "awaiting_opposed", "awaiting_protocol_repair", "cancelled", "completed"] = "awaiting_reaction"
     staged_save: dict[str, Any] = Field(default_factory=dict)
     original_request: dict[str, Any] = Field(default_factory=dict)
     accumulated_reply_text: str = Field(default="", min_length=0)
@@ -425,6 +426,8 @@ class PendingTurnState(BaseModel):
     npc_role_id: str | None = None
     public_round_id: str | None = None
     public_phase_before_pause: "PublicTurnPhase | None" = None
+    public_turn_protocol_repair_request: "PublicTurnProtocolRepairRequest | None" = None
+    public_turn_protocol_repair_notice: "PublicTurnProtocolRepairNotice | None" = None
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
@@ -440,7 +443,7 @@ class PendingTurnContinueResponse(BaseModel):
     session_id: str
     pending_turn_id: str | None = None
     flow_kind: Literal["main_chat", "encounter", "npc_chat", "map_move", "public_turn"]
-    status: Literal["awaiting_reaction", "awaiting_opposed", "completed", "cancelled"]
+    status: Literal["awaiting_reaction", "awaiting_opposed", "awaiting_protocol_repair", "completed", "cancelled"]
     reply_text: str = Field(default="", min_length=0)
     scene_events: list[SceneEvent] = Field(default_factory=list)
     tool_events: list[ToolEvent] = Field(default_factory=list)
@@ -455,6 +458,28 @@ class PendingTurnContinueResponse(BaseModel):
     public_turn_presentation: "PublicTurnPresentation | None" = None
     archived_sub_zone_turn_id: str | None = None
     npc_role_id: str | None = None
+    public_turn_protocol_repair_notice: "PublicTurnProtocolRepairNotice | None" = None
+    public_turn_protocol_repair_request: "PublicTurnProtocolRepairRequest | None" = None
+
+
+class PublicTurnProtocolEnumViolation(BaseModel):
+    field_path: str = Field(..., min_length=1)
+    invalid_value: str | None = None
+    allowed_ids: list[str] = Field(default_factory=list)
+    reason: str = Field(default="", min_length=0)
+
+
+class PublicTurnProtocolRepairNotice(BaseModel):
+    code: str = Field(default="AI_PROTOCOL_ENUM_INVALID", min_length=1)
+    message: str = Field(default="AI 首次输出协议错误，正在自动修复并续跑...", min_length=1)
+    violations: list[PublicTurnProtocolEnumViolation] = Field(default_factory=list)
+
+
+class PublicTurnProtocolRepairRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    pending_turn_id: str = Field(..., min_length=1)
+    continue_kind: Literal["entry", "continue", "reaction", "opposed"]
+    config: ChatConfig | None = None
 
 
 class PathStatusResponse(BaseModel):

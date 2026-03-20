@@ -4,6 +4,10 @@ import json
 import random
 from typing import Any, Literal
 
+from openai import OpenAI
+
+from app.core.prompt_table import prompt_table
+from app.core.token_usage import token_usage_store
 from app.models.schemas import (
     ActionCheckRequest,
     ActionCheckResponse,
@@ -27,22 +31,24 @@ from app.models.schemas import (
     SaveFile,
     SceneEvent,
 )
+from app.services.ai_adapter import build_completion_options, create_sync_client, has_ai_config
 from app.services import public_scene_runtime_v2 as public_scene_runtime
 from app.services import public_scene_service as public_scene_legacy
 from app.services import reaction_check_service
 from app.services import world_service as world
 from app.services.encounter_service import apply_active_encounter_situation_delta_in_save
 from app.services.public_turn_interaction_service import build_ai_interaction_response
-from app.services.public_turn_interaction_service import classify_contest_between_actions
-from app.services.public_turn_interaction_service import classify_interaction_consent
 from app.services.public_turn_interaction_service import classify_player_interaction_response
 from app.services.public_turn_interaction_service import infer_world_impact_type
+from app.services.public_turn_interaction_service import is_direct_world_counter_response
 from app.services.public_turn_interaction_service import public_turn_actor_type
 from app.services.public_turn_interaction_service import ResolvedInteractionTarget
 from app.services.public_turn_interaction_service import resolve_interaction_target
 from app.services.public_turn_interaction_service import resolve_speech_target
 from app.services.public_turn_interaction_service import validate_prompt_target_alignment
 from app.services import zone_metric_service
+from app.services.generation_debug_log_service import current_generation_debug_log
+from app.services.public_turn_target_context_service import build_targeted_actor_text
 from app.services.public_turn_candidates import (
     actor_name_match,
     dex_modifier_for_actor,
@@ -152,6 +158,123 @@ def _default_gm_resolution_summary(actor_name: str, action_summary: str, situati
     if clean_action:
         return f"{actor_name}的动作落地后，现场对“{clean_action[:24]}”给出了直接回应。"
     return f"{actor_name}的动作落地后，周围人的注意力和站位都发生了变化。"
+
+
+def _default_opposed_resolution_summary(
+    *,
+    actor_name: str,
+    target_name: str,
+    actor_action_summary: str,
+    target_action_summary: str,
+    target_speech_text: str,
+    action_result: ActionCheckResponse,
+) -> str:
+    actor_action = _normalize_public_turn_text(actor_action_summary, limit=120)
+    target_action = _normalize_public_turn_text(target_action_summary, limit=120)
+    target_speech = _normalize_public_turn_text(target_speech_text, limit=120)
+    actor_focus = actor_action[:28] if actor_action else "这一下动作"
+    target_focus = target_action[:28] if target_action else "当场的回应"
+    if action_result.success:
+        if action_result.critical == "critical_success":
+            return (
+                f"{actor_name}这一记正面压制来得又快又狠，{target_name}刚要{target_focus}就被当场打断，"
+                f"连带着场上的主动权也一下倒向了{actor_name}。"
+            )[:280]
+        return (
+            f"{actor_name}顶住了{target_name}的回手，硬是把{actor_focus}压到了实处，"
+            f"逼得{target_name}{target_focus}时只能顺着这股压力后退。"
+        )[:280]
+    if action_result.critical == "critical_failure":
+        return (
+            f"{actor_name}本想借着{actor_focus}一口气压过去，结果节奏反而被{target_name}抓住，"
+            f"{target_name}{target_focus}时当场把局面整个顶了回来。"
+        )[:280]
+    if target_speech:
+        return (
+            f"{actor_name}没能把这次硬碰硬压住，{target_name}一边{target_focus}，一边抛出“{target_speech[:24]}”，"
+            f"把这次对抗的势头重新扳回了自己手里。"
+        )[:280]
+    return (
+        f"{actor_name}没能把这次硬碰硬压住，{target_name}{target_focus}时稳稳顶住了这波冲击，"
+        f"让{actor_name}的攻势当场失了准头。"
+    )[:280]
+
+
+def _generate_opposed_resolution_summary(
+    *,
+    session_id: str,
+    actor_name: str,
+    target_name: str,
+    actor_action_summary: str,
+    actor_speech_text: str,
+    target_action_summary: str,
+    target_speech_text: str,
+    stakes_summary: str,
+    action_result: ActionCheckResponse | None,
+    config: ChatConfig | None,
+) -> str:
+    if action_result is None or action_result.resolution_rule != "opposed_actor":
+        return ""
+    fallback = _default_opposed_resolution_summary(
+        actor_name=actor_name,
+        target_name=target_name,
+        actor_action_summary=actor_action_summary,
+        target_action_summary=target_action_summary,
+        target_speech_text=target_speech_text,
+        action_result=action_result,
+    )
+    if not has_ai_config(config):
+        return fallback
+    assert config is not None
+    try:
+        prompt = prompt_table.render(
+            "public.turn.opposed_resolution.user",
+            (
+                "你要为一次公开回合中的正面对抗补写结果导致的即时叙事后果。"
+                "只输出1-2句简体中文。"
+                "重点写对抗落地后现场立刻发生了什么、谁被压住或谁抢回了主动、气氛和局势怎样偏转。"
+                "可以参考双方动作和台词，但不要机械复述原句，不要输出骰点、DC、成功失败、检定、系统、回合等词。"
+                "不要写未来推测，只写已经发生的可见后果。"
+                "actor_name=$actor_name; target_name=$target_name; actor_action=$actor_action; actor_speech=$actor_speech; "
+                "target_action=$target_action; target_speech=$target_speech; stakes=$stakes; outcome=$outcome; critical=$critical"
+            ),
+            actor_name=actor_name,
+            target_name=target_name,
+            actor_action=actor_action_summary[:200],
+            actor_speech=actor_speech_text[:160],
+            target_action=target_action_summary[:200],
+            target_speech=target_speech_text[:160],
+            stakes=stakes_summary[:200],
+            outcome=("actor_success" if action_result.success else "actor_failure"),
+            critical=action_result.critical,
+        )
+        client = create_sync_client(config, client_cls=OpenAI)
+        resp = client.chat.completions.create(
+            model=config.model,
+            **build_completion_options(config),
+            messages=[
+                {
+                    "role": "system",
+                    "content": prompt_table.get_text(
+                        "public.turn.opposed_resolution.system",
+                        "你是跑团公开回合的结果叙事器。只输出简体中文结果叙述，不输出解释。",
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+        )
+        usage = getattr(resp, "usage", None)
+        if usage is not None:
+            token_usage_store.add(
+                session_id,
+                "chat",
+                getattr(usage, "prompt_tokens", 0) or 0,
+                getattr(usage, "completion_tokens", 0) or 0,
+            )
+        text = _normalize_public_turn_text(resp.choices[0].message.content or "", limit=280)
+        return text or fallback
+    except Exception:
+        return fallback
 
 
 def build_settlement_check(action_result: ActionCheckResponse | None) -> PublicTurnSettlementCheck | None:
@@ -300,6 +423,20 @@ def _normalize_public_turn_text(text: str, *, limit: int) -> str:
     return " ".join(str(text or "").split()).strip()[:limit]
 
 
+def _prompt_action_target_details(
+    *,
+    prompt_target_actor_id: str | None,
+    prompt_target_actor_name: str | None,
+    prompt_target_actor_kind: PublicTurnActorType | None,
+    source_action_target_name: str | None,
+) -> tuple[str | None, str | None, PublicTurnActorType | None]:
+    clean_action_target_name = _normalize_public_turn_text(source_action_target_name or "", limit=120) or None
+    clean_prompt_target_name = _normalize_public_turn_text(prompt_target_actor_name or "", limit=120) or None
+    if clean_action_target_name and clean_prompt_target_name and clean_action_target_name == clean_prompt_target_name:
+        return prompt_target_actor_id, clean_action_target_name, prompt_target_actor_kind
+    return None, clean_action_target_name, None
+
+
 def normalize_public_turn_ai_payload(
     payload: dict[str, object] | None,
     *,
@@ -316,17 +453,10 @@ def normalize_public_turn_ai_payload(
     if not audience_may_speak:
         speech_text = ""
     specific_threat = _normalize_public_turn_text(str(source.get("specific_threat") or ""), limit=200)
-    action_type = _action_type_for_text(
-        "\n".join(part for part in (str(source.get("action_type") or ""), action_summary, specific_threat) if part.strip())
-    )
+    action_type = str(source.get("action_type") or "").strip().lower() or "check"
     target_label = _normalize_public_turn_text(str(source.get("target_label") or ""), limit=80)
     speech_target_label = _normalize_public_turn_text(str(source.get("speech_target_label") or ""), limit=80)
-    world_impact_type = infer_world_impact_type(
-        action_type=action_type,
-        action_summary=action_summary,
-        speech_text=speech_text,
-        explicit_value=str(source.get("world_impact_type") or ""),
-    )
+    world_impact_type = str(source.get("world_impact_type") or "").strip().lower() or PublicTurnWorldImpactType.NON_WORLD.value
     action_prompt = _normalize_public_turn_text(
         str(source.get("action_prompt") or "") or f"actor={actor_name}; intent={action_summary}; threat={specific_threat}",
         limit=240,
@@ -339,7 +469,7 @@ def normalize_public_turn_ai_payload(
         "specific_threat": specific_threat,
         "target_label": target_label,
         "speech_target_label": speech_target_label,
-        "world_impact_type": world_impact_type.value,
+        "world_impact_type": world_impact_type,
         "action_type": action_type,
         "action_prompt": action_prompt,
         "situation_delta_hint": max(-8, min(8, int(source.get("situation_delta_hint") or 0))),
@@ -498,16 +628,36 @@ def resolve_player_submission(
         else str(action_check.target_name or "").strip() if action_check is not None
         else ""
     )
+    player_speech_target_name = player_action_target_name if speech_text.strip() else ""
+    targeted_context = build_targeted_actor_text(
+        actor_name=save.player_static_data.name,
+        action_text=action_text,
+        speech_text=speech_text,
+        action_target_name=player_action_target_name,
+        speech_target_name=player_speech_target_name,
+    )
     scene_conflict_summary = "\n".join(
         part
         for part in (
             current_primary_aggressor_name and f"primary_aggressor={current_primary_aggressor_name}",
             current_primary_target_name and f"primary_target={current_primary_target_name}",
             player_action_target_name and f"player_action_target={player_action_target_name}",
+            targeted_context.combined_text_for_ai,
             gm_resolution_summary or display_text,
         )
         if part
     )
+    debug_log = current_generation_debug_log()
+    if debug_log is not None:
+        debug_log.record(
+            "public_turn_targeted_context",
+            "built targeted player submission context",
+            {
+                "display_text": display_text,
+                "targeted_context": targeted_context.debug_context_payload,
+                "gm_resolution_summary": gm_resolution_summary,
+            },
+        )
     events: list[SceneEvent] = [
         world._new_scene_event(
             "public_turn_actor_action",
@@ -542,8 +692,8 @@ def resolve_player_submission(
     relation_rows, relation_events = apply_player_npc_reactions(
         save,
         session_id=session_id,
-        player_text=display_text,
-        summary=gm_resolution_summary or display_text,
+        player_text=targeted_context.combined_text_for_ai,
+        summary=gm_resolution_summary or targeted_context.combined_text_for_ai,
         relation_delta=relation_delta,
         target_role_id=(action_result.target_role_id if action_result is not None else (action_check.target_role_id if action_check is not None else None)),
         player_action_target_name=player_action_target_name,
@@ -556,8 +706,8 @@ def resolve_player_submission(
     team_rows, reaction_events = apply_player_team_reactions(
         save,
         session_id=session_id,
-        player_text=display_text,
-        summary=gm_resolution_summary or display_text,
+        player_text=targeted_context.combined_text_for_ai,
+        summary=gm_resolution_summary or targeted_context.combined_text_for_ai,
         player_action_target_name=player_action_target_name,
         current_primary_aggressor_name=current_primary_aggressor_name,
         current_primary_target_name=current_primary_target_name,
@@ -592,6 +742,18 @@ def resolve_player_submission(
         environment_shift=(2 if any(token in display_text.lower() for token in _DESTRUCTIVE_TOKENS) else 0),
         scene_events=events,
     )
+    gm_resolution_summary = _generate_opposed_resolution_summary(
+        session_id=session_id,
+        actor_name=save.player_static_data.name,
+        target_name=str((action_result.target_name if action_result is not None else player_action_target_name) or "对方"),
+        actor_action_summary=action_text.strip() or display_text,
+        actor_speech_text=speech_text.strip(),
+        target_action_summary="",
+        target_speech_text="",
+        stakes_summary=display_text,
+        action_result=action_result,
+        config=config,
+    )
     settlement = build_settlement_entry(
         round_state=round_state,
         actor_id=save.player_static_data.player_id,
@@ -601,7 +763,7 @@ def resolve_player_submission(
         speech_text=speech_text.strip(),
         action_result=action_result,
         impact=impact,
-        gm_resolution_summary="",
+        gm_resolution_summary=gm_resolution_summary,
         action_target_actor_id=(action_result.target_role_id if action_result is not None else (action_check.target_role_id if action_check is not None else None)),
         action_target_name=player_action_target_name or None,
         action_target_kind=(
@@ -667,6 +829,8 @@ def _maybe_build_player_opposed_prompt(
     action_type = str(payload.get("action_type") or "check").strip().lower()
     if action_type == "attack":
         return None
+    if str(payload.get("world_impact_type") or "").strip().lower() != PublicTurnWorldImpactType.WORLD.value:
+        return None
     combined = "\n".join(
         part.strip()
         for part in (
@@ -678,7 +842,13 @@ def _maybe_build_player_opposed_prompt(
         )
         if str(part or "").strip()
     )
-    if world._opposed_rule_for_prompt(combined) is None:
+    target = resolve_interaction_target(
+        save,
+        actor_role_id=actor_id,
+        action_prompt=str(payload.get("action_prompt") or ""),
+        target_label=str(payload.get("target_label") or ""),
+    )
+    if target is None or target.actor_id != save.player_static_data.player_id:
         return None
     player_name = save.player_static_data.name
     if not any(marker and marker in combined for marker in (player_name, "玩家", "你", "你们")):
@@ -724,6 +894,7 @@ def _finalize_ai_actor_turn(
     opposed_target_action: str | None = None,
     opposed_target_speech: str | None = None,
     opposed_target_speech_target_name: str | None = None,
+    gm_resolution_summary: str = "",
 ) -> tuple[list[SceneEvent], PublicTurnImpact, PublicTurnSettlementEntry, int]:
     actor_id = str(actor.get("actor_id") or "")
     events = list(base_events)
@@ -772,7 +943,7 @@ def _finalize_ai_actor_turn(
         speech_text=str(payload.get("speech_line") or payload.get("speech_summary") or ""),
         action_result=action_result,
         impact=impact,
-        gm_resolution_summary="",
+        gm_resolution_summary=gm_resolution_summary,
         action_target_actor_id=action_target_actor_id,
         action_target_name=action_target_name,
         action_target_kind=action_target_kind,
@@ -961,6 +1132,12 @@ def resolve_opposed_prompt_submission(
     round_state: PublicTurnRound,
     config: ChatConfig | None,
 ) -> tuple[list[SceneEvent], PublicTurnImpact, PublicTurnSettlementEntry, ActionCheckResponse]:
+    action_target_actor_id, action_target_name, action_target_kind = _prompt_action_target_details(
+        prompt_target_actor_id=prompt.target_actor_id,
+        prompt_target_actor_name=prompt.target_actor_name,
+        prompt_target_actor_kind=(settlement_actor_type("player") if prompt.target_actor_id == save.player_static_data.player_id else None),
+        source_action_target_name=prompt.source_action_target_name,
+    )
     plan = world.plan_public_turn_opposed_exchange(
         PublicTurnOpposedPlanRequest(
             session_id=session_id,
@@ -1021,6 +1198,18 @@ def resolve_opposed_prompt_submission(
             config=config,
         )
     )
+    gm_resolution_summary = _generate_opposed_resolution_summary(
+        session_id=session_id,
+        actor_name=prompt.source_actor_name,
+        target_name=prompt.target_actor_name,
+        actor_action_summary=prompt.source_action_summary,
+        actor_speech_text=prompt.source_speech_text,
+        target_action_summary=target_action_summary,
+        target_speech_text=target_speech_text,
+        stakes_summary=prompt.stakes_summary,
+        action_result=action_result,
+        config=config,
+    )
     base_events = [
         world._new_scene_event(
             "public_turn_actor_action",
@@ -1031,7 +1220,7 @@ def resolve_opposed_prompt_submission(
                 "actor_type": actor_type,
                 "round_id": round_state.round_id,
                 "phase": round_state.phase.value,
-                "target_label": prompt.source_action_target_name or prompt.target_actor_name,
+                "target_label": prompt.source_action_target_name or "",
                 "speech_target_label": prompt.source_speech_target_name or "",
                 "specific_threat": prompt.stakes_summary,
             },
@@ -1058,13 +1247,14 @@ def resolve_opposed_prompt_submission(
         action_result=action_result,
         reputation_score=reputation_score,
         base_events=base_events,
-        action_target_actor_id=prompt.target_actor_id,
-        action_target_name=prompt.source_action_target_name or prompt.target_actor_name,
-        action_target_kind=(settlement_actor_type("player") if prompt.target_actor_id == save.player_static_data.player_id else None),
+        action_target_actor_id=action_target_actor_id,
+        action_target_name=action_target_name,
+        action_target_kind=action_target_kind,
         speech_target_name=prompt.source_speech_target_name,
         opposed_target_name=prompt.target_actor_name,
         opposed_target_action=target_action_summary,
         opposed_target_speech=target_speech_text,
+        gm_resolution_summary=gm_resolution_summary,
     )
     return events, impact, settlement, action_result
 
@@ -1090,9 +1280,16 @@ def resolve_interaction_prompt_submission(
         prompt_target_actor_id=prompt.target_actor_id,
         prompt_target_actor_name=prompt.target_actor_name,
         source_action_target_name=prompt.source_action_target_name,
+        source_speech_target_name=prompt.source_speech_target_name,
         expected_player_id=save.player_static_data.player_id,
     ):
         raise ValueError("PUBLIC_TURN_INTERACTION_TARGET_MISMATCH")
+    action_target_actor_id, action_target_name, action_target_kind = _prompt_action_target_details(
+        prompt_target_actor_id=prompt.target_actor_id,
+        prompt_target_actor_name=prompt.target_actor_name,
+        prompt_target_actor_kind=prompt.target_actor_kind,
+        source_action_target_name=prompt.source_action_target_name,
+    )
     actor_type = "npc"
     if any(item.role_id == prompt.source_actor_id for item in getattr(save.team_state, "members", [])):
         actor_type = "team"
@@ -1109,6 +1306,7 @@ def resolve_interaction_prompt_submission(
         save,
         source_actor_id=prompt.source_actor_id,
         source_actor_name=prompt.source_actor_name,
+        source_world_impact_type=prompt.source_world_impact_type,
         action_text=target_action_summary,
         speech_text=target_speech_text,
         response_kind=target_response_kind,
@@ -1141,7 +1339,7 @@ def resolve_interaction_prompt_submission(
                 "actor_type": actor_type,
                 "round_id": round_state.round_id,
                 "phase": round_state.phase.value,
-                "target_label": prompt.source_action_target_name or prompt.target_actor_name,
+                "target_label": prompt.source_action_target_name or "",
                 "speech_target_label": prompt.source_speech_target_name or "",
                 "specific_threat": prompt.source_action_summary,
             },
@@ -1165,18 +1363,22 @@ def resolve_interaction_prompt_submission(
             target=source_target,
             source_actor_id=prompt.target_actor_id,
             source_actor_name=prompt.target_actor_name,
+            source_world_impact_type=response.world_impact_type,
             source_action_summary=target_action_summary,
             source_speech_text=target_speech_text,
             gm_summary=prompt.source_action_summary or prompt.source_actor_name,
             config=config,
         )
-        contest_state = classify_contest_between_actions(
-            target_action_summary,
-            target_speech_text,
-            source_response.action_summary,
-            source_response.speech_text,
-            prompt.source_interaction_kind,
-        )
+        contest_state = source_response.contest_state
+        if is_direct_world_counter_response(
+            source_world_impact_type=response.world_impact_type,
+            response_world_impact_type=source_response.world_impact_type,
+            source_actor_id=prompt.target_actor_id,
+            source_actor_name=prompt.target_actor_name,
+            response_target_actor_id=source_response.action_target_actor_id,
+            response_target_name=source_response.action_target_name,
+        ):
+            contest_state = "opposed"
         if contest_state == "opposed":
             opposed_prompt = PublicTurnOpposedPrompt(
                 check_id=f"{round_state.round_id}_{prompt.source_actor_id}_opposed",
@@ -1187,7 +1389,7 @@ def resolve_interaction_prompt_submission(
                 source_action_summary=source_response.action_summary or prompt.source_action_summary,
                 source_speech_text=source_response.speech_text,
                 source_interaction_kind=prompt.source_interaction_kind,
-                source_action_target_name=prompt.target_actor_name,
+                source_action_target_name=source_response.action_target_name or prompt.target_actor_name,
                 source_speech_target_name=source_response.speech_target_name,
                 target_actor_id=prompt.target_actor_id,
                 target_actor_name=prompt.target_actor_name,
@@ -1228,7 +1430,7 @@ def resolve_interaction_prompt_submission(
         settlement.interaction_target_name = prompt.source_actor_name
         settlement.interaction_resolution = (
             "accepted"
-            if classify_interaction_consent(source_response.action_summary, source_response.speech_text) == "accepted"
+            if source_response.consent_state == "accepted"
             else "ambiguous_non_opposed"
         )
         settlement.opposed_target_name = prompt.source_actor_name
@@ -1237,13 +1439,16 @@ def resolve_interaction_prompt_submission(
         settlement.opposed_target_speech_target_name = source_response.speech_target_name
         return events, impact, settlement, action_result, None
 
-    contest_state = classify_contest_between_actions(
-        prompt.source_action_summary,
-        prompt.source_speech_text,
-        target_action_summary,
-        target_speech_text,
-        prompt.source_interaction_kind,
-    )
+    contest_state = response.contest_state
+    if is_direct_world_counter_response(
+        source_world_impact_type=prompt.source_world_impact_type,
+        response_world_impact_type=response.world_impact_type,
+        source_actor_id=prompt.source_actor_id,
+        source_actor_name=prompt.source_actor_name,
+        response_target_actor_id=(response_target.actor_id if response_target is not None else None),
+        response_target_name=(response_target.name if response_target is not None else response.target_label),
+    ):
+        contest_state = "opposed"
     if contest_state == "opposed":
         opposed_prompt = PublicTurnOpposedPrompt(
             check_id=f"{round_state.round_id}_{prompt.source_actor_id}_opposed",
@@ -1284,8 +1489,8 @@ def resolve_interaction_prompt_submission(
                 source_context="public_turn",
                 resolution_rule="static_dc",
                 target_role_id=None,
-                target_name=prompt.target_actor_name,
-                target_actor_kind=("player" if prompt.target_actor_kind == "player" else "npc"),
+                target_name=action_target_name,
+                target_actor_kind=("player" if action_target_actor_id == save.player_static_data.player_id else None),
                 forced_target_dice_roll=None,
                 allow_backend_roll=True,
                 resolution_context="embedded",
@@ -1310,7 +1515,7 @@ def resolve_interaction_prompt_submission(
             "\n".join(part for part in (prompt.source_action_summary, target_action_summary) if part.strip())
         ),
     }
-    interaction_resolution = "accepted" if classify_interaction_consent(target_action_summary, target_speech_text) == "accepted" else "ambiguous_non_opposed"
+    interaction_resolution = "accepted" if response.consent_state == "accepted" else "ambiguous_non_opposed"
     events, impact, settlement, _ = _finalize_ai_actor_turn(
         save,
         actor=actor,
@@ -1320,9 +1525,9 @@ def resolve_interaction_prompt_submission(
         action_result=action_result,
         reputation_score=reputation_score,
         base_events=base_events,
-        action_target_actor_id=prompt.target_actor_id,
-        action_target_name=prompt.source_action_target_name or prompt.target_actor_name,
-        action_target_kind=prompt.target_actor_kind,
+        action_target_actor_id=action_target_actor_id,
+        action_target_name=action_target_name,
+        action_target_kind=action_target_kind,
         speech_target_name=prompt.source_speech_target_name,
         source_world_impact_type=prompt.source_world_impact_type,
         target_response_world_impact_type=response.world_impact_type,

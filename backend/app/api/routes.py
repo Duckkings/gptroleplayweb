@@ -108,6 +108,7 @@ from app.models.schemas import (
     PublicTurnOpposedPlanRequest,
     PublicTurnOpposedPlanResponse,
     PublicTurnOpposedResolveRequest,
+    PublicTurnProtocolRepairRequest,
     PublicTurnReactionCheckRequest,
     PublicTurnResponse,
     PublicTurnStateResponse,
@@ -256,6 +257,8 @@ from app.services.public_turn_service import (
     run_public_turn_entry_stream,
     run_public_turn_opposed_once,
     run_public_turn_opposed_plan_once,
+    run_public_turn_protocol_repair_once,
+    run_public_turn_protocol_repair_stream,
     run_public_turn_opposed_stream,
     run_public_turn_reaction_once,
     run_public_turn_reaction_stream,
@@ -313,7 +316,9 @@ def _public_turn_status_code(detail: str) -> int:
         return 403
     if detail in {"PUBLIC_TURN_PENDING_NOT_FOUND"}:
         return 404
-    if detail in {"PUBLIC_TURN_REACTION_MISMATCH", "PUBLIC_TURN_OPPOSED_MISMATCH", "PUBLIC_TURN_PLAYER_CHECK_REQUIRED"}:
+    if detail.startswith("AI_CONFIG_REQUIRED"):
+        return 400
+    if detail in {"PUBLIC_TURN_REACTION_MISMATCH", "PUBLIC_TURN_OPPOSED_MISMATCH", "PUBLIC_TURN_PLAYER_CHECK_REQUIRED", "PUBLIC_TURN_PROTOCOL_REPAIR_MISMATCH"}:
         return 409
     return 409
 
@@ -616,6 +621,8 @@ async def pending_turn_current(session_id: str) -> PendingTurnContinueResponse |
         public_turn_state=public_turn_state,
         public_turn_presentation=public_turn_presentation,
         npc_role_id=state.npc_role_id,
+        public_turn_protocol_repair_notice=state.public_turn_protocol_repair_notice,
+        public_turn_protocol_repair_request=state.public_turn_protocol_repair_request,
     )
 
 
@@ -640,6 +647,18 @@ async def public_turn_entry(payload: PublicTurnEntryRequest) -> PublicTurnRespon
 async def public_turn_continue(payload: PublicTurnContinueRequest) -> PublicTurnResponse | PendingTurnContinueResponse:
     try:
         return run_public_turn_continue_once(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=_public_turn_status_code(str(exc)), detail=str(exc))
+    except RateLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except APIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.post("/public-turn/protocol-repair", response_model=PublicTurnResponse | PendingTurnContinueResponse)
+async def public_turn_protocol_repair(payload: PublicTurnProtocolRepairRequest) -> PublicTurnResponse | PendingTurnContinueResponse:
+    try:
+        return run_public_turn_protocol_repair_once(payload)
     except ValueError as exc:
         raise HTTPException(status_code=_public_turn_status_code(str(exc)), detail=str(exc))
     except RateLimitError as exc:
@@ -764,6 +783,66 @@ async def public_turn_continue_stream(request: Request, payload: PublicTurnConti
                 if isinstance(result, PendingTurnContinueResponse):
                     pass
                 else:
+                    await queue.put(
+                        (
+                            "end",
+                            {
+                                "archived_sub_zone_turn_id": result.archived_sub_zone_turn_id,
+                                "round_completed": result.round_completed,
+                                "phase": result.phase.value,
+                                "public_turn_state": result.public_turn_state.model_dump(mode="json"),
+                                "presentation": result.presentation.model_dump(mode="json"),
+                            },
+                        )
+                    )
+            except asyncio.CancelledError:
+                pass
+            except ValueError as exc:
+                await queue.put(("error", {"code": _public_turn_status_code(str(exc)), "message": str(exc)}))
+            except RateLimitError as exc:
+                await queue.put(("error", {"code": 429, "message": str(exc)}))
+            except APIError as exc:
+                await queue.put(("error", {"code": 502, "message": str(exc)}))
+            except Exception as exc:
+                await queue.put(("error", {"code": 500, "message": str(exc)}))
+            finally:
+                await queue.put((None, None))
+
+        task = asyncio.create_task(worker())
+        yield _sse_frame("start", {"session_id": payload.session_id})
+        try:
+            while True:
+                event, data = await queue.get()
+                if event is None:
+                    break
+                yield _sse_frame(event, data or {})
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+
+@router.post("/public-turn/protocol-repair/stream")
+async def public_turn_protocol_repair_stream(request: Request, payload: PublicTurnProtocolRepairRequest) -> StreamingResponse:
+    async def event_gen():
+        queue: asyncio.Queue[tuple[str | None, dict | None]] = asyncio.Queue()
+
+        async def emit(event: str, data: dict) -> None:
+            await queue.put((event, data))
+
+        async def worker() -> None:
+            try:
+                result = await run_public_turn_protocol_repair_stream(
+                    payload,
+                    emit=emit,
+                    is_cancelled=request.is_disconnected,
+                )
+                if not isinstance(result, PendingTurnContinueResponse):
                     await queue.put(
                         (
                             "end",

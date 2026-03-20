@@ -253,3 +253,16 @@
   - prompt `target_actor_*` is the real action target / responding actor
   - `speech_target_*` is auxiliary narration metadata only
 - `response_kind="no_action"` persists as a normal resolved interaction outcome rather than a canceled / interrupted state.
+
+## 2026-03-20 Public-Turn Protocol Repair Persistence
+
+- `PendingTurnState.status` now allows `awaiting_protocol_repair`.
+- `PendingTurnContinueResponse.status` now allows `awaiting_protocol_repair`.
+- `PendingTurnState` may now persist:
+  - `public_turn_protocol_repair_notice`
+  - `public_turn_protocol_repair_request`
+- `PendingTurnContinueResponse` may now mirror:
+  - `public_turn_protocol_repair_notice`
+  - `public_turn_protocol_repair_request`
+- No new save shard was added for protocol repair.
+- The repair checkpoint still reuses the staged pending-turn save snapshot and original request payload.

@@ -146,7 +146,7 @@ export type PendingTurnContinueResponse = {
   session_id: string;
   pending_turn_id?: string | null;
   flow_kind: 'main_chat' | 'encounter' | 'npc_chat' | 'map_move' | 'public_turn';
-  status: 'awaiting_reaction' | 'awaiting_opposed' | 'completed' | 'cancelled';
+  status: 'awaiting_reaction' | 'awaiting_opposed' | 'awaiting_protocol_repair' | 'completed' | 'cancelled';
   reply_text: string;
   scene_events: SceneEvent[];
   tool_events: ToolEvent[];
@@ -161,6 +161,28 @@ export type PendingTurnContinueResponse = {
   public_turn_presentation?: PublicTurnPresentation | null;
   archived_sub_zone_turn_id?: string | null;
   npc_role_id?: string | null;
+  public_turn_protocol_repair_notice?: PublicTurnProtocolRepairNotice | null;
+  public_turn_protocol_repair_request?: PublicTurnProtocolRepairRequest | null;
+};
+
+export type PublicTurnProtocolEnumViolation = {
+  field_path: string;
+  invalid_value?: string | null;
+  allowed_ids: string[];
+  reason: string;
+};
+
+export type PublicTurnProtocolRepairNotice = {
+  code: string;
+  message: string;
+  violations: PublicTurnProtocolEnumViolation[];
+};
+
+export type PublicTurnProtocolRepairRequest = {
+  session_id: string;
+  pending_turn_id: string;
+  continue_kind: 'entry' | 'continue' | 'reaction' | 'opposed';
+  config?: AppConfig;
 };
 
 export type PublicTurnPhase =

@@ -185,10 +185,10 @@ export function PublicTurnOpposedModal({
             </p>
             <div className="scene-event-kv-grid">
               <p>
-                对方: d20({result.dice_roll ?? '-'}) {formatModifier(result.ability_modifier)} = {result.total_score ?? '-'}
+                你: d20({result.dice_roll ?? rollValue ?? '-'}) {formatModifier(result.ability_modifier)} = {result.total_score ?? '-'}
               </p>
               <p>
-                你: d20({result.target_dice_roll ?? rollValue ?? '-'}) {formatModifier(result.target_ability_modifier)} ={' '}
+                对方: {result.target_name || '对手'} d20({result.target_dice_roll ?? '-'}) {formatModifier(result.target_ability_modifier)} ={' '}
                 {result.target_total_score ?? '-'}
               </p>
             </div>
