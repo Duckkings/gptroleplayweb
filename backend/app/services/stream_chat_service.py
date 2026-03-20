@@ -2488,7 +2488,7 @@ async def run_main_turn_stream(
                         await _emit_phase(emit, "intent_route", "done", "requires model turn")
                         time_spent_min = world.apply_speech_time(payload.session_id, last_user.content, payload.config)
                         save = world.get_current_save(default_session_id=payload.session_id)
-                        context_json = world.build_main_turn_context_json(save, last_user.content, recent_turn_count=8)
+                        context_json = world.build_main_turn_context_json(save, last_user.content, recent_turn_count=4)
                         audience_context = _public_audience_context(save, last_user.content)
 
                         await _emit_phase(emit, "tool_plan", "running", "planning tools")
@@ -2972,7 +2972,7 @@ async def _continue_main_turn_state(
         if last_user is None:
             raise ValueError("LAST_USER_MESSAGE_REQUIRED")
         save = world.get_current_save(default_session_id=payload.session_id)
-        context_json = world.build_main_turn_context_json(save, last_user.content, recent_turn_count=8)
+        context_json = world.build_main_turn_context_json(save, last_user.content, recent_turn_count=4)
         audience_context = _public_audience_context(save, last_user.content)
         candidate_rows = public_scene_runtime.candidate_rows(
             save,
@@ -3329,4 +3329,3 @@ async def run_pending_turn_stream(
 
 async def run_pending_turn_once(req) -> PendingTurnContinueResponse:
     return await run_pending_turn_stream(req, emit=None, is_cancelled=None)
-

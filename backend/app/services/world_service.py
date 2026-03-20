@@ -446,7 +446,11 @@ def build_main_turn_context_payload(save: SaveFile, player_message: str, *, rece
 
 
 def build_main_turn_context_json(save: SaveFile, player_message: str, *, recent_turn_count: int = 8) -> str:
-    return json.dumps(build_main_turn_context_payload(save, player_message, recent_turn_count=recent_turn_count), ensure_ascii=False, indent=2)
+    return json.dumps(
+        build_main_turn_context_payload(save, player_message, recent_turn_count=recent_turn_count),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def _build_scene_context_payload(
@@ -6389,4 +6393,3 @@ def describe_behavior(session_id: str, movement_log: MovementLog, config: ChatCo
         raise
     except Exception as exc:
         raise AIBehaviorError(str(exc)) from exc
-
