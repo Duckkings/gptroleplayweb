@@ -166,6 +166,12 @@ function renderActorEntry(entry: PublicTurnSettlementEntry) {
           {renderCheck(entry.check)}
         </div>
       ) : null}
+      {entry.gm_resolution_summary.trim() && (
+        <div className="scene-event-block">
+          <span>Outcome Narration</span>
+          <p>{entry.gm_resolution_summary}</p>
+        </div>
+      )}
       {emptyActorEntry && <p className="hint">AI returned no visible action or speech this turn.</p>}
       <div className="scene-event-block">
         <span>Structured Consequences</span>
