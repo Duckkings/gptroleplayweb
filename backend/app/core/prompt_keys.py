@@ -59,9 +59,4 @@ REQUIRED_PROMPT_KEYS: tuple[str, ...] = (
     PromptKeys.ENCOUNTER_REJOIN_USER,
     PromptKeys.ENCOUNTER_DEBUG_SUMMARY_USER,
     PromptKeys.ENCOUNTER_OUTCOME_PACKAGE_USER,
-    # Death system prompts (optional for now)
-    PromptKeys.DEATH_DYING_NARRATIVE,
-    PromptKeys.DEATH_SAVE_NARRATIVE,
-    PromptKeys.DEATH_DECLARATION_NARRATIVE,
-    PromptKeys.DEATH_REVIVAL_NARRATIVE,
 )

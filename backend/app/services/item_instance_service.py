@@ -39,6 +39,36 @@ def _find_item_instance(save: SaveFile, item_instance_id: str | None) -> ItemIns
     return next((item for item in save.item_instance_state.items if item.item_instance_id == item_instance_id), None)
 
 
+def _sync_instance_from_inventory_item(instance: ItemInstance, item: InventoryItem) -> bool:
+    changed = False
+    quantity = max(1, int(item.quantity or 1))
+    if instance.quantity != quantity:
+        instance.quantity = quantity
+        changed = True
+    if instance.uses_left != item.uses_left:
+        instance.uses_left = item.uses_left
+        changed = True
+    if instance.uses_max != item.uses_max:
+        instance.uses_max = item.uses_max
+        changed = True
+    if item.name and instance.display_name != item.name:
+        instance.display_name = item.name
+        changed = True
+    description = str(item.description or "")
+    if instance.description_override != description:
+        instance.description_override = description
+        changed = True
+    metadata = dict(instance.metadata or {})
+    compat_item_id = str(item.item_id or "").strip()
+    if compat_item_id and metadata.get("compat_item_id") != compat_item_id:
+        metadata["compat_item_id"] = compat_item_id
+        instance.metadata = metadata
+        changed = True
+    if changed:
+        instance.updated_at = _utc_now()
+    return changed
+
+
 def _template_maps() -> tuple[dict[str, ItemDefinition], dict[str, EquipmentDefinition]]:
     library = load_template_library()
     item_defs = {item.definition_id: item for item in library.item_definitions}
@@ -184,11 +214,17 @@ def _migrate_profile_inventory(save: SaveFile) -> bool:
                     old_to_new[instance_id] = instance_id
         for item in sheet.backpack.items:
             if item.item_id in existing_ids:
+                existing = _find_item_instance(save, item.item_id)
+                if existing is not None and _sync_instance_from_inventory_item(existing, item):
+                    changed = True
                 old_to_new[item.item_id] = item.item_id
                 continue
             definition_id = ensure_definition_for_inventory_item(item)
             instance_id = f"{owner_kind}_{owner_id}_{item.item_id}".replace(" ", "_")
             if instance_id in existing_ids:
+                existing = _find_item_instance(save, instance_id)
+                if existing is not None and _sync_instance_from_inventory_item(existing, item):
+                    changed = True
                 old_to_new[item.item_id] = instance_id
                 continue
             instance = ItemInstance(
@@ -265,6 +301,11 @@ def ensure_item_system(save: SaveFile) -> bool:
     _ensure_owner_backpack_projection(save)
     _project_interactables(save)
     return changed
+
+
+def refresh_item_system_projection(save: SaveFile) -> None:
+    _ensure_owner_backpack_projection(save)
+    _project_interactables(save)
 
 
 def resolve_owner_instances(save: SaveFile, *, owner_kind: str, owner_id: str) -> list[ItemInstance]:

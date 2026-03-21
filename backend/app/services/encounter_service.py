@@ -50,6 +50,15 @@ from app.services.consistency_service import (
     validate_entity_refs,
 )
 from app.services.ai_adapter import build_completion_options, create_sync_client
+from app.services.ai_protocol_contract_service import (
+    AI_PROTOCOL_REPAIR_FAILED,
+    AI_PROVIDER_CALL_FAILED,
+    EnumContractField,
+    allow_protocol_repair,
+    render_enum_pool_text,
+    require_ai_config,
+    validate_or_repair_json_payload,
+)
 from app.services.generation_debug_log_service import current_generation_debug_log
 from app.services.world_service import (
     _advance_clock,
@@ -929,7 +938,7 @@ def _ai_generate_encounter(save, trigger_kind: str, config: ChatConfig | None) -
     try:
         client = create_sync_client(config, client_cls=OpenAI)
         resp = client.chat.completions.create(
-            model=model,
+            model=config.model,
             **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
@@ -937,10 +946,24 @@ def _ai_generate_encounter(save, trigger_kind: str, config: ChatConfig | None) -
                 {"role": "user", "content": prompt},
             ],
         )
-        parsed = _extract_json_content((resp.choices[0].message.content or "").strip())
-        typ = str(parsed.get("type") or "event").strip().lower()
-        if typ not in {"npc", "event", "anomaly"}:
-            typ = "event"
+        raw_json = (resp.choices[0].message.content or "").strip() or "{}"
+        parsed = _extract_json_content(raw_json)
+        parsed = validate_or_repair_json_payload(
+            parsed=parsed,
+            raw_json=raw_json,
+            fields=(
+                EnumContractField(field_path="type", allowed_ids=("npc", "event", "anomaly")),
+                EnumContractField(
+                    field_path="termination_conditions[].kind",
+                    allowed_ids=("npc_leaves", "player_escapes", "target_resolved", "time_elapsed", "manual_custom"),
+                    required=False,
+                ),
+            ),
+            config=config,
+            system_prompt=prompt_table.get_text("encounter.generate.system", "Return JSON only."),
+            original_prompt=prompt,
+        )
+        typ = str(parsed.get("type") or "").strip().lower()
         title = str(parsed.get("title") or "").strip()
         description = str(parsed.get("description") or "").strip()
         tags = parsed.get("tags") if isinstance(parsed.get("tags"), list) else []
@@ -965,12 +988,7 @@ def _ai_generate_encounter(save, trigger_kind: str, config: ChatConfig | None) -
 
 
 def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig | None) -> EncounterEntry | None:
-    if config is None:
-        return None
-    api_key = (config.openai_api_key or "").strip()
-    model = (config.model or "").strip()
-    if not api_key or not model:
-        return None
+    config = require_ai_config(config)
 
     zone_name, sub_name, zone_id, sub_zone_id = _current_area_data(save)
     zone_metric = zone_metric_service.get_zone_metric_entry(save, zone_id=zone_id, zone_name=zone_name, create=True)
@@ -1019,6 +1037,11 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
         visible_npcs=_prompt_list([f"{npc.role_id}:{npc.name}" for npc in snapshot.available_npcs]),
         active_quests=_prompt_list([f"{quest.quest_id}:{quest.title}" for quest in snapshot.active_quests]),
     )
+    prompt = (
+        f"{prompt}\nAllowed enum ids:\n"
+        f"{render_enum_pool_text((EnumContractField(field_path='type', allowed_ids=('npc', 'event', 'anomaly')), EnumContractField(field_path='termination_conditions[].kind', allowed_ids=('npc_leaves', 'player_escapes', 'target_resolved', 'time_elapsed', 'manual_custom'), required=False)))}\n"
+        "Use only the allowed stable ids for type and termination_conditions[].kind."
+    )
     debug_log = current_generation_debug_log()
     if debug_log is not None:
         debug_log.record(
@@ -1029,7 +1052,7 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
     try:
         client = create_sync_client(config, client_cls=OpenAI)
         resp = client.chat.completions.create(
-            model=model,
+            model=config.model,
             **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
@@ -1037,10 +1060,25 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
                 {"role": "user", "content": prompt},
             ],
         )
-        parsed = _extract_json_content((resp.choices[0].message.content or "").strip())
-        typ = str(parsed.get("type") or "event").strip().lower()
-        if typ not in {"npc", "event", "anomaly"}:
-            typ = "event"
+        raw_json = (resp.choices[0].message.content or "").strip() or "{}"
+        parsed = _extract_json_content(raw_json)
+        with allow_protocol_repair():
+            parsed = validate_or_repair_json_payload(
+                parsed=parsed,
+                raw_json=raw_json,
+                fields=(
+                    EnumContractField(field_path="type", allowed_ids=("npc", "event", "anomaly")),
+                    EnumContractField(
+                        field_path="termination_conditions[].kind",
+                        allowed_ids=("npc_leaves", "player_escapes", "target_resolved", "time_elapsed", "manual_custom"),
+                        required=False,
+                    ),
+                ),
+                config=config,
+                system_prompt=prompt_table.get_text("encounter.generate.system", "Return JSON only."),
+                original_prompt=prompt,
+            )
+        typ = str(parsed.get("type") or "").strip().lower()
         title = _force_chinese_text(parsed.get("title"), fallback_encounter.title, limit=80)
         description = _force_chinese_text(parsed.get("description"), fallback_encounter.description, limit=240)
         scene_summary = _force_chinese_text(
@@ -1051,7 +1089,7 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
         tags = parsed.get("tags") if isinstance(parsed.get("tags"), list) else []
         clean_tags = [str(item).strip()[:40] for item in tags[:6] if str(item).strip()]
         if not title or not description:
-            return None
+            raise ValueError(AI_PROTOCOL_REPAIR_FAILED)
 
         entity_refs: list[EntityRef] = []
         npc_role_id = _sanitize_allowed_id(parsed.get("npc_role_id"), allowed_npc_ids)
@@ -1075,8 +1113,6 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
                 continue
             kind = str(raw.get("kind") or "").strip()
             description_text = _force_chinese_text(raw.get("description"), "", limit=160)
-            if kind not in {"npc_leaves", "player_escapes", "target_resolved", "time_elapsed", "manual_custom"}:
-                continue
             if not description_text:
                 continue
             termination_conditions.append(
@@ -1101,7 +1137,7 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
                         "npc encounter missing npc carrier",
                         {"reason": "npc_type_missing_npc_role_id_new_npc_and_temporary_npcs"},
                     )
-                return None
+                raise ValueError(AI_PROTOCOL_REPAIR_FAILED)
             npc_name = next((item.name for item in save.role_pool if item.role_id == npc_role_id), npc_role_id)
             if npc_role_id and npc_name and npc_name not in title:
                 title = f"{npc_name}: {title}"
@@ -1146,10 +1182,12 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
                 encounter.participant_role_ids.append(npc_role_id)
         encounter.entity_refs = extract_entity_refs_from_encounter(encounter) + entity_refs
         return encounter
+    except ValueError:
+        raise
     except Exception as exc:
         if debug_log is not None:
             debug_log.record("encounter_generation_error", str(exc))
-        return None
+        raise ValueError(f"{AI_PROVIDER_CALL_FAILED}: {exc}") from exc
 
 
 def get_pending_encounters(session_id: str) -> EncounterPendingResponse:
@@ -1206,14 +1244,6 @@ def check_for_encounter(req: EncounterCheckRequest) -> EncounterCheckResponse:
         return EncounterCheckResponse(ok=True, generated=False, blocked_by_higher_priority_modal=_has_pending_quest(save))
 
     encounter = _ai_generate_encounter_guarded(save, req.trigger_kind, req.config)
-    if encounter is None:
-        if debug_log is not None:
-            debug_log.record(
-                "encounter_generation_fallback",
-                "using fallback encounter",
-                {"reason": "ai_generation_returned_none", "trigger_kind": req.trigger_kind},
-            )
-        encounter = _fallback_encounter(save, req.trigger_kind)
     encounter.source_world_revision = world_state.world_revision
     encounter.source_map_revision = world_state.map_revision
     encounter.situation_start_value = _calculate_initial_situation_value(save, encounter)
@@ -1461,12 +1491,7 @@ def _legacy_unused_resolve_fallback_reply_v1(encounter: EncounterEntry, player_p
 
 def _legacy_unused_ai_resolve_encounter_v1(encounter: EncounterEntry, req: EncounterActRequest) -> dict[str, object] | None:
     config = req.config
-    if config is None:
-        return None
-    api_key = (config.openai_api_key or "").strip()
-    model = (config.model or "").strip()
-    if not api_key or not model:
-        return None
+    config = require_ai_config(config)
     fallback_reply, fallback_minutes = _resolve_fallback_reply(encounter, req.player_prompt)
     save = get_current_save(default_session_id=req.session_id)
     team_members, visible_npcs = _visible_participant_text(save, encounter)
@@ -1501,7 +1526,7 @@ def _legacy_unused_ai_resolve_encounter_v1(encounter: EncounterEntry, req: Encou
     try:
         client = create_sync_client(config, client_cls=OpenAI)
         resp = client.chat.completions.create(
-            model=model,
+            model=config.model,
             **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
@@ -1593,17 +1618,12 @@ def act_on_encounter(encounter_id: str, req: EncounterActRequest) -> EncounterAc
         content=req.player_prompt.strip(),
     )
     resolved = _ai_resolve_encounter(encounter, req)
-    if resolved is None:
-        reply, time_spent_min = _resolve_fallback_reply(encounter, req.player_prompt)
-        next_scene_summary, termination_updates, step_kind = _fallback_step_updates(encounter, req.player_prompt)
-        situation_delta_hint = _fallback_situation_delta(encounter, req.player_prompt)
-    else:
-        reply = str(resolved.get("reply") or "").strip()
-        time_spent_min = max(1, min(30, int(resolved.get("time_spent_min") or 1)))
-        next_scene_summary = str(resolved.get("scene_summary") or "").strip() or encounter.scene_summary or encounter.description
-        termination_updates = resolved.get("termination_updates") if isinstance(resolved.get("termination_updates"), list) else []
-        step_kind = str(resolved.get("step_kind") or "gm_update")
-        situation_delta_hint = _clamp(int(resolved.get("situation_delta_hint") or 0), -8, 8)
+    reply = str(resolved.get("reply") or "").strip()
+    time_spent_min = max(1, min(30, int(resolved.get("time_spent_min") or 1)))
+    next_scene_summary = str(resolved.get("scene_summary") or "").strip() or encounter.scene_summary or encounter.description
+    termination_updates = resolved.get("termination_updates") if isinstance(resolved.get("termination_updates"), list) else []
+    step_kind = str(resolved.get("step_kind") or "gm_update")
+    situation_delta_hint = _clamp(int(resolved.get("situation_delta_hint") or 0), -8, 8)
     if save.area_snapshot.clock is None:
         save.area_snapshot.clock = _default_world_clock()
     save.area_snapshot.clock = _advance_clock(save.area_snapshot.clock, time_spent_min)

@@ -29,6 +29,14 @@ from app.models.schemas import (
     TeamStateResponse,
 )
 from app.services.ai_adapter import build_completion_options, create_sync_client
+from app.services.ai_protocol_contract_service import (
+    AI_PROVIDER_CALL_FAILED,
+    EnumContractField,
+    allow_protocol_repair,
+    render_enum_pool_text,
+    require_ai_config,
+    validate_or_repair_json_payload,
+)
 from app.services.consistency_service import build_npc_knowledge_snapshot
 from app.services.world_service import (
     _ability_mod,
@@ -1047,12 +1055,7 @@ def _fallback_team_chat_reply(role: NpcRoleCard, player_text: str) -> tuple[str,
 
 
 def _ai_team_chat_reply(save, role: NpcRoleCard, player_text: str, config) -> tuple[str, str] | None:
-    if config is None:
-        return None
-    api_key = (config.openai_api_key or "").strip()
-    model = (config.model or "").strip()
-    if not api_key or not model:
-        return None
+    config = require_ai_config(config)
     try:
         client = create_sync_client(config, client_cls=OpenAI)
         knowledge = build_npc_knowledge_snapshot(save, role.role_id)
@@ -1093,8 +1096,9 @@ def _ai_team_chat_reply(save, role: NpcRoleCard, player_text: str, config) -> tu
             context=context,
             player_text=player_text,
         )
+        prompt = f"{prompt}\nAllowed enum ids:\n{render_enum_pool_text((EnumContractField(field_path='response_mode', allowed_ids=('speech', 'action')),))}"
         resp = client.chat.completions.create(
-            model=model,
+            model=config.model,
             **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
@@ -1109,16 +1113,26 @@ def _ai_team_chat_reply(save, role: NpcRoleCard, player_text: str, config) -> tu
             getattr(usage, "prompt_tokens", 0) or 0,
             getattr(usage, "completion_tokens", 0) or 0,
         )
-        parsed = json.loads((resp.choices[0].message.content or "{}").strip())
+        raw_json = (resp.choices[0].message.content or "{}").strip() or "{}"
+        parsed = json.loads(raw_json)
+        with allow_protocol_repair():
+            parsed = validate_or_repair_json_payload(
+                parsed=parsed if isinstance(parsed, dict) else {},
+                raw_json=raw_json,
+                fields=(EnumContractField(field_path="response_mode", allowed_ids=("speech", "action")),),
+                config=config,
+                system_prompt=config.gm_prompt,
+                original_prompt=prompt,
+            )
         content = str(parsed.get("content") or "").strip()
         if not content:
-            return None
-        response_mode = str(parsed.get("response_mode") or "speech").strip().lower()
-        if response_mode not in {"speech", "action"}:
-            response_mode = "speech"
+            raise ValueError("AI_PROTOCOL_REPAIR_FAILED")
+        response_mode = str(parsed.get("response_mode") or "").strip().lower()
         return content[:120], response_mode
-    except Exception:
-        return None
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"{AI_PROVIDER_CALL_FAILED}: {exc}") from exc
 
 
 def team_chat(req: TeamChatRequest) -> TeamChatResponse:
@@ -1155,11 +1169,7 @@ def team_chat(req: TeamChatRequest) -> TeamChatResponse:
             clock=save.area_snapshot.clock,
             context_kind="team_chat",
         )
-        generated = _ai_team_chat_reply(save, role, player_text, req.config)
-        if generated is None:
-            content, response_mode = _fallback_team_chat_reply(role, player_text)
-        else:
-            content, response_mode = generated
+        content, response_mode = _ai_team_chat_reply(save, role, player_text, req.config)
         affinity_delta, trust_delta = _team_chat_deltas(player_text)
         _append_npc_dialogue(
             role=role,

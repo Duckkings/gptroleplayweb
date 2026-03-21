@@ -10,6 +10,15 @@ from app.core.prompt_keys import PromptKeys
 from app.core.prompt_table import prompt_table
 from app.models.schemas import ChatConfig, EncounterActRequest, EncounterDebugOverviewResponse, EncounterEntry, EncounterResolution
 from app.services.ai_adapter import build_completion_options, create_sync_client
+from app.services.ai_protocol_contract_service import (
+    AI_PROTOCOL_REPAIR_FAILED,
+    AI_PROVIDER_CALL_FAILED,
+    EnumContractField,
+    allow_protocol_repair,
+    render_enum_pool_text,
+    require_ai_config,
+    validate_or_repair_json_payload,
+)
 from app.services.world_service import _new_scene_event, _parse_player_intent, ensure_encounter_location_target_in_save
 
 
@@ -167,15 +176,9 @@ def resolve_fallback_reply(save, encounter: EncounterEntry, player_prompt: str, 
     return reply, minutes
 
 
-def ai_resolve_encounter(encounter: EncounterEntry, req: EncounterActRequest, *, assessment: SituationAssessment | None = None) -> dict[str, object] | None:
+def ai_resolve_encounter(encounter: EncounterEntry, req: EncounterActRequest, *, assessment: SituationAssessment | None = None) -> dict[str, object]:
     legacy = _legacy()
-    config = req.config
-    if config is None:
-        return None
-    api_key = (config.openai_api_key or "").strip()
-    model = (config.model or "").strip()
-    if not api_key or not model:
-        return None
+    config = require_ai_config(req.config)
     save = legacy.get_current_save(default_session_id=req.session_id)
     fallback_reply, fallback_minutes = resolve_fallback_reply(save, encounter, req.player_prompt, assessment=assessment)
     team_members, visible_npcs = legacy._visible_participant_text(save, encounter)
@@ -195,10 +198,16 @@ def ai_resolve_encounter(encounter: EncounterEntry, req: EncounterActRequest, *,
         visible_npcs=visible_npcs,
         participant_role_ids=", ".join(encounter.participant_role_ids) if encounter.participant_role_ids else "none",
     )
+    prompt = (
+        f"{prompt}\nAllowed enum ids:\n"
+        f"{render_enum_pool_text((EnumContractField(field_path='step_kind', allowed_ids=('gm_update', 'resolution')),))}\n"
+        "Use only the allowed stable ids for step_kind."
+    )
     try:
+        system_prompt = prompt_table.get_text("encounter.resolve.system", "浣犲彧杈撳嚭 JSON銆傛墍鏈夋枃鏈瓧娈典娇鐢ㄧ畝浣撲腑鏂囥€?")
         client = create_sync_client(config, client_cls=OpenAI)
         resp = client.chat.completions.create(
-            model=model,
+            model=config.model,
             **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
@@ -206,11 +215,19 @@ def ai_resolve_encounter(encounter: EncounterEntry, req: EncounterActRequest, *,
                 {"role": "user", "content": prompt},
             ],
         )
-        parsed = legacy._extract_json_content((resp.choices[0].message.content or "").strip())
+        raw_json = (resp.choices[0].message.content or "").strip() or "{}"
+        parsed = legacy._extract_json_content(raw_json)
+        with allow_protocol_repair():
+            parsed = validate_or_repair_json_payload(
+                parsed=parsed,
+                raw_json=raw_json,
+                fields=(EnumContractField(field_path="step_kind", allowed_ids=("gm_update", "resolution")),),
+                config=config,
+                system_prompt=system_prompt,
+                original_prompt=prompt,
+            )
         minutes = max(1, min(30, int(parsed.get("time_spent_min") or fallback_minutes or 1)))
-        step_kind = str(parsed.get("step_kind") or "gm_update").strip().lower()
-        if step_kind not in {"gm_update", "resolution"}:
-            step_kind = "gm_update"
+        step_kind = str(parsed.get("step_kind") or "").strip().lower()
         reply, next_scene_summary = concretize_encounter_reply(
             save,
             encounter,
@@ -222,6 +239,14 @@ def ai_resolve_encounter(encounter: EncounterEntry, req: EncounterActRequest, *,
             opened_opportunity=str(parsed.get("opened_opportunity") or ""),
             assessment=assessment,
         )
+        reply = legacy._force_chinese_text(reply, fallback_reply, limit=240)
+        next_scene_summary = legacy._force_chinese_text(
+            next_scene_summary,
+            encounter.scene_summary or encounter.description or fallback_reply,
+            limit=240,
+        )
+        if not reply:
+            raise ValueError(AI_PROTOCOL_REPAIR_FAILED)
         termination_updates = parsed.get("termination_updates")
         if not isinstance(termination_updates, list):
             termination_updates = []
@@ -275,8 +300,10 @@ def ai_resolve_encounter(encounter: EncounterEntry, req: EncounterActRequest, *,
             "step_kind": step_kind,
             "termination_updates": termination_updates,
         }
-    except Exception:
-        return None
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"{AI_PROVIDER_CALL_FAILED}: {exc}") from exc
 
 
 def fallback_step_updates(encounter: EncounterEntry, player_prompt: str) -> tuple[str, list[dict[str, object]], str]:
@@ -640,6 +667,7 @@ def _apply_background_world_pushes(
 
 def advance_active_encounter_in_save(save, *, session_id: str, minutes_elapsed: int, config: ChatConfig | None = None) -> EncounterEntry | None:
     legacy = _legacy()
+    config = require_ai_config(config)
     state = legacy._state(save)
     encounter = legacy._current_active_encounter(state)
     if encounter is None or encounter.player_presence != "away" or encounter.status not in {"active", "escaped"}:
@@ -656,13 +684,9 @@ def advance_active_encounter_in_save(save, *, session_id: str, minutes_elapsed: 
     raw_scene_summary = encounter.scene_summary or encounter.description
     world_pushes: list[dict[str, Any]] = []
     actor_updates: list[dict[str, Any]] = []
-    if config is not None:
-        api_key = (config.openai_api_key or "").strip()
-        model = (config.model or "").strip()
-        if api_key and model:
-            try:
-                client = create_sync_client(config, client_cls=OpenAI)
-                prompt = prompt_table.render(
+    try:
+        client = create_sync_client(config, client_cls=OpenAI)
+        prompt = prompt_table.render(
                     PromptKeys.ENCOUNTER_BACKGROUND_TICK_USER,
                     "",
                     title=encounter.title,
@@ -675,8 +699,8 @@ def advance_active_encounter_in_save(save, *, session_id: str, minutes_elapsed: 
                     team_members=team_members,
                     visible_npcs=visible_npcs,
                 )
-                resp = client.chat.completions.create(
-                    model=model,
+        resp = client.chat.completions.create(
+            model=config.model,
                     **build_completion_options(config),
                     response_format={"type": "json_object"},
                     messages=[
@@ -684,14 +708,16 @@ def advance_active_encounter_in_save(save, *, session_id: str, minutes_elapsed: 
                         {"role": "user", "content": prompt},
                     ],
                 )
-                parsed = legacy._extract_json_content((resp.choices[0].message.content or "").strip())
-                raw_reply = str(parsed.get("reply") or raw_reply)
-                raw_scene_summary = str(parsed.get("scene_summary") or raw_scene_summary)
-                world_pushes = _normalize_background_world_pushes(parsed)
-                actor_updates = _normalize_background_actor_updates(parsed)
-                legacy._apply_termination_updates(encounter, parsed.get("termination_updates"))
-            except Exception:
-                pass
+        parsed = legacy._extract_json_content((resp.choices[0].message.content or "").strip())
+        raw_reply = str(parsed.get("reply") or raw_reply)
+        raw_scene_summary = str(parsed.get("scene_summary") or raw_scene_summary)
+        world_pushes = _normalize_background_world_pushes(parsed)
+        actor_updates = _normalize_background_actor_updates(parsed)
+        legacy._apply_termination_updates(encounter, parsed.get("termination_updates"))
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"{AI_PROVIDER_CALL_FAILED}: {exc}") from exc
 
     reply, next_scene_summary = concretize_encounter_reply(
         save,
@@ -773,7 +799,14 @@ def advance_active_encounter_from_main_chat_in_save(
             _new_scene_event(
                 "encounter_progress",
                 result.reply,
-                metadata={"encounter_id": result.encounter_id, "encounter_title": encounter.title, "status": result.status},
+                metadata={
+                    "encounter_id": result.encounter_id,
+                    "encounter_title": encounter.title,
+                    "status": result.status,
+                    "requires_check": True,
+                    "escape_success": result.escape_success,
+                    "from_main_chat": True,
+                },
             )
         ]
 
@@ -794,16 +827,11 @@ def advance_active_encounter_from_main_chat_in_save(
             config=config,
         ),
     )
-    if resolved is None:
-        reply, _ = legacy._resolve_fallback_reply(encounter, display_text or gm_narration)
-        next_scene_summary, termination_updates, step_kind = legacy._fallback_step_updates(encounter, display_text or gm_narration)
-        situation_delta_hint = legacy._fallback_situation_delta(encounter, display_text or gm_narration)
-    else:
-        reply = str(resolved.get("reply") or "").strip()
-        next_scene_summary = str(resolved.get("scene_summary") or "").strip() or encounter.scene_summary or encounter.description
-        termination_updates = resolved.get("termination_updates") if isinstance(resolved.get("termination_updates"), list) else []
-        step_kind = str(resolved.get("step_kind") or "gm_update")
-        situation_delta_hint = legacy._clamp(int(resolved.get("situation_delta_hint") or 0), -8, 8)
+    reply = str(resolved.get("reply") or "").strip()
+    next_scene_summary = str(resolved.get("scene_summary") or "").strip() or encounter.scene_summary or encounter.description
+    termination_updates = resolved.get("termination_updates") if isinstance(resolved.get("termination_updates"), list) else []
+    step_kind = str(resolved.get("step_kind") or "gm_update")
+    situation_delta_hint = legacy._clamp(int(resolved.get("situation_delta_hint") or 0), -8, 8)
 
     situation_delta = legacy._clamp(situation_delta_hint + legacy._check_bonus_from_player_prompt(player_text), -20, 20)
     assessment = assess_situation_change(encounter.situation_value, situation_delta, legacy._clamp(encounter.situation_value + situation_delta, 0, 100))
@@ -874,6 +902,7 @@ def advance_active_encounter_from_main_chat_in_save(
 
 def advance_active_encounter_in_save_v3(save, *, session_id: str, minutes_elapsed: int, config: ChatConfig | None = None) -> EncounterEntry | None:
     legacy = _legacy()
+    config = require_ai_config(config)
     state = legacy._state(save)
     encounter = legacy._current_active_encounter(state)
     if encounter is None or encounter.player_presence != "away" or encounter.status not in {"active", "escaped"}:
@@ -1110,10 +1139,6 @@ def advance_active_encounter_from_main_chat_in_save_v3(
             metadata={"encounter_id": encounter.encounter_id, "encounter_title": encounter.title, "status": encounter.status},
         ),
     ]
-
-
-advance_active_encounter_in_save = advance_active_encounter_in_save_v3
-advance_active_encounter_from_main_chat_in_save = advance_active_encounter_from_main_chat_in_save_v3
 
 
 def get_encounter_debug_overview(session_id: str) -> EncounterDebugOverviewResponse:

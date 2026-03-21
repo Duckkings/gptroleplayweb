@@ -15,6 +15,7 @@ from app.models.schemas import (
     AreaZone,
     ChatConfig,
     Coord3D,
+    EncounterCheckResponse,
     MoveRequest,
     Position,
     RegionGenerateRequest,
@@ -36,8 +37,64 @@ class MapFlowServiceTests(unittest.TestCase):
         storage_state.set_save_path(str(root / "current-save.json"))
         storage_state.set_config_path(str(root / "config.json"))
         set_current_user(None)
+        self._encounter_check_patcher = patch(
+            "app.services.encounter_service.check_for_encounter",
+            return_value=EncounterCheckResponse(generated=False),
+        )
+        self._action_plan_patcher = patch(
+            "app.services.world_service._ai_action_plan",
+            return_value={
+                "ability_used": "intelligence",
+                "dc": 12,
+                "time_spent_min": 3,
+                "requires_check": True,
+                "check_task": "检查地面的痕迹",
+            },
+        )
+        self._scene_actor_action_patcher = patch(
+            "app.services.public_scene_runtime_v2._ai_actor_action",
+            return_value={
+                "response_mode": "respond",
+                "incoming_from_actor_id": "",
+                "incoming_from_actor_name": "",
+                "incoming_summary": "",
+                "incoming_reaction_narration": "",
+                "incoming_reaction_speech": "",
+                "ignore_reason": "",
+                "external_action_narration": "旁观者迅速关注到现场变化。",
+                "speech_line": "先稳住眼前局势。",
+                "visible_intent": "先压住公开场景里的风险。",
+                "private_goal": "保护现场。",
+                "private_reason": "风险正在扩大。",
+                "expression_cues": "神情紧绷",
+                "body_language": "压低重心",
+                "risk_source": "现场",
+                "risk_object": "公开局势",
+                "risk_location": "当前区域",
+                "specific_threat": "公开局势的压力还在持续上升。",
+                "target_label": "公开局势",
+                "speech_target_label": "玩家",
+                "world_impact_type": "non_world",
+                "needs_check": True,
+                "action_type": "check",
+                "action_prompt": "actor=旁观者; target=公开局势; threat=公开局势的压力还在持续上升",
+                "situation_delta_hint": 1,
+            },
+        )
+        self._scene_round_resolution_patcher = patch(
+            "app.services.public_scene_runtime_v2._ai_round_resolution",
+            return_value="公开场景暂时稳定下来。",
+        )
+        self._encounter_check_patcher.start()
+        self._action_plan_patcher.start()
+        self._scene_actor_action_patcher.start()
+        self._scene_round_resolution_patcher.start()
 
     def tearDown(self) -> None:
+        self._scene_round_resolution_patcher.stop()
+        self._scene_actor_action_patcher.stop()
+        self._action_plan_patcher.stop()
+        self._encounter_check_patcher.stop()
         storage_state.set_save_path(str(self._orig_save))
         storage_state.set_config_path(str(self._orig_config))
         set_current_user(self._orig_user)

@@ -2189,7 +2189,7 @@ def _apply_structured_main_turn_bundle_result(
         save,
         session_id=session_id,
         minutes_elapsed=time_spent_min,
-        config=None,
+        config=config,
     )
     if advanced is not None:
         scene_events.append(

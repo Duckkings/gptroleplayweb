@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app.core.storage import _save_bundle_dir, read_json, storage_state
 from app.models.schemas import (
@@ -10,6 +11,7 @@ from app.models.schemas import (
     Coord3D,
     EncounterActRequest,
     EncounterCheckRequest,
+    EncounterEntry,
     EncounterPresentRequest,
     FateEvaluateRequest,
     FateGenerateRequest,
@@ -36,11 +38,41 @@ class QuestFateEncounterTests(unittest.TestCase):
         root = Path(self._tmpdir.name)
         storage_state.set_save_path(str(root / 'current-save.json'))
         storage_state.set_config_path(str(root / 'config.json'))
+        self._patchers = [
+            patch('app.services.encounter_service._ai_generate_encounter_guarded', side_effect=self._fake_generate_encounter),
+            patch('app.services.encounter_service._ai_resolve_encounter', side_effect=self._fake_resolve_encounter),
+        ]
+        for patcher in self._patchers:
+            patcher.start()
 
     def tearDown(self) -> None:
+        for patcher in reversed(getattr(self, '_patchers', [])):
+            patcher.stop()
         storage_state.set_save_path(str(self._orig_save))
         storage_state.set_config_path(str(self._orig_config))
         self._tmpdir.cleanup()
+
+    def _fake_generate_encounter(self, save, trigger_kind: str, config=None):
+        return EncounterEntry(
+            encounter_id='enc_test_generated',
+            type='anomaly',
+            trigger_kind=(trigger_kind if trigger_kind in {'quest_rule', 'fate_rule', 'scripted', 'debug_forced', 'random_move', 'random_dialog'} else 'quest_rule'),
+            title='异常核心',
+            description='一处正在扩散的异常核心。',
+            zone_id='zone_town',
+            sub_zone_id='sub_zone_town_1',
+            scene_summary='异常核心正在波动。',
+        )
+
+    def _fake_resolve_encounter(self, encounter, req):
+        return {
+            'reply': '你成功压制了异常核心。',
+            'time_spent_min': 3,
+            'scene_summary': '异常核心被成功压制。',
+            'termination_updates': [{'condition_index': 0, 'satisfied': True}],
+            'step_kind': 'resolution',
+            'situation_delta_hint': 6,
+        }
 
     def _seed_context(self, session_id: str) -> None:
         save = clear_current_save(session_id)

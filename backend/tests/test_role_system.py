@@ -73,14 +73,106 @@ class RoleSystemTests(unittest.TestCase):
         root = Path(self._tmpdir.name)
         storage_state.set_save_path(str(root / "current-save.json"))
         storage_state.set_config_path(str(root / "config.json"))
+        from app.services import public_scene_runtime_v2 as public_scene_runtime_module
+        from app.services import world_service as world_service_module
+
+        self._real_actor_action = public_scene_runtime_module._ai_actor_action
+        self._real_round_resolution = public_scene_runtime_module._ai_round_resolution
+        self._real_action_plan = world_service_module._ai_action_plan
+        self._actor_action_patcher = patch(
+            "app.services.public_scene_runtime_v2._ai_actor_action",
+            side_effect=self._fake_actor_action,
+        )
+        self._round_resolution_patcher = patch(
+            "app.services.public_scene_runtime_v2._ai_round_resolution",
+            side_effect=self._fake_round_resolution,
+        )
+        self._action_plan_patcher = patch(
+            "app.services.world_service._ai_action_plan",
+            side_effect=self._fake_action_plan,
+        )
+        self._actor_action_mock = self._actor_action_patcher.start()
+        self._round_resolution_mock = self._round_resolution_patcher.start()
+        self._action_plan_mock = self._action_plan_patcher.start()
 
     def tearDown(self) -> None:
+        self._action_plan_patcher.stop()
+        self._round_resolution_patcher.stop()
+        self._actor_action_patcher.stop()
         storage_state.set_save_path(str(self._orig_save))
         storage_state.set_config_path(str(self._orig_config))
         self._tmpdir.cleanup()
 
     def _chat_config(self) -> ChatConfig:
         return ChatConfig(openai_api_key="test-key", model="test-model", stream=False, gm_prompt="gm")
+
+    def _fake_actor_action(self, save, actor: dict[str, object], **kwargs):
+        actor_name = str(actor.get("name") or "角色")
+        target_label = "现场局势"
+        prompt_table.render(
+            PromptKeys.SCENE_ACTOR_ACTION_USER,
+            "",
+            role_name=actor_name,
+            actor_type=str(actor.get("actor_type") or "npc"),
+            roleplay_brief=f"{actor_name}关注公开场景里的风险。",
+            player_text=str(kwargs.get("player_text") or ""),
+            gm_summary=str(kwargs.get("gm_summary") or ""),
+            world_time_text="",
+            priority_reason=str(actor.get("priority_reason") or ""),
+            incoming_interaction_json=json.dumps(kwargs.get("incoming_interaction") or {}, ensure_ascii=False),
+            scene_context_json=json.dumps(kwargs.get("scene_context") or {}, ensure_ascii=False),
+        )
+        return {
+            "response_mode": "respond",
+            "incoming_from_actor_id": "",
+            "incoming_from_actor_name": "",
+            "incoming_summary": "",
+            "incoming_reaction_narration": "",
+            "incoming_reaction_speech": "",
+            "ignore_reason": "",
+            "external_action_narration": f"{actor_name}立刻朝最危险的位置靠近。",
+            "speech_line": f"{actor_name}低声提醒大家先稳住局势。",
+            "visible_intent": f"{actor_name}想先压住眼前最危险的变化。",
+            "private_goal": f"{actor_name}想保护现场并继续推进局势。",
+            "private_reason": f"{actor_name}判断拖延会让风险继续扩大。",
+            "expression_cues": "神情紧绷",
+            "body_language": "压低重心",
+            "risk_source": actor_name,
+            "risk_object": target_label,
+            "risk_location": "人群中央",
+            "specific_threat": f"{target_label}的压力还在持续上升。",
+            "target_label": target_label,
+            "speech_target_label": "玩家",
+            "world_impact_type": "non_world",
+            "needs_check": True,
+            "action_type": "check",
+            "action_prompt": f"actor={actor_name}; target={target_label}; threat={target_label}的压力还在持续上升",
+            "situation_delta_hint": 2,
+        }
+
+    def _fake_round_resolution(self, result_rows: list[dict[str, object]], **kwargs) -> str:
+        actor_names = [str(item.get("actor_name") or "").strip() for item in result_rows if str(item.get("actor_name") or "").strip()]
+        joined = "、".join(actor_names[:3]) or "众人"
+        prompt_table.render(
+            PromptKeys.SCENE_ROUND_RESOLVE_USER,
+            "",
+            player_text=str(kwargs.get("player_text") or ""),
+            gm_summary=str(kwargs.get("gm_summary") or ""),
+            direction=str(kwargs.get("direction") or "hold"),
+            predicted_situation_value=int(kwargs.get("predicted_situation_value") or 0),
+            scene_context_json=json.dumps(kwargs.get("scene_context") or {}, ensure_ascii=False),
+            result_rows_json=json.dumps(result_rows, ensure_ascii=False),
+        )
+        return f"{joined}暂时把公开场景稳了下来。"
+
+    def _fake_action_plan(self, action_type: str, action_prompt: str, config):
+        return {
+            "ability_used": "intelligence",
+            "dc": 12,
+            "time_spent_min": 3,
+            "requires_check": True,
+            "check_task": "判断当前局势并采取行动",
+        }
 
     def _fake_openai_client(self, content: str):
         response = SimpleNamespace(

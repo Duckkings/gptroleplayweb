@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.core.storage import storage_state
@@ -48,6 +49,16 @@ class EncounterServiceTests(unittest.TestCase):
         storage_state.set_config_path(str(self._orig_config))
         self._tmpdir.cleanup()
 
+    def _chat_config(self) -> ChatConfig:
+        return ChatConfig(openai_api_key="test-key", model="test-model", stream=False, gm_prompt="gm")
+
+    def _fake_client(self, content: str):
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        )
+        return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_: response)))
+
     def _seed_context(self, session_id: str) -> None:
         save = clear_current_save(session_id)
         save.area_snapshot = AreaSnapshot(
@@ -74,7 +85,13 @@ class EncounterServiceTests(unittest.TestCase):
         save.encounter_state.debug_force_trigger = True
         save_current(save)
 
-        response = check_for_encounter(EncounterCheckRequest(session_id=sid, trigger_kind="debug_forced"))
+        fake_client = self._fake_client(
+            '{"type":"event","title":"异响","description":"广场附近传来可疑异动。","scene_summary":"广场开始紧张起来。","termination_conditions":[{"kind":"target_resolved","description":"查明异动来源。"}],"tags":["odd"]}'
+        )
+        with patch("app.services.encounter_service.create_sync_client", return_value=fake_client):
+            response = check_for_encounter(
+                EncounterCheckRequest(session_id=sid, trigger_kind="debug_forced", config=self._chat_config())
+            )
 
         self.assertTrue(response.generated)
         self.assertIsNotNone(response.encounter)
@@ -133,7 +150,16 @@ class EncounterServiceTests(unittest.TestCase):
         self.assertEqual(result.encounter_state.active_encounter_id, encounter.encounter_id)
 
         updated = get_current_save(sid)
-        advanced = advance_active_encounter_in_save(updated, session_id=sid, minutes_elapsed=5)
+        fake_client = self._fake_client(
+            '{"reply":"现场在玩家离开后继续变化。","scene_summary":"威胁仍在缓慢扩散。","termination_updates":[],"world_pushes":[],"actor_updates":[]}'
+        )
+        with patch("app.services.encounter_runtime_v2.create_sync_client", return_value=fake_client):
+            advanced = advance_active_encounter_in_save(
+                updated,
+                session_id=sid,
+                minutes_elapsed=5,
+                config=self._chat_config(),
+            )
         self.assertIsNotNone(advanced)
         assert advanced is not None
         self.assertEqual(advanced.background_tick_count, 1)
@@ -210,6 +236,7 @@ class EncounterServiceTests(unittest.TestCase):
             relation_tag_suggestion=None,
         )
 
+        save_current(save)
         with patch("app.services.world_service.action_check", return_value=action_result) as mocked:
             events = advance_active_encounter_from_main_chat_in_save(
                 save,
@@ -452,20 +479,14 @@ class EncounterServiceTests(unittest.TestCase):
         save = get_current_save(sid)
         save.encounter_state.debug_force_trigger = True
         save_current(save)
-        config = ChatConfig(openai_api_key="test-key", model="test-model", stream=False, gm_prompt="gm")
+        fake_client = self._fake_client(
+            '{"type":"event","title":"Strange Noise","description":"A suspicious sound echoes near the square.","scene_summary":"The square grows tense.","termination_conditions":[{"kind":"time_elapsed","description":"Time passes."}],"tags":["odd"]}'
+        )
 
-        class _FakeResponse:
-            def __init__(self) -> None:
-                self.choices = [type("Choice", (), {"message": type("Message", (), {"content": '{"type":"event","title":"Strange Noise","description":"A suspicious sound echoes near the square.","scene_summary":"The square grows tense.","termination_conditions":[{"kind":"time_elapsed","description":"Time passes."}],"tags":["odd"]}'})()})]
-
-        fake_client = type(
-            "Client",
-            (),
-            {"chat": type("Chat", (), {"completions": type("Completions", (), {"create": lambda *args, **kwargs: _FakeResponse()})()})()},
-        )()
-
-        with patch("app.services.encounter_service.OpenAI", return_value=fake_client):
-            response = check_for_encounter(EncounterCheckRequest(session_id=sid, trigger_kind="debug_forced", config=config))
+        with patch("app.services.encounter_service.create_sync_client", return_value=fake_client):
+            response = check_for_encounter(
+                EncounterCheckRequest(session_id=sid, trigger_kind="debug_forced", config=self._chat_config())
+            )
 
         self.assertTrue(response.generated)
         self.assertIsNotNone(response.encounter)
@@ -506,7 +527,7 @@ class EncounterServiceTests(unittest.TestCase):
             {"chat": type("Chat", (), {"completions": type("Completions", (), {"create": lambda *args, **kwargs: _FakeResponse()})()})()},
         )()
 
-        with patch("app.services.encounter_service.OpenAI", return_value=fake_client):
+        with patch("app.services.encounter_runtime_v2.create_sync_client", return_value=fake_client):
             result = act_on_encounter(
                 encounter.encounter_id,
                 EncounterActRequest(session_id=sid, player_prompt="我压低脚步，靠近巷口观察。", config=config),
@@ -702,7 +723,7 @@ class EncounterServiceTests(unittest.TestCase):
             {"chat": type("Chat", (), {"completions": type("Completions", (), {"create": lambda *args, **kwargs: _FakeResponse()})()})()},
         )()
 
-        with patch("app.services.encounter_service.OpenAI", return_value=fake_client):
+        with patch("app.services.encounter_service.create_sync_client", return_value=fake_client):
             response = check_for_encounter(EncounterCheckRequest(session_id=sid, trigger_kind="debug_forced", config=config))
 
         self.assertTrue(response.generated)

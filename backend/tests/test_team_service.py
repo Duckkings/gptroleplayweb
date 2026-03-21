@@ -37,8 +37,14 @@ class TeamServiceTests(unittest.TestCase):
         root = Path(self._tmpdir.name)
         storage_state.set_save_path(str(root / "current-save.json"))
         storage_state.set_config_path(str(root / "config.json"))
+        self._team_chat_patcher = patch(
+            "app.services.team_service._ai_team_chat_reply",
+            return_value=("我会继续跟上。", "speech"),
+        )
+        self._team_chat_patcher.start()
 
     def tearDown(self) -> None:
+        self._team_chat_patcher.stop()
         storage_state.set_save_path(str(self._orig_save))
         storage_state.set_config_path(str(self._orig_config))
         self._tmpdir.cleanup()
