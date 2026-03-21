@@ -948,6 +948,7 @@ class PublicTurnSegmentActorDirective(BaseModel):
     specific_threat: str = Field(default="", min_length=0)
     stakes_summary: str = Field(default="", min_length=0)
     situation_delta_hint: int = 0
+    reputation_delta_hint: int = 0
     pause_kind: Literal["none", "player_interaction", "player_reaction", "player_opposed"] = "none"
 
 
@@ -998,6 +999,8 @@ class PublicTurnOpposedPrompt(BaseModel):
     source_interaction_kind: str = Field(default="", min_length=0)
     source_action_target_name: str | None = None
     source_speech_target_name: str | None = None
+    source_situation_delta_hint: int = 0
+    source_reputation_delta_hint: int = 0
     target_actor_id: str = Field(..., min_length=1)
     target_actor_name: str = Field(..., min_length=1)
     stakes_summary: str = Field(default="", min_length=0)
@@ -1016,6 +1019,8 @@ class PublicTurnInteractionPrompt(BaseModel):
     source_speech_target_name: str | None = None
     source_action_prompt: str = Field(default="", min_length=0)
     source_world_impact_type: PublicTurnWorldImpactType = PublicTurnWorldImpactType.NON_WORLD
+    source_situation_delta_hint: int = 0
+    source_reputation_delta_hint: int = 0
     source_planned_requires_check: bool = False
     source_planned_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
     source_planned_dc: int | None = Field(default=None, ge=5, le=30)

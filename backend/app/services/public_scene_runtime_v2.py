@@ -469,6 +469,9 @@ def _ai_actor_action(
         "Do not use gaze targets, wink targets, gesture targets, or silent coordination partners as speech_target_label.\n"
         "If the narration mentions looking at actor A but the spoken line is addressed to actor B, speech_target_label must be actor B.\n"
         "If there is no spoken addressee, return an empty speech_target_label.\n"
+        "situation_delta_hint must be an integer between -8 and 8.\n"
+        "reputation_delta_hint must be an integer between -3 and 3 and represents direct public reputation impact in the current zone.\n"
+        "If there is no clear public reputation impact, return reputation_delta_hint as 0.\n"
         "When incoming_interaction_json is not empty, also classify whether this response accepts, rejects, or ambiguously answers the incoming interaction via consent_state, and whether it creates a direct opposed exchange via contest_state."
     )
     try:
@@ -540,6 +543,11 @@ def _ai_actor_action(
         "action_type": str(parsed.get("action_type") or "check").strip().lower(),
         "action_prompt": str(parsed.get("action_prompt") or "")[:200],
         "situation_delta_hint": legacy._clamp(int(parsed.get("situation_delta_hint") or 0), -8, 8),
+        "reputation_delta_hint": (
+            legacy._clamp(int(parsed.get("reputation_delta_hint") or 0), -3, 3)
+            if "reputation_delta_hint" in parsed
+            else None
+        ),
     }
     if payload["response_mode"] not in {"respond", "ignore", "none"}:
         raise ValueError("AI_PROTOCOL_REPAIR_FAILED")

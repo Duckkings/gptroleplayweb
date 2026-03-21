@@ -6409,7 +6409,7 @@ function App() {
                 )}
                 {structuredPublicTurnOutput ? (
                   <div className="public-turn-output-layout">
-                    <PublicTurnSettlementPane presentation={structuredPublicTurnOutput} />
+                    <PublicTurnSettlementPane presentation={structuredPublicTurnOutput} roundActive={Boolean(publicTurnRound)} />
                     <PublicTurnNarrativePane presentation={structuredPublicTurnOutput} />
                   </div>
                 ) : (

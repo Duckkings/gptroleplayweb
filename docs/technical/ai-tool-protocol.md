@@ -273,6 +273,20 @@
 - Alternation is only legal when a target-side `world` response points back at the original source actor.
 - If AI produces a reverse `world` response aimed at a third party, runtime must not open a new interaction branch from that payload.
 
+## 2026-03-21 Public-Turn Delta Hint Addendum
+
+- Public-turn actor action payloads may now include:
+  - `situation_delta_hint`
+  - `reputation_delta_hint`
+- `reputation_delta_hint` is interpreted as direct public reputation impact in the current zone and is clamped to `-3..3`.
+- Segment planner actor overrides may also return `reputation_delta_hint`.
+- Once a player-facing `interaction` or `opposed` pause is created, runtime now preserves the actor-side structured hints through:
+  - `PublicTurnInteractionPrompt.source_situation_delta_hint`
+  - `PublicTurnInteractionPrompt.source_reputation_delta_hint`
+  - `PublicTurnOpposedPrompt.source_situation_delta_hint`
+  - `PublicTurnOpposedPrompt.source_reputation_delta_hint`
+- Resume-time settlement must consume these structured hints directly instead of re-deriving deltas from free text.
+
 ## 2026-03-20 Enum Contract / Repair Policy
 
 - AI control fields now follow a shared protocol contract layer.

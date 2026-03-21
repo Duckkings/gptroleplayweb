@@ -9,10 +9,15 @@ import { PublicTurnInitiativeTrack } from './PublicTurnInitiativeTrack';
 
 type Props = {
   presentation: PublicTurnPresentation | null;
+  roundActive?: boolean;
 };
 
 function formatSigned(value: number): string {
   return `${value >= 0 ? '+' : ''}${value}`;
+}
+
+function cleanText(value: string | null | undefined): string {
+  return (value ?? '').trim();
 }
 
 function renderReactionText(action: string, speech: string, fallback: string): string | null {
@@ -32,11 +37,11 @@ function renderReactionText(action: string, speech: string, fallback: string): s
 
 function renderReactionMeta(focusName?: string | null, speechTargetName?: string | null): string | null {
   const parts: string[] = [];
-  if ((focusName ?? '').trim()) {
-    parts.push(`focus=${focusName}`);
+  if (cleanText(focusName)) {
+    parts.push(`focus=${cleanText(focusName)}`);
   }
-  if ((speechTargetName ?? '').trim()) {
-    parts.push(`to=${speechTargetName}`);
+  if (cleanText(speechTargetName)) {
+    parts.push(`to=${cleanText(speechTargetName)}`);
   }
   return parts.length ? parts.join(' / ') : null;
 }
@@ -80,7 +85,28 @@ function renderTeamReaction(row: PublicTurnTeamAffinityDelta) {
   );
 }
 
-function renderConsequences(entry: PublicTurnSettlementEntry) {
+function deriveOutcomeNarration(entry: PublicTurnSettlementEntry): string | null {
+  const gmText = cleanText(entry.gm_resolution_summary);
+  if (gmText) {
+    return gmText;
+  }
+  if (entry.check?.resolution_rule !== 'opposed_actor') {
+    return null;
+  }
+  const targetName = cleanText(entry.opposed_target_name) || cleanText(entry.check.target_name);
+  if (!targetName) {
+    return null;
+  }
+  const targetAction = cleanText(entry.opposed_target_action);
+  const targetSpeech = cleanText(entry.opposed_target_speech);
+  const targetResponse = [targetAction, targetSpeech ? `"${targetSpeech}"` : ''].filter(Boolean).join(' / ');
+  const outcomeText = entry.check.success
+    ? `${entry.actor_name}在这次对抗里压过了${targetName}。`
+    : `${entry.actor_name}没能压过${targetName}的回应。`;
+  return [targetResponse, outcomeText].filter(Boolean).join(' ');
+}
+
+function renderConsequences(entry: PublicTurnSettlementEntry, roundActive: boolean) {
   const hasConsequences =
     entry.situation_delta !== 0 ||
     entry.zone_reputation_delta !== 0 ||
@@ -97,9 +123,9 @@ function renderConsequences(entry: PublicTurnSettlementEntry) {
     <div className="public-turn-consequence-list">
       {(entry.situation_delta !== 0 || entry.zone_reputation_delta !== 0 || entry.environment_shift !== 0) && (
         <div className="scene-event-kv-grid">
-          {entry.situation_delta !== 0 && <p>Situation: {formatSigned(entry.situation_delta)}</p>}
-          {entry.zone_reputation_delta !== 0 && <p>Reputation: {formatSigned(entry.zone_reputation_delta)}</p>}
-          {entry.environment_shift !== 0 && <p>Environment: {formatSigned(entry.environment_shift)}</p>}
+          {entry.situation_delta !== 0 && <p>{roundActive ? 'Pending Situation' : 'Situation'}: {formatSigned(entry.situation_delta)}</p>}
+          {entry.zone_reputation_delta !== 0 && <p>{roundActive ? 'Pending Reputation' : 'Reputation'}: {formatSigned(entry.zone_reputation_delta)}</p>}
+          {entry.environment_shift !== 0 && <p>{roundActive ? 'Pending Environment' : 'Environment'}: {formatSigned(entry.environment_shift)}</p>}
         </div>
       )}
       {entry.relation_deltas.length > 0 && (
@@ -130,11 +156,13 @@ function renderConsequences(entry: PublicTurnSettlementEntry) {
   );
 }
 
-function renderActorEntry(entry: PublicTurnSettlementEntry) {
+function renderActorEntry(entry: PublicTurnSettlementEntry, roundActive: boolean) {
   const emptyActorEntry = !entry.action_summary.trim() && !entry.speech_text.trim();
   const noActionResponse =
     entry.target_response_kind === 'no_action' && !entry.opposed_target_action && !entry.opposed_target_speech;
   const shouldRenderCheck = entry.interaction_exchange_kind !== 'non_world_exchange';
+  const outcomeNarration = deriveOutcomeNarration(entry);
+
   return (
     <>
       <div className="scene-event-block">
@@ -166,22 +194,22 @@ function renderActorEntry(entry: PublicTurnSettlementEntry) {
           {renderCheck(entry.check)}
         </div>
       ) : null}
-      {entry.gm_resolution_summary.trim() && (
+      {outcomeNarration ? (
         <div className="scene-event-block">
           <span>Outcome Narration</span>
-          <p>{entry.gm_resolution_summary}</p>
+          <p>{outcomeNarration}</p>
         </div>
-      )}
-      {emptyActorEntry && <p className="hint">AI returned no visible action or speech this turn.</p>}
+      ) : null}
+      {emptyActorEntry ? <p className="hint">AI returned no visible action or speech this turn.</p> : null}
       <div className="scene-event-block">
-        <span>Structured Consequences</span>
-        {renderConsequences(entry)}
+        <span>{roundActive ? 'Pending Consequences' : 'Structured Consequences'}</span>
+        {renderConsequences(entry, roundActive)}
       </div>
     </>
   );
 }
 
-function renderGmEntry(entry: PublicTurnSettlementEntry) {
+function renderGmEntry(entry: PublicTurnSettlementEntry, roundActive: boolean) {
   const result = entry.gm_push_result;
   return (
     <>
@@ -189,26 +217,26 @@ function renderGmEntry(entry: PublicTurnSettlementEntry) {
         <span>Environment / Atmosphere</span>
         <p>{entry.gm_resolution_summary || 'No extra GM text this round.'}</p>
       </div>
-      {result && (
+      {result ? (
         <div className="scene-event-block">
           <span>d6 Push</span>
           <div className="scene-event-kv-grid">
             <p>Roll: {result.roll_d6}</p>
             <p>Outcome: {result.outcome_label || result.outcome_kind}</p>
-            {result.environment_change_text && <p>Environment: {result.environment_change_text}</p>}
-            {result.spawned_npc_name && <p>Intervention: {result.spawned_npc_name}</p>}
+            {result.environment_change_text ? <p>Environment: {result.environment_change_text}</p> : null}
+            {result.spawned_npc_name ? <p>Intervention: {result.spawned_npc_name}</p> : null}
           </div>
         </div>
-      )}
+      ) : null}
       <div className="scene-event-block">
-        <span>Structured Consequences</span>
-        {renderConsequences(entry)}
+        <span>{roundActive ? 'Pending Consequences' : 'Structured Consequences'}</span>
+        {renderConsequences(entry, roundActive)}
       </div>
     </>
   );
 }
 
-export function PublicTurnSettlementPane({ presentation }: Props) {
+export function PublicTurnSettlementPane({ presentation, roundActive = false }: Props) {
   const entries = presentation?.settlement_entries ?? [];
 
   return (
@@ -216,12 +244,15 @@ export function PublicTurnSettlementPane({ presentation }: Props) {
       <header className="public-turn-pane-header">
         <h3>结算区</h3>
         <p>Checks, opposed rolls, structured consequences, and the GM push appear here.</p>
+        {roundActive ? (
+          <p className="hint">本轮展示的 Situation / Reputation / Environment 变化仍是暂存值，只有当前公开回合结束后才会真正写入地区声望和遭遇局势。</p>
+        ) : null}
       </header>
 
       <PublicTurnInitiativeTrack entries={presentation?.initiative_order ?? []} />
 
       <div className="public-turn-settlement-list">
-        {entries.length === 0 && <p className="hint">No resolved actions yet this round.</p>}
+        {entries.length === 0 ? <p className="hint">No resolved actions yet this round.</p> : null}
         {entries.map((entry) => (
           <article key={entry.entry_id} className="scene-event-card public-turn-settlement-card">
             <header className="scene-event-card-header">
@@ -230,7 +261,9 @@ export function PublicTurnSettlementPane({ presentation }: Props) {
               </strong>
               <span className="scene-event-tag">{entry.entry_kind === 'gm_push' ? 'gm_push' : entry.phase}</span>
             </header>
-            <div className="scene-event-card-body">{entry.entry_kind === 'gm_push' ? renderGmEntry(entry) : renderActorEntry(entry)}</div>
+            <div className="scene-event-card-body">
+              {entry.entry_kind === 'gm_push' ? renderGmEntry(entry, roundActive) : renderActorEntry(entry, roundActive)}
+            </div>
           </article>
         ))}
       </div>

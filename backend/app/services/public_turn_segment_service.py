@@ -138,6 +138,7 @@ def _directive_payload(
         "action_type": directive.action_type,
         "action_prompt": directive.action_prompt,
         "situation_delta_hint": directive.situation_delta_hint,
+        "reputation_delta_hint": directive.reputation_delta_hint,
     }
 
 
@@ -484,6 +485,7 @@ def _fallback_directive(
         specific_threat=specific_threat,
         stakes_summary=specific_threat or action_summary,
         situation_delta_hint=max(-8, min(8, int(normalized.get("situation_delta_hint") or 0))),
+        reputation_delta_hint=max(-3, min(3, int(normalized.get("reputation_delta_hint") or 0))),
         pause_kind=planned["pause_kind"],  # type: ignore[arg-type]
     )
 
@@ -505,6 +507,8 @@ def _planner_prompt_payload(
                 "fallback_speech_text": directive.speech_text,
                 "fallback_specific_threat": directive.specific_threat,
                 "fallback_action_type": directive.action_type,
+                "fallback_situation_delta_hint": directive.situation_delta_hint,
+                "fallback_reputation_delta_hint": directive.reputation_delta_hint,
             }
         )
     return payload
@@ -608,6 +612,17 @@ def _apply_planner_overrides(
                 int((override or {}).get("situation_delta_hint") if (override or {}).get("situation_delta_hint") is not None else base.situation_delta_hint),
             ),
         ),
+        reputation_delta_hint=max(
+            -3,
+            min(
+                3,
+                int(
+                    (override or {}).get("reputation_delta_hint")
+                    if (override or {}).get("reputation_delta_hint") is not None
+                    else base.reputation_delta_hint
+                ),
+            ),
+        ),
         pause_kind=planned["pause_kind"],  # type: ignore[arg-type]
     )
 
@@ -634,7 +649,7 @@ def _planner_overrides(
                 "你是公开回合的段级行动规划器。只输出 JSON，结构为 "
                 "{\"actors\":[{\"actor_id\":\"...\",\"action_type\":\"check|attack|item_use\","
                 "\"action_summary\":\"...\",\"speech_text\":\"...\",\"specific_threat\":\"...\","
-                "\"speech_target_label\":\"\",\"situation_delta_hint\":0,"
+                "\"speech_target_label\":\"\",\"situation_delta_hint\":0,\"reputation_delta_hint\":0,"
                 "\"pause_kind\":\"none|player_interaction|player_reaction|player_opposed\"}]}。"
                 "你必须严格保持输入 actor 顺序，只能规划给定 actors。"
                 "target_label 表示动作目标，speech_target_label 表示说话对象，两者可以不同。"
@@ -656,7 +671,9 @@ def _planner_overrides(
             "speech_target_label must identify only the listener of the spoken line.\n"
             "Do not use gaze targets, wink targets, gesture targets, or silent coordination partners as speech_target_label.\n"
             "If an actor looks at player A but the spoken line is directed at actor B, speech_target_label must be actor B.\n"
-            "If there is no spoken addressee, return an empty speech_target_label."
+            "If there is no spoken addressee, return an empty speech_target_label.\n"
+            "situation_delta_hint must stay within -8..8.\n"
+            "reputation_delta_hint must stay within -3..3 and should describe direct public reputation impact in the current zone."
         )
         system_prompt = prompt_table.get_text("public.turn.segment_plan.system", "Return JSON only.")
         client = create_sync_client(config, client_cls=OpenAI)
@@ -842,6 +859,8 @@ def resolve_public_turn_segment(
                 source_speech_target_name=directive.speech_target_name,
                 source_action_prompt=directive.action_prompt,
                 source_world_impact_type=directive.world_impact_type,
+                source_situation_delta_hint=directive.situation_delta_hint,
+                source_reputation_delta_hint=directive.reputation_delta_hint,
                 source_planned_requires_check=directive.planned_requires_check,
                 source_planned_ability_used=directive.planned_ability_used,
                 source_planned_dc=directive.planned_dc,
@@ -888,6 +907,8 @@ def resolve_public_turn_segment(
                 source_interaction_kind=directive.interaction_kind,
                 source_action_target_name=directive.action_target_name,
                 source_speech_target_name=directive.speech_target_name,
+                source_situation_delta_hint=directive.situation_delta_hint,
+                source_reputation_delta_hint=directive.reputation_delta_hint,
                 target_actor_id=directive.interaction_target_actor_id or save.player_static_data.player_id,
                 target_actor_name=directive.interaction_target_name or save.player_static_data.name,
                 stakes_summary=directive.stakes_summary,
@@ -944,12 +965,14 @@ def resolve_public_turn_segment(
             interaction_resolution = "attack_flow"
         events, impact, settlement, situation_delta = _finalize_ai_actor_turn(
             save,
+            session_id=save.session_id,
             actor=actor,
             payload=payload,
             round_state=round_state,
             action_content=action_content,
             action_result=action_result,
             reputation_score=reputation_score,
+            config=config,
             base_events=events,
             action_target_actor_id=directive.action_target_actor_id,
             action_target_name=directive.action_target_name,

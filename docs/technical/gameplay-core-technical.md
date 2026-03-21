@@ -292,6 +292,18 @@
   - allowed for `team`
   - forced to `0` for all other actor kinds
 - Deterministic narration formatting now treats player settlements specially by appending AI NPC/team reaction fragments after the player action/speech.
+
+## Public Turn Hint Carry-Through Note (2026-03-21)
+
+- `PublicTurnSegmentActorDirective` now carries both:
+  - `situation_delta_hint`
+  - `reputation_delta_hint`
+- Planner overrides may now return `reputation_delta_hint` in addition to `situation_delta_hint`.
+- `PublicTurnInteractionPrompt` and `PublicTurnOpposedPrompt` now preserve:
+  - `source_situation_delta_hint`
+  - `source_reputation_delta_hint`
+- Pause/resume settlement no longer recomputes these values from text heuristics once a structured source hint already exists.
+- Public-turn settlement cards may show provisional `Situation / Reputation / Environment` deltas while a round is still active; actual zone reputation and encounter situation are committed only at round-end apply / GM push.
 - Stream emission still uses settlement-order fragments, but now falls back to direct settlement formatting if a compatible `narrative_entry` is not already present in the response payload.
 ## 2026-03-20 Public-Turn Target / Addressee / Contest Routing
 

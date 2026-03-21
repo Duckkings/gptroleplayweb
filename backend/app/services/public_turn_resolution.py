@@ -473,6 +473,9 @@ def normalize_public_turn_ai_payload(
         "action_type": action_type,
         "action_prompt": action_prompt,
         "situation_delta_hint": max(-8, min(8, int(source.get("situation_delta_hint") or 0))),
+        "reputation_delta_hint": (
+            max(-3, min(3, int(source.get("reputation_delta_hint") or 0))) if source.get("reputation_delta_hint") is not None else None
+        ),
         "incoming_reaction_narration": _normalize_public_turn_text(str(source.get("incoming_reaction_narration") or ""), limit=200),
         "incoming_reaction_speech": _normalize_public_turn_text(str(source.get("incoming_reaction_speech") or ""), limit=200),
     }
@@ -861,6 +864,8 @@ def _maybe_build_player_opposed_prompt(
         source_actor_name=str(actor.get("name") or ""),
         source_action_summary=str(payload.get("action_narration") or payload.get("visible_intent") or action_content)[:200],
         source_speech_text=str(payload.get("speech_line") or payload.get("speech_summary") or "")[:200],
+        source_situation_delta_hint=int(payload.get("situation_delta_hint") or 0),
+        source_reputation_delta_hint=int(payload.get("reputation_delta_hint") or 0),
         target_actor_id=save.player_static_data.player_id,
         target_actor_name=player_name,
         stakes_summary=str(payload.get("specific_threat") or action_content)[:240],
@@ -870,12 +875,14 @@ def _maybe_build_player_opposed_prompt(
 def _finalize_ai_actor_turn(
     save: SaveFile,
     *,
+    session_id: str,
     actor: dict[str, object],
     payload: dict[str, object],
     round_state: PublicTurnRound,
     action_content: str,
     action_result: ActionCheckResponse | None,
     reputation_score: int,
+    config: ChatConfig | None,
     base_events: list[SceneEvent],
     action_target_actor_id: str | None = None,
     action_target_name: str | None = None,
@@ -901,7 +908,13 @@ def _finalize_ai_actor_turn(
     del reputation_score, save
     actor_type = str(actor.get("actor_type") or "npc")
     situation_delta = public_scene_legacy._clamp(int(payload.get("situation_delta_hint") or 0) + check_bonus(action_result), -20, 20)
-    reputation_delta = reputation_delta_from_situation(situation_delta) if public_turn_zone_reputation_allowed(actor_type) else 0
+    reputation_hint = payload.get("reputation_delta_hint")
+    reputation_delta = 0
+    if public_turn_zone_reputation_allowed(actor_type):
+        if reputation_hint is None:
+            reputation_delta = reputation_delta_from_situation(situation_delta)
+        else:
+            reputation_delta = public_scene_legacy._clamp(int(reputation_hint or 0), -3, 3)
     relation_rows: list[dict[str, Any]] = []
     team_rows: list[dict[str, Any]] = []
     resolution_text = _last_nonempty_line(action_result.narrative if action_result is not None else "")
@@ -934,6 +947,26 @@ def _finalize_ai_actor_turn(
         environment_shift=(2 if any(token in str(payload.get("specific_threat") or "") for token in _DESTRUCTIVE_TOKENS) else 0),
         scene_events=events,
     )
+    resolution_summary = gm_resolution_summary
+    if (
+        not resolution_summary
+        and action_result is not None
+        and action_result.resolution_rule == "opposed_actor"
+        and opposed_target_name
+        and opposed_target_action
+    ):
+        resolution_summary = _generate_opposed_resolution_summary(
+            session_id=session_id,
+            actor_name=str(actor.get("name") or ""),
+            target_name=opposed_target_name,
+            actor_action_summary=str(payload.get("action_narration") or payload.get("visible_intent") or action_content),
+            actor_speech_text=str(payload.get("speech_line") or payload.get("speech_summary") or ""),
+            target_action_summary=opposed_target_action,
+            target_speech_text=opposed_target_speech or "",
+            stakes_summary=str(payload.get("specific_threat") or action_content),
+            action_result=action_result,
+            config=config,
+        )
     settlement = build_settlement_entry(
         round_state=round_state,
         actor_id=actor_id,
@@ -943,7 +976,7 @@ def _finalize_ai_actor_turn(
         speech_text=str(payload.get("speech_line") or payload.get("speech_summary") or ""),
         action_result=action_result,
         impact=impact,
-        gm_resolution_summary=gm_resolution_summary,
+        gm_resolution_summary=resolution_summary,
         action_target_actor_id=action_target_actor_id,
         action_target_name=action_target_name,
         action_target_kind=action_target_kind,
@@ -1045,12 +1078,14 @@ def resolve_ai_actor_turn(
         )
     events, impact, settlement, situation_delta = _finalize_ai_actor_turn(
         save,
+        session_id=save.session_id,
         actor=actor,
         payload=payload,
         round_state=round_state,
         action_content=action_content,
         action_result=action_result,
         reputation_score=reputation_score,
+        config=config,
         base_events=events,
     )
     pending_reaction = _build_reaction_for_actor(actor, payload=payload, situation_delta=situation_delta)
@@ -1234,18 +1269,19 @@ def resolve_opposed_prompt_submission(
         "speech_line": prompt.source_speech_text,
         "speech_summary": prompt.source_speech_text,
         "specific_threat": prompt.stakes_summary,
-        "situation_delta_hint": _situation_hint_from_text(
-            "\n".join(part for part in (prompt.source_action_summary, target_action_summary) if part.strip())
-        ),
+        "situation_delta_hint": prompt.source_situation_delta_hint,
+        "reputation_delta_hint": prompt.source_reputation_delta_hint,
     }
     events, impact, settlement, _ = _finalize_ai_actor_turn(
         save,
+        session_id=session_id,
         actor=actor,
         payload=payload,
         round_state=round_state,
         action_content=action_content,
         action_result=action_result,
         reputation_score=reputation_score,
+        config=config,
         base_events=base_events,
         action_target_actor_id=action_target_actor_id,
         action_target_name=action_target_name,
@@ -1391,6 +1427,8 @@ def resolve_interaction_prompt_submission(
                 source_interaction_kind=prompt.source_interaction_kind,
                 source_action_target_name=source_response.action_target_name or prompt.target_actor_name,
                 source_speech_target_name=source_response.speech_target_name,
+                source_situation_delta_hint=prompt.source_situation_delta_hint,
+                source_reputation_delta_hint=prompt.source_reputation_delta_hint,
                 target_actor_id=prompt.target_actor_id,
                 target_actor_name=prompt.target_actor_name,
                 stakes_summary=prompt.source_action_summary or prompt.source_action_prompt,
@@ -1461,6 +1499,8 @@ def resolve_interaction_prompt_submission(
             source_interaction_kind=prompt.source_interaction_kind,
             source_action_target_name=prompt.source_action_target_name,
             source_speech_target_name=prompt.source_speech_target_name,
+            source_situation_delta_hint=prompt.source_situation_delta_hint,
+            source_reputation_delta_hint=prompt.source_reputation_delta_hint,
             target_actor_id=prompt.target_actor_id,
             target_actor_name=prompt.target_actor_name,
             stakes_summary=prompt.source_action_summary or prompt.source_action_prompt,
@@ -1511,19 +1551,20 @@ def resolve_interaction_prompt_submission(
         "speech_summary": prompt.source_speech_text,
         "specific_threat": prompt.source_action_summary,
         "world_impact_type": prompt.source_world_impact_type.value,
-        "situation_delta_hint": _situation_hint_from_text(
-            "\n".join(part for part in (prompt.source_action_summary, target_action_summary) if part.strip())
-        ),
+        "situation_delta_hint": prompt.source_situation_delta_hint,
+        "reputation_delta_hint": prompt.source_reputation_delta_hint,
     }
     interaction_resolution = "accepted" if response.consent_state == "accepted" else "ambiguous_non_opposed"
     events, impact, settlement, _ = _finalize_ai_actor_turn(
         save,
+        session_id=session_id,
         actor=actor,
         payload=payload,
         round_state=round_state,
         action_content=action_content,
         action_result=action_result,
         reputation_score=reputation_score,
+        config=config,
         base_events=base_events,
         action_target_actor_id=action_target_actor_id,
         action_target_name=action_target_name,

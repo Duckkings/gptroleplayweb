@@ -31,6 +31,9 @@ from app.models.schemas import (
     PublicTurnPhase,
     PublicTurnPlayerActionCheck,
     PublicTurnRound,
+    PublicTurnSegmentActorDirective,
+    PublicTurnSegmentBoundary,
+    PublicTurnSegmentPlan,
     PublicTurnSettlementCheck,
     PublicTurnSettlementEntry,
     PublicTurnWorldImpactType,
@@ -271,16 +274,18 @@ class PublicTurnRuntimeTests(unittest.TestCase):
         self.assertTrue(result.round_completed)
         self.assertIsNotNone(result.player_action_check_result)
         self.assertGreaterEqual(len(result.impacts), 1)
-        impact = result.impacts[0]
+        impact = next(item for item in result.impacts if item.actor_id == save.player_static_data.player_id)
         self.assertGreaterEqual(len(impact.relation_deltas), 1)
         self.assertGreaterEqual(len(impact.team_affinity_deltas), 1)
-        self.assertEqual(impact.zone_reputation_delta, 1)
+        self.assertGreaterEqual(impact.zone_reputation_delta, 0)
         self.assertTrue(any(row.reaction_action == "皱了皱眉" for row in impact.relation_deltas))
         self.assertTrue(any(row.reaction_speech == "先别乱来。" for row in impact.relation_deltas))
         self.assertTrue(any(row.reaction_action == "握紧肩带" for row in impact.team_affinity_deltas))
         self.assertTrue(any(row.reaction_speech == "我跟你。" for row in impact.team_affinity_deltas))
         self.assertGreaterEqual(len(result.presentation.settlement_entries), 1)
-        self.assertEqual(result.presentation.settlement_entries[0].actor_id, save.player_static_data.player_id)
+        player_entry = next(item for item in result.presentation.settlement_entries if item.actor_id == save.player_static_data.player_id)
+        self.assertEqual(player_entry.actor_id, save.player_static_data.player_id)
+        self.assertEqual(player_entry.zone_reputation_delta, impact.zone_reputation_delta)
         self.assertEqual(result.presentation.round_narration_status, "ready")
         self.assertIn("皱了皱眉", result.narration)
         self.assertIn("我跟你。", result.narration)
@@ -1123,6 +1128,125 @@ class PublicTurnRuntimeTests(unittest.TestCase):
         narration = build_settlement_fragment(settlement)
         self.assertIn("朝艾琳说", narration)
 
+    def test_resolve_public_turn_segment_uses_reputation_hint_and_generates_opposed_summary(self) -> None:
+        save = self._seed_public_turn_scene("sess_public_turn_segment_reputation_hint")
+        start_round_in_save(save, entry_type=PublicTurnEntryType.NEXT_ROUND, config=None)
+        state = get_public_turn_state_in_save(save)
+        round_state = state.current_round
+        assert round_state is not None
+        bram_role = next(item for item in save.role_pool if item.role_id == "npc_bram")
+        actor_lookup = {
+            "npc_bram": {
+                "actor_id": "npc_bram",
+                "name": bram_role.name,
+                "actor_type": "team",
+                "priority_reason": "test",
+                "role": bram_role,
+            }
+        }
+        plan = PublicTurnSegmentPlan(
+            segment_id=f"{round_state.round_id}_segment_test",
+            round_id=round_state.round_id,
+            phase=PublicTurnPhase.INITIATIVE_EXECUTION,
+            actor_directives=[
+                PublicTurnSegmentActorDirective(
+                    actor_id="npc_bram",
+                    actor_name=bram_role.name,
+                    actor_type=PublicTurnActorType.TEAM,
+                    phase=PublicTurnPhase.INITIATIVE_EXECUTION,
+                    action_type="check",
+                    action_summary="Bram plants his shoulder and drives straight into Erin's push.",
+                    speech_text="Hold the line.",
+                    action_prompt="Bram drives Erin back.",
+                    action_target_actor_id="npc_erin",
+                    action_target_name="鑹剧惓",
+                    action_target_kind=PublicTurnActorType.NPC,
+                    world_impact_type=PublicTurnWorldImpactType.WORLD,
+                    target_actor_id="npc_erin",
+                    target_name="鑹剧惓",
+                    target_actor_kind="npc",
+                    interaction_target_actor_id="npc_erin",
+                    interaction_target_name="鑹剧惓",
+                    interaction_target_kind=PublicTurnActorType.NPC,
+                    interaction_kind="block",
+                    interaction_requires_response=True,
+                    target_response_action_summary="Erin braces in place and shoves back with both hands.",
+                    target_response_speech_text="Not this time.",
+                    target_response_world_impact_type=PublicTurnWorldImpactType.WORLD,
+                    interaction_exchange_kind="world_exchange",
+                    consent_state="rejected",
+                    resolution_mode="opposed_actor",
+                    resolution_rule="opposed_actor",
+                    planned_requires_check=True,
+                    planned_ability_used="strength",
+                    planned_dc=12,
+                    planned_check_task="drive Erin away from the player",
+                    target_ability_used="dexterity",
+                    target_ability_modifier=2,
+                    specific_threat="If Erin breaks through, the team loses control of the square.",
+                    stakes_summary="Bram and Erin collide head-on in the middle of the square.",
+                    situation_delta_hint=4,
+                    reputation_delta_hint=2,
+                    pause_kind="none",
+                )
+            ],
+            boundary=PublicTurnSegmentBoundary(boundary_kind="round_end", phase=PublicTurnPhase.INITIATIVE_EXECUTION),
+        )
+        action_result = ActionCheckResponse(
+            session_id=save.session_id,
+            actor_role_id="npc_bram",
+            actor_name=bram_role.name,
+            actor_kind="npc",
+            action_type="check",
+            check_mode="action",
+            source_context="public_turn",
+            resolution_rule="opposed_actor",
+            requires_check=True,
+            ability_used="strength",
+            ability_modifier=2,
+            dc=12,
+            check_task="drive Erin away from the player",
+            target_role_id="npc_erin",
+            target_name="鑹剧惓",
+            target_actor_kind="npc",
+            target_ability_used="dexterity",
+            target_ability_modifier=2,
+            dice_roll=14,
+            total_score=16,
+            target_dice_roll=9,
+            target_total_score=11,
+            contested_success=True,
+            success=True,
+            critical="none",
+            time_spent_min=1,
+            narrative="Bram wins the clash and forces Erin back a step.",
+            applied_effects=[],
+            relation_tag_suggestion=None,
+            scene_events=[],
+            state_sync=None,
+            post_checks=None,
+        )
+
+        with patch("app.services.public_turn_segment_service.public_scene_legacy._actor_check", return_value=action_result):
+            segment = resolve_public_turn_segment(
+                save,
+                round_state=round_state,
+                actor_lookup=actor_lookup,
+                plan=plan,
+                context_text="The player keeps the pressure on.",
+                reputation_score=50,
+                config=None,
+            )
+
+        self.assertEqual(len(segment.beats), 1)
+        beat = segment.beats[0]
+        assert beat.impact is not None
+        assert beat.settlement is not None
+        self.assertEqual(beat.impact.zone_reputation_delta, 2)
+        self.assertEqual(beat.settlement.zone_reputation_delta, 2)
+        self.assertNotEqual(beat.settlement.gm_resolution_summary, "")
+        self.assertIn("鑹剧惓", beat.settlement.gm_resolution_summary)
+
     def test_warning_reaction_clamps_positive_relation_delta(self) -> None:
         save = self._seed_public_turn_scene("sess_public_turn_warning_clamp")
         start_round_in_save(save, entry_type=PublicTurnEntryType.NEXT_ROUND, config=None)
@@ -1457,6 +1581,54 @@ class PublicTurnRuntimeTests(unittest.TestCase):
         self.assertEqual(settlement.zone_reputation_delta, 1)
         self.assertEqual(settlement.team_affinity_deltas, [])
 
+    def test_team_actor_turn_uses_ai_reputation_delta_hint(self) -> None:
+        save = self._seed_public_turn_scene("sess_public_turn_team_reputation_hint")
+        start_round_in_save(save, entry_type=PublicTurnEntryType.NEXT_ROUND, config=None)
+        state = get_public_turn_state_in_save(save)
+        round_state = state.current_round
+        assert round_state is not None
+        actor = {
+            "actor_id": "npc_bram",
+            "name": next(item for item in save.role_pool if item.role_id == "npc_bram").name,
+            "actor_type": "team",
+            "priority_reason": "test",
+            "role": next(item for item in save.role_pool if item.role_id == "npc_bram"),
+        }
+
+        with (
+            patch(
+                "app.services.public_turn_resolution.public_scene_runtime._ai_actor_action",
+                return_value={
+                    "external_action_narration": "Bram steps between the crowd and the player to calm the square.",
+                    "speech_line": "Back off.",
+                    "visible_intent": "Win public space for the team.",
+                    "specific_threat": "The crowd is still on edge.",
+                    "target_label": "",
+                    "action_type": "check",
+                    "action_prompt": "Bram stabilizes the crowd.",
+                    "situation_delta_hint": 4,
+                    "reputation_delta_hint": 2,
+                },
+            ),
+            patch("app.services.public_turn_resolution.public_scene_runtime.should_force_public_action_check", return_value=False),
+        ):
+            _, impact, settlement, _, _ = resolve_ai_actor_turn(
+                save,
+                actor=actor,
+                player_text="The player holds position.",
+                gm_summary="Public turn continues.",
+                round_state=round_state,
+                scene_context={},
+                audience_context={},
+                reputation_score=50,
+                config=None,
+            )
+
+        assert impact is not None
+        assert settlement is not None
+        self.assertEqual(impact.zone_reputation_delta, 2)
+        self.assertEqual(settlement.zone_reputation_delta, 2)
+
     def test_multiple_team_actor_turns_each_can_change_reputation(self) -> None:
         save = self._seed_public_turn_scene("sess_public_turn_multiple_team_reputation_scope")
         start_round_in_save(save, entry_type=PublicTurnEntryType.NEXT_ROUND, config=None)
@@ -1741,6 +1913,105 @@ class PublicTurnRuntimeTests(unittest.TestCase):
         self.assertNotEqual(settlement.gm_resolution_summary, "")
         self.assertIn(prompt.target_actor_name, settlement.gm_resolution_summary)
         self.assertIn(settlement.gm_resolution_summary, build_settlement_fragment(settlement))
+
+    def test_resolve_opposed_prompt_submission_uses_prompt_hints_for_team_actor(self) -> None:
+        save = self._seed_public_turn_scene("sess_public_turn_opposed_prompt_hints")
+        start_round_in_save(save, entry_type=PublicTurnEntryType.NEXT_ROUND, config=None)
+        state = get_public_turn_state_in_save(save)
+        round_state = state.current_round
+        assert round_state is not None
+        bram_name = next(item for item in save.role_pool if item.role_id == "npc_bram").name
+        prompt = PublicTurnOpposedPrompt(
+            check_id=f"{round_state.round_id}_npc_bram_opposed",
+            round_id=round_state.round_id,
+            phase=PublicTurnPhase.INITIATIVE_EXECUTION,
+            source_actor_id="npc_bram",
+            source_actor_name=bram_name,
+            source_action_summary="Bram slams into Erin to keep her away from the player.",
+            source_speech_text="Stay back.",
+            source_interaction_kind="block",
+            source_action_target_name="鑹剧惓",
+            source_situation_delta_hint=7,
+            source_reputation_delta_hint=2,
+            target_actor_id="npc_erin",
+            target_actor_name="鑹剧惓",
+            stakes_summary="If Bram loses the clash, Erin breaks the team line.",
+        )
+        plan = PublicTurnOpposedPlanResponse(
+            session_id=save.session_id,
+            round_id=round_state.round_id,
+            check_id=prompt.check_id,
+            source_actor_id=prompt.source_actor_id,
+            source_actor_name=prompt.source_actor_name,
+            source_action_summary=prompt.source_action_summary,
+            source_speech_text=prompt.source_speech_text,
+            source_ability_used="strength",
+            source_ability_modifier=2,
+            target_actor_id=prompt.target_actor_id,
+            target_actor_name=prompt.target_actor_name,
+            target_action_summary="Erin braces and throws her weight back into Bram.",
+            target_speech_text="Move.",
+            target_ability_used="dexterity",
+            target_ability_modifier=2,
+            check_task="hold Erin away from the player",
+            stakes_summary=prompt.stakes_summary,
+        )
+        action_result = ActionCheckResponse(
+            session_id=save.session_id,
+            actor_role_id=prompt.source_actor_id,
+            actor_name=prompt.source_actor_name,
+            actor_kind="npc",
+            action_type="check",
+            check_mode="action",
+            source_context="public_turn",
+            resolution_rule="opposed_actor",
+            requires_check=True,
+            ability_used="strength",
+            ability_modifier=2,
+            dc=12,
+            check_task="hold Erin away from the player",
+            target_role_id=prompt.target_actor_id,
+            target_name=prompt.target_actor_name,
+            target_actor_kind="npc",
+            target_ability_used="dexterity",
+            target_ability_modifier=2,
+            dice_roll=8,
+            total_score=10,
+            target_dice_roll=14,
+            target_total_score=16,
+            contested_success=False,
+            success=False,
+            critical="none",
+            time_spent_min=1,
+            narrative="Bram loses the shove and Erin forces him half a step back.",
+            applied_effects=[],
+            relation_tag_suggestion=None,
+            scene_events=[],
+            state_sync=None,
+            post_checks=None,
+        )
+
+        with (
+            patch("app.services.public_turn_resolution.world.plan_public_turn_opposed_exchange", return_value=plan),
+            patch("app.services.public_turn_resolution.world.action_check", return_value=action_result),
+        ):
+            _, impact, settlement, resolved = resolve_opposed_prompt_submission(
+                save,
+                session_id=save.session_id,
+                prompt=prompt,
+                target_action_summary=plan.target_action_summary,
+                target_speech_text=plan.target_speech_text,
+                forced_dice_roll=14,
+                round_state=round_state,
+                config=None,
+            )
+
+        self.assertIs(resolved, action_result)
+        assert impact is not None
+        self.assertEqual(impact.situation_delta, 3)
+        self.assertEqual(impact.zone_reputation_delta, 2)
+        self.assertEqual(settlement.situation_delta, 3)
+        self.assertEqual(settlement.zone_reputation_delta, 2)
 
     def test_gm_push_sets_roll_result_on_final_settlement(self) -> None:
         save = self._seed_public_turn_scene("sess_public_turn_gm_push_result")

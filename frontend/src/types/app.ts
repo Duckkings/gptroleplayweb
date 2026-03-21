@@ -410,6 +410,8 @@ export type PublicTurnOpposedPrompt = {
   source_interaction_kind: string;
   source_action_target_name?: string | null;
   source_speech_target_name?: string | null;
+  source_situation_delta_hint: number;
+  source_reputation_delta_hint: number;
   target_actor_id: string;
   target_actor_name: string;
   stakes_summary: string;
@@ -428,6 +430,8 @@ export type PublicTurnInteractionPrompt = {
   source_speech_target_name?: string | null;
   source_action_prompt: string;
   source_world_impact_type: PublicTurnWorldImpactType;
+  source_situation_delta_hint: number;
+  source_reputation_delta_hint: number;
   source_planned_requires_check: boolean;
   source_planned_ability_used?: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma' | null;
   source_planned_dc?: number | null;
