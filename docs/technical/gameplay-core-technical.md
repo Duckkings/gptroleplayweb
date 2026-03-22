@@ -1,377 +1,315 @@
 # 核心玩法技术文档
-
-更新日期：`2026-03-09`
+更新时间: `2026-03-22`
 
 ## 1. 范围
-本文描述当前版本的主聊天、公开场景、遭遇、任务/命运阻塞规则，以及前后端之间的主流程约束。
 
-核心目标只有一条：玩家在主聊天中做出的明确玩法行为，必须由后端真实落地，而不是只由 AI 写成一段看似发生过的文本。
+本文档描述当前主聊天中的公开回合运行时，以及会阻塞主聊天的角色构筑入口，不覆盖独立 battle sandbox。
 
-## 2. 当前核心流程
+当前相关后端模块:
+- `backend/app/services/public_turn_runtime.py`
+- `backend/app/services/public_turn_resolution.py`
+- `backend/app/services/public_turn_service.py`
+- `backend/app/services/public_turn_state_store.py`
+- `backend/app/services/public_turn_attack_service.py`
 
-### 2.1 主聊天回合
-`POST /api/v1/chat` 与 `POST /api/v1/chat/stream` 都走同一条主链路：
-1. 读取当前 `SaveFile`
-2. 解析最后一条玩家输入
-3. 调用 `route_main_turn_intent(...)`
-4. 若命中确定性玩法动作，则先执行后端真实逻辑
-5. 若未命中，进入模型主聊天与工具调用
-6. 推进公开场景导演器
-7. 推进活跃遭遇或后台遭遇
-8. 写入 `tool_events`、`scene_events`、`game_logs`
-9. 返回 `reply.content`
+当前相关前端模块:
+- `frontend/src/App.tsx`
+- `frontend/src/components/CharacterBuildModal.tsx`
+- `frontend/src/components/PublicTurnPanel.tsx`
+- `frontend/src/components/PublicTurnInteractionModal.tsx`
+- `frontend/src/components/PublicTurnAttackModal.tsx`
+- `frontend/src/components/PublicTurnAttackDefenseModal.tsx`
+- `frontend/src/components/PublicTurnDeathSaveModal.tsx`
 
-### 2.2 后端路由优先原则
-`backend/app/services/chat_service.py::route_main_turn_intent(...)` 当前优先处理：
-- `move_to_zone`
-- `move_to_sub_zone`
-- `inventory_mutate`
-- `inventory_interact`
-- `team_invite_npc`
-- `team_remove_npc`
-- `encounter_escape`
-- `encounter_rejoin`
-- `encounter_act`
-- 当前可见 NPC 的公开点名
-- `passive_turn`
+## 2. 公开回合阶段
 
-命中条件固定为：
-- 有明确动词
-- 有合法实体匹配
-- 当前状态允许执行
+当前 `PublicTurnPhase` 包含:
+- `idle`
+- `initiative_declaration`
+- `initiative_execution`
+- `normal_advancement`
+- `gm_push`
+- `situation_advancement`
+- `awaiting_player_interaction`
+- `awaiting_player_reaction`
+- `awaiting_player_opposed`
+- `awaiting_player_attack_response`
+- `awaiting_player_attack_defense`
+- `awaiting_player_death_save`
 
-否则回落给模型自由叙事或工具决策。
+其中 `awaiting_player_death_save` 是本次新增阶段，用于玩家在公开回合内进入死亡豁免后的专用暂停点。
 
-## 3. 公开场景导演器
+## 3. 双状态模型
 
-### 3.1 服务位置
-- `backend/app/services/public_scene_service.py`
-- `backend/app/services/world_service.py::advance_public_scene_in_save(...)` 只是兼容入口，实际逻辑已转发到导演器服务
+角色生命状态继续使用 `death_state.life_status`:
+- `healthy`
+- `dying`
+- `stable`
+- `dead`
 
-### 3.2 固定顺序
-每个主聊天回合的公开区域推进顺序固定为：
-1. 玩家动作
-2. GM 直接反馈
-3. 导演器选择最多 4 名非玩家行动体逐个行动
-4. 其余角色合并为 crowd summary
+角色行动状态新增 `role_action_status`:
+- `free_action`
+- `death_saving`
+- `dead`
+- `unable_to_act`
 
-### 3.3 行动体优先级
-- 被玩家点名的当前可见 NPC
-- 当前活跃遭遇锚点角色
-- 本轮刚浮出 desire/story 的队友
-- 与玩家动作直接相关的队友或 NPC
-- 其余旁观者
+当前映射约束:
+- 正常角色: `healthy + free_action`
+- 进入死亡豁免: `dying + death_saving`
+- 外部稳定成功: `stable + unable_to_act`
+- 已死亡: `dead + dead`
+- 未来控制类状态: `healthy + unable_to_act`
 
-### 3.4 输出约束
-- AI 的行动意图只允许输出结构化 actor intent JSON
-- 检定结果由后端完成
-- 公开动作只能写入 `scene_events`、`SubZoneChatTurn.events`、`game_logs`
-- 不允许直接拼进 `reply.content`
+当前实现里，`death_saving` 和 `dead` 已接入公开回合；`unable_to_act` 仅接入 speech-only 限制，不承担完整 BUFF 系统职责。
 
-### 3.5 当前 scene event
-当前主聊天会把以下公开事件送到前端：
-- `public_actor_resolution`
-- `role_desire_surface`
-- `companion_story_surface`
-- `reputation_update`
-- `encounter_situation_update`
-- `encounter_started`
-- `encounter_progress`
-- `encounter_resolution`
+## 4. HP 归零分流
 
-同时仍保留兼容用事件：
-- `public_targeted_npc_reply`
-- `public_bystander_reaction`
-- `team_public_reaction`
+### 4.1 玩家
 
-## 4. 阻塞规则
+玩家在公开回合中 `HP <= 0` 后:
+- 若满足超额伤害即死，直接进入 `dead`
+- 否则进入 `dying + death_saving`
+- `SceneEvent.kind` 会追加 `player_entered_death_save`
 
-### 4.1 模态优先级
-固定为：
-1. `Quest/Fate`
-2. `Encounter`
-3. 主聊天
+### 4.2 队友 NPC
 
-### 4.2 不变规则
-- 所有模态都会阻塞聊天输入
-- Fate quest 仍是 accept-only
-- 普通 quest 仍允许 accept/reject，但走模态
-- `quest accept/reject` 仍不开放给主聊天自由文本直接完成
+队友 NPC 在公开回合中 `HP <= 0` 后:
+- 进入 `dying + death_saving`
+- 不立即写入 `dead_npc_records`
+- `SceneEvent.kind` 会追加 `team_npc_entered_death_save`
 
-## 5. 主聊天与遭遇的联动
+### 4.3 非队友 NPC
 
-### 5.1 活跃遭遇存在时
-- 主聊天回合可能被路由为 `encounter_act`
-- 公开场景中的 NPC/队友行动也可以修改当前 `situation_value`
-- 主聊天结束后仍会检查活跃遭遇是否需要继续推进或结算
+非队友 NPC 与遭遇临时 NPC 在当前规则下:
+- `HP <= 0` 直接死亡
+- `NpcRoleCard.state = "dead"`
+- `role.profile.dnd5e_sheet.role_action_status = "dead"`
+- 当前子区块写入 `dead_npc_records`
+- `SceneEvent.kind` 追加 `sub_zone_dead_npc_recorded`
 
-### 5.2 被遭遇打断时
-- NPC 单聊会被强制切回主聊天
-- 遭遇结果通过 scene events 和 encounter lane 展示
-- 结算后不会自动回到之前的 NPC 单聊上下文
+## 5. 玩家死亡豁免流程
 
-## 6. API 总览
+### 5.1 被他人点名为目标时
 
-### 6.1 主链路
-- `POST /api/v1/chat`
-- `POST /api/v1/chat/stream`
+若玩家当前 `role_action_status in {"death_saving", "unable_to_act"}`:
+- 前端禁用 `action_text`
+- 前端只允许输入 `speech_text`
+- 后端不做文本检测，不再调用 AI 判断“是不是纯说话”
+- 后端直接走确定性 speech-only 分支
 
-### 6.2 公开状态读取
-- `GET /api/v1/scene/public-state`
-- `GET /api/v1/reputation/current`
-- `GET /api/v1/role-drives`
+其中:
+- `death_saving` 会保持等待专用死亡豁免窗口
+- `unable_to_act` 只会清空 `action_text`，继续常规结算
 
-### 6.3 遭遇
-- `GET /api/v1/encounters/pending`
-- `GET /api/v1/encounters/history`
-- `POST /api/v1/encounters/check`
-- `POST /api/v1/encounters/{encounter_id}/present`
-- `POST /api/v1/encounters/{encounter_id}/act`
-- `POST /api/v1/encounters/{encounter_id}/escape`
-- `POST /api/v1/encounters/{encounter_id}/rejoin`
-- `GET /api/v1/encounters/debug/overview`
+若 speech-only 状态仍提交 `action_text`:
+- 后端直接抛 `PUBLIC_TURN_SPEECH_ONLY`
 
-## 7. 前端联动点
-- `frontend/src/App.tsx` 负责主聊天、scene events、encounter lane 和模态优先级
-- `frontend/src/components/SubZoneContextPanel.tsx` 渲染公开事件
-- `frontend/src/components/EncounterLane.tsx` 与 `frontend/src/components/EncounterModal.tsx` 渲染局势值、趋势和结果摘要
-- `frontend/src/components/PlayerPanel.tsx` 渲染当前子区块声望
-- `frontend/src/components/TeamPanel.tsx` 与 `frontend/src/components/RoleProfileModal.tsx` 渲染欲望与故事
+### 5.2 到玩家自己回合时
 
-## 8. 当前限制
-- 公开场景导演器是叙事轮值器，不是完整战斗先攻系统
-- `crowd_summary` 目前只做摘要，不单独拥有检定和关系结算
-- 队友故事默认只是公开话题或队伍聊天入口，不强制升级成任务
+若玩家自己处于 `death_saving`:
+- 玩家提交语言后，后端不再做 `planActionCheck`
+- 公开回合直接暂停到 `awaiting_player_death_save`
+- 返回专用 `death_save_prompt`
+- 前端弹出 `PublicTurnDeathSaveModal`
 
-## 9. 回归测试
-- `backend/tests/test_chat_route_scene_rendering.py`
-- `backend/tests/test_action_check_routes.py`
-- `backend/tests/test_npc_chat_routes.py`
-- `backend/tests/test_role_system.py`
-- `backend/tests/test_encounter_service.py`
+### 5.3 死亡豁免判定
 
-## 10. Public Turn Baseline (2026-03-18)
+当前固定规则:
+- `DC = 10`
+- `d20 >= 10` 记 1 次成功
+- `natural 1` 记 2 次失败
+- `natural 20` 立即恢复 `1 HP`
+- `3` 次成功后恢复 `1 HP`
+- `3` 次失败后进入 `dead`
 
-- Mainline public scene progression now uses `public turn` instead of freeform `/chat`.
-- Backend state machine phases:
-  - `idle`
-  - `initiative_declaration`
-  - `initiative_execution`
-  - `normal_advancement`
-  - `situation_advancement`
-  - `awaiting_player_reaction`
-- Mainline entry points:
-  - `POST /api/v1/public-turn/entry`
-  - `POST /api/v1/public-turn/continue`
-  - `POST /api/v1/public-turn/reaction-check`
-  - `GET /api/v1/public-turn/state`
-- Streaming entry points:
-  - `POST /api/v1/public-turn/entry/stream`
-  - `POST /api/v1/public-turn/continue/stream`
-  - `POST /api/v1/public-turn/reaction-check/stream`
-- Public turn now owns situation, relation, affinity/trust, reputation, environment risk, scene event, and archived sub-zone turn settlement.
-- Public turn presentation is now split into:
-  - `initiative_order` for left-pane initiative display
-  - `settlement_entries` for structured per-actor action/check/consequence cards
-  - `round_narration` for right-pane whole-round prose generated only after round completion
-- Legacy `/api/v1/chat` remains for compatibility and debug, but mainline public scenes return `409 MAIN_CHAT_DISABLED_UNDER_PUBLIC_TURN` unless God Mode is active.
+再受伤规则:
+- 濒死中受到普通伤害: `death_save_failures + 1`
+- 单次伤害达到 `ceil(max_hp * 0.5)` 视为重伤，直接死亡
 
-## Public Turn 4.2 Correction Note (2026-03-18)
+前端死亡豁免分辨率:
+- 新增 `POST /public-turn/death-save-check`
+- 新增 `POST /public-turn/death-save-check/stream`
+- SSE 新增 `death_save_required`
 
-- `entry(next_round)` now runs internal AI initiative judgment/execution before pausing at the player's `normal_advancement` slot.
-- `entry(initiative)` now inserts the player into the initiative order and pauses only when the initiative cursor reaches the player.
-- `PublicTurnContinueRequest` now accepts `player_action_check`.
-- public-turn player submissions now settle relation / affinity / trust / reputation in the same action resolution pass.
-- player-facing public-turn checks must be planned through `/api/v1/actions/check/plan` and rolled in the frontend before `/api/v1/public-turn/continue`.
-- opposed public-turn checks are supported through `resolution_rule="opposed_actor"` and are used for direct physical conflict prompts with a resolvable NPC target.
+## 6. 队友 NPC 死亡豁免
 
-## Public Turn Scheme A Runtime Note (2026-03-19)
+队友 NPC 在 `death_saving` 时:
+- 只能做 non-world 微动作与语言
+- 不再产生 world-impact 行为
+- 不再成为有效对抗输入方
+- 到自己回合时由后端自动掷骰
 
-- Public-turn runtime now executes AI-only progression as `segment`s instead of per-actor free-running loops.
-- Each AI-only segment uses:
-  - one batch planner pass
-  - one batch narrator pass
-- Embedded public-turn `action_check()` no longer calls `_ai_action_plan()` or `_ai_action_resolution_text()`.
-- NPC/AI dice, opposed comparison, situation/reputation/relation/team settlement remain backend-deterministic.
-- Stream routes no longer wait for the full public-turn request to finish before emitting output.
-- The stream now emits after each resolved segment:
-  - `settlement_entry`
-  - `narrative_fragment_*`
-  - `scene_event`
-  - `impact`
-- Player submissions and opposed resumes are folded into the same segment narration flow by seeding deterministic settlements before the next AI segment or `gm_push`.
-- Public-turn actor typing now accepts `encounter_temp_npc` end-to-end in initiative declarations, initiative order, settlements, and frontend state typing.
+## 7. 角色构筑入口
 
-## Public Turn Interaction Technical Note (2026-03-19)
+### 7.1 入口优先级
 
-- New phase:
-  - `awaiting_player_interaction`
-- New backend / frontend structures:
-  - `PublicTurnInteractionPrompt`
-  - `PublicTurnInteractionResponseSubmission`
-- `PublicTurnRound` now stores `pending_interaction_prompt` so interaction pauses survive save sync and restore without using `PendingTurnState`.
-- `PublicTurnResponse` now carries `public_interaction_prompt`.
-- `PublicTurnContinueRequest` now accepts `player_interaction_response`.
-- `PublicTurnSegmentActorDirective` now carries structured interaction metadata:
-  - `interaction_target_actor_id`
-  - `interaction_target_name`
-  - `interaction_target_kind`
-  - `interaction_kind`
-  - `interaction_requires_response`
-  - `target_response_action_summary`
-  - `target_response_speech_text`
-  - `consent_state`
-  - `resolution_mode`
-- Public-turn target resolution is now structured-first:
-  - explicit target role id in prompt
-  - structured `target_label`
-  - limited text fallback
-  - no automatic player lock merely because the prompt text mentions the player
-- Directed non-attack interactions now use deterministic consent classification:
-  - `accepted`
-  - `rejected`
-  - `ambiguous`
-  - `not_applicable`
-- Resolution routing is now:
-  - `attack` -> existing attack / reaction flow
-  - targeted non-attack + `rejected` -> `opposed_actor`
-  - targeted non-attack + `accepted|ambiguous` -> `static_dc` or no-roll settlement
-- `PublicTurnSettlementEntry` now records:
-  - `interaction_target_name`
-  - `interaction_resolution`
-  - target-side response action / speech for both non-opposed and opposed interaction settlements
-- Stream routes now emit `interaction_required` when a player-targeted interaction pause is reached.
-- Blocking gameplay modals now support minimize / restore in the frontend while preserving state; minimized workflows still keep chat submission locked.
+当前前端新增 `CharacterBuildModal`，优先级高于主聊天、地图、Debug 面板和普通调试弹窗。
 
-## Public Turn Settlement And GM Push Technical Note (2026-03-20)
+当 `GET /character-build/state` 返回:
+- `forced_entry=true`
 
-- Public-turn presentation no longer depends on AI stitched narration output.
-- `PublicTurnPresentation.round_narration`, `accumulated_narration`, and `narrative_entries` are now rebuilt deterministically from `settlement_entries`.
-- The deterministic formatter uses settlement order and only includes visible actor content:
-  - actor name
-  - action summary
-  - speech text
-  - opposed / interaction target response text
-- Actor settlements no longer surface GM summary text; `gm_resolution_summary` stays empty on actor entries for compatibility.
-- `PublicTurnSettlementEntry` now distinguishes:
-  - `entry_kind="actor"`
-  - `entry_kind="gm_push"`
-- `PublicTurnGmPushResult` is attached to:
-  - `PublicTurnSettlementEntry.gm_push_result`
-  - `PublicTurnRound.gm_push_result`
-  - `PublicTurnPresentation.gm_push_result`
-- Round-end GM push is now a dedicated backend step:
-  1. aggregate impacts
-  2. roll backend `1d6`
-  3. classify outcome as `none | environment_change | extra_npc_intervention`
-  4. call AI once for environment / atmosphere text
-  5. append one GM settlement card
-- `d6=5` raises the round environment risk and emits `public_turn_environment_update`.
-- `d6=6` spawns a persistent scene NPC, appends its immediate same-round settlement, and defers its normal initiative participation to later rounds.
-- `PublicTurnEntryType.INITIATIVE` now uses full initiative candidate declarations instead of hostile-text filtering, so the player is not auto-first unless `god_override` forces it.
-- Public-turn actor planning / interaction response paths no longer call NPC fallback output helpers.
-- Public-turn AI payload normalization now allows partial output; missing fields remain empty instead of causing fallback prose generation.
+前端行为:
+- 直接打开玩家构筑模态
+- 聊天输入区仍可见，但被模态完全遮挡
+- 关闭按钮在强制建角场景下不可用
 
-## Public Turn Reaction Ownership Technical Note (2026-03-20 v3)
+### 7.2 立绘工作流
 
-- Player-action reactions are now a dedicated post-settlement layer and no longer reused by non-player actor turns.
-- `PublicTurnRelationDelta` now carries:
-  - `reaction_action`
-  - `reaction_speech`
-  - compatibility `reaction_text`
-- `PublicTurnTeamAffinityDelta` now carries:
-  - `reaction_action`
-  - `reaction_speech`
-  - compatibility `reaction_text`
-- Only `resolve_player_submission(...)` may populate:
-  - `relation_deltas`
-  - `team_affinity_deltas`
-- `_finalize_ai_actor_turn(...)` now leaves both lists empty for non-player settlements.
-- Zone reputation is now actor-gated:
-  - allowed for `player`
-  - allowed for `team`
-  - forced to `0` for all other actor kinds
-- Deterministic narration formatting now treats player settlements specially by appending AI NPC/team reaction fragments after the player action/speech.
+当前固定链路:
+1. `POST /character-build/media/upload` 或 `POST /character-build/media/generate`
+2. 在前端选定 `selected_raw_asset_id`
+3. `POST /character-build/media/remove-background`
+4. 在 `立绘确认` 页面查看透明 PNG
+5. `POST /character-build/media/finalize`
+6. `POST /character-build/media/describe`
 
-## Public Turn Hint Carry-Through Note (2026-03-21)
+约束:
+- 去背景是必经步骤
+- 从确认页返回立绘定制时，不丢 prompt、参考图、上传图和候选图
+- `describe` 仅接受 `bg_removed` 或 `final_portrait`
 
-- `PublicTurnSegmentActorDirective` now carries both:
-  - `situation_delta_hint`
-  - `reputation_delta_hint`
-- Planner overrides may now return `reputation_delta_hint` in addition to `situation_delta_hint`.
-- `PublicTurnInteractionPrompt` and `PublicTurnOpposedPrompt` now preserve:
-  - `source_situation_delta_hint`
-  - `source_reputation_delta_hint`
-- Pause/resume settlement no longer recomputes these values from text heuristics once a structured source hint already exists.
-- Public-turn settlement cards may show provisional `Situation / Reputation / Environment` deltas while a round is still active; actual zone reputation and encounter situation are committed only at round-end apply / GM push.
-- Stream emission still uses settlement-order fragments, but now falls back to direct settlement formatting if a compatible `narrative_entry` is not already present in the response payload.
-## 2026-03-20 Public-Turn Target / Addressee / Contest Routing
+### 7.3 首个随从提示
 
-- Public-turn actor directives and settlements now distinguish:
-  - action target
-  - speech target
-- Public-turn targeted actor actions no longer use `attack -> player_reaction` as the primary path.
-- New routing rule:
-  - role-to-role targeted action -> interaction assessment
-  - player target -> pause for player interaction response
-  - non-player target -> AI target response
-  - source/target actions -> contest classification -> `opposed_actor` or `static_dc` / `none`
-- `player_reaction` remains on the public-turn path only for non-actor hazards such as environment or GM push consequences.
-- Player post-action reaction payloads now carry:
-  - `reaction_tone`
-  - `reaction_focus_actor_name`
-  - `reaction_speech_target_name`
-- Server-side tone clamps prevent warning / hostile reaction text from yielding large positive relation or affinity deltas.
-- Deterministic narration formatter now emits target-aware and addressee-aware fragments for settlements and pause previews.
-## 2026-03-20 Public Turn Interaction v7
+当前玩家构筑成功后，若:
+- `player_status=completed`
+- `initial_companion_offer_seen=false`
+- 当前队伍为空
 
-- `PublicTurnInteractionPrompt` no longer carries `stakes_summary`.
-- Public-turn interaction routing now has a hard invariant:
-  - `target_actor_*` in the prompt must match the resolved `action_target_*`
-  - if planner output conflicts with the resolved action target, runtime ignores the planner pause suggestion
-- `speech_target_*` is now presentation-only:
-  - used by settlement / narration formatting
-  - never used to select the responding actor
-- Public-turn interaction now records world-impact classification:
-  - `source_world_impact_type`
-  - `target_response_world_impact_type`
-  - `interaction_exchange_kind`
-  - `alternation_depth`
-  - `target_response_kind`
-- `non_world_exchange` never emits:
-  - action check
-  - opposed prompt
-- Alternation flow is supported once per interaction:
-  - initial `non_world` source action
-  - target-side `world` response aimed at original source
-  - source/target swap
-  - no second alternation
-- Player interaction submission now supports:
-  - `response_kind="explicit_response"`
-  - `response_kind="no_action"`
-- `no_action` is resolved backend-side as:
-  - empty action/speech
-  - `world_impact_type=non_world`
-  - valid terminal interaction response
-- Runtime no longer clears the pending interaction prompt before validating / resolving the player's response, so invalid reverse targeting does not destroy the pending pause state.
-## 2026-03-20 AI Required / Protocol Repair Note
+前端会弹一次“是否继续创建首个随从”。
 
-- AI gameplay interfaces no longer use `no-AI fallback` when `config`, `api_key`, or `model` is missing.
-- Public-turn AI control fields now use explicit enum pools in prompts and stable English ids in responses:
-  - `reaction_tone`
-  - `world_impact_type`
-  - `response_mode`
-  - `action_type`
-  - `pause_kind`
-- Public-turn first-pass enum violations no longer silently normalize on the backend.
-- Public-turn now stages `awaiting_protocol_repair` in `PendingTurnState` / `PendingTurnContinueResponse`, then exposes:
-  - `POST /api/v1/public-turn/protocol-repair`
-  - `POST /api/v1/public-turn/protocol-repair/stream`
-- Public-turn streams may now emit `protocol_repair_required`.
-- Frontend auto-continues public-turn protocol repair and shows a transient notice instead of immediately surfacing a hard error.
-- Public-turn AI inputs now include targeted helper text:
-  - `{actor}对{target}的行为：...`
-  - `{actor}自己的行为：...`
-  - `{actor}对{speech_target}说：...`
-  - `{actor}说：...`
-- Targeted helper text is prompt/debug-only and does not replace user-facing original action/speech text.
+用户无论接受还是拒绝，都会调用:
+- `POST /character-build/companion-offer`
+
+这样保证该提示只出现一次。
+
+相关事件:
+- `team_npc_death_save_result`
+- `team_npc_died`
+
+## 7. 普通 NPC 死亡清理
+
+当前子区块死亡 NPC 会被写入:
+- `AreaSubZone.state.dead_npc_records`
+
+每条记录至少包含:
+- `role_id`
+- `name`
+- `death_at`
+- `death_cause`
+- `was_team_member`
+
+运行时过滤位置:
+- `world_service._visible_public_roles()`
+- `public_turn_interaction_service._current_sub_zone_actor_candidates()`
+- `public_turn_candidates.hidden_actor_rows()`
+- `team_service._restore_area_presence()`
+
+效果:
+- 当前轮起就不再参与公开回合候选
+- 不再作为互动目标
+- 离开并重返子区块后不再恢复成可互动 NPC
+
+## 8. 关键接口与模型
+
+### 8.1 Schema 变更
+
+`Dnd5eCharacterSheet` 新增:
+- `role_action_status`
+- `death_state`
+
+`PublicTurnRound` 新增:
+- `pending_death_save_prompt`
+
+`PublicTurnResponse` / `PendingTurnContinueResponse` 新增:
+- `death_save_prompt`
+
+`PendingTurnState.status` 新增:
+- `awaiting_player_death_save`
+
+`SubZoneState` 新增:
+- `dead_npc_records`
+
+`BattleRollPrompt.roll_kind` / `BattleRollResolution.roll_kind` 新增:
+- `death_save`
+- `stabilize`
+
+### 8.2 Scene Event 新增种类
+
+当前至少支持:
+- `player_entered_death_save`
+- `player_death_save_result`
+- `player_died`
+- `team_npc_entered_death_save`
+- `team_npc_death_save_result`
+- `team_npc_died`
+- `sub_zone_dead_npc_recorded`
+
+## 9. 前端联动
+
+当前前端新增:
+- `death_save_prompt` 的 pending restore
+- `speechOnly` 模式的互动 / 攻击回应弹窗
+- `PublicTurnDeathSaveModal`
+- 玩家 `role_action_status` 透传到 `PublicTurnPanel`
+
+当前 UI 行为:
+- `death_saving` / `unable_to_act` 时，主行动面板禁用行为输入
+- 被点名响应时，互动与攻击回应弹窗禁用行为输入
+- 死亡豁免通过专用 d20 弹窗完成，不复用 reaction prompt
+
+## 10. AI 与确定性边界
+
+本轮相关规则必须遵守:
+- 前后端不做字符检测来猜测死亡、speech-only、攻击分类结果
+- AI 侧只接收稳定枚举池，必须从允许值中选择
+- 不做 fallback 文本兜底，不接受“半结构化 + 猜测修补”作为正常路径
+
+当前确定性分支:
+- `death_saving` / `unable_to_act` 的 speech-only 限制
+- 非队友 NPC `0 HP -> dead`
+- 队友 NPC `0 HP -> death_saving`
+- 玩家回合进入死亡豁免窗口
+
+## 11. 已验证项
+
+当前已验证:
+- 前端 `npm run build`
+- `backend.tests.test_public_turn_runtime`
+
+新增回归覆盖:
+- 玩家被打到 `0 HP` 后进入 `death_saving`
+- 玩家回合提交语言后返回 `death_save_prompt`
+- `death_saving` 状态提交行为文本会抛 `PUBLIC_TURN_SPEECH_ONLY`
+- 非队友 NPC 死亡后写入 `dead_npc_records`
+- 队友 NPC `0 HP` 后进入 `death_saving` 而非直接死亡
+
+## 附录: 玩家输入校验前置阶段
+
+当前聊天提交流程在真正进入 `ActionCheck`、`continuePublicTurn` 或 `npcChat` 前，新增统一的玩家输入校验阶段。
+
+当前已接入入口:
+- `main_chat`
+- `npc_chat`
+- `teammate_chat`
+- `public_turn_action`
+- `public_turn_interaction_response`
+- `public_turn_attack_response`
+- `debug_panel`
+
+前置阶段职责:
+- 只校验带 `action_text` 的输入，纯 `speech_text` 直接跳过
+- 先用 AI 规范化成单个、自身、无结果宣告的动作
+- 再用后端确定性规则校验法术、武技、道具和行动状态
+- 不推进时间
+- 不执行检定
+- 不写存档
+- 不写 pending turn
+
+当前前端行为:
+- `accepted` 时直接采用 `normalized_action_text` / `normalized_speech_text`
+- `needs_player_confirmation` 时弹统一确认模态
+- 玩家可选择 `采用建议` 或 `返回修改`
+- 采用建议后的再次提交只在前端内存中绕过一次，不持久化
+
+新接口:
+- `POST /api/v1/player-input/validate`

@@ -1,0 +1,6 @@
+﻿definition_id,name,attack_mode,scaling_ability,martial_cost,cooldown_rounds,damage_dice,damage_bonus,damage_type,area_shape,area_radius_m,area_length_m,self_target_policy,description,resolution_notes
+power_strike,Power Strike,targeted_attack,strength,1,0,1d8,2,slashing,none,0,0,never,A heavy melee technique that converts momentum into extra damage.,Single-target martial technique with a flat damage rider.
+shield_bash,Shield Bash,targeted_attack,strength,1,0,1d6,0,bludgeoning,none,0,0,never,A shield-led strike used to stagger or create space.,Can carry shove or stagger flavor if the turn resolver supports it.
+parry,Parry,targeted_attack,dexterity,1,0,,0,none,none,0,0,never,A defensive technique that turns timing and weapon control into protection.,Primarily defensive; resolver may translate this into AC or reaction flavor.
+sweeping_slash,Sweeping Slash,aoe_attack,strength,1,0,1d6,0,slashing,cone,0,3,never,A wide horizontal cut meant to pressure adjacent enemies.,Short-range martial sweep for clustered melee targets.
+battle_focus,Battle Focus,targeted_attack,wisdom,1,0,,0,none,none,0,0,always_include_self,A disciplined breathing sequence that steadies the fighter under pressure.,Self-buff or concentration-like martial setup.

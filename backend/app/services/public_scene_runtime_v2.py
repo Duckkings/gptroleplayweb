@@ -30,6 +30,7 @@ def _matched_actor_ids(text: str, actors: list[dict[str, object]]) -> list[str]:
     clean_text = str(text or "").strip()
     if not clean_text:
         return []
+    legacy = _legacy()
     matches: list[str] = []
     seen: set[str] = set()
     for actor in actors:
@@ -37,7 +38,7 @@ def _matched_actor_ids(text: str, actors: list[dict[str, object]]) -> list[str]:
         actor_name = str(actor.get("name") or "").strip()
         if not actor_id or not actor_name:
             continue
-        if actor_name in clean_text and actor_id not in seen:
+        if legacy._find_actor_name_match(actor_name, clean_text) and actor_id not in seen:
             seen.add(actor_id)
             matches.append(actor_id)
     return matches
@@ -203,7 +204,10 @@ def candidate_rows(
     visible_npcs = _local_public_roles(save)
     team_roles = list(legacy._team_role_map(save).values())
     active_encounter = legacy._active_encounter_for_current_sub_zone(save)
-    temp_npcs = legacy._encounter_temp_npcs(save)
+    reserved_name_keys = {legacy._normalize_actor_name_key(getattr(getattr(save, "player_static_data", None), "name", ""))}
+    reserved_name_keys.update(legacy._normalize_actor_name_key(role.name) for role in visible_npcs)
+    reserved_name_keys.update(legacy._normalize_actor_name_key(role.name) for role in team_roles)
+    temp_npcs = legacy._encounter_temp_npcs_for_candidates(save, existing_names=reserved_name_keys)
     visible_rows: list[dict[str, object]] = [
         {"actor_id": role.role_id, "name": role.name, "actor_type": "npc", "priority_reason": "", "role": role}
         for role in visible_npcs
@@ -469,6 +473,9 @@ def _ai_actor_action(
         "Do not use gaze targets, wink targets, gesture targets, or silent coordination partners as speech_target_label.\n"
         "If the narration mentions looking at actor A but the spoken line is addressed to actor B, speech_target_label must be actor B.\n"
         "If there is no spoken addressee, return an empty speech_target_label.\n"
+        "When the action is a recognizable DND-style spell or weapon attack, classify it using DND-style intent rather than surface wording.\n"
+        "Recognizable direct-damage spells, explosive spells, and area spells such as Fireball must use action_type=attack even if they affect multiple visible targets.\n"
+        "Do not collapse an obvious AOE spell into a harmless single-target check.\n"
         "situation_delta_hint must be an integer between -8 and 8.\n"
         "reputation_delta_hint must be an integer between -3 and 3 and represents direct public reputation impact in the current zone.\n"
         "If there is no clear public reputation impact, return reputation_delta_hint as 0.\n"

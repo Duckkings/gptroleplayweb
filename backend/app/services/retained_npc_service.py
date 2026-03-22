@@ -19,6 +19,7 @@ class RetainedNpc:
     role_data: dict[str, Any]
     retained_at: str
     notes: str = ""
+    archive_dir: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -27,6 +28,7 @@ class RetainedNpc:
             "role_data": self.role_data,
             "retained_at": self.retained_at,
             "notes": self.notes,
+            "archive_dir": self.archive_dir,
         }
 
     @classmethod
@@ -37,6 +39,7 @@ class RetainedNpc:
             role_data=data["role_data"],
             retained_at=data["retained_at"],
             notes=data.get("notes", ""),
+            archive_dir=data.get("archive_dir"),
         )
 
 
@@ -203,6 +206,26 @@ class RetainedNpcService:
                 # Re-save the file
                 self._save_role_file(npc, username)
                 return npc
+        return None
+
+    def update_role_data(
+        self,
+        retained_id: str,
+        role_data: dict[str, Any],
+        *,
+        archive_dir: str | None = None,
+        username: str | None = None,
+    ) -> RetainedNpc | None:
+        """Update role data for a retained NPC without changing its ID."""
+        npcs = self._load_data(username)
+        for npc in npcs:
+            if npc.retained_id != retained_id:
+                continue
+            npc.role_data = role_data
+            if archive_dir is not None:
+                npc.archive_dir = archive_dir
+            self._save_role_file(npc, username)
+            return npc
         return None
 
 

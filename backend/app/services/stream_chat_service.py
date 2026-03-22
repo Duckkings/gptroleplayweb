@@ -923,7 +923,7 @@ def _npc_reply_prompt(req: NpcChatRequest, role, save) -> str:
         f"Talkative: {role.talkative_current}/{role.talkative_maximum}\n"
         f"Conversation state:\n{conversation_state}\n"
         f"Knowledge rules:\n{_json_text(knowledge.response_rules)}\n"
-        f"Recent dialogue:\n{context}\n"
+        f"Private chat context and recent dialogue:\n{context}\n"
         f"Player action: {intent['action_text'] or 'none'}\n"
         f"Player speech: {intent['speech_text'] or 'none'}\n"
         f"Player action check: {_json_text(action_check or {'status': 'none'})}\n"
@@ -960,7 +960,7 @@ def _npc_segment_prompt(req: NpcChatRequest, role, save) -> str:
         f"Talkative: {role.talkative_current}/{role.talkative_maximum}\n"
         f"Conversation state:\n{conversation_state}\n"
         f"Knowledge rules:\n{_json_text(knowledge.response_rules)}\n"
-        f"Recent dialogue:\n{context}\n"
+        f"Private chat context and recent dialogue:\n{context}\n"
         f"Player action: {intent['action_text'] or 'none'}\n"
         f"Player speech: {intent['speech_text'] or 'none'}\n"
         f"Player action check: {_json_text(action_check or {'status': 'none'})}\n"
@@ -2231,6 +2231,7 @@ def _apply_structured_npc_bundle_result(
     time_spent_min: int,
     *,
     is_continuation: bool = False,
+    restore_talkative: bool = True,
 ) -> NpcBundleApplyResult:
     role = next((item for item in save.role_pool if item.role_id == req.npc_role_id), None)
     if role is None:
@@ -2239,6 +2240,7 @@ def _apply_structured_npc_bundle_result(
     if save.area_snapshot.clock is None:
         save.area_snapshot.clock = world._default_world_clock()
     world._ensure_npc_role_complete(save, role)
+    world._sync_team_role_before_private_chat(save, role)
     player = save.player_static_data
     intent = world._parse_player_intent(req.player_message)
     action_text = str(intent["action_text"])
@@ -2255,7 +2257,7 @@ def _apply_structured_npc_bundle_result(
             content=player_text,
             clock=save.area_snapshot.clock,
         )
-    recovered_talkative = world._restore_npc_talkative(role, save.area_snapshot.clock)
+    recovered_talkative = world._restore_npc_talkative(role, save.area_snapshot.clock, save) if restore_talkative else 0
     pending_reaction = _normalize_player_reaction_check(bundle, resolution_context="npc_chat")
     action_reaction, speech_reply = world._normalize_npc_reply_parts(
         role,
@@ -2309,6 +2311,19 @@ def _apply_structured_npc_bundle_result(
         )
     )
     try:
+        from app.services.team_service import apply_private_chat_feedback_in_save
+
+        apply_private_chat_feedback_in_save(
+            save,
+            session_id=req.session_id,
+            role_id=role.role_id,
+            player_text=player_text,
+            reply=reply,
+            relation_tag=relation_tag,
+        )
+    except Exception:
+        logger.exception("npc private chat feedback failed")
+    try:
         from app.services.team_service import apply_team_reactions_in_save
 
         apply_team_reactions_in_save(
@@ -2328,7 +2343,7 @@ def _apply_structured_npc_bundle_result(
         save,
         session_id=req.session_id,
         minutes_elapsed=time_spent_min,
-        config=None,
+        config=req.config,
     )
     if advanced is not None:
         scene_events.append(
@@ -2338,6 +2353,7 @@ def _apply_structured_npc_bundle_result(
                 metadata={"encounter_id": advanced.encounter_id},
             )
         )
+    response_time_spent_min = max(1, time_spent_min)
     response = NpcChatResponse(
         session_id=req.session_id,
         npc_role_id=role.role_id,
@@ -2346,7 +2362,7 @@ def _apply_structured_npc_bundle_result(
         speech_reply=speech_reply,
         talkative_current=role.talkative_current,
         talkative_maximum=role.talkative_maximum,
-        time_spent_min=time_spent_min,
+        time_spent_min=response_time_spent_min,
         dialogue_logs=role.dialogue_logs[-20:],
         scene_events=scene_events,
     )
@@ -2755,11 +2771,18 @@ async def run_npc_chat_stream(
                     if role is None:
                         raise KeyError("ROLE_NOT_FOUND")
                     world._ensure_npc_role_complete(save, role)
+                    world._sync_team_role_before_private_chat(save, role)
+                    recovered_talkative = world._restore_npc_talkative(role, save.area_snapshot.clock, save)
                     await _emit_phase(emit, "prepare", "done", "npc ready")
                     debug_log.record(
                         "npc_prepare",
                         "npc loaded",
-                        {"npc_role_id": role.role_id, "npc_name": role.name, "talkative_current": role.talkative_current},
+                        {
+                            "npc_role_id": role.role_id,
+                            "npc_name": role.name,
+                            "talkative_current": role.talkative_current,
+                            "talkative_recovered": recovered_talkative,
+                        },
                     )
 
                     time_spent_min = world.apply_speech_time(payload.session_id, payload.player_message, payload.config)
@@ -2770,7 +2793,7 @@ async def run_npc_chat_stream(
                     await _emit_phase(emit, "model_reply", "running", "streaming npc reply")
                     if role.talkative_current <= 0:
                         bundle = {
-                            "action_reaction": f"{role.name}明显不想继续交谈，只是移开了视线。",
+                            "action_reaction": world._npc_private_chat_ignore_action(role),
                             "speech_reply": "",
                             "relation_tag": "wary",
                         }
@@ -2858,7 +2881,14 @@ async def run_npc_chat_stream(
                                 )
                     await _emit_phase(emit, "model_reply", "done", "npc reply complete")
                     await _emit_phase(emit, "bundle_parse", "running", "applying npc bundle")
-                    applied = _apply_structured_npc_bundle_result(save, payload, bundle, reply_text, time_spent_min)
+                    applied = _apply_structured_npc_bundle_result(
+                        save,
+                        payload,
+                        bundle,
+                        reply_text,
+                        time_spent_min,
+                        restore_talkative=False,
+                    )
                     result = applied.response
                     await _emit_phase(emit, "bundle_parse", "done", "npc bundle applied")
                     if applied.pending_reaction is not None:

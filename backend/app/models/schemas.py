@@ -117,6 +117,79 @@ class ProviderConfigMap(BaseModel):
         return getattr(self, provider)
 
 
+class ProviderBuildMediaConfig(BaseModel):
+    api_key: str = Field(default="", min_length=0)
+    base_url_override: str | None = None
+    generation_model: str = Field(default="", min_length=0)
+    background_removal_model: str = Field(default="", min_length=0)
+    vision_model: str = Field(default="", min_length=0)
+
+
+class ProviderBuildMediaConfigMap(BaseModel):
+    openai: ProviderBuildMediaConfig = Field(default_factory=ProviderBuildMediaConfig)
+    deepseek: ProviderBuildMediaConfig = Field(default_factory=ProviderBuildMediaConfig)
+    gemini: ProviderBuildMediaConfig = Field(default_factory=ProviderBuildMediaConfig)
+
+    def for_provider(self, provider: AIProvider) -> ProviderBuildMediaConfig:
+        return getattr(self, provider)
+
+
+def _empty_build_media_provider_config() -> dict[str, Any]:
+    return {
+        "api_key": "",
+        "base_url_override": None,
+        "generation_model": "",
+        "background_removal_model": "",
+        "vision_model": "",
+    }
+
+
+def _normalize_build_media_provider_payload(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    data = dict(raw)
+    if "openai_api_key" in data and "api_key" not in data:
+        data["api_key"] = data.pop("openai_api_key")
+    normalized: dict[str, Any] = {}
+    for key in ("api_key", "base_url_override", "generation_model", "background_removal_model", "vision_model"):
+        if key in data:
+            normalized[key] = data.get(key)
+    if "model" in data and "generation_model" not in normalized:
+        normalized["generation_model"] = data.get("model")
+    return normalized
+
+
+class BuildMediaConfig(BaseModel):
+    mode: Literal["follow_chat_provider", "explicit_provider"] = "follow_chat_provider"
+    explicit_provider: Literal["openai", "gemini"] | None = None
+    provider_configs: ProviderBuildMediaConfigMap = Field(default_factory=ProviderBuildMediaConfigMap)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy(cls, raw: Any) -> Any:
+        if not isinstance(raw, dict):
+            return raw
+        data = dict(raw)
+        provider_configs = {
+            name: _empty_build_media_provider_config()
+            for name in AI_PROVIDERS
+        }
+        raw_provider_configs = data.get("provider_configs")
+        if isinstance(raw_provider_configs, dict):
+            for name in AI_PROVIDERS:
+                if name not in raw_provider_configs:
+                    continue
+                provider_configs[name].update(_normalize_build_media_provider_payload(raw_provider_configs[name]))
+        data["provider_configs"] = provider_configs
+        mode = str(data.get("mode") or "follow_chat_provider").strip().lower()
+        if mode not in {"follow_chat_provider", "explicit_provider"}:
+            data["mode"] = "follow_chat_provider"
+        explicit = str(data.get("explicit_provider") or "").strip().lower()
+        if explicit not in {"openai", "gemini"}:
+            data["explicit_provider"] = None
+        return data
+
+
 class ChatConfig(BaseModel):
     version: str = Field(default="2.0.0")
     provider: AIProvider = "openai"
@@ -130,6 +203,7 @@ class ChatConfig(BaseModel):
     speech_time_per_50_tokens_min: int = Field(default=1, ge=1, le=30)
     sub_zone_debug: SubZoneDebugConfig = Field(default_factory=SubZoneDebugConfig)
     public_scene: PublicSceneConfig = Field(default_factory=PublicSceneConfig)
+    build_media: BuildMediaConfig = Field(default_factory=BuildMediaConfig)
     ui: UIConfig | None = None
 
     @model_validator(mode="before")
@@ -174,6 +248,8 @@ class ChatConfig(BaseModel):
         data["base_url_override"] = selected.get("base_url_override")
         data["model"] = selected.get("model", "")
         data["runtime"] = selected.get("runtime", {})
+        if "build_media" not in data:
+            data["build_media"] = BuildMediaConfig().model_dump(mode="json")
         return data
 
     @property
@@ -294,9 +370,15 @@ class SceneEvent(BaseModel):
         "player_reaction_result",
         "player_dying",
         "player_death_save",
+        "player_entered_death_save",
+        "player_death_save_result",
         "player_stabilized",
         "player_died",
         "player_revived",
+        "team_npc_entered_death_save",
+        "team_npc_death_save_result",
+        "team_npc_died",
+        "sub_zone_dead_npc_recorded",
         "system_notice",
     ]
     actor_role_id: str = Field(default="", min_length=0)
@@ -412,7 +494,16 @@ class PendingTurnState(BaseModel):
     pending_turn_id: str = Field(..., min_length=1)
     session_id: str = Field(..., min_length=1)
     flow_kind: Literal["main_chat", "encounter", "npc_chat", "map_move", "public_turn"]
-    status: Literal["awaiting_reaction", "awaiting_opposed", "awaiting_protocol_repair", "cancelled", "completed"] = "awaiting_reaction"
+    status: Literal[
+        "awaiting_reaction",
+        "awaiting_opposed",
+        "awaiting_player_attack_response",
+        "awaiting_player_attack_defense",
+        "awaiting_player_death_save",
+        "awaiting_protocol_repair",
+        "cancelled",
+        "completed",
+    ] = "awaiting_reaction"
     staged_save: dict[str, Any] = Field(default_factory=dict)
     original_request: dict[str, Any] = Field(default_factory=dict)
     accumulated_reply_text: str = Field(default="", min_length=0)
@@ -420,7 +511,10 @@ class PendingTurnState(BaseModel):
     accumulated_tool_events: list[ToolEvent] = Field(default_factory=list)
     time_spent_min: int = 0
     pending_reaction: PlayerReactionCheck | None = None
+    public_attack_prompt: "PublicTurnAttackPrompt | None" = None
+    public_attack_defense_prompt: "PublicTurnAttackDefensePrompt | None" = None
     public_opposed_prompt: "PublicTurnOpposedPrompt | None" = None
+    death_save_prompt: "DeathSavePrompt | None" = None
     continuation_index: int = 0
     usage: Usage = Field(default_factory=Usage)
     npc_role_id: str | None = None
@@ -443,7 +537,16 @@ class PendingTurnContinueResponse(BaseModel):
     session_id: str
     pending_turn_id: str | None = None
     flow_kind: Literal["main_chat", "encounter", "npc_chat", "map_move", "public_turn"]
-    status: Literal["awaiting_reaction", "awaiting_opposed", "awaiting_protocol_repair", "completed", "cancelled"]
+    status: Literal[
+        "awaiting_reaction",
+        "awaiting_opposed",
+        "awaiting_player_attack_response",
+        "awaiting_player_attack_defense",
+        "awaiting_player_death_save",
+        "awaiting_protocol_repair",
+        "completed",
+        "cancelled",
+    ]
     reply_text: str = Field(default="", min_length=0)
     scene_events: list[SceneEvent] = Field(default_factory=list)
     tool_events: list[ToolEvent] = Field(default_factory=list)
@@ -451,7 +554,10 @@ class PendingTurnContinueResponse(BaseModel):
     current_zone_metric: "ZoneMetricEntry | None" = None
     pending_reaction: PlayerReactionCheck | None = None
     public_interaction_prompt: "PublicTurnInteractionPrompt | None" = None
+    public_attack_prompt: "PublicTurnAttackPrompt | None" = None
+    public_attack_defense_prompt: "PublicTurnAttackDefensePrompt | None" = None
     public_opposed_prompt: "PublicTurnOpposedPrompt | None" = None
+    death_save_prompt: "DeathSavePrompt | None" = None
     reaction_result: "ActionCheckResponse | None" = None
     player_action_check_result: "ActionCheckResponse | None" = None
     public_turn_state: "PublicTurnState | None" = None
@@ -478,7 +584,7 @@ class PublicTurnProtocolRepairNotice(BaseModel):
 class PublicTurnProtocolRepairRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     pending_turn_id: str = Field(..., min_length=1)
-    continue_kind: Literal["entry", "continue", "reaction", "opposed"]
+    continue_kind: Literal["entry", "continue", "reaction", "opposed", "attack_defense", "death_save"]
     config: ChatConfig | None = None
 
 
@@ -566,10 +672,25 @@ class EquipmentDefinition(BaseModel):
     slot_type: Literal["weapon", "armor", "shield"] = "weapon"
     damage_dice: str = Field(default="", min_length=0)
     damage_type: str = Field(default="bludgeoning", min_length=1)
+    attack_mode: Literal["targeted_attack", "aoe_attack"] = "targeted_attack"
+    attack_ability_mode: Literal[
+        "strength",
+        "dexterity",
+        "finesse_choice",
+        "intelligence",
+        "wisdom",
+        "charisma",
+        "other",
+    ] = "strength"
+    damage_bonus: int = 0
     attack_bonus: int = 0
     armor_bonus: int = 0
     range_normal: int = Field(default=0, ge=0)
     range_long: int = Field(default=0, ge=0)
+    area_shape: Literal["none", "sphere", "cone", "line", "burst", "emanation"] = "none"
+    area_radius_m: float = Field(default=0, ge=0)
+    area_length_m: float = Field(default=0, ge=0)
+    self_target_policy: Literal["never", "can_include_self", "always_include_self"] = "never"
     two_handed: bool = False
     light: bool = False
     heavy: bool = False
@@ -580,6 +701,41 @@ class EquipmentDefinition(BaseModel):
     rarity: str = Field(default="common", min_length=1)
     weight: float = Field(default=0, ge=0)
     value: int = Field(default=0, ge=0)
+
+
+class SpellDefinition(BaseModel):
+    definition_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    attack_mode: Literal["targeted_attack", "aoe_attack"] = "targeted_attack"
+    casting_ability: Literal["intelligence", "wisdom", "charisma", "other"] = "intelligence"
+    spell_cost: int = Field(default=1, ge=0, le=9)
+    damage_dice: str = Field(default="", min_length=0)
+    damage_bonus: int = 0
+    damage_type: str = Field(default="force", min_length=1)
+    area_shape: Literal["none", "sphere", "cone", "line", "burst", "emanation"] = "none"
+    area_radius_m: float = Field(default=0, ge=0)
+    area_length_m: float = Field(default=0, ge=0)
+    self_target_policy: Literal["never", "can_include_self", "always_include_self"] = "never"
+    description: str = Field(default="", min_length=0)
+    resolution_notes: str = Field(default="", min_length=0)
+
+
+class WarArtDefinition(BaseModel):
+    definition_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    attack_mode: Literal["targeted_attack", "aoe_attack"] = "targeted_attack"
+    scaling_ability: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma", "other"] = "strength"
+    martial_cost: int = Field(default=1, ge=0, le=9)
+    cooldown_rounds: int = Field(default=0, ge=0, le=99)
+    damage_dice: str = Field(default="", min_length=0)
+    damage_bonus: int = 0
+    damage_type: str = Field(default="bludgeoning", min_length=1)
+    area_shape: Literal["none", "sphere", "cone", "line", "burst", "emanation"] = "none"
+    area_radius_m: float = Field(default=0, ge=0)
+    area_length_m: float = Field(default=0, ge=0)
+    self_target_policy: Literal["never", "can_include_self", "always_include_self"] = "never"
+    description: str = Field(default="", min_length=0)
+    resolution_notes: str = Field(default="", min_length=0)
 
 
 class InteractableTemplate(BaseModel):
@@ -666,6 +822,15 @@ class ZoneState(BaseModel):
 class SubZoneState(BaseModel):
     time_segment: str = Field(default="day")
     flags: list[str] = Field(default_factory=lambda: ["normal"])
+    dead_npc_records: list["DeadNpcRecord"] = Field(default_factory=list)
+
+
+class DeadNpcRecord(BaseModel):
+    role_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    death_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    death_cause: str = Field(default="", min_length=0)
+    was_team_member: bool = False
 
 
 class PublicTurnPhase(str, Enum):
@@ -678,6 +843,9 @@ class PublicTurnPhase(str, Enum):
     AWAITING_PLAYER_INTERACTION = "awaiting_player_interaction"
     AWAITING_PLAYER_REACTION = "awaiting_player_reaction"
     AWAITING_PLAYER_OPPOSED = "awaiting_player_opposed"
+    AWAITING_PLAYER_ATTACK_RESPONSE = "awaiting_player_attack_response"
+    AWAITING_PLAYER_ATTACK_DEFENSE = "awaiting_player_attack_defense"
+    AWAITING_PLAYER_DEATH_SAVE = "awaiting_player_death_save"
 
 
 class EnvironmentRiskLevel(str, Enum):
@@ -861,6 +1029,15 @@ class PublicTurnSettlementEntry(BaseModel):
         "rejected_opposed",
         "attack_flow",
     ] = "non_interactive"
+    attack_kind: Literal["ordinary_action", "targeted_attack", "aoe_attack"] | None = None
+    attack_basis: Literal["weapon", "spell", "other"] | None = None
+    attack_definition_id: str | None = None
+    attack_definition_name: str | None = None
+    attack_area_shape: Literal["none", "sphere", "cone", "line", "burst", "emanation"] | None = None
+    threatened_target_names: list[str] = Field(default_factory=list)
+    hit_target_names: list[str] = Field(default_factory=list)
+    avoided_target_names: list[str] = Field(default_factory=list)
+    revealed_target_names: list[str] = Field(default_factory=list)
     opposed_target_name: str | None = None
     opposed_target_action: str | None = None
     opposed_target_speech: str | None = None
@@ -899,7 +1076,15 @@ class PublicTurnNarrativeEntry(BaseModel):
 
 
 class PublicTurnSegmentBoundary(BaseModel):
-    boundary_kind: Literal["player_turn", "player_interaction", "player_reaction", "player_opposed", "round_end"] = "round_end"
+    boundary_kind: Literal[
+        "player_turn",
+        "player_interaction",
+        "player_reaction",
+        "player_opposed",
+        "player_attack_response",
+        "player_attack_defense",
+        "round_end",
+    ] = "round_end"
     phase: PublicTurnPhase = PublicTurnPhase.IDLE
     pause_source_actor_id: str | None = None
     pause_source_actor_name: str | None = None
@@ -949,7 +1134,14 @@ class PublicTurnSegmentActorDirective(BaseModel):
     stakes_summary: str = Field(default="", min_length=0)
     situation_delta_hint: int = 0
     reputation_delta_hint: int = 0
-    pause_kind: Literal["none", "player_interaction", "player_reaction", "player_opposed"] = "none"
+    pause_kind: Literal[
+        "none",
+        "player_interaction",
+        "player_reaction",
+        "player_opposed",
+        "player_attack_response",
+        "player_attack_defense",
+    ] = "none"
 
 
 class PublicTurnSegmentPlan(BaseModel):
@@ -1006,6 +1198,71 @@ class PublicTurnOpposedPrompt(BaseModel):
     stakes_summary: str = Field(default="", min_length=0)
 
 
+class DeathSavePrompt(BaseModel):
+    prompt_id: str = Field(..., min_length=1)
+    round_id: str = Field(..., min_length=1)
+    phase: PublicTurnPhase = PublicTurnPhase.AWAITING_PLAYER_DEATH_SAVE
+    actor_id: str = Field(..., min_length=1)
+    actor_name: str = Field(..., min_length=1)
+    successes: int = Field(default=0, ge=0, le=3)
+    failures: int = Field(default=0, ge=0, le=3)
+    dc: int = Field(default=10, ge=1, le=30)
+    severe_wound_threshold: int = Field(default=1, ge=1)
+    speech_only: bool = True
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class PublicTurnAttackPrompt(BaseModel):
+    prompt_id: str = Field(..., min_length=1)
+    round_id: str = Field(..., min_length=1)
+    phase: PublicTurnPhase = PublicTurnPhase.IDLE
+    source_actor_id: str = Field(..., min_length=1)
+    source_actor_name: str = Field(..., min_length=1)
+    source_action_summary: str = Field(default="", min_length=0)
+    source_speech_text: str = Field(default="", min_length=0)
+    attack_kind: Literal["targeted_attack", "aoe_attack"] = "targeted_attack"
+    attack_basis: Literal["weapon", "spell", "other"] = "other"
+    attack_definition_id: str | None = None
+    attack_definition_name: str | None = None
+    attack_area_shape: Literal["none", "sphere", "cone", "line", "burst", "emanation"] = "none"
+    attack_area_radius_m: float = Field(default=0, ge=0)
+    attack_area_length_m: float = Field(default=0, ge=0)
+    can_include_self: bool = False
+    current_target_actor_id: str = Field(..., min_length=1)
+    current_target_name: str = Field(..., min_length=1)
+    current_target_kind: PublicTurnActorType = PublicTurnActorType.PLAYER
+    threatened_target_names: list[str] = Field(default_factory=list)
+    revealed_target_names: list[str] = Field(default_factory=list)
+    player_in_danger: bool = False
+    attack_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
+    suggested_response_hint: str = Field(default="", min_length=0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class PublicTurnAttackDefensePrompt(BaseModel):
+    check_id: str = Field(..., min_length=1)
+    round_id: str = Field(..., min_length=1)
+    phase: PublicTurnPhase = PublicTurnPhase.IDLE
+    attack_kind: Literal["targeted_attack", "aoe_attack"] = "targeted_attack"
+    source_actor_id: str = Field(..., min_length=1)
+    source_actor_name: str = Field(..., min_length=1)
+    source_action_summary: str = Field(default="", min_length=0)
+    source_speech_text: str = Field(default="", min_length=0)
+    source_attack_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] = "strength"
+    source_attack_ability_modifier: int = 0
+    target_actor_id: str = Field(..., min_length=1)
+    target_actor_name: str = Field(..., min_length=1)
+    target_action_summary: str = Field(default="", min_length=0)
+    target_speech_text: str = Field(default="", min_length=0)
+    target_defense_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] = "dexterity"
+    target_defense_ability_modifier: int = 0
+    threatened_target_names: list[str] = Field(default_factory=list)
+    hit_target_names: list[str] = Field(default_factory=list)
+    aoe_remaining_target_count: int = Field(default=0, ge=0)
+    stakes_summary: str = Field(default="", min_length=0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class PublicTurnInteractionPrompt(BaseModel):
     prompt_id: str = Field(..., min_length=1)
     round_id: str = Field(..., min_length=1)
@@ -1034,6 +1291,14 @@ class PublicTurnInteractionPrompt(BaseModel):
     suggested_target_label: str = Field(default="", min_length=0)
 
 
+class PublicTurnAttackResponseSubmission(BaseModel):
+    prompt_id: str = Field(..., min_length=1)
+    target_actor_id: str = Field(..., min_length=1)
+    action_text: str = Field(default="", min_length=0)
+    speech_text: str = Field(default="", min_length=0)
+    response_kind: Literal["explicit_response", "no_action"] = "explicit_response"
+
+
 class PublicTurnRound(BaseModel):
     round_id: str = Field(..., min_length=1)
     round_number: int = Field(default=1, ge=1)
@@ -1049,6 +1314,9 @@ class PublicTurnRound(BaseModel):
     situation_dc: int = 10
     pending_reaction_check_id: str | None = None
     pending_interaction_prompt: PublicTurnInteractionPrompt | None = None
+    pending_attack_prompt: PublicTurnAttackPrompt | None = None
+    pending_attack_defense_prompt: PublicTurnAttackDefensePrompt | None = None
+    pending_death_save_prompt: DeathSavePrompt | None = None
     current_actor_id: str | None = None
     awaiting_player_action: bool = False
     awaiting_player_action_phase: PublicTurnPhase | None = None
@@ -1214,7 +1482,7 @@ class Dnd5eHitPoints(BaseModel):
 
 
 class Dnd5eSpellSlots(BaseModel):
-    level_1: int = Field(default=2, ge=0, le=9)
+    level_1: int = Field(default=1, ge=0, le=9)
     level_2: int = Field(default=0, ge=0, le=9)
     level_3: int = Field(default=0, ge=0, le=9)
     level_4: int = Field(default=0, ge=0, le=9)
@@ -1251,6 +1519,11 @@ class RoleBuff(BaseModel):
     effect: RoleBuffEffect = Field(default_factory=RoleBuffEffect)
 
 
+class OriginStamp(BaseModel):
+    origin_kind: Literal["starting_build", "level_up", "loot", "quest_reward", "purchase", "learned", "crafted", "gifted", "debug"] = "debug"
+    origin_ref: str = Field(default="", min_length=0)
+
+
 class InventoryItem(BaseModel):
     item_id: str = Field(..., min_length=1)
     name: str = Field(..., min_length=1)
@@ -1268,6 +1541,7 @@ class InventoryItem(BaseModel):
     slot_type: Literal["weapon", "armor", "misc"] = "misc"
     attack_bonus: int = 0
     armor_bonus: int = 0
+    origin: OriginStamp | None = None
 
 
 class InventoryData(BaseModel):
@@ -1315,6 +1589,9 @@ class PlayerDeathState(BaseModel):
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
+RoleActionStatus = Literal["free_action", "death_saving", "dead", "unable_to_act"]
+
+
 class DeathPenalties(BaseModel):
     """死亡惩罚计算结果"""
     gold_lost: int = 0
@@ -1339,6 +1616,7 @@ class Dnd5eCharacterSheet(BaseModel):
     stamina_current: int = Field(default=10, ge=0)
     stamina_maximum: int = Field(default=10, ge=1)
     is_dead: bool = False
+    role_action_status: RoleActionStatus = "free_action"
     status_flags: list[str] = Field(default_factory=list)
     hit_dice: str = Field(default="1d8", min_length=1)
     hit_points: Dnd5eHitPoints = Field(default_factory=Dnd5eHitPoints)
@@ -1356,15 +1634,46 @@ class Dnd5eCharacterSheet(BaseModel):
     buffs: list[RoleBuff] = Field(default_factory=list)
     features_traits: list[str] = Field(default_factory=list)
     spells: list[str] = Field(default_factory=list)
+    war_arts: list[str] = Field(default_factory=list)
+    spell_origins: dict[str, OriginStamp] = Field(default_factory=dict)
+    skill_origins: dict[str, OriginStamp] = Field(default_factory=dict)
+    war_art_origins: dict[str, OriginStamp] = Field(default_factory=dict)
     spell_slots_max: Dnd5eSpellSlots = Field(default_factory=Dnd5eSpellSlots)
     spell_slots_current: Dnd5eSpellSlots = Field(default_factory=Dnd5eSpellSlots)
+    martial_points_current: int = Field(default=0, ge=0, le=9)
+    martial_points_maximum: int = Field(default=0, ge=0, le=9)
     notes: str = Field(default="", min_length=0)
     death_state: PlayerDeathState = Field(default_factory=PlayerDeathState)
+
+
+class PortraitAssetRef(BaseModel):
+    asset_id: str = Field(..., min_length=1)
+    relative_path: str = Field(..., min_length=1)
+    mime_type: str = Field(default="image/png", min_length=1)
+    width: int = Field(default=768, ge=1)
+    height: int = Field(default=1344, ge=1)
+    variant_kind: Literal["uploaded_raw", "generated_raw", "bg_removed", "final_portrait"] = "uploaded_raw"
+    derived_from_asset_id: str | None = None
+    provider: AIProvider | None = None
+    model: str | None = None
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class CharacterBuildState(BaseModel):
+    player_status: Literal["uncreated", "completed"] = "uncreated"
+    initial_companion_offer_seen: bool = False
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 class PlayerStaticData(BaseModel):
     player_id: str = Field(default="player_001", min_length=1)
     name: str = Field(default="玩家", min_length=1)
+    age: int = Field(default=18, ge=0, le=999)
+    height_cm: int = Field(default=170, ge=50, le=300)
+    body_type: str = Field(default="", min_length=0)
+    appearance: str = Field(default="", min_length=0)
+    portrait: PortraitAssetRef | None = None
+    build_archive_id: str | None = None
     move_speed_mph: int = Field(default=4500, gt=0)
     role_type: Literal["player", "npc", "monster"] = "player"
     dnd5e_sheet: Dnd5eCharacterSheet = Field(default_factory=Dnd5eCharacterSheet)
@@ -1454,6 +1763,8 @@ class NpcRoleCard(BaseModel):
     talkative_maximum: int = Field(default=100, ge=1, le=100)
     last_private_chat_at: str | None = None
     last_public_turn_at: str | None = None
+    portrait: PortraitAssetRef | None = None
+    retained_id: str | None = None
     profile: PlayerStaticData = Field(default_factory=lambda: PlayerStaticData(role_type="npc"))
     relations: list[RoleRelation] = Field(default_factory=list)
     cognition_changes: list[str] = Field(default_factory=list)
@@ -1815,7 +2126,7 @@ class BattleRollResolution(BaseModel):
     prompt_id: str = Field(..., min_length=1)
     actor_combatant_id: str = Field(..., min_length=1)
     actor_name: str = Field(..., min_length=1)
-    roll_kind: Literal["initiative", "attack", "observe", "escape", "reaction", "item_use"] = "attack"
+    roll_kind: Literal["initiative", "attack", "observe", "escape", "reaction", "item_use", "death_save", "stabilize"] = "attack"
     ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] = "strength"
     ability_modifier: int = 0
     dc: int = Field(default=10, ge=1, le=30)
@@ -1935,6 +2246,7 @@ class SaveFile(BaseModel):
     quest_state: QuestState = Field(default_factory=lambda: QuestState())
     encounter_state: EncounterState = Field(default_factory=lambda: EncounterState())
     fate_state: FateState = Field(default_factory=lambda: FateState())
+    character_build_state: CharacterBuildState = Field(default_factory=CharacterBuildState)
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -1948,6 +2260,289 @@ class SaveSetRequest(BaseModel):
 
 class SaveClearRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
+
+
+class CharacterBuildBasicInfo(BaseModel):
+    name: str = Field(default="", min_length=0)
+    age: int = Field(default=18, ge=0, le=999)
+    race: str = Field(default="", min_length=0)
+    height_cm: int = Field(default=170, ge=50, le=300)
+    body_type: str = Field(default="", min_length=0)
+
+
+class CharacterBuildChoiceOption(BaseModel):
+    option_id: str = Field(..., min_length=1)
+    label: str = Field(..., min_length=1)
+    description: str = Field(default="", min_length=0)
+    source_kind: Literal["spell", "equipment", "skill", "item", "armor"] = "item"
+    definition_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CharacterBuildMediaCapabilities(BaseModel):
+    active_provider: AIProvider | None = None
+    supports_generation: bool = False
+    supports_background_removal: bool = False
+    supports_vision: bool = False
+    requires_explicit_provider: bool = False
+    detail: str = Field(default="", min_length=0)
+
+
+class CharacterBuildStateResponse(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    state: CharacterBuildState = Field(default_factory=CharacterBuildState)
+    forced_entry: bool = False
+    can_build_companion: bool = False
+    companion_offer_pending: bool = False
+    media_capabilities: CharacterBuildMediaCapabilities = Field(default_factory=CharacterBuildMediaCapabilities)
+
+
+class CharacterBuildOptionsResponse(BaseModel):
+    kind: Literal["player", "companion"] = "player"
+    specialization: Literal["warrior", "mage"] = "warrior"
+    point_buy_total: int = 27
+    point_buy_costs: dict[str, int] = Field(default_factory=dict)
+    recommended_races: list[str] = Field(default_factory=list)
+    body_type_suggestions: list[str] = Field(default_factory=list)
+    spell_pick_count: int = 0
+    equipment_pick_count: int = 0
+    skill_pick_count: int = 0
+    spell_options: list[CharacterBuildChoiceOption] = Field(default_factory=list)
+    equipment_options: list[CharacterBuildChoiceOption] = Field(default_factory=list)
+    skill_options: list[CharacterBuildChoiceOption] = Field(default_factory=list)
+    granted_armor: CharacterBuildChoiceOption | None = None
+    granted_items: list[CharacterBuildChoiceOption] = Field(default_factory=list)
+
+
+class CharacterBuildBasicInfoSuggestRequest(BaseModel):
+    config: ChatConfig | None = None
+    prompt: str = Field(default="", min_length=0)
+    current: CharacterBuildBasicInfo | None = None
+    kind: Literal["player", "companion"] = "player"
+
+
+class CharacterBuildBasicInfoSuggestResponse(BaseModel):
+    basic_info: CharacterBuildBasicInfo
+
+
+class CharacterBuildAbilitySuggestRequest(BaseModel):
+    config: ChatConfig | None = None
+    prompt: str = Field(default="", min_length=0)
+    current_scores: Dnd5eAbilityScores | None = None
+    specialization: Literal["warrior", "mage"] | None = None
+
+
+class CharacterBuildAbilitySuggestResponse(BaseModel):
+    ability_scores: Dnd5eAbilityScores = Field(default_factory=Dnd5eAbilityScores)
+    points_spent: int = 0
+
+
+class CharacterBuildPortraitPromptSuggestRequest(BaseModel):
+    config: ChatConfig | None = None
+    prompt: str = Field(default="", min_length=0)
+    current_prompt: str = Field(default="", min_length=0)
+    basic_info: CharacterBuildBasicInfo | None = None
+
+
+class CharacterBuildPortraitPromptSuggestResponse(BaseModel):
+    portrait_prompt: str = Field(default="", min_length=0)
+
+
+class CharacterBuildLoadoutSuggestRequest(BaseModel):
+    config: ChatConfig | None = None
+    prompt: str = Field(default="", min_length=0)
+    kind: Literal["player", "companion"] = "player"
+    specialization: Literal["warrior", "mage"] = "warrior"
+    basic_info: CharacterBuildBasicInfo | None = None
+    appearance: str = Field(default="", min_length=0)
+    available_spell_option_ids: list[str] = Field(default_factory=list)
+    available_equipment_option_ids: list[str] = Field(default_factory=list)
+    available_skill_option_ids: list[str] = Field(default_factory=list)
+
+
+class CharacterBuildLoadoutSuggestResponse(BaseModel):
+    spell_option_ids: list[str] = Field(default_factory=list)
+    equipment_option_ids: list[str] = Field(default_factory=list)
+    skill_option_ids: list[str] = Field(default_factory=list)
+
+
+class CharacterBuildCompanionFlavor(BaseModel):
+    personality: str = Field(default="", min_length=0)
+    speaking_style: str = Field(default="", min_length=0)
+    cognition: str = Field(default="", min_length=0)
+    secret: str = Field(default="", min_length=0)
+    likes: list[str] = Field(default_factory=list)
+
+
+class CharacterBuildCompanionFlavorSuggestRequest(BaseModel):
+    config: ChatConfig | None = None
+    prompt: str = Field(default="", min_length=0)
+    current: CharacterBuildCompanionFlavor | None = None
+    basic_info: CharacterBuildBasicInfo | None = None
+    appearance: str = Field(default="", min_length=0)
+
+
+class CharacterBuildCompanionFlavorSuggestResponse(BaseModel):
+    flavor: CharacterBuildCompanionFlavor = Field(default_factory=CharacterBuildCompanionFlavor)
+
+
+class CharacterBuildMediaUploadRequest(BaseModel):
+    data_base64: str = Field(..., min_length=1)
+    mime_type: str = Field(default="image/png", min_length=1)
+    file_name: str = Field(default="", min_length=0)
+
+
+class CharacterBuildMediaUploadResponse(BaseModel):
+    asset: PortraitAssetRef
+
+
+class CharacterBuildMediaGenerateRequest(BaseModel):
+    config: ChatConfig
+    prompt: str = Field(..., min_length=1)
+    basic_info: CharacterBuildBasicInfo | None = None
+    reference_asset_id: str | None = None
+
+
+class CharacterBuildMediaGenerateResponse(BaseModel):
+    assets: list[PortraitAssetRef] = Field(default_factory=list)
+    provider: AIProvider
+    model: str = Field(..., min_length=1)
+    prompt_used: str = Field(..., min_length=1)
+
+
+class CharacterBuildMediaRemoveBackgroundRequest(BaseModel):
+    config: ChatConfig
+    raw_asset_id: str = Field(..., min_length=1)
+
+
+class CharacterBuildMediaRemoveBackgroundResponse(BaseModel):
+    raw_asset: PortraitAssetRef
+    bg_removed_asset: PortraitAssetRef
+
+
+class CharacterBuildMediaFinalizeRequest(BaseModel):
+    asset_id: str = Field(..., min_length=1)
+
+
+class CharacterBuildMediaFinalizeResponse(BaseModel):
+    asset: PortraitAssetRef
+
+
+class CharacterBuildMediaDescribeRequest(BaseModel):
+    config: ChatConfig
+    asset_id: str = Field(..., min_length=1)
+    basic_info: CharacterBuildBasicInfo | None = None
+
+
+class CharacterBuildMediaDescribeResponse(BaseModel):
+    description: str = Field(default="", min_length=0)
+    asset_id: str = Field(..., min_length=1)
+    provider: AIProvider
+    model: str = Field(..., min_length=1)
+
+
+class CharacterBuildLoadoutSelection(BaseModel):
+    spell_option_ids: list[str] = Field(default_factory=list)
+    equipment_option_ids: list[str] = Field(default_factory=list)
+    skill_option_ids: list[str] = Field(default_factory=list)
+
+
+class PlayerBuildSeedSummary(BaseModel):
+    archive_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    created_at: str = Field(..., min_length=1)
+    portrait: PortraitAssetRef | None = None
+
+
+class PlayerBuildSeed(BaseModel):
+    archive_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    created_at: str = Field(..., min_length=1)
+    basic_info: CharacterBuildBasicInfo = Field(default_factory=CharacterBuildBasicInfo)
+    specialization: Literal["warrior", "mage"] = "warrior"
+    player_static_data: PlayerStaticData
+
+
+class PlayerBuildSeedListResponse(BaseModel):
+    items: list[PlayerBuildSeedSummary] = Field(default_factory=list)
+
+
+class PlayerBuildSeedResponse(BaseModel):
+    seed: PlayerBuildSeed
+
+
+class CompanionBuildSeedSummary(BaseModel):
+    retained_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    retained_at: str = Field(..., min_length=1)
+    portrait: PortraitAssetRef | None = None
+
+
+class CompanionBuildSeedListResponse(BaseModel):
+    items: list[CompanionBuildSeedSummary] = Field(default_factory=list)
+
+
+class CompanionBuildSeedResponse(BaseModel):
+    retained_id: str = Field(..., min_length=1)
+    retained_at: str = Field(..., min_length=1)
+    role: NpcRoleCard
+
+
+class CharacterBuildPlayerCompleteRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    basic_info: CharacterBuildBasicInfo
+    specialization: Literal["warrior", "mage"] = "warrior"
+    ability_scores: Dnd5eAbilityScores = Field(default_factory=Dnd5eAbilityScores)
+    final_portrait_asset_id: str = Field(..., min_length=1)
+    appearance: str = Field(default="", min_length=0)
+    loadout: CharacterBuildLoadoutSelection = Field(default_factory=CharacterBuildLoadoutSelection)
+
+
+class CharacterBuildPlayerCompleteResponse(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    player: PlayerStaticData
+    state: CharacterBuildState = Field(default_factory=CharacterBuildState)
+    archive_id: str = Field(..., min_length=1)
+
+
+class CharacterBuildCompanionCompleteRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    basic_info: CharacterBuildBasicInfo
+    specialization: Literal["warrior", "mage"] = "warrior"
+    ability_scores: Dnd5eAbilityScores = Field(default_factory=Dnd5eAbilityScores)
+    final_portrait_asset_id: str = Field(..., min_length=1)
+    appearance: str = Field(default="", min_length=0)
+    loadout: CharacterBuildLoadoutSelection = Field(default_factory=CharacterBuildLoadoutSelection)
+    flavor: CharacterBuildCompanionFlavor = Field(default_factory=CharacterBuildCompanionFlavor)
+
+
+class CharacterBuildCompanionCompleteResponse(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    role: NpcRoleCard
+    member: TeamMember
+    retained_id: str = Field(..., min_length=1)
+
+
+class CharacterBuildCompanionOfferRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    seen: bool = True
+
+
+class DebugSaveResetRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+
+
+class DebugSaveResetResponse(BaseModel):
+    ok: bool = True
+    session_id: str = Field(..., min_length=1)
+    save: SaveFile
+    cleared_active_encounter_ids: list[str] = Field(default_factory=list)
+    cleared_pending_encounter_ids: list[str] = Field(default_factory=list)
+    cleared_public_round_ids: list[str] = Field(default_factory=list)
+    cleared_recent_turn_count: int = Field(default=0, ge=0)
+    cleared_team_member_role_ids: list[str] = Field(default_factory=list)
+    cleared_pending_turn: bool = False
+    summary: str = Field(default="", min_length=0)
 
 
 class RegionGenerateRequest(BaseModel):
@@ -2450,21 +3045,29 @@ class TemplateLibraryStatusResponse(BaseModel):
     template_dir: str
     item_definition_count: int = Field(default=0, ge=0)
     equipment_definition_count: int = Field(default=0, ge=0)
+    spell_definition_count: int = Field(default=0, ge=0)
+    war_art_definition_count: int = Field(default=0, ge=0)
     interactable_template_count: int = Field(default=0, ge=0)
     last_filled_at: str | None = None
 
 
 class TemplateLibraryFillRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
+    fill_scope: Literal["all", "spells"] = "all"
+    spell_fill_count: int = Field(default=20, ge=1, le=100)
     config: ChatConfig | None = None
 
 
 class TemplateLibraryFillResponse(TemplateLibraryStatusResponse):
     appended_item_definition_ids: list[str] = Field(default_factory=list)
     appended_equipment_definition_ids: list[str] = Field(default_factory=list)
+    appended_spell_definition_ids: list[str] = Field(default_factory=list)
+    appended_war_art_definition_ids: list[str] = Field(default_factory=list)
     appended_interactable_template_ids: list[str] = Field(default_factory=list)
     updated_item_definition_ids: list[str] = Field(default_factory=list)
     updated_equipment_definition_ids: list[str] = Field(default_factory=list)
+    updated_spell_definition_ids: list[str] = Field(default_factory=list)
+    updated_war_art_definition_ids: list[str] = Field(default_factory=list)
     updated_interactable_template_ids: list[str] = Field(default_factory=list)
 
 
@@ -2519,6 +3122,78 @@ class NpcChatResponse(BaseModel):
     scene_events: list[SceneEvent] = Field(default_factory=list)
 
 
+class PlayerInputValidationRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    entry_point: Literal[
+        "main_chat",
+        "npc_chat",
+        "teammate_chat",
+        "public_turn_action",
+        "public_turn_interaction_response",
+        "public_turn_attack_response",
+        "debug_panel",
+    ]
+    action_text: str = Field(default="", min_length=0)
+    speech_text: str = Field(default="", min_length=0)
+    actor_role_id: str | None = None
+    config: ChatConfig | None = None
+
+
+class PlayerInputValidationIssue(BaseModel):
+    code: Literal[
+        "multiple_world_actions",
+        "claimed_outcome",
+        "controls_other_actor",
+        "spell_not_known",
+        "spell_slot_insufficient",
+        "war_art_not_known",
+        "war_art_points_insufficient",
+        "war_art_requires_weapon",
+        "item_not_owned",
+        "speech_only_required",
+        "actor_dead",
+    ]
+    message: str = Field(..., min_length=1)
+    field: Literal["action_text", "speech_text", "both"] = "action_text"
+
+
+class PlayerInputResourceStatus(BaseModel):
+    check_status: Literal["not_applicable", "passed", "failed"] = "not_applicable"
+    resource_kind: Literal["none", "spell", "war_art", "item"] = "none"
+    mentioned_name: str = Field(default="", min_length=0)
+    resolved_name: str = Field(default="", min_length=0)
+    resolved_definition_id: str | None = None
+    required_amount: int | None = Field(default=None, ge=0)
+    current_amount: int | None = Field(default=None, ge=0)
+    requirement_summary: str = Field(default="", min_length=0)
+    current_summary: str = Field(default="", min_length=0)
+
+
+class PlayerInputValidationResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    entry_point: Literal[
+        "main_chat",
+        "npc_chat",
+        "teammate_chat",
+        "public_turn_action",
+        "public_turn_interaction_response",
+        "public_turn_attack_response",
+        "debug_panel",
+    ]
+    actor_role_id: str
+    actor_name: str
+    actor_kind: Literal["player", "npc"] = "player"
+    status: Literal["accepted", "needs_player_confirmation"] = "accepted"
+    normalized_action_text: str = Field(default="", min_length=0)
+    normalized_speech_text: str = Field(default="", min_length=0)
+    fallback_action_text: str = Field(default="", min_length=0)
+    display_text: str = Field(default="", min_length=0)
+    summary: str = Field(default="", min_length=0)
+    issues: list[PlayerInputValidationIssue] = Field(default_factory=list)
+    resource_status: PlayerInputResourceStatus = Field(default_factory=PlayerInputResourceStatus)
+
+
 class ActionCheckRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     action_type: Literal["attack", "check", "item_use"] = "check"
@@ -2551,7 +3226,7 @@ class ActionCheckRequest(BaseModel):
 
 class ActionCheckPlanRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
-    action_type: Literal["attack", "check", "item_use"] = "check"
+    action_type: Literal["attack", "check", "item_use", "auto"] = "check"
     check_mode: Literal["action", "reaction_save"] = "action"
     action_prompt: str = Field(..., min_length=1)
     actor_role_id: str | None = None
@@ -2885,6 +3560,7 @@ class PublicTurnContinueRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     action_submission: PublicTurnActionSubmission | None = None
     player_interaction_response: PublicTurnInteractionResponseSubmission | None = None
+    player_attack_response: PublicTurnAttackResponseSubmission | None = None
     player_action_check: PublicTurnPlayerActionCheck | None = None
     config: ChatConfig | None = None
 
@@ -2892,6 +3568,13 @@ class PublicTurnContinueRequest(BaseModel):
 class PublicTurnReactionCheckRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     check_id: str = Field(..., min_length=1)
+    forced_dice_roll: int = Field(..., ge=1, le=20)
+    config: ChatConfig | None = None
+
+
+class PublicTurnDeathSaveResolveRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    prompt_id: str = Field(..., min_length=1)
     forced_dice_roll: int = Field(..., ge=1, le=20)
     config: ChatConfig | None = None
 
@@ -2940,6 +3623,13 @@ class PublicTurnOpposedResolveRequest(BaseModel):
     config: ChatConfig | None = None
 
 
+class PublicTurnAttackDefenseResolveRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    check_id: str = Field(..., min_length=1)
+    forced_dice_roll: int = Field(..., ge=1, le=20)
+    config: ChatConfig | None = None
+
+
 class PublicTurnPresentation(BaseModel):
     round_id: str = Field(default="", min_length=0)
     round_number: int = Field(default=0, ge=0)
@@ -2962,7 +3652,10 @@ class PublicTurnResponse(BaseModel):
     scene_events: list[SceneEvent] = Field(default_factory=list)
     reaction_check: PlayerReactionCheck | None = None
     public_interaction_prompt: PublicTurnInteractionPrompt | None = None
+    public_attack_prompt: PublicTurnAttackPrompt | None = None
+    public_attack_defense_prompt: PublicTurnAttackDefensePrompt | None = None
     public_opposed_prompt: PublicTurnOpposedPrompt | None = None
+    death_save_prompt: DeathSavePrompt | None = None
     round_completed: bool = False
     awaiting_entry: bool = False
     public_turn_state: PublicTurnState = Field(default_factory=PublicTurnState)
@@ -3195,6 +3888,10 @@ class PlayerSkillSetRequest(BaseModel):
 
 class PlayerSpellSlotAdjustRequest(BaseModel):
     level: int = Field(..., ge=1, le=9)
+    amount: int = Field(default=1, ge=1, le=9)
+
+
+class PlayerMartialPointAdjustRequest(BaseModel):
     amount: int = Field(default=1, ge=1, le=9)
 
 

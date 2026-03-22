@@ -7,8 +7,10 @@ from uuid import uuid4
 from app.models.schemas import (
     PendingTurnContinueResponse,
     PendingTurnState,
+    PublicTurnAttackDefenseResolveRequest,
     PublicTurnActionSubmission,
     PublicTurnContinueRequest,
+    PublicTurnDeathSaveResolveRequest,
     PublicTurnEntryRequest,
     PublicTurnNarrativeEntry,
     PublicTurnOpposedPlanRequest,
@@ -31,10 +33,14 @@ from app.services.public_turn_runtime import (
     PublicTurnRunResult,
     continue_round_in_save,
     iter_round_after_opposed_steps_in_save,
+    iter_round_after_attack_defense_steps_in_save,
+    iter_round_after_death_save_steps_in_save,
     iter_round_after_reaction_steps_in_save,
     iter_round_continue_steps_in_save,
     iter_round_entry_steps_in_save,
     resume_round_after_opposed_in_save,
+    resume_round_after_attack_defense_in_save,
+    resume_round_after_death_save_in_save,
     resume_round_after_reaction_in_save,
     start_round_in_save,
 )
@@ -64,7 +70,10 @@ def _to_response(session_id: str, result: PublicTurnRunResult, save) -> PublicTu
         scene_events=result.scene_events,
         reaction_check=result.reaction_check,
         public_interaction_prompt=result.public_interaction_prompt,
+        public_attack_prompt=result.public_attack_prompt,
+        public_attack_defense_prompt=result.public_attack_defense_prompt,
         public_opposed_prompt=result.public_opposed_prompt,
+        death_save_prompt=result.death_save_prompt,
         round_completed=result.round_completed,
         awaiting_entry=state.awaiting_player_entry,
         public_turn_state=state,
@@ -144,6 +153,8 @@ def _stage_protocol_repair_checkpoint(
         accumulated_tool_events=[],
         time_spent_min=0,
         pending_reaction=None,
+        public_attack_prompt=None,
+        public_attack_defense_prompt=None,
         public_opposed_prompt=None,
         continuation_index=0,
         npc_role_id=None,
@@ -164,6 +175,8 @@ def _stage_protocol_repair_checkpoint(
         scene_events=[],
         tool_events=[],
         pending_reaction=None,
+        public_attack_prompt=None,
+        public_attack_defense_prompt=None,
         public_turn_state=state,
         public_turn_presentation=_public_turn_presentation_from_save(save),
         npc_role_id=None,
@@ -216,6 +229,161 @@ def _stage_opposed_checkpoint(
         tool_events=[],
         pending_reaction=None,
         public_opposed_prompt=result.public_opposed_prompt,
+        player_action_check_result=result.player_action_check_result,
+        public_turn_state=state,
+        public_turn_presentation=result.presentation,
+        npc_role_id=None,
+    )
+
+
+def _stage_attack_response_checkpoint(
+    *,
+    session_id: str,
+    original_request: dict[str, Any],
+    save,
+    result: PublicTurnRunResult,
+) -> PendingTurnContinueResponse:
+    state = get_public_turn_state_in_save(save)
+    round_state = state.current_round
+    if round_state is None or result.public_attack_prompt is None:
+        raise ValueError("PUBLIC_TURN_NOT_ACTIVE")
+    now = world._utc_now()
+    pending_turn_id = f"pt_{uuid4().hex}"
+    pending_state = PendingTurnState(
+        pending_turn_id=pending_turn_id,
+        session_id=session_id,
+        flow_kind="public_turn",
+        status="awaiting_player_attack_response",
+        staged_save=save.model_dump(mode="json"),
+        original_request=original_request,
+        accumulated_reply_text=result.narration,
+        accumulated_scene_events=result.scene_events,
+        accumulated_tool_events=[],
+        time_spent_min=0,
+        pending_reaction=None,
+        public_attack_prompt=result.public_attack_prompt,
+        continuation_index=0,
+        npc_role_id=None,
+        public_round_id=round_state.round_id,
+        public_phase_before_pause=round_state.awaiting_player_action_phase or round_state.phase,
+        created_at=now,
+        updated_at=now,
+    )
+    save_pending_turn(pending_state)
+    return PendingTurnContinueResponse(
+        session_id=session_id,
+        pending_turn_id=pending_turn_id,
+        flow_kind="public_turn",
+        status="awaiting_player_attack_response",
+        reply_text=result.narration,
+        scene_events=result.scene_events,
+        tool_events=[],
+        pending_reaction=None,
+        public_attack_prompt=result.public_attack_prompt,
+        player_action_check_result=result.player_action_check_result,
+        public_turn_state=state,
+        public_turn_presentation=result.presentation,
+        npc_role_id=None,
+    )
+
+
+def _stage_attack_defense_checkpoint(
+    *,
+    session_id: str,
+    original_request: dict[str, Any],
+    save,
+    result: PublicTurnRunResult,
+) -> PendingTurnContinueResponse:
+    state = get_public_turn_state_in_save(save)
+    round_state = state.current_round
+    if round_state is None or result.public_attack_defense_prompt is None:
+        raise ValueError("PUBLIC_TURN_NOT_ACTIVE")
+    now = world._utc_now()
+    pending_turn_id = f"pt_{uuid4().hex}"
+    pending_state = PendingTurnState(
+        pending_turn_id=pending_turn_id,
+        session_id=session_id,
+        flow_kind="public_turn",
+        status="awaiting_player_attack_defense",
+        staged_save=save.model_dump(mode="json"),
+        original_request=original_request,
+        accumulated_reply_text=result.narration,
+        accumulated_scene_events=result.scene_events,
+        accumulated_tool_events=[],
+        time_spent_min=0,
+        pending_reaction=None,
+        public_attack_defense_prompt=result.public_attack_defense_prompt,
+        continuation_index=0,
+        npc_role_id=None,
+        public_round_id=round_state.round_id,
+        public_phase_before_pause=round_state.awaiting_player_action_phase or round_state.phase,
+        created_at=now,
+        updated_at=now,
+    )
+    save_pending_turn(pending_state)
+    return PendingTurnContinueResponse(
+        session_id=session_id,
+        pending_turn_id=pending_turn_id,
+        flow_kind="public_turn",
+        status="awaiting_player_attack_defense",
+        reply_text=result.narration,
+        scene_events=result.scene_events,
+        tool_events=[],
+        pending_reaction=None,
+        public_attack_defense_prompt=result.public_attack_defense_prompt,
+        player_action_check_result=result.player_action_check_result,
+        public_turn_state=state,
+        public_turn_presentation=result.presentation,
+        npc_role_id=None,
+    )
+
+
+def _stage_death_save_checkpoint(
+    *,
+    session_id: str,
+    original_request: dict[str, Any],
+    save,
+    result: PublicTurnRunResult,
+) -> PendingTurnContinueResponse:
+    state = get_public_turn_state_in_save(save)
+    round_state = state.current_round
+    if round_state is None or result.death_save_prompt is None:
+        raise ValueError("PUBLIC_TURN_NOT_ACTIVE")
+    now = world._utc_now()
+    pending_turn_id = f"pt_{uuid4().hex}"
+    pending_state = PendingTurnState(
+        pending_turn_id=pending_turn_id,
+        session_id=session_id,
+        flow_kind="public_turn",
+        status="awaiting_player_death_save",
+        staged_save=save.model_dump(mode="json"),
+        original_request=original_request,
+        accumulated_reply_text=result.narration,
+        accumulated_scene_events=result.scene_events,
+        accumulated_tool_events=[],
+        time_spent_min=0,
+        pending_reaction=None,
+        death_save_prompt=result.death_save_prompt,
+        continuation_index=0,
+        npc_role_id=None,
+        public_round_id=round_state.round_id,
+        public_phase_before_pause=PublicTurnPhase(
+            str(result.death_save_prompt.metadata.get("phase_before_pause") or round_state.phase.value)
+        ),
+        created_at=now,
+        updated_at=now,
+    )
+    save_pending_turn(pending_state)
+    return PendingTurnContinueResponse(
+        session_id=session_id,
+        pending_turn_id=pending_turn_id,
+        flow_kind="public_turn",
+        status="awaiting_player_death_save",
+        reply_text=result.narration,
+        scene_events=result.scene_events,
+        tool_events=[],
+        pending_reaction=None,
+        death_save_prompt=result.death_save_prompt,
         player_action_check_result=result.player_action_check_result,
         public_turn_state=state,
         public_turn_presentation=result.presentation,
@@ -320,6 +488,10 @@ async def _emit_public_turn_step(
         await emit("impact", impact.model_dump(mode="json"))
     if result.public_interaction_prompt is not None:
         await emit("interaction_required", result.public_interaction_prompt.model_dump(mode="json"))
+    if result.public_attack_prompt is not None:
+        await emit("attack_response_required", result.public_attack_prompt.model_dump(mode="json"))
+    if result.public_attack_defense_prompt is not None:
+        await emit("attack_defense_required", result.public_attack_defense_prompt.model_dump(mode="json"))
     if result.presentation.phase == PublicTurnPhase.GM_PUSH and result.round_completed:
         await emit("gm_push", {"round_id": result.presentation.round_id, "round_number": result.presentation.round_number})
 
@@ -331,6 +503,12 @@ async def _emit_pending_response(
 ) -> None:
     if result.status == "awaiting_protocol_repair":
         event_name = "protocol_repair_required"
+    elif result.status == "awaiting_player_attack_response":
+        event_name = "attack_response_required"
+    elif result.status == "awaiting_player_attack_defense":
+        event_name = "attack_defense_required"
+    elif result.status == "awaiting_player_death_save":
+        event_name = "death_save_required"
     else:
         event_name = "opposed_check_required" if result.status == "awaiting_opposed" else "reaction_check_required"
     await emit(
@@ -341,8 +519,19 @@ async def _emit_pending_response(
             "reply_so_far": result.reply_text,
             "scene_events_so_far": [item.model_dump(mode="json") for item in result.scene_events],
             "pending_reaction": (result.pending_reaction.model_dump(mode="json") if result.pending_reaction is not None else None),
+            "public_attack_prompt": (
+                result.public_attack_prompt.model_dump(mode="json") if result.public_attack_prompt is not None else None
+            ),
+            "public_attack_defense_prompt": (
+                result.public_attack_defense_prompt.model_dump(mode="json")
+                if result.public_attack_defense_prompt is not None
+                else None
+            ),
             "public_opposed_prompt": (
                 result.public_opposed_prompt.model_dump(mode="json") if result.public_opposed_prompt is not None else None
+            ),
+            "death_save_prompt": (
+                result.death_save_prompt.model_dump(mode="json") if result.death_save_prompt is not None else None
             ),
             "npc_role_id": result.npc_role_id,
             "public_turn_state": (result.public_turn_state.model_dump(mode="json") if result.public_turn_state is not None else None),
@@ -372,7 +561,10 @@ def _merge_step_results(results: list[PublicTurnRunResult]) -> PublicTurnRunResu
     settlements = []
     reaction_check = None
     public_interaction_prompt = None
+    public_attack_prompt = None
+    public_attack_defense_prompt = None
     public_opposed_prompt = None
+    death_save_prompt = None
     player_action_check_result = None
     archived_sub_zone_turn_id = None
     for item in results:
@@ -381,7 +573,10 @@ def _merge_step_results(results: list[PublicTurnRunResult]) -> PublicTurnRunResu
         settlements.extend(item.settlement_entries)
         reaction_check = item.reaction_check or reaction_check
         public_interaction_prompt = item.public_interaction_prompt or public_interaction_prompt
+        public_attack_prompt = item.public_attack_prompt or public_attack_prompt
+        public_attack_defense_prompt = item.public_attack_defense_prompt or public_attack_defense_prompt
         public_opposed_prompt = item.public_opposed_prompt or public_opposed_prompt
+        death_save_prompt = item.death_save_prompt or death_save_prompt
         player_action_check_result = item.player_action_check_result or player_action_check_result
         archived_sub_zone_turn_id = item.archived_sub_zone_turn_id or archived_sub_zone_turn_id
     return PublicTurnRunResult(
@@ -395,7 +590,10 @@ def _merge_step_results(results: list[PublicTurnRunResult]) -> PublicTurnRunResu
         archived_sub_zone_turn_id=archived_sub_zone_turn_id,
         reaction_check=reaction_check,
         public_interaction_prompt=public_interaction_prompt,
+        public_attack_prompt=public_attack_prompt,
+        public_attack_defense_prompt=public_attack_defense_prompt,
         public_opposed_prompt=public_opposed_prompt,
+        death_save_prompt=death_save_prompt,
         player_action_check_result=player_action_check_result,
     )
 
@@ -420,6 +618,8 @@ def run_public_turn_entry_once(payload: PublicTurnEntryRequest) -> PublicTurnRes
             str(payload.player_action or "").strip()
             and result.reaction_check is None
             and result.public_interaction_prompt is None
+            and result.public_attack_prompt is None
+            and result.public_attack_defense_prompt is None
             and result.public_opposed_prompt is None
             and not result.round_completed
         ):
@@ -437,11 +637,39 @@ def run_public_turn_entry_once(payload: PublicTurnEntryRequest) -> PublicTurnRes
                     forced_first=payload.entry_type.value == "god_override",
                 ),
                 interaction_response=None,
+                attack_response=None,
                 action_check=None,
                 config=payload.config,
             )
             if result.reaction_check is not None:
                 pending = _stage_reaction_checkpoint(
+                    session_id=payload.session_id,
+                    original_request=payload.model_dump(mode="json"),
+                    save=save,
+                    result=result,
+                )
+                world.save_current(save)
+                return pending
+            if result.public_attack_prompt is not None:
+                pending = _stage_attack_response_checkpoint(
+                    session_id=payload.session_id,
+                    original_request=payload.model_dump(mode="json"),
+                    save=save,
+                    result=result,
+                )
+                world.save_current(save)
+                return pending
+            if result.public_attack_defense_prompt is not None:
+                pending = _stage_attack_defense_checkpoint(
+                    session_id=payload.session_id,
+                    original_request=payload.model_dump(mode="json"),
+                    save=save,
+                    result=result,
+                )
+                world.save_current(save)
+                return pending
+            if result.death_save_prompt is not None:
+                pending = _stage_death_save_checkpoint(
                     session_id=payload.session_id,
                     original_request=payload.model_dump(mode="json"),
                     save=save,
@@ -458,6 +686,33 @@ def run_public_turn_entry_once(payload: PublicTurnEntryRequest) -> PublicTurnRes
                 )
                 world.save_current(save)
                 return pending
+        if result.public_attack_prompt is not None:
+            pending = _stage_attack_response_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending
+        if result.public_attack_defense_prompt is not None:
+            pending = _stage_attack_defense_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending
+        if result.death_save_prompt is not None:
+            pending = _stage_death_save_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending
         if result.public_opposed_prompt is not None:
             pending = _stage_opposed_checkpoint(
                 session_id=payload.session_id,
@@ -491,11 +746,39 @@ def run_public_turn_continue_once(payload: PublicTurnContinueRequest) -> PublicT
             save,
             submission=payload.action_submission,
             interaction_response=payload.player_interaction_response,
+            attack_response=payload.player_attack_response,
             action_check=payload.player_action_check,
             config=payload.config,
         )
         if result.reaction_check is not None:
             pending = _stage_reaction_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending
+        if result.public_attack_prompt is not None:
+            pending = _stage_attack_response_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending
+        if result.public_attack_defense_prompt is not None:
+            pending = _stage_attack_defense_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending
+        if result.death_save_prompt is not None:
+            pending = _stage_death_save_checkpoint(
                 session_id=payload.session_id,
                 original_request=payload.model_dump(mode="json"),
                 save=save,
@@ -565,6 +848,33 @@ def run_public_turn_reaction_once(payload: PublicTurnReactionCheckRequest) -> Pu
             )
             world.save_current(save)
             return pending_response
+        if result.public_attack_prompt is not None:
+            pending_response = _stage_attack_response_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending_response
+        if result.public_attack_defense_prompt is not None:
+            pending_response = _stage_attack_defense_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending_response
+        if result.death_save_prompt is not None:
+            pending_response = _stage_death_save_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending_response
         if result.public_opposed_prompt is not None:
             pending_response = _stage_opposed_checkpoint(
                 session_id=payload.session_id,
@@ -619,6 +929,33 @@ def run_public_turn_opposed_once(payload: PublicTurnOpposedResolveRequest) -> Pu
             )
             world.save_current(save)
             return pending_response
+        if result.public_attack_prompt is not None:
+            pending_response = _stage_attack_response_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending_response
+        if result.public_attack_defense_prompt is not None:
+            pending_response = _stage_attack_defense_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending_response
+        if result.death_save_prompt is not None:
+            pending_response = _stage_death_save_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending_response
         if result.public_opposed_prompt is not None:
             pending_response = _stage_opposed_checkpoint(
                 session_id=payload.session_id,
@@ -636,6 +973,168 @@ def run_public_turn_opposed_once(payload: PublicTurnOpposedResolveRequest) -> Pu
                 session_id=payload.session_id,
                 original_request=payload.model_dump(mode="json"),
                 continue_kind="opposed",
+                staged_save=staged_save,
+                error=exc,
+            )
+        raise ValueError(exc.code) from exc
+
+
+def run_public_turn_attack_defense_once(
+    payload: PublicTurnAttackDefenseResolveRequest,
+) -> PublicTurnResponse | PendingTurnContinueResponse:
+    pending = load_pending_turn(payload.session_id)
+    if pending is None or pending.flow_kind != "public_turn":
+        raise ValueError("PUBLIC_TURN_PENDING_NOT_FOUND")
+    prompt = pending.public_attack_defense_prompt
+    if pending.status != "awaiting_player_attack_defense" or prompt is None:
+        raise ValueError("PUBLIC_TURN_PENDING_NOT_FOUND")
+    if prompt.check_id != payload.check_id:
+        raise ValueError("PUBLIC_TURN_ATTACK_DEFENSE_MISMATCH")
+    save = world.SaveFile.model_validate(pending.staged_save)
+    staged_save = pending.staged_save
+    try:
+        result = resume_round_after_attack_defense_in_save(
+            save,
+            phase_before_pause=pending.public_phase_before_pause,
+            prompt=prompt,
+            forced_dice_roll=payload.forced_dice_roll,
+            config=payload.config,
+        )
+        clear_pending_turn(payload.session_id)
+        if result.reaction_check is not None:
+            pending_response = _stage_reaction_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending_response
+        if result.public_attack_prompt is not None:
+            pending_response = _stage_attack_response_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending_response
+        if result.public_attack_defense_prompt is not None:
+            pending_response = _stage_attack_defense_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending_response
+        if result.death_save_prompt is not None:
+            pending_response = _stage_death_save_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending_response
+        if result.public_opposed_prompt is not None:
+            pending_response = _stage_opposed_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending_response
+        world.save_current(save)
+        return _to_response(payload.session_id, result, save)
+    except AiProtocolContractError as exc:
+        if exc.code == AI_PROTOCOL_ENUM_INVALID:
+            return _stage_protocol_repair_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                continue_kind="attack_defense",
+                staged_save=staged_save,
+                error=exc,
+            )
+        raise ValueError(exc.code) from exc
+
+
+def run_public_turn_death_save_once(
+    payload: PublicTurnDeathSaveResolveRequest,
+) -> PublicTurnResponse | PendingTurnContinueResponse:
+    pending = load_pending_turn(payload.session_id)
+    if pending is None or pending.flow_kind != "public_turn":
+        raise ValueError("PUBLIC_TURN_PENDING_NOT_FOUND")
+    prompt = pending.death_save_prompt
+    if pending.status != "awaiting_player_death_save" or prompt is None:
+        raise ValueError("PUBLIC_TURN_PENDING_NOT_FOUND")
+    if prompt.prompt_id != payload.prompt_id:
+        raise ValueError("PUBLIC_TURN_DEATH_SAVE_MISMATCH")
+    save = world.SaveFile.model_validate(pending.staged_save)
+    staged_save = pending.staged_save
+    try:
+        result = resume_round_after_death_save_in_save(
+            save,
+            phase_before_pause=pending.public_phase_before_pause,
+            prompt=prompt,
+            forced_dice_roll=payload.forced_dice_roll,
+            config=payload.config,
+        )
+        clear_pending_turn(payload.session_id)
+        if result.reaction_check is not None:
+            pending_response = _stage_reaction_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending_response
+        if result.public_attack_prompt is not None:
+            pending_response = _stage_attack_response_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending_response
+        if result.public_attack_defense_prompt is not None:
+            pending_response = _stage_attack_defense_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending_response
+        if result.death_save_prompt is not None:
+            pending_response = _stage_death_save_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending_response
+        if result.public_opposed_prompt is not None:
+            pending_response = _stage_opposed_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=result,
+            )
+            world.save_current(save)
+            return pending_response
+        world.save_current(save)
+        return _to_response(payload.session_id, result, save)
+    except AiProtocolContractError as exc:
+        if exc.code == AI_PROTOCOL_ENUM_INVALID:
+            return _stage_protocol_repair_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                continue_kind="death_save",
                 staged_save=staged_save,
                 error=exc,
             )
@@ -669,6 +1168,10 @@ def run_public_turn_protocol_repair_once(
             return run_public_turn_reaction_once(PublicTurnReactionCheckRequest.model_validate(request_data))
         if repair_request.continue_kind == "opposed":
             return run_public_turn_opposed_once(PublicTurnOpposedResolveRequest.model_validate(request_data))
+        if repair_request.continue_kind == "attack_defense":
+            return run_public_turn_attack_defense_once(PublicTurnAttackDefenseResolveRequest.model_validate(request_data))
+        if repair_request.continue_kind == "death_save":
+            return run_public_turn_death_save_once(PublicTurnDeathSaveResolveRequest.model_validate(request_data))
     raise ValueError("PUBLIC_TURN_PENDING_NOT_FOUND")
 
 
@@ -702,6 +1205,18 @@ async def run_public_turn_protocol_repair_stream(
             return await run_public_turn_reaction_stream(PublicTurnReactionCheckRequest.model_validate(request_data), emit=emit, is_cancelled=is_cancelled)
         if repair_request.continue_kind == "opposed":
             return await run_public_turn_opposed_stream(PublicTurnOpposedResolveRequest.model_validate(request_data), emit=emit, is_cancelled=is_cancelled)
+        if repair_request.continue_kind == "attack_defense":
+            return await run_public_turn_attack_defense_stream(
+                PublicTurnAttackDefenseResolveRequest.model_validate(request_data),
+                emit=emit,
+                is_cancelled=is_cancelled,
+            )
+        if repair_request.continue_kind == "death_save":
+            return await run_public_turn_death_save_stream(
+                PublicTurnDeathSaveResolveRequest.model_validate(request_data),
+                emit=emit,
+                is_cancelled=is_cancelled,
+            )
     raise ValueError("PUBLIC_TURN_PENDING_NOT_FOUND")
 
 
@@ -744,6 +1259,8 @@ async def run_public_turn_entry_stream(
             str(payload.player_action or "").strip()
             and merged.reaction_check is None
             and merged.public_interaction_prompt is None
+            and merged.public_attack_prompt is None
+            and merged.public_attack_defense_prompt is None
             and merged.public_opposed_prompt is None
             and not merged.round_completed
         ):
@@ -761,6 +1278,7 @@ async def run_public_turn_entry_stream(
                     save,
                     submission=submission,
                     interaction_response=None,
+                    attack_response=None,
                     action_check=None,
                     config=payload.config,
                 ):
@@ -781,6 +1299,39 @@ async def run_public_turn_entry_stream(
                 merged = _merge_step_results(step_results)
         if merged.reaction_check is not None:
             pending = _stage_reaction_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending, emit=emit)
+            return pending
+        if merged.public_attack_prompt is not None:
+            pending = _stage_attack_response_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending, emit=emit)
+            return pending
+        if merged.public_attack_defense_prompt is not None:
+            pending = _stage_attack_defense_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending, emit=emit)
+            return pending
+        if merged.death_save_prompt is not None:
+            pending = _stage_death_save_checkpoint(
                 session_id=payload.session_id,
                 original_request=payload.model_dump(mode="json"),
                 save=save,
@@ -836,6 +1387,7 @@ async def run_public_turn_continue_stream(
             save,
             submission=payload.action_submission,
             interaction_response=payload.player_interaction_response,
+            attack_response=payload.player_attack_response,
             action_check=payload.player_action_check,
             config=payload.config,
         ):
@@ -856,6 +1408,39 @@ async def run_public_turn_continue_stream(
         merged = _merge_step_results(step_results)
         if merged.reaction_check is not None:
             pending = _stage_reaction_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending, emit=emit)
+            return pending
+        if merged.public_attack_prompt is not None:
+            pending = _stage_attack_response_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending, emit=emit)
+            return pending
+        if merged.public_attack_defense_prompt is not None:
+            pending = _stage_attack_defense_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending, emit=emit)
+            return pending
+        if merged.death_save_prompt is not None:
+            pending = _stage_death_save_checkpoint(
                 session_id=payload.session_id,
                 original_request=payload.model_dump(mode="json"),
                 save=save,
@@ -957,6 +1542,39 @@ async def run_public_turn_reaction_stream(
             if emit is not None:
                 await _emit_pending_response(result=pending_response, emit=emit)
             return pending_response
+        if merged.public_attack_prompt is not None:
+            pending_response = _stage_attack_response_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending_response, emit=emit)
+            return pending_response
+        if merged.public_attack_defense_prompt is not None:
+            pending_response = _stage_attack_defense_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending_response, emit=emit)
+            return pending_response
+        if merged.death_save_prompt is not None:
+            pending_response = _stage_death_save_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending_response, emit=emit)
+            return pending_response
         if merged.public_opposed_prompt is not None:
             pending_response = _stage_opposed_checkpoint(
                 session_id=payload.session_id,
@@ -1043,6 +1661,39 @@ async def run_public_turn_opposed_stream(
             if emit is not None:
                 await _emit_pending_response(result=pending_response, emit=emit)
             return pending_response
+        if merged.public_attack_prompt is not None:
+            pending_response = _stage_attack_response_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending_response, emit=emit)
+            return pending_response
+        if merged.public_attack_defense_prompt is not None:
+            pending_response = _stage_attack_defense_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending_response, emit=emit)
+            return pending_response
+        if merged.death_save_prompt is not None:
+            pending_response = _stage_death_save_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending_response, emit=emit)
+            return pending_response
         if merged.public_opposed_prompt is not None:
             pending_response = _stage_opposed_checkpoint(
                 session_id=payload.session_id,
@@ -1063,6 +1714,238 @@ async def run_public_turn_opposed_stream(
             session_id=payload.session_id,
             original_request=payload.model_dump(mode="json"),
             continue_kind="opposed",
+            staged_save=staged_save,
+            error=exc,
+        )
+        if emit is not None:
+            await _emit_pending_response(result=pending_response, emit=emit)
+        return pending_response
+
+
+async def run_public_turn_attack_defense_stream(
+    payload: PublicTurnAttackDefenseResolveRequest,
+    *,
+    emit: EmitCallback | None = None,
+    is_cancelled: Callable[[], Awaitable[bool]] | None = None,
+) -> PublicTurnResponse | PendingTurnContinueResponse:
+    if is_cancelled is not None and await is_cancelled():
+        raise asyncio.CancelledError()
+    pending = load_pending_turn(payload.session_id)
+    if pending is None or pending.flow_kind != "public_turn":
+        raise ValueError("PUBLIC_TURN_PENDING_NOT_FOUND")
+    prompt = pending.public_attack_defense_prompt
+    if pending.status != "awaiting_player_attack_defense" or prompt is None:
+        raise ValueError("PUBLIC_TURN_PENDING_NOT_FOUND")
+    if prompt.check_id != payload.check_id:
+        raise ValueError("PUBLIC_TURN_ATTACK_DEFENSE_MISMATCH")
+    save = world.SaveFile.model_validate(pending.staged_save)
+    staged_save = pending.staged_save
+    clear_pending_turn(payload.session_id)
+    try:
+        step_results: list[PublicTurnRunResult] = []
+        if emit is not None:
+            await emit("attack_defense_resolved", {"check_id": payload.check_id})
+        for step in iter_round_after_attack_defense_steps_in_save(
+            save,
+            phase_before_pause=pending.public_phase_before_pause,
+            prompt=prompt,
+            forced_dice_roll=payload.forced_dice_roll,
+            config=payload.config,
+        ):
+            step_results.append(step)
+            if emit is not None:
+                await _emit_public_turn_step(result=step, emit=emit)
+                await emit("turn_state", get_public_turn_state_in_save(save).model_dump(mode="json"))
+                if step.round_completed:
+                    await emit(
+                        "round_completed",
+                        {
+                            "archived_sub_zone_turn_id": step.archived_sub_zone_turn_id,
+                            "phase": step.presentation.phase.value,
+                        },
+                    )
+            if is_cancelled is not None and await is_cancelled():
+                raise asyncio.CancelledError()
+        merged = _merge_step_results(step_results)
+        if merged.reaction_check is not None:
+            pending_response = _stage_reaction_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending_response, emit=emit)
+            return pending_response
+        if merged.public_attack_prompt is not None:
+            pending_response = _stage_attack_response_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending_response, emit=emit)
+            return pending_response
+        if merged.public_attack_defense_prompt is not None:
+            pending_response = _stage_attack_defense_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending_response, emit=emit)
+            return pending_response
+        if merged.death_save_prompt is not None:
+            pending_response = _stage_death_save_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending_response, emit=emit)
+            return pending_response
+        if merged.public_opposed_prompt is not None:
+            pending_response = _stage_opposed_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending_response, emit=emit)
+            return pending_response
+        world.save_current(save)
+        return _to_response(payload.session_id, merged, save)
+    except AiProtocolContractError as exc:
+        if exc.code != AI_PROTOCOL_ENUM_INVALID:
+            raise ValueError(exc.code) from exc
+        pending_response = _stage_protocol_repair_checkpoint(
+            session_id=payload.session_id,
+            original_request=payload.model_dump(mode="json"),
+            continue_kind="attack_defense",
+            staged_save=staged_save,
+            error=exc,
+        )
+        if emit is not None:
+            await _emit_pending_response(result=pending_response, emit=emit)
+        return pending_response
+
+
+async def run_public_turn_death_save_stream(
+    payload: PublicTurnDeathSaveResolveRequest,
+    *,
+    emit: EmitCallback | None = None,
+    is_cancelled: Callable[[], Awaitable[bool]] | None = None,
+) -> PublicTurnResponse | PendingTurnContinueResponse:
+    if is_cancelled is not None and await is_cancelled():
+        raise asyncio.CancelledError()
+    pending = load_pending_turn(payload.session_id)
+    if pending is None or pending.flow_kind != "public_turn":
+        raise ValueError("PUBLIC_TURN_PENDING_NOT_FOUND")
+    prompt = pending.death_save_prompt
+    if pending.status != "awaiting_player_death_save" or prompt is None:
+        raise ValueError("PUBLIC_TURN_PENDING_NOT_FOUND")
+    if prompt.prompt_id != payload.prompt_id:
+        raise ValueError("PUBLIC_TURN_DEATH_SAVE_MISMATCH")
+    save = world.SaveFile.model_validate(pending.staged_save)
+    staged_save = pending.staged_save
+    clear_pending_turn(payload.session_id)
+    try:
+        step_results: list[PublicTurnRunResult] = []
+        for step in iter_round_after_death_save_steps_in_save(
+            save,
+            phase_before_pause=pending.public_phase_before_pause,
+            prompt=prompt,
+            forced_dice_roll=payload.forced_dice_roll,
+            config=payload.config,
+        ):
+            step_results.append(step)
+            if emit is not None:
+                await _emit_public_turn_step(result=step, emit=emit)
+                await emit("turn_state", get_public_turn_state_in_save(save).model_dump(mode="json"))
+                if step.round_completed:
+                    await emit(
+                        "round_completed",
+                        {
+                            "archived_sub_zone_turn_id": step.archived_sub_zone_turn_id,
+                            "phase": step.presentation.phase.value,
+                        },
+                    )
+            if is_cancelled is not None and await is_cancelled():
+                raise asyncio.CancelledError()
+        merged = _merge_step_results(step_results)
+        if merged.reaction_check is not None:
+            pending_response = _stage_reaction_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending_response, emit=emit)
+            return pending_response
+        if merged.public_attack_prompt is not None:
+            pending_response = _stage_attack_response_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending_response, emit=emit)
+            return pending_response
+        if merged.public_attack_defense_prompt is not None:
+            pending_response = _stage_attack_defense_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending_response, emit=emit)
+            return pending_response
+        if merged.death_save_prompt is not None:
+            pending_response = _stage_death_save_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending_response, emit=emit)
+            return pending_response
+        if merged.public_opposed_prompt is not None:
+            pending_response = _stage_opposed_checkpoint(
+                session_id=payload.session_id,
+                original_request=payload.model_dump(mode="json"),
+                save=save,
+                result=merged,
+            )
+            world.save_current(save)
+            if emit is not None:
+                await _emit_pending_response(result=pending_response, emit=emit)
+            return pending_response
+        world.save_current(save)
+        return _to_response(payload.session_id, merged, save)
+    except AiProtocolContractError as exc:
+        if exc.code != AI_PROTOCOL_ENUM_INVALID:
+            raise ValueError(exc.code) from exc
+        pending_response = _stage_protocol_repair_checkpoint(
+            session_id=payload.session_id,
+            original_request=payload.model_dump(mode="json"),
+            continue_kind="death_save",
             staged_save=staged_save,
             error=exc,
         )

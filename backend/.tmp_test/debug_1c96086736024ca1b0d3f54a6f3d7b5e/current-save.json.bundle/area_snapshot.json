@@ -1,0 +1,60 @@
+{
+  "version": "0.1.0",
+  "zones": [],
+  "sub_zones": [
+    {
+      "sub_zone_id": "sub_zone_a",
+      "zone_id": "zone_a",
+      "name": "酒馆",
+      "coord": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      },
+      "radius_m": 20,
+      "description": "当前子区块",
+      "generated_mode": "pre",
+      "key_interactions": [],
+      "npcs": [
+        {
+          "npc_id": "npc_sub_zone_a_6833",
+          "name": "zone_a向导岚岑",
+          "state": "idle"
+        }
+      ],
+      "state": {
+        "time_segment": "day",
+        "flags": [
+          "normal"
+        ],
+        "dead_npc_records": []
+      },
+      "chat_context": {
+        "version": "0.2.0",
+        "recent_turns": [],
+        "public_turn_state": {
+          "version": "0.2.0",
+          "current_round": null,
+          "round_history": [],
+          "max_history": 20,
+          "environment_risk_level": "stable",
+          "situation_dc": 10,
+          "awaiting_player_entry": true,
+          "updated_at": "2026-03-22T07:35:11.511401+00:00"
+        },
+        "updated_at": "2026-03-22T07:35:11.511412+00:00"
+      }
+    }
+  ],
+  "current_zone_id": null,
+  "current_sub_zone_id": null,
+  "clock": {
+    "calendar": "fantasy_default",
+    "year": 1024,
+    "month": 3,
+    "day": 14,
+    "hour": 9,
+    "minute": 30,
+    "updated_at": "2026-03-22T07:35:11.507307+00:00"
+  }
+}

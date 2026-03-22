@@ -504,6 +504,11 @@ def is_targeted_interaction_candidate(
 
 def _current_sub_zone_actor_candidates(save: SaveFile, *, exclude_actor_id: str | None = None) -> list[ResolvedInteractionTarget]:
     current_sub_zone_id = str(save.area_snapshot.current_sub_zone_id or "")
+    current_sub_zone = world._current_sub_zone(save)
+    dead_ids = {
+        str(getattr(record, "role_id", "") or "")
+        for record in getattr(getattr(current_sub_zone, "state", None), "dead_npc_records", [])
+    }
     candidates: list[ResolvedInteractionTarget] = []
     if save.player_static_data.player_id != exclude_actor_id:
         candidates.append(
@@ -516,6 +521,8 @@ def _current_sub_zone_actor_candidates(save: SaveFile, *, exclude_actor_id: str 
         )
     for role in save.role_pool:
         if role.role_id == exclude_actor_id:
+            continue
+        if role.role_id in dead_ids or role.state == "dead" or role.profile.dnd5e_sheet.role_action_status == "dead":
             continue
         if current_sub_zone_id and role.sub_zone_id and role.sub_zone_id != current_sub_zone_id:
             continue

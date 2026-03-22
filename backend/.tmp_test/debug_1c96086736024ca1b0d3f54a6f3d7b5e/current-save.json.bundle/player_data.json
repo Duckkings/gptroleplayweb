@@ -1,0 +1,148 @@
+{
+  "player_static_data": {
+    "player_id": "player_001",
+    "name": "玩家",
+    "age": 18,
+    "height_cm": 170,
+    "body_type": "",
+    "appearance": "",
+    "portrait": null,
+    "build_archive_id": null,
+    "move_speed_mph": 4500,
+    "role_type": "player",
+    "dnd5e_sheet": {
+      "level": 1,
+      "experience_current": 0,
+      "experience_to_next_level": 300,
+      "race": "",
+      "char_class": "",
+      "background": "",
+      "alignment": "",
+      "proficiency_bonus": 2,
+      "armor_class": 10,
+      "difficulty_class": 10,
+      "speed_ft": 30,
+      "initiative_bonus": 0,
+      "stamina_current": 10,
+      "stamina_maximum": 10,
+      "is_dead": false,
+      "role_action_status": "free_action",
+      "status_flags": [],
+      "hit_dice": "1d8",
+      "hit_points": {
+        "current": 10,
+        "maximum": 10,
+        "temporary": 0
+      },
+      "ability_scores": {
+        "strength": 10,
+        "dexterity": 10,
+        "constitution": 10,
+        "intelligence": 10,
+        "wisdom": 10,
+        "charisma": 10
+      },
+      "current_ability_scores": {
+        "strength": 10,
+        "dexterity": 10,
+        "constitution": 10,
+        "intelligence": 10,
+        "wisdom": 10,
+        "charisma": 10
+      },
+      "ability_modifiers": {
+        "strength": 0,
+        "dexterity": 0,
+        "constitution": 0,
+        "intelligence": 0,
+        "wisdom": 0,
+        "charisma": 0
+      },
+      "current_ability_modifiers": {
+        "strength": 0,
+        "dexterity": 0,
+        "constitution": 0,
+        "intelligence": 0,
+        "wisdom": 0,
+        "charisma": 0
+      },
+      "saving_throws_proficient": [],
+      "skills_proficient": [],
+      "languages": [],
+      "tool_proficiencies": [],
+      "equipment": [],
+      "equipment_slots": {
+        "weapon_item_id": null,
+        "armor_item_id": null,
+        "shield_item_id": null,
+        "weapon_item_instance_id": null,
+        "armor_item_instance_id": null,
+        "shield_item_instance_id": null
+      },
+      "backpack": {
+        "gold": 0,
+        "item_instance_ids": [],
+        "items": []
+      },
+      "buffs": [],
+      "features_traits": [],
+      "spells": [],
+      "war_arts": [],
+      "spell_origins": {},
+      "skill_origins": {},
+      "war_art_origins": {},
+      "spell_slots_max": {
+        "level_1": 0,
+        "level_2": 0,
+        "level_3": 0,
+        "level_4": 0,
+        "level_5": 0,
+        "level_6": 0,
+        "level_7": 0,
+        "level_8": 0,
+        "level_9": 0
+      },
+      "spell_slots_current": {
+        "level_1": 0,
+        "level_2": 0,
+        "level_3": 0,
+        "level_4": 0,
+        "level_5": 0,
+        "level_6": 0,
+        "level_7": 0,
+        "level_8": 0,
+        "level_9": 0
+      },
+      "martial_points_current": 0,
+      "martial_points_maximum": 0,
+      "notes": "",
+      "death_state": {
+        "version": "0.1.0",
+        "life_status": "healthy",
+        "death_save_successes": 0,
+        "death_save_failures": 0,
+        "death_count": 0,
+        "death_streak_count": 0,
+        "death_streak_reset_at": null,
+        "last_death_at": null,
+        "last_death_zone_id": null,
+        "last_death_sub_zone_id": null,
+        "last_death_cause": "",
+        "revived_at": null,
+        "revival_method": null,
+        "revival_weakness_until": null,
+        "updated_at": "2026-03-22T07:35:11.475273+00:00"
+      }
+    }
+  },
+  "player_runtime_data": {
+    "session_id": "sess_public_actor_fallback",
+    "current_position": {
+      "x": 0,
+      "y": 0,
+      "z": 0,
+      "zone_id": "zone_0_0_0"
+    },
+    "updated_at": "2026-03-22T07:35:11.688258+00:00"
+  }
+}

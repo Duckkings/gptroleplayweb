@@ -46,6 +46,55 @@ function renderReactionMeta(focusName?: string | null, speechTargetName?: string
   return parts.length ? parts.join(' / ') : null;
 }
 
+function renderAttackKindLabel(entry: PublicTurnSettlementEntry): string | null {
+  if (!entry.attack_kind) return null;
+  if (entry.attack_kind === 'targeted_attack') return 'Targeted Attack';
+  if (entry.attack_kind === 'aoe_attack') return 'AOE Attack';
+  return 'Ordinary Action';
+}
+
+function renderAttackMeta(entry: PublicTurnSettlementEntry) {
+  const parts: string[] = [];
+  const attackKind = renderAttackKindLabel(entry);
+  if (attackKind) {
+    parts.push(`Kind: ${attackKind}`);
+  }
+  if (entry.attack_basis) {
+    parts.push(`Basis: ${entry.attack_basis}`);
+  }
+  if (cleanText(entry.attack_definition_name)) {
+    parts.push(`Definition: ${cleanText(entry.attack_definition_name)}`);
+  }
+  if (cleanText(entry.attack_area_shape) && entry.attack_area_shape !== 'none') {
+    parts.push(`Area: ${cleanText(entry.attack_area_shape)}`);
+  }
+  if (entry.threatened_target_names.length > 0) {
+    parts.push(`Threatened: ${entry.threatened_target_names.join(', ')}`);
+  }
+  if (entry.hit_target_names.length > 0) {
+    parts.push(`Hit: ${entry.hit_target_names.join(', ')}`);
+  }
+  if (entry.avoided_target_names.length > 0) {
+    parts.push(`Avoided: ${entry.avoided_target_names.join(', ')}`);
+  }
+  if (entry.revealed_target_names.length > 0) {
+    parts.push(`Revealed: ${entry.revealed_target_names.join(', ')}`);
+  }
+  if (parts.length === 0) {
+    return null;
+  }
+  return (
+    <div className="scene-event-block">
+      <span>Attack</span>
+      <div className="scene-event-kv-grid">
+        {parts.map((part) => (
+          <p key={part}>{part}</p>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function renderCheck(check: PublicTurnSettlementCheck | null | undefined) {
   if (!check) {
     return <p className="hint">No formal check triggered.</p>;
@@ -171,6 +220,7 @@ function renderActorEntry(entry: PublicTurnSettlementEntry, roundActive: boolean
         {entry.action_target_name ? <p>Action Target: {entry.action_target_name}</p> : null}
         {entry.interaction_exchange_kind === 'alternated_exchange' ? <p>Exchange: Alternated interaction</p> : null}
       </div>
+      {renderAttackMeta(entry)}
       {entry.speech_text.trim() && (
         <div className="scene-event-block">
           <span>Speech</span>

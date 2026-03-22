@@ -1,0 +1,12 @@
+{
+  "asset_id": "portrait_b6d355e24dcf4d378cb425740bcdf4f8",
+  "relative_path": "build-temp/portrait_assets/portrait_b6d355e24dcf4d378cb425740bcdf4f8.png",
+  "mime_type": "image/png",
+  "width": 768,
+  "height": 1344,
+  "variant_kind": "generated_raw",
+  "derived_from_asset_id": null,
+  "provider": "gemini",
+  "model": "gemini-2.5-flash-image",
+  "created_at": "2026-03-22T05:01:13.448703+00:00"
+}

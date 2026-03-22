@@ -3,13 +3,15 @@
 import asyncio
 from datetime import datetime, timezone
 import json
+import logging
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from openai import APIError, RateLimitError
 from pydantic import ValidationError
 
 from app.core.dialogs import pick_directory
 from app.core.storage import read_json, storage_state, write_json_atomic
+from app.core.token_usage import token_usage_store
 from app.core.user_context import get_current_user
 from app.models.schemas import (
     AreaCurrentResponse,
@@ -18,6 +20,8 @@ from app.models.schemas import (
     DeathDeclareRequest,
     DeathDeclareResponse,
     DeathStatusResponse,
+    DebugSaveResetRequest,
+    DebugSaveResetResponse,
     EncounterActRequest,
     EncounterActResponse,
     EncounterCheckRequest,
@@ -54,6 +58,35 @@ from app.models.schemas import (
     BattleStartRequest,
     BattleStartResponse,
     ChatConfig,
+    CharacterBuildAbilitySuggestRequest,
+    CharacterBuildAbilitySuggestResponse,
+    CharacterBuildBasicInfoSuggestRequest,
+    CharacterBuildBasicInfoSuggestResponse,
+    CharacterBuildCompanionCompleteRequest,
+    CharacterBuildCompanionCompleteResponse,
+    CharacterBuildCompanionFlavorSuggestRequest,
+    CharacterBuildCompanionFlavorSuggestResponse,
+    CharacterBuildCompanionOfferRequest,
+    CharacterBuildMediaDescribeRequest,
+    CharacterBuildMediaDescribeResponse,
+    CharacterBuildMediaFinalizeRequest,
+    CharacterBuildMediaFinalizeResponse,
+    CharacterBuildMediaGenerateRequest,
+    CharacterBuildMediaGenerateResponse,
+    CharacterBuildMediaRemoveBackgroundRequest,
+    CharacterBuildMediaRemoveBackgroundResponse,
+    CharacterBuildMediaUploadRequest,
+    CharacterBuildMediaUploadResponse,
+    CharacterBuildLoadoutSuggestRequest,
+    CharacterBuildLoadoutSuggestResponse,
+    CharacterBuildOptionsResponse,
+    CharacterBuildPlayerCompleteRequest,
+    CharacterBuildPlayerCompleteResponse,
+    CharacterBuildPortraitPromptSuggestRequest,
+    CharacterBuildPortraitPromptSuggestResponse,
+    CharacterBuildStateResponse,
+    CompanionBuildSeedListResponse,
+    CompanionBuildSeedResponse,
     FateCurrentResponse,
     FateEvaluateRequest,
     FateEvaluateResponse,
@@ -86,6 +119,8 @@ from app.models.schemas import (
     NpcChatResponse,
     NpcGreetRequest,
     NpcGreetResponse,
+    PlayerInputValidationRequest,
+    PlayerInputValidationResponse,
     PathConfig,
     PathStatusResponse,
     PendingTurnContinueRequest,
@@ -97,6 +132,7 @@ from app.models.schemas import (
     PlayerItemRemoveRequest,
     PlayerRuntimeData,
     PlayerSkillSetRequest,
+    PlayerMartialPointAdjustRequest,
     PlayerSpellSetRequest,
     PlayerSpellSlotAdjustRequest,
     PlayerStaticData,
@@ -104,6 +140,7 @@ from app.models.schemas import (
     PlayerUnequipRequest,
     PublicSceneStateResponse,
     PublicTurnContinueRequest,
+    PublicTurnDeathSaveResolveRequest,
     PublicTurnEntryRequest,
     PublicTurnOpposedPlanRequest,
     PublicTurnOpposedPlanResponse,
@@ -111,6 +148,7 @@ from app.models.schemas import (
     PublicTurnProtocolRepairRequest,
     PublicTurnReactionCheckRequest,
     PublicTurnResponse,
+    PublicTurnAttackDefenseResolveRequest,
     PublicTurnStateResponse,
     ReputationStateResponse,
     MapBootstrapResponse,
@@ -150,6 +188,8 @@ from app.models.schemas import (
     WorldClockInitRequest,
     WorldClockInitResponse,
     NpcKnowledgeResponse,
+    PlayerBuildSeedListResponse,
+    PlayerBuildSeedResponse,
 )
 from app.services.ai_adapter import discover_models, resolve_model_profile
 from app.services.battle_service import (
@@ -179,7 +219,34 @@ from app.services.map_flow_service import (
     run_action_check_with_state_sync,
 )
 from app.services.pending_turn_service import cancel_pending_turn, load_pending_turn
+from app.services.debug_save_reset_service import reset_debug_test_state
 from app.services.template_library_debug_service import fill_template_library, get_template_library_status_response
+from app.services.character_build_service import (
+    build_portrait_generation_prompt,
+    complete_companion_build,
+    complete_player_build,
+    get_character_build_options,
+    get_character_build_state,
+    get_companion_build_seed,
+    get_player_build_seed,
+    list_companion_build_seeds,
+    list_player_build_seeds,
+    mark_companion_offer_seen,
+    suggest_abilities,
+    suggest_basic_info,
+    suggest_companion_flavor,
+    suggest_loadout,
+    suggest_portrait_prompt,
+)
+from app.services.character_media_service import (
+    describe_portrait,
+    duplicate_asset_as_final,
+    generate_portrait_assets,
+    load_asset,
+    remove_portrait_background,
+    resolve_asset_file,
+    store_uploaded_portrait,
+)
 from app.services.world_service import (
     AIBehaviorError,
     AIRegionGenerationError,
@@ -206,8 +273,10 @@ from app.services.world_service import (
     add_player_item,
     add_player_skill,
     add_player_spell,
+    consume_martial_points,
     consume_spell_slots,
     consume_stamina,
+    recover_martial_points,
     recover_spell_slots,
     recover_stamina,
     remove_player_buff,
@@ -253,8 +322,12 @@ from app.services.public_turn_service import (
     get_public_turn_state,
     run_public_turn_continue_once,
     run_public_turn_continue_stream,
+    run_public_turn_death_save_once,
+    run_public_turn_death_save_stream,
     run_public_turn_entry_once,
     run_public_turn_entry_stream,
+    run_public_turn_attack_defense_once,
+    run_public_turn_attack_defense_stream,
     run_public_turn_opposed_once,
     run_public_turn_opposed_plan_once,
     run_public_turn_protocol_repair_once,
@@ -264,6 +337,7 @@ from app.services.public_turn_service import (
     run_public_turn_reaction_stream,
 )
 from app.services.public_turn_state_store import current_sub_zone as current_public_turn_sub_zone, get_public_turn_state_in_save
+from app.services.player_input_validation_service import validate_player_input
 from app.services.quest_service import (
     accept_quest,
     debug_generate_quest,
@@ -294,6 +368,7 @@ from app.services.team_service import (
 from app.services.retained_npc_service import retained_npc_service
 from app.services.death_service import death_service
 
+logger = logging.getLogger("roleplay.api.routes")
 router = APIRouter(prefix="/api/v1", tags=["api"])
 
 
@@ -574,6 +649,8 @@ async def pending_turn_cancel(pending_turn_id: str, session_id: str) -> PendingT
         scene_events=[],
         tool_events=[],
         pending_reaction=None,
+        public_attack_prompt=None,
+        public_attack_defense_prompt=None,
         npc_role_id=state.npc_role_id,
     )
 
@@ -617,7 +694,10 @@ async def pending_turn_current(session_id: str) -> PendingTurnContinueResponse |
         main_turn_summary=None,
         current_zone_metric=None,
         pending_reaction=state.pending_reaction,
+        public_attack_prompt=state.public_attack_prompt,
+        public_attack_defense_prompt=state.public_attack_defense_prompt,
         public_opposed_prompt=state.public_opposed_prompt,
+        death_save_prompt=state.death_save_prompt,
         public_turn_state=public_turn_state,
         public_turn_presentation=public_turn_presentation,
         npc_role_id=state.npc_role_id,
@@ -695,6 +775,34 @@ async def public_turn_opposed_check_plan(payload: PublicTurnOpposedPlanRequest) 
 async def public_turn_opposed_check(payload: PublicTurnOpposedResolveRequest) -> PublicTurnResponse | PendingTurnContinueResponse:
     try:
         return run_public_turn_opposed_once(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=_public_turn_status_code(str(exc)), detail=str(exc))
+    except RateLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except APIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.post("/public-turn/attack-defense-check", response_model=PublicTurnResponse | PendingTurnContinueResponse)
+async def public_turn_attack_defense_check(
+    payload: PublicTurnAttackDefenseResolveRequest,
+) -> PublicTurnResponse | PendingTurnContinueResponse:
+    try:
+        return run_public_turn_attack_defense_once(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=_public_turn_status_code(str(exc)), detail=str(exc))
+    except RateLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except APIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.post("/public-turn/death-save-check", response_model=PublicTurnResponse | PendingTurnContinueResponse)
+async def public_turn_death_save_check(
+    payload: PublicTurnDeathSaveResolveRequest,
+) -> PublicTurnResponse | PendingTurnContinueResponse:
+    try:
+        return run_public_turn_death_save_once(payload)
     except ValueError as exc:
         raise HTTPException(status_code=_public_turn_status_code(str(exc)), detail=str(exc))
     except RateLimitError as exc:
@@ -1007,6 +1115,132 @@ async def public_turn_opposed_check_stream(request: Request, payload: PublicTurn
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 
+@router.post("/public-turn/attack-defense-check/stream")
+async def public_turn_attack_defense_check_stream(
+    request: Request,
+    payload: PublicTurnAttackDefenseResolveRequest,
+) -> StreamingResponse:
+    async def event_gen():
+        queue: asyncio.Queue[tuple[str | None, dict | None]] = asyncio.Queue()
+
+        async def emit(event: str, data: dict) -> None:
+            await queue.put((event, data))
+
+        async def worker() -> None:
+            try:
+                result = await run_public_turn_attack_defense_stream(
+                    payload,
+                    emit=emit,
+                    is_cancelled=request.is_disconnected,
+                )
+                if isinstance(result, PublicTurnResponse):
+                    await queue.put(
+                        (
+                            "end",
+                            {
+                                "archived_sub_zone_turn_id": result.archived_sub_zone_turn_id,
+                                "round_completed": result.round_completed,
+                                "phase": result.phase.value,
+                                "public_turn_state": result.public_turn_state.model_dump(mode="json"),
+                                "presentation": result.presentation.model_dump(mode="json"),
+                            },
+                        )
+                    )
+            except asyncio.CancelledError:
+                pass
+            except ValueError as exc:
+                await queue.put(("error", {"code": _public_turn_status_code(str(exc)), "message": str(exc)}))
+            except RateLimitError as exc:
+                await queue.put(("error", {"code": 429, "message": str(exc)}))
+            except APIError as exc:
+                await queue.put(("error", {"code": 502, "message": str(exc)}))
+            except Exception as exc:
+                await queue.put(("error", {"code": 500, "message": str(exc)}))
+            finally:
+                await queue.put((None, None))
+
+        task = asyncio.create_task(worker())
+        yield _sse_frame("start", {"session_id": payload.session_id, "check_id": payload.check_id})
+        try:
+            while True:
+                event, data = await queue.get()
+                if event is None:
+                    break
+                yield _sse_frame(event, data or {})
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+
+@router.post("/public-turn/death-save-check/stream")
+async def public_turn_death_save_check_stream(
+    request: Request,
+    payload: PublicTurnDeathSaveResolveRequest,
+) -> StreamingResponse:
+    async def event_gen():
+        queue: asyncio.Queue[tuple[str | None, dict | None]] = asyncio.Queue()
+
+        async def emit(event: str, data: dict) -> None:
+            await queue.put((event, data))
+
+        async def worker() -> None:
+            try:
+                result = await run_public_turn_death_save_stream(
+                    payload,
+                    emit=emit,
+                    is_cancelled=request.is_disconnected,
+                )
+                if isinstance(result, PublicTurnResponse):
+                    await queue.put(
+                        (
+                            "end",
+                            {
+                                "archived_sub_zone_turn_id": result.archived_sub_zone_turn_id,
+                                "round_completed": result.round_completed,
+                                "phase": result.phase.value,
+                                "public_turn_state": result.public_turn_state.model_dump(mode="json"),
+                                "presentation": result.presentation.model_dump(mode="json"),
+                            },
+                        )
+                    )
+            except asyncio.CancelledError:
+                pass
+            except ValueError as exc:
+                await queue.put(("error", {"code": _public_turn_status_code(str(exc)), "message": str(exc)}))
+            except RateLimitError as exc:
+                await queue.put(("error", {"code": 429, "message": str(exc)}))
+            except APIError as exc:
+                await queue.put(("error", {"code": 502, "message": str(exc)}))
+            except Exception as exc:
+                await queue.put(("error", {"code": 500, "message": str(exc)}))
+            finally:
+                await queue.put((None, None))
+
+        task = asyncio.create_task(worker())
+        yield _sse_frame("start", {"session_id": payload.session_id, "prompt_id": payload.prompt_id})
+        try:
+            while True:
+                event, data = await queue.get()
+                if event is None:
+                    break
+                yield _sse_frame(event, data or {})
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+
 @router.post("/battle/debug/start", response_model=BattleStartResponse)
 async def battle_debug_start(payload: BattleStartRequest) -> BattleStartResponse:
     return start_debug_battle(payload)
@@ -1140,6 +1374,223 @@ async def import_save_file(payload: SaveImportRequest) -> SaveFile:
 async def clear_save(payload: SaveClearRequest) -> SaveFile:
     _require_user()
     return clear_current_save(payload.session_id)
+
+
+@router.get("/character-build/state", response_model=CharacterBuildStateResponse)
+async def character_build_state_get(session_id: str) -> CharacterBuildStateResponse:
+    _require_user()
+    return get_character_build_state(session_id)
+
+
+@router.get("/character-build/options", response_model=CharacterBuildOptionsResponse)
+async def character_build_options_get(kind: str, specialization: str) -> CharacterBuildOptionsResponse:
+    _require_user()
+    return get_character_build_options(kind, specialization)
+
+
+@router.get("/character-build/seeds/players", response_model=PlayerBuildSeedListResponse)
+async def character_build_player_seeds() -> PlayerBuildSeedListResponse:
+    _require_user()
+    return list_player_build_seeds()
+
+
+@router.get("/character-build/seeds/players/{archive_id}", response_model=PlayerBuildSeedResponse)
+async def character_build_player_seed_get(archive_id: str) -> PlayerBuildSeedResponse:
+    _require_user()
+    return get_player_build_seed(archive_id)
+
+
+@router.get("/character-build/seeds/companions", response_model=CompanionBuildSeedListResponse)
+async def character_build_companion_seeds() -> CompanionBuildSeedListResponse:
+    _require_user()
+    return list_companion_build_seeds()
+
+
+@router.get("/character-build/seeds/companions/{retained_id}", response_model=CompanionBuildSeedResponse)
+async def character_build_companion_seed_get(retained_id: str) -> CompanionBuildSeedResponse:
+    _require_user()
+    try:
+        return get_companion_build_seed(retained_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="retained NPC not found")
+
+
+@router.post("/character-build/suggest/basic-info", response_model=CharacterBuildBasicInfoSuggestResponse)
+async def character_build_suggest_basic_info(payload: CharacterBuildBasicInfoSuggestRequest) -> CharacterBuildBasicInfoSuggestResponse:
+    _require_user()
+    return suggest_basic_info(payload.prompt, current=payload.current, config=payload.config)
+
+
+@router.post("/character-build/suggest/abilities", response_model=CharacterBuildAbilitySuggestResponse)
+async def character_build_suggest_abilities(payload: CharacterBuildAbilitySuggestRequest) -> CharacterBuildAbilitySuggestResponse:
+    _require_user()
+    return suggest_abilities(
+        payload.prompt,
+        specialization=payload.specialization,
+        current_scores=payload.current_scores,
+        config=payload.config,
+    )
+
+
+@router.post("/character-build/suggest/portrait-prompt", response_model=CharacterBuildPortraitPromptSuggestResponse)
+async def character_build_suggest_portrait_prompt(payload: CharacterBuildPortraitPromptSuggestRequest) -> CharacterBuildPortraitPromptSuggestResponse:
+    _require_user()
+    return suggest_portrait_prompt(
+        payload.prompt,
+        basic_info=payload.basic_info,
+        current_prompt=payload.current_prompt,
+        config=payload.config,
+    )
+
+
+@router.post("/character-build/suggest/loadout", response_model=CharacterBuildLoadoutSuggestResponse)
+async def character_build_suggest_loadout(payload: CharacterBuildLoadoutSuggestRequest) -> CharacterBuildLoadoutSuggestResponse:
+    _require_user()
+    return suggest_loadout(
+        payload.specialization,
+        prompt=payload.prompt,
+        available_spell_option_ids=payload.available_spell_option_ids,
+        available_equipment_option_ids=payload.available_equipment_option_ids,
+        available_skill_option_ids=payload.available_skill_option_ids,
+        config=payload.config,
+    )
+
+
+@router.post("/character-build/suggest/companion-personality", response_model=CharacterBuildCompanionFlavorSuggestResponse)
+async def character_build_suggest_companion_personality(
+    payload: CharacterBuildCompanionFlavorSuggestRequest,
+) -> CharacterBuildCompanionFlavorSuggestResponse:
+    _require_user()
+    return suggest_companion_flavor(
+        payload.prompt,
+        basic_info=payload.basic_info,
+        appearance=payload.appearance,
+        current=payload.current,
+        config=payload.config,
+    )
+
+
+@router.post("/character-build/media/upload", response_model=CharacterBuildMediaUploadResponse)
+async def character_build_media_upload(payload: CharacterBuildMediaUploadRequest) -> CharacterBuildMediaUploadResponse:
+    _require_user()
+    asset = store_uploaded_portrait(payload.data_base64, payload.mime_type)
+    return CharacterBuildMediaUploadResponse(asset=asset)
+
+
+@router.post("/character-build/media/generate", response_model=CharacterBuildMediaGenerateResponse)
+async def character_build_media_generate(payload: CharacterBuildMediaGenerateRequest) -> CharacterBuildMediaGenerateResponse:
+    _require_user()
+    prompt_used = build_portrait_generation_prompt(payload.prompt, payload.basic_info)
+    try:
+        assets, provider, model = generate_portrait_assets(
+            payload.config,
+            prompt=prompt_used,
+            reference_asset_id=payload.reference_asset_id,
+        )
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except RateLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except APIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.exception("character build portrait generation failed")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return CharacterBuildMediaGenerateResponse(assets=assets, provider=provider, model=model, prompt_used=prompt_used)
+
+
+@router.post("/character-build/media/remove-background", response_model=CharacterBuildMediaRemoveBackgroundResponse)
+async def character_build_media_remove_background(
+    payload: CharacterBuildMediaRemoveBackgroundRequest,
+) -> CharacterBuildMediaRemoveBackgroundResponse:
+    _require_user()
+    try:
+        raw_asset = load_asset(payload.raw_asset_id)
+        bg_removed_asset = remove_portrait_background(payload.config, payload.raw_asset_id)
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except RateLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except APIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.exception("character build background removal failed")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return CharacterBuildMediaRemoveBackgroundResponse(raw_asset=raw_asset, bg_removed_asset=bg_removed_asset)
+
+
+@router.post("/character-build/media/finalize", response_model=CharacterBuildMediaFinalizeResponse)
+async def character_build_media_finalize(payload: CharacterBuildMediaFinalizeRequest) -> CharacterBuildMediaFinalizeResponse:
+    _require_user()
+    try:
+        asset = duplicate_asset_as_final(payload.asset_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return CharacterBuildMediaFinalizeResponse(asset=asset)
+
+
+@router.post("/character-build/media/describe", response_model=CharacterBuildMediaDescribeResponse)
+async def character_build_media_describe(payload: CharacterBuildMediaDescribeRequest) -> CharacterBuildMediaDescribeResponse:
+    _require_user()
+    basic = payload.basic_info
+    summary = ""
+    if basic is not None:
+        summary = f"name={basic.name}; race={basic.race}; age={basic.age}; height_cm={basic.height_cm}; body_type={basic.body_type}"
+    try:
+        description, provider, model = describe_portrait(payload.config, payload.asset_id, summary)
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except RateLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except APIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.exception("character build portrait description failed")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return CharacterBuildMediaDescribeResponse(description=description, asset_id=payload.asset_id, provider=provider, model=model)
+
+
+@router.get("/character-build/assets/{asset_id}")
+async def character_build_asset_get(asset_id: str) -> FileResponse:
+    _require_user()
+    path = resolve_asset_file(asset_id)
+    return FileResponse(path, media_type="image/png")
+
+
+@router.post("/character-build/player/complete", response_model=CharacterBuildPlayerCompleteResponse)
+async def character_build_player_complete(payload: CharacterBuildPlayerCompleteRequest) -> CharacterBuildPlayerCompleteResponse:
+    _require_user()
+    try:
+        return complete_player_build(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/character-build/companion/complete", response_model=CharacterBuildCompanionCompleteResponse)
+async def character_build_companion_complete(payload: CharacterBuildCompanionCompleteRequest) -> CharacterBuildCompanionCompleteResponse:
+    _require_user()
+    try:
+        return complete_companion_build(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/character-build/companion-offer", response_model=CharacterBuildStateResponse)
+async def character_build_companion_offer(payload: CharacterBuildCompanionOfferRequest) -> CharacterBuildStateResponse:
+    _require_user()
+    return mark_companion_offer_seen(payload.session_id, payload.seen)
+
+
+@router.post("/debug/save-reset", response_model=DebugSaveResetResponse)
+async def debug_save_reset(payload: DebugSaveResetRequest) -> DebugSaveResetResponse:
+    _require_user()
+    return reset_debug_test_state(payload.session_id)
 
 
 @router.post("/world-map/regions/generate", response_model=RegionGenerateResponse)
@@ -1436,7 +1887,11 @@ async def consistency_run(payload: ConsistencyRunRequest) -> ConsistencyRunRespo
 
 @router.get("/token-usage", response_model=TokenUsageResponse)
 async def token_usage(session_id: str) -> TokenUsageResponse:
-    return token_usage_store.get(session_id)
+    try:
+        return token_usage_store.get(session_id)
+    except Exception:
+        logger.exception("token usage read failed for session %s; resetting counters", session_id)
+        return token_usage_store.reset(session_id)
 
 
 @router.get("/player/static", response_model=PlayerStaticData)
@@ -1580,6 +2035,19 @@ async def player_spell_slots_consume(session_id: str, payload: PlayerSpellSlotAd
 @router.post("/player/resources/spell-slots/recover", response_model=PlayerStaticData)
 async def player_spell_slots_recover(session_id: str, payload: PlayerSpellSlotAdjustRequest) -> PlayerStaticData:
     return recover_spell_slots(session_id, payload)
+
+
+@router.post("/player/resources/martial-points/consume", response_model=PlayerStaticData)
+async def player_martial_points_consume(session_id: str, payload: PlayerMartialPointAdjustRequest) -> PlayerStaticData:
+    try:
+        return consume_martial_points(session_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.post("/player/resources/martial-points/recover", response_model=PlayerStaticData)
+async def player_martial_points_recover(session_id: str, payload: PlayerMartialPointAdjustRequest) -> PlayerStaticData:
+    return recover_martial_points(session_id, payload)
 
 
 @router.post("/player/resources/stamina/consume", response_model=PlayerStaticData)
@@ -1938,7 +2406,11 @@ async def debug_template_library_fill(payload: TemplateLibraryFillRequest) -> Te
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except APIError as exc:
+        logger.warning("template library fill upstream API error for session %s: %s", payload.session_id, exc)
         raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        logger.exception("template library fill failed for session %s", payload.session_id)
+        raise HTTPException(status_code=500, detail="template library fill failed") from exc
 
 
 @router.post("/actions/check/plan", response_model=ActionCheckPlanResponse)
@@ -1947,6 +2419,16 @@ async def action_check_plan_run(payload: ActionCheckPlanRequest) -> ActionCheckP
         return plan_action_check(payload)
     except KeyError:
         raise HTTPException(status_code=404, detail="role not found")
+
+
+@router.post("/player-input/validate", response_model=PlayerInputValidationResponse)
+async def player_input_validate_run(payload: PlayerInputValidationRequest) -> PlayerInputValidationResponse:
+    try:
+        return validate_player_input(payload)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="role not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 @router.post("/actions/check", response_model=ActionCheckResponse)

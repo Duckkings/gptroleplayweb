@@ -961,8 +961,6 @@ def resolve_public_turn_segment(
                 interaction_resolution = "rejected_opposed"
             else:
                 interaction_resolution = "ambiguous_non_opposed"
-        elif directive.action_type == "attack":
-            interaction_resolution = "attack_flow"
         events, impact, settlement, situation_delta = _finalize_ai_actor_turn(
             save,
             session_id=save.session_id,

@@ -1,0 +1,23 @@
+{
+  "version": "0.1.0",
+  "members": [
+    {
+      "role_id": "team_1",
+      "name": "缇儿",
+      "origin_zone_id": "zone_a",
+      "origin_sub_zone_id": "sub_zone_a",
+      "joined_at": "2026-03-22T07:35:11.512934+00:00",
+      "affinity": 50,
+      "trust": 40,
+      "join_source": "debug",
+      "join_reason": "",
+      "is_debug": true,
+      "debug_prompt": "",
+      "status": "active",
+      "last_reaction_at": null,
+      "last_reaction_preview": ""
+    }
+  ],
+  "reactions": [],
+  "updated_at": "2026-03-22T07:35:11.483576+00:00"
+}

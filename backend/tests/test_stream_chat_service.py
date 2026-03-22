@@ -7,8 +7,45 @@ from unittest.mock import AsyncMock, patch
 
 from app.core.storage import storage_state
 from app.core.user_context import get_current_user, set_current_user
-from app.models.schemas import ActionCheckResponse, AreaSnapshot, AreaSubZone, ChatRequest, ChatConfig, Coord3D, EncounterCheckResponse, EncounterEntry, EncounterTerminationCondition, Message, NpcRoleCard, SceneEvent, TeamMember, ToolEvent, WorldClock
-from app.services.stream_chat_service import StreamProtocolError, StreamingTurnParser, _PLANNER_TOOLS, _execute_planned_tools, _main_turn_summary_from_scene_events, apply_structured_main_turn_bundle, run_main_turn_stream
+from app.models.schemas import (
+    ActionCheckResponse,
+    AreaSnapshot,
+    AreaSubZone,
+    AreaZone,
+    ChatConfig,
+    ChatRequest,
+    Coord3D,
+    EncounterCheckResponse,
+    EncounterEntry,
+    EncounterTerminationCondition,
+    Message,
+    NpcChatRequest,
+    NpcRoleCard,
+    PendingTurnContinueRequest,
+    PendingTurnState,
+    PlayerReactionCheck,
+    PlayerStaticData,
+    Position,
+    SceneEvent,
+    SubZoneChatTurn,
+    TeamMember,
+    ToolEvent,
+    Usage,
+    WorldClock,
+)
+from app.services.pending_turn_service import load_pending_turn, save_pending_turn
+from app.services.stream_chat_service import (
+    StreamProtocolError,
+    StreamingTurnParser,
+    _PLANNER_TOOLS,
+    _execute_planned_tools,
+    _main_turn_summary_from_scene_events,
+    apply_structured_main_turn_bundle,
+    apply_structured_npc_bundle,
+    run_main_turn_stream,
+    run_npc_chat_stream,
+    run_pending_turn_once,
+)
 from app.services.world_service import clear_current_save, get_current_save, save_current, save_transaction
 
 
@@ -84,6 +121,22 @@ class SaveTransactionTests(unittest.TestCase):
 
 
 class PlannedToolExecutionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._orig_save = storage_state.save_path
+        self._orig_config = storage_state.config_path
+        self._orig_user = get_current_user()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        root = Path(self._tmpdir.name)
+        storage_state.set_save_path(str(root / "current-save.json"))
+        storage_state.set_config_path(str(root / "config.json"))
+        set_current_user(None)
+
+    def tearDown(self) -> None:
+        storage_state.set_save_path(str(self._orig_save))
+        storage_state.set_config_path(str(self._orig_config))
+        set_current_user(self._orig_user)
+        self._tmpdir.cleanup()
+
     def test_planner_tools_expose_inventory_grant_and_consume(self) -> None:
         self.assertIn("inventory_grant_item", _PLANNER_TOOLS)
         self.assertIn("inventory_consume_item", _PLANNER_TOOLS)
@@ -722,6 +775,267 @@ class PlannedToolExecutionTests(unittest.TestCase):
         self.assertEqual(encounter.zone_id, world_push_event.metadata.get("target_zone_id"))
         self.assertEqual(encounter.sub_zone_id, world_push_event.metadata.get("target_sub_zone_id"))
         self.assertTrue(any(ref.entity_type == "sub_zone" and ref.entity_id == encounter.sub_zone_id for ref in encounter.entity_refs))
+
+
+class StreamingNpcChatTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._orig_save = storage_state.save_path
+        self._orig_config = storage_state.config_path
+        self._orig_user = get_current_user()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        root = Path(self._tmpdir.name)
+        storage_state.set_save_path(str(root / "current-save.json"))
+        storage_state.set_config_path(str(root / "config.json"))
+        set_current_user(None)
+
+    def tearDown(self) -> None:
+        storage_state.set_save_path(str(self._orig_save))
+        storage_state.set_config_path(str(self._orig_config))
+        set_current_user(self._orig_user)
+        self._tmpdir.cleanup()
+
+    def _chat_config(self) -> ChatConfig:
+        return ChatConfig(openai_api_key="test-key", model="test-model", stream=True, gm_prompt="gm")
+
+    def test_apply_structured_npc_bundle_passes_config_to_encounter_advance(self) -> None:
+        session_id = "sess_stream_npc_config"
+        save = clear_current_save(session_id)
+        save.session_id = session_id
+        save.role_pool = [
+            NpcRoleCard(
+                role_id="npc_stream",
+                name="Iris",
+                profile=PlayerStaticData(role_type="npc"),
+            )
+        ]
+        save_current(save)
+        req = NpcChatRequest(
+            session_id=session_id,
+            npc_role_id="npc_stream",
+            player_message='{"input_type":"player_intent_v1","speech_description":"Status?"}',
+            config=self._chat_config(),
+        )
+
+        with patch("app.services.stream_chat_service.encounter_runtime.advance_active_encounter_in_save", return_value=None) as mocked_advance:
+            response = apply_structured_npc_bundle(
+                get_current_save(default_session_id=session_id),
+                req,
+                {"action_reaction": "She looks up.", "speech_reply": "Still here.", "relation_tag": "met"},
+                "She looks up.\nStill here.",
+                1,
+            )
+
+        self.assertEqual(response.npc_role_id, "npc_stream")
+        self.assertIs(mocked_advance.call_args.kwargs["config"], req.config)
+
+    def test_run_npc_chat_stream_restores_talkative_from_public_turns_before_guard(self) -> None:
+        session_id = "sess_stream_npc_talkative_restore"
+        save = clear_current_save(session_id)
+        save.session_id = session_id
+        save.area_snapshot = AreaSnapshot(
+            zones=[AreaZone(zone_id="zone_now", name="Harbor", center=Coord3D(x=0, y=0, z=0), sub_zone_ids=["sub_now"])],
+            sub_zones=[
+                AreaSubZone(
+                    sub_zone_id="sub_now",
+                    zone_id="zone_now",
+                    name="Dock",
+                    coord=Coord3D(x=0, y=0, z=0),
+                    description="Current dock",
+                )
+            ],
+            current_zone_id="zone_now",
+            current_sub_zone_id="sub_now",
+            clock=WorldClock(calendar="fantasy_default", year=1024, month=3, day=14, hour=9, minute=30),
+        )
+        save.map_snapshot.player_position = Position(x=0, y=0, z=0, zone_id="zone_now")
+        role = NpcRoleCard(
+            role_id="npc_stream",
+            name="Iris",
+            zone_id="zone_now",
+            sub_zone_id="sub_now",
+            personality="careful",
+            speaking_style="short answers",
+            talkative_current=0,
+            talkative_maximum=100,
+            last_private_chat_at="1024-03-14T09:00:00+00:00",
+            profile=PlayerStaticData(role_type="npc"),
+        )
+        save.role_pool = [role]
+        save.area_snapshot.sub_zones[0].chat_context.recent_turns.extend(
+            [
+                SubZoneChatTurn(
+                    turn_id="turn_1",
+                    source="main_chat",
+                    world_time_text="1024-03-14 09:05",
+                    world_time={"year": 1024, "month": 3, "day": 14, "hour": 9, "minute": 5},
+                    gm_narration="Round one moves on.",
+                ),
+                SubZoneChatTurn(
+                    turn_id="turn_2",
+                    source="main_chat",
+                    world_time_text="1024-03-14 09:10",
+                    world_time={"year": 1024, "month": 3, "day": 14, "hour": 9, "minute": 10},
+                    gm_narration="Round two moves on.",
+                ),
+                SubZoneChatTurn(
+                    turn_id="turn_3",
+                    source="main_chat",
+                    world_time_text="1024-03-14 09:15",
+                    world_time={"year": 1024, "month": 3, "day": 14, "hour": 9, "minute": 15},
+                    gm_narration="Round three moves on.",
+                ),
+            ]
+        )
+        save_current(save)
+        payload = NpcChatRequest(
+            session_id=session_id,
+            npc_role_id="npc_stream",
+            player_message='{"input_type":"player_intent_v1","speech_description":"Say it directly."}',
+            config=self._chat_config(),
+        )
+        fake_stream = AsyncMock(
+            return_value=(
+                "She answers without looking away.",
+                {"action_reaction": "She answers without looking away.", "speech_reply": "Keep moving.", "relation_tag": "met"},
+                Usage(input_tokens=1, output_tokens=1),
+            )
+        )
+
+        async def run_case() -> None:
+            with patch("app.services.stream_chat_service._use_legacy_tag_protocol", return_value=True), patch(
+                "app.services.stream_chat_service._require_async_client",
+                return_value=object(),
+            ), patch(
+                "app.services.stream_chat_service._stream_tagged_completion",
+                fake_stream,
+            ), patch(
+                "app.services.stream_chat_service.encounter_runtime.advance_active_encounter_in_save",
+                return_value=None,
+            ):
+                response = await run_npc_chat_stream(payload, emit=None, is_cancelled=None)
+            self.assertEqual(response.reply, "She answers without looking away.")
+            self.assertEqual(response.talkative_current, 2)
+            self.assertEqual(fake_stream.await_count, 1)
+
+        asyncio.run(run_case())
+
+    def test_run_pending_turn_once_continues_npc_chat_after_reaction_roll(self) -> None:
+        session_id = "sess_stream_npc_continue_reaction"
+        save = clear_current_save(session_id)
+        save.session_id = session_id
+        save.role_pool = [
+            NpcRoleCard(
+                role_id="npc_stream",
+                name="Iris",
+                talkative_current=40,
+                talkative_maximum=100,
+                profile=PlayerStaticData(role_type="npc"),
+            )
+        ]
+        save_current(save)
+        request = NpcChatRequest(
+            session_id=session_id,
+            npc_role_id="npc_stream",
+            player_message='{"input_type":"player_intent_v1","speech_description":"Keep talking."}',
+            config=self._chat_config(),
+        )
+        pending_reaction = PlayerReactionCheck(
+            reaction_id="react_npc_continue",
+            source_kind="npc_chat",
+            source_actor_id="npc_stream",
+            source_actor_name="Iris",
+            source_label="Iris 的防备动作",
+            trigger_summary="她突然抬手拦住你。",
+            threatened_consequence="你会被迫停在原地。",
+            ability_used="dexterity",
+            dc=12,
+            check_task="贴身跟上她的移动，不被甩开。",
+            resolution_context="npc_chat",
+            success_hint="你及时跟住了她。",
+            failure_hint="你被她轻巧甩开。",
+            critical_success_hint="你几乎预判了她的动作。",
+            critical_failure_hint="你踉跄了一下，彻底失去节奏。",
+        )
+        state = PendingTurnState(
+            pending_turn_id="pt_npc_continue",
+            session_id=session_id,
+            flow_kind="npc_chat",
+            status="awaiting_reaction",
+            staged_save=save.model_dump(mode="json"),
+            original_request=request.model_dump(mode="json"),
+            accumulated_reply_text="Iris narrows her eyes.",
+            accumulated_scene_events=[],
+            accumulated_tool_events=[],
+            time_spent_min=2,
+            pending_reaction=pending_reaction,
+            continuation_index=0,
+            npc_role_id="npc_stream",
+            created_at="2026-03-22T00:00:00+00:00",
+            updated_at="2026-03-22T00:00:00+00:00",
+        )
+        save_pending_turn(state)
+        reaction_result = ActionCheckResponse(
+            session_id=session_id,
+            actor_role_id=save.player_static_data.player_id,
+            actor_name=save.player_static_data.name,
+            actor_kind="player",
+            action_type="check",
+            check_mode="reaction_save",
+            requires_check=True,
+            ability_used="dexterity",
+            ability_modifier=2,
+            dc=12,
+            check_task="贴身跟上她的移动，不被甩开。",
+            dice_roll=8,
+            total_score=10,
+            success=False,
+            critical="none",
+            time_spent_min=1,
+            narrative="你慢了半拍，被她拉开距离。",
+            applied_effects=[],
+            scene_events=[],
+            relation_tag_suggestion=None,
+        )
+        fake_stream = AsyncMock(
+            return_value=(
+                'She pivots away.\n"Keep moving."',
+                {"action_reaction": "She pivots away.", "speech_reply": "Keep moving.", "relation_tag": "met"},
+                Usage(input_tokens=1, output_tokens=1),
+            )
+        )
+
+        async def run_case() -> None:
+            with patch(
+                "app.services.stream_chat_service.reaction_check_service.continue_pending_turn_once",
+                return_value=(state, reaction_result),
+            ), patch(
+                "app.services.stream_chat_service._use_legacy_tag_protocol",
+                return_value=True,
+            ), patch(
+                "app.services.stream_chat_service._require_async_client",
+                return_value=object(),
+            ), patch(
+                "app.services.stream_chat_service._stream_tagged_completion",
+                fake_stream,
+            ), patch(
+                "app.services.stream_chat_service.encounter_runtime.advance_active_encounter_in_save",
+                return_value=None,
+            ):
+                response = await run_pending_turn_once(
+                    PendingTurnContinueRequest(
+                        session_id=session_id,
+                        pending_turn_id="pt_npc_continue",
+                        forced_dice_roll=8,
+                        config=self._chat_config(),
+                    )
+                )
+            self.assertEqual(response.flow_kind, "npc_chat")
+            self.assertEqual(response.status, "completed")
+            self.assertIn("Keep moving.", response.reply_text)
+            self.assertEqual(fake_stream.await_count, 1)
+            self.assertIsNone(load_pending_turn(session_id))
+
+        asyncio.run(run_case())
 
 
 if __name__ == "__main__":

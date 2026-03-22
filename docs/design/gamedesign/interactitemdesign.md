@@ -417,102 +417,6 @@ type SceneInteractable = {
 - 卸下后物品仍留在背包
 - 如果物品被移除/消耗/丢弃，装备槽必须自动失效
 
-## 7. 武器设计
-
-## 7.1 武器目标
-
-武器不只影响战斗。
-
-它同时影响：
-
-- 主聊天公开动作的威慑感
-- NPC 对玩家态度
-- 遭遇中的威胁判断
-- 战斗中的攻击与伤害
-- 某些可交互物的处理方式
-
-例如：
-
-- 匕首可以割断绳索
-- 长杆武器适合隔着障碍试探
-- 火把可以点燃易燃物，也能临时提供照明
-
-## 7.2 武器分类
-
-建议统一分为：
-
-- `unarmed`
-- `light_melee`
-- `one_handed_melee`
-- `two_handed_melee`
-- `polearm`
-- `light_ranged`
-- `heavy_ranged`
-- `improvised`
-
-## 7.3 武器字段
-
-```ts
-type WeaponProfile = {
-  weapon_class: 'unarmed' | 'light_melee' | 'one_handed_melee' | 'two_handed_melee' | 'polearm' | 'light_ranged' | 'heavy_ranged' | 'improvised';
-  attack_ability: 'strength' | 'dexterity';
-  damage_dice: string;
-  damage_type: 'bludgeoning' | 'piercing' | 'slashing' | 'fire' | 'cold' | 'lightning' | 'poison' | 'psychic';
-  attack_bonus_flat?: number;
-  range_band?: 'engaged' | 'near' | 'far';
-  handedness: 'one_hand' | 'two_hands' | 'off_hand_only';
-  traits: string[];
-};
-```
-
-常用 `traits`：
-
-- `finesse`
-- `reach`
-- `thrown`
-- `reload`
-- `concealable`
-- `loud`
-- `improvised_ok`
-- `nonlethal_ok`
-
-## 7.4 武器第一阶段规则
-
-与独立战斗模块对齐，第一阶段武器只要求支持：
-
-- 命中加值
-- 伤害骰
-- 伤害类型
-- 单双手限制
-- 站位距离
-- 少量特性标签
-
-暂不要求第一阶段完整支持：
-
-- 弹药管理
-- 复杂双持
-- 专长修正
-- 武器熟练缺失惩罚
-
-## 7.5 推荐第一阶段武器模板
-
-- 徒手
-- 匕首
-- 短剑
-- 长刀
-- 木棍
-- 短弓
-- 投石
-- 酒瓶
-- 火把
-
-这样足够覆盖：
-
-- 城市场景
-- 酒馆冲突
-- 小规模战斗
-- 临时 improvised weapon 场景
-
 ## 8. 护甲与盾牌设计
 
 ## 8.1 护甲分类
@@ -537,17 +441,17 @@ type ArmorProfile = {
 };
 ```
 
-## 8.3 AC 规则
+## ~~8.3 AC 规则~~
 
-与当前战斗设计兼容，建议正式写法为：
+~~与当前战斗设计兼容，建议正式写法为：~~
 
-- 无护甲：`10 + 敏捷调整值`
-- 轻甲：`armor_class_base + 敏捷调整值`
-- 中甲：`armor_class_base + min(敏捷调整值, dex_cap)`
-- 重甲：`armor_class_base`
-- 盾牌：在最终 AC 上 `+2`
+- ~~无护甲：`10 + 敏捷调整值`~~
+- ~~轻甲：`armor_class_base + 敏捷调整值`~~
+- ~~中甲：`armor_class_base + min(敏捷调整值, dex_cap)`~~
+- ~~重甲：`armor_class_base`~~
+- ~~盾牌：在最终 AC 上 `+2`~~
 
-这样比早期文档里“AC = 武器攻击力 + 力量/敏捷加值”更一致，也更契合你当前战斗方向。
+~~这样比早期文档里“AC = 武器攻击力 + 力量/敏捷加值”更一致，也更契合你当前战斗方向。~~
 
 ## 9. 消耗品与投掷物
 

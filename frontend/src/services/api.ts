@@ -18,8 +18,30 @@
   BattleStartResponse,
   ChatMessage,
   ChatResponse,
+  CharacterBuildAbilitySuggestResponse,
+  CharacterBuildBasicInfo,
+  CharacterBuildBasicInfoSuggestResponse,
+  CharacterBuildCompanionCompleteResponse,
+  CharacterBuildCompanionFlavor,
+  CharacterBuildCompanionFlavorSuggestResponse,
+  CharacterBuildLoadoutSelection,
+  CharacterBuildLoadoutSuggestResponse,
+  CharacterBuildMediaDescribeResponse,
+  CharacterBuildMediaFinalizeResponse,
+  CharacterBuildMediaGenerateResponse,
+  CharacterBuildMediaRemoveBackgroundResponse,
+  CharacterBuildMediaUploadResponse,
+  CharacterBuildOptionsResponse,
+  CharacterBuildPlayerCompleteResponse,
+  CharacterBuildPortraitPromptSuggestResponse,
+  CharacterBuildStateResponse,
+  CompanionBuildSeedListResponse,
+  CompanionBuildSeedResponse,
   ConsistencyRunResponse,
   ConsistencyStatusResponse,
+  DebugSaveResetResponse,
+  DeathSavePrompt,
+  Dnd5eAbilityScores,
   EncounterActResponse,
   EncounterCheckResponse,
   EncounterDebugOverviewResponse,
@@ -44,7 +66,14 @@
   NpcKnowledgeResponse,
   NpcRoleCard,
   PendingTurnContinueResponse,
+  PlayerInputValidationRequest,
+  PlayerInputValidationResponse,
+  PlayerBuildSeedListResponse,
+  PlayerBuildSeedResponse,
   PlayerReactionCheck,
+  PublicTurnAttackDefensePrompt,
+  PublicTurnAttackPrompt,
+  PublicTurnAttackResponseSubmission,
   PublicTurnOpposedPlanResponse,
   PublicTurnInteractionPrompt,
   PublicTurnOpposedPrompt,
@@ -168,6 +197,21 @@ export async function validateConfig(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(config),
+    },
+    report,
+  );
+}
+
+export async function validatePlayerInput(
+  payload: PlayerInputValidationRequest,
+  report?: DebugReporter,
+): Promise<PlayerInputValidationResponse> {
+  return requestJson(
+    '/player-input/validate',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
     },
     report,
   );
@@ -687,6 +731,284 @@ export async function clearSave(sessionId: string, report?: DebugReporter): Prom
   );
 }
 
+export async function getCharacterBuildState(sessionId: string, report?: DebugReporter): Promise<CharacterBuildStateResponse> {
+  return requestJson(`/character-build/state?session_id=${encodeURIComponent(sessionId)}`, { method: 'GET' }, report);
+}
+
+export async function getCharacterBuildOptions(
+  kind: 'player' | 'companion',
+  specialization: 'warrior' | 'mage',
+  report?: DebugReporter,
+): Promise<CharacterBuildOptionsResponse> {
+  const params = new URLSearchParams({ kind, specialization });
+  return requestJson(`/character-build/options?${params.toString()}`, { method: 'GET' }, report);
+}
+
+export async function getPlayerBuildSeeds(report?: DebugReporter): Promise<PlayerBuildSeedListResponse> {
+  return requestJson('/character-build/seeds/players', { method: 'GET' }, report);
+}
+
+export async function getPlayerBuildSeed(archiveId: string, report?: DebugReporter): Promise<PlayerBuildSeedResponse> {
+  return requestJson(`/character-build/seeds/players/${encodeURIComponent(archiveId)}`, { method: 'GET' }, report);
+}
+
+export async function getCompanionBuildSeeds(report?: DebugReporter): Promise<CompanionBuildSeedListResponse> {
+  return requestJson('/character-build/seeds/companions', { method: 'GET' }, report);
+}
+
+export async function getCompanionBuildSeed(retainedId: string, report?: DebugReporter): Promise<CompanionBuildSeedResponse> {
+  return requestJson(`/character-build/seeds/companions/${encodeURIComponent(retainedId)}`, { method: 'GET' }, report);
+}
+
+export async function suggestCharacterBuildBasicInfo(
+  payload: { config?: AppConfig; prompt: string; current?: CharacterBuildBasicInfo | null; kind?: 'player' | 'companion' },
+  report?: DebugReporter,
+): Promise<CharacterBuildBasicInfoSuggestResponse> {
+  return requestJson(
+    '/character-build/suggest/basic-info',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function suggestCharacterBuildAbilities(
+  payload: { config?: AppConfig; prompt: string; current_scores?: Dnd5eAbilityScores | null; specialization?: 'warrior' | 'mage' | null },
+  report?: DebugReporter,
+): Promise<CharacterBuildAbilitySuggestResponse> {
+  return requestJson(
+    '/character-build/suggest/abilities',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function suggestCharacterBuildPortraitPrompt(
+  payload: { config?: AppConfig; prompt: string; current_prompt?: string; basic_info?: CharacterBuildBasicInfo | null },
+  report?: DebugReporter,
+): Promise<CharacterBuildPortraitPromptSuggestResponse> {
+  return requestJson(
+    '/character-build/suggest/portrait-prompt',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function suggestCharacterBuildLoadout(
+  payload: {
+    config?: AppConfig;
+    prompt: string;
+    kind?: 'player' | 'companion';
+    specialization: 'warrior' | 'mage';
+    basic_info?: CharacterBuildBasicInfo | null;
+    appearance?: string;
+    available_spell_option_ids?: string[];
+    available_equipment_option_ids?: string[];
+    available_skill_option_ids?: string[];
+  },
+  report?: DebugReporter,
+): Promise<CharacterBuildLoadoutSuggestResponse> {
+  return requestJson(
+    '/character-build/suggest/loadout',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function suggestCharacterBuildCompanionFlavor(
+  payload: {
+    config?: AppConfig;
+    prompt: string;
+    current?: CharacterBuildCompanionFlavor | null;
+    basic_info?: CharacterBuildBasicInfo | null;
+    appearance?: string;
+  },
+  report?: DebugReporter,
+): Promise<CharacterBuildCompanionFlavorSuggestResponse> {
+  return requestJson(
+    '/character-build/suggest/companion-personality',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function uploadCharacterPortrait(
+  payload: { data_base64: string; mime_type?: string; file_name?: string },
+  report?: DebugReporter,
+): Promise<CharacterBuildMediaUploadResponse> {
+  return requestJson(
+    '/character-build/media/upload',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function generateCharacterPortrait(
+  payload: {
+    config: AppConfig;
+    prompt: string;
+    basic_info?: CharacterBuildBasicInfo | null;
+    reference_asset_id?: string | null;
+  },
+  report?: DebugReporter,
+): Promise<CharacterBuildMediaGenerateResponse> {
+  return requestJson(
+    '/character-build/media/generate',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function removeCharacterPortraitBackground(
+  payload: { config: AppConfig; raw_asset_id: string },
+  report?: DebugReporter,
+): Promise<CharacterBuildMediaRemoveBackgroundResponse> {
+  return requestJson(
+    '/character-build/media/remove-background',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function finalizeCharacterPortrait(
+  payload: { asset_id: string },
+  report?: DebugReporter,
+): Promise<CharacterBuildMediaFinalizeResponse> {
+  return requestJson(
+    '/character-build/media/finalize',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function describeCharacterPortrait(
+  payload: { config: AppConfig; asset_id: string; basic_info?: CharacterBuildBasicInfo | null },
+  report?: DebugReporter,
+): Promise<CharacterBuildMediaDescribeResponse> {
+  return requestJson(
+    '/character-build/media/describe',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export function getCharacterBuildAssetUrl(assetId: string): string {
+  return `${API_BASE}/character-build/assets/${encodeURIComponent(assetId)}`;
+}
+
+export async function completePlayerBuild(
+  payload: {
+    session_id: string;
+    basic_info: CharacterBuildBasicInfo;
+    specialization: 'warrior' | 'mage';
+    ability_scores: Dnd5eAbilityScores;
+    final_portrait_asset_id: string;
+    appearance: string;
+    loadout: CharacterBuildLoadoutSelection;
+  },
+  report?: DebugReporter,
+): Promise<CharacterBuildPlayerCompleteResponse> {
+  return requestJson(
+    '/character-build/player/complete',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function completeCompanionBuild(
+  payload: {
+    session_id: string;
+    basic_info: CharacterBuildBasicInfo;
+    specialization: 'warrior' | 'mage';
+    ability_scores: Dnd5eAbilityScores;
+    final_portrait_asset_id: string;
+    appearance: string;
+    loadout: CharacterBuildLoadoutSelection;
+    flavor: CharacterBuildCompanionFlavor;
+  },
+  report?: DebugReporter,
+): Promise<CharacterBuildCompanionCompleteResponse> {
+  return requestJson(
+    '/character-build/companion/complete',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function markCharacterBuildCompanionOfferSeen(
+  payload: { session_id: string; seen?: boolean },
+  report?: DebugReporter,
+): Promise<CharacterBuildStateResponse> {
+  return requestJson(
+    '/character-build/companion-offer',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function debugSaveReset(sessionId: string, report?: DebugReporter): Promise<DebugSaveResetResponse> {
+  return requestJson(
+    '/debug/save-reset',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId }),
+    },
+    report,
+  );
+}
+
 export async function generateRegions(
   payload: {
     session_id: string;
@@ -1054,6 +1376,7 @@ export async function continuePublicTurn(
     session_id: string;
     action_submission?: PublicTurnActionSubmission | null;
     player_interaction_response?: PublicTurnInteractionResponseSubmission | null;
+    player_attack_response?: PublicTurnAttackResponseSubmission | null;
     player_action_check?: PublicTurnPlayerActionCheck | null;
     config?: AppConfig;
   },
@@ -1148,13 +1471,55 @@ export async function resolvePublicTurnOpposedCheck(
   );
 }
 
+export async function resolvePublicTurnAttackDefense(
+  payload: {
+    session_id: string;
+    check_id: string;
+    forced_dice_roll: number;
+    config?: AppConfig;
+  },
+  report?: DebugReporter,
+): Promise<PublicTurnResponse | PendingTurnContinueResponse> {
+  return requestJson(
+    '/public-turn/attack-defense-check',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function resolvePublicTurnDeathSave(
+  payload: {
+    session_id: string;
+    prompt_id: string;
+    forced_dice_roll: number;
+    config?: AppConfig;
+  },
+  report?: DebugReporter,
+): Promise<PublicTurnResponse | PendingTurnContinueResponse> {
+  return requestJson(
+    '/public-turn/death-save-check',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
 async function consumePublicTurnStream(
   endpoint:
     | '/public-turn/entry/stream'
     | '/public-turn/continue/stream'
     | '/public-turn/protocol-repair/stream'
     | '/public-turn/reaction-check/stream'
-    | '/public-turn/opposed-check/stream',
+    | '/public-turn/opposed-check/stream'
+    | '/public-turn/attack-defense-check/stream'
+    | '/public-turn/death-save-check/stream',
   payload: unknown,
   handlers: {
     onPhase: (event: StreamPhaseEvent) => void;
@@ -1181,6 +1546,36 @@ async function consumePublicTurnStream(
       reply_so_far: string;
       scene_events_so_far: SceneEvent[];
       public_opposed_prompt: PublicTurnOpposedPrompt | null;
+      npc_role_id?: string | null;
+      public_turn_state?: PublicTurnState | null;
+      public_turn_presentation?: PublicTurnPresentation | null;
+    }) => void;
+    onAttackResponseRequired?: (payload: {
+      pending_turn_id: string;
+      flow_kind: PendingTurnContinueResponse['flow_kind'];
+      reply_so_far: string;
+      scene_events_so_far: SceneEvent[];
+      public_attack_prompt: PublicTurnAttackPrompt | null;
+      npc_role_id?: string | null;
+      public_turn_state?: PublicTurnState | null;
+      public_turn_presentation?: PublicTurnPresentation | null;
+    }) => void;
+    onAttackDefenseRequired?: (payload: {
+      pending_turn_id: string;
+      flow_kind: PendingTurnContinueResponse['flow_kind'];
+      reply_so_far: string;
+      scene_events_so_far: SceneEvent[];
+      public_attack_defense_prompt: PublicTurnAttackDefensePrompt | null;
+      npc_role_id?: string | null;
+      public_turn_state?: PublicTurnState | null;
+      public_turn_presentation?: PublicTurnPresentation | null;
+    }) => void;
+    onDeathSaveRequired?: (payload: {
+      pending_turn_id: string;
+      flow_kind: PendingTurnContinueResponse['flow_kind'];
+      reply_so_far: string;
+      scene_events_so_far: SceneEvent[];
+      death_save_prompt: DeathSavePrompt | null;
       npc_role_id?: string | null;
       public_turn_state?: PublicTurnState | null;
       public_turn_presentation?: PublicTurnPresentation | null;
@@ -1256,7 +1651,10 @@ async function consumePublicTurnStream(
           scene_events_so_far?: SceneEvent[];
           pending_reaction?: PlayerReactionCheck | null;
           public_interaction_prompt?: PublicTurnInteractionPrompt | null;
+          public_attack_prompt?: PublicTurnAttackPrompt | null;
+          public_attack_defense_prompt?: PublicTurnAttackDefensePrompt | null;
           public_opposed_prompt?: PublicTurnOpposedPrompt | null;
+          death_save_prompt?: DeathSavePrompt | null;
           npc_role_id?: string | null;
           archived_sub_zone_turn_id?: string | null;
           round_completed?: boolean;
@@ -1313,6 +1711,42 @@ async function consumePublicTurnStream(
             reply_so_far: data.reply_so_far ?? '',
             scene_events_so_far: data.scene_events_so_far ?? [],
             public_opposed_prompt: data.public_opposed_prompt ?? null,
+            npc_role_id: data.npc_role_id ?? null,
+            public_turn_state: data.public_turn_state ?? null,
+            public_turn_presentation: data.presentation ?? (data as { public_turn_presentation?: PublicTurnPresentation | null }).public_turn_presentation ?? null,
+          });
+        } else if (event === 'attack_response_required') {
+          terminalEventReceived = true;
+          handlers.onAttackResponseRequired?.({
+            pending_turn_id: data.pending_turn_id ?? '',
+            flow_kind: data.flow_kind ?? 'public_turn',
+            reply_so_far: data.reply_so_far ?? '',
+            scene_events_so_far: data.scene_events_so_far ?? [],
+            public_attack_prompt: data.public_attack_prompt ?? null,
+            npc_role_id: data.npc_role_id ?? null,
+            public_turn_state: data.public_turn_state ?? null,
+            public_turn_presentation: data.presentation ?? (data as { public_turn_presentation?: PublicTurnPresentation | null }).public_turn_presentation ?? null,
+          });
+        } else if (event === 'attack_defense_required') {
+          terminalEventReceived = true;
+          handlers.onAttackDefenseRequired?.({
+            pending_turn_id: data.pending_turn_id ?? '',
+            flow_kind: data.flow_kind ?? 'public_turn',
+            reply_so_far: data.reply_so_far ?? '',
+            scene_events_so_far: data.scene_events_so_far ?? [],
+            public_attack_defense_prompt: data.public_attack_defense_prompt ?? null,
+            npc_role_id: data.npc_role_id ?? null,
+            public_turn_state: data.public_turn_state ?? null,
+            public_turn_presentation: data.presentation ?? (data as { public_turn_presentation?: PublicTurnPresentation | null }).public_turn_presentation ?? null,
+          });
+        } else if (event === 'death_save_required') {
+          terminalEventReceived = true;
+          handlers.onDeathSaveRequired?.({
+            pending_turn_id: data.pending_turn_id ?? '',
+            flow_kind: data.flow_kind ?? 'public_turn',
+            reply_so_far: data.reply_so_far ?? '',
+            scene_events_so_far: data.scene_events_so_far ?? [],
+            death_save_prompt: data.death_save_prompt ?? null,
             npc_role_id: data.npc_role_id ?? null,
             public_turn_state: data.public_turn_state ?? null,
             public_turn_presentation: data.presentation ?? (data as { public_turn_presentation?: PublicTurnPresentation | null }).public_turn_presentation ?? null,
@@ -1376,6 +1810,7 @@ export async function streamContinuePublicTurn(
     session_id: string;
     action_submission?: PublicTurnActionSubmission | null;
     player_interaction_response?: PublicTurnInteractionResponseSubmission | null;
+    player_attack_response?: PublicTurnAttackResponseSubmission | null;
     player_action_check?: PublicTurnPlayerActionCheck | null;
     config?: AppConfig;
   },
@@ -1418,6 +1853,34 @@ export async function streamResolvePublicTurnOpposedCheck(
   report?: DebugReporter,
 ): Promise<void> {
   return consumePublicTurnStream('/public-turn/opposed-check/stream', payload, handlers, signal, report);
+}
+
+export async function streamResolvePublicTurnAttackDefense(
+  payload: {
+    session_id: string;
+    check_id: string;
+    forced_dice_roll: number;
+    config?: AppConfig;
+  },
+  handlers: Parameters<typeof consumePublicTurnStream>[2],
+  signal: AbortSignal,
+  report?: DebugReporter,
+): Promise<void> {
+  return consumePublicTurnStream('/public-turn/attack-defense-check/stream', payload, handlers, signal, report);
+}
+
+export async function streamResolvePublicTurnDeathSave(
+  payload: {
+    session_id: string;
+    prompt_id: string;
+    forced_dice_roll: number;
+    config?: AppConfig;
+  },
+  handlers: Parameters<typeof consumePublicTurnStream>[2],
+  signal: AbortSignal,
+  report?: DebugReporter,
+): Promise<void> {
+  return consumePublicTurnStream('/public-turn/death-save-check/stream', payload, handlers, signal, report);
 }
 
 export async function generateFate(
@@ -1800,6 +2263,22 @@ export async function recoverSpellSlots(
   );
 }
 
+export async function consumeMartialPoints(sessionId: string, amount = 1, report?: DebugReporter): Promise<PlayerStaticData> {
+  return requestJson(
+    `/player/resources/martial-points/consume?session_id=${encodeURIComponent(sessionId)}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ amount }) },
+    report,
+  );
+}
+
+export async function recoverMartialPoints(sessionId: string, amount = 1, report?: DebugReporter): Promise<PlayerStaticData> {
+  return requestJson(
+    `/player/resources/martial-points/recover?session_id=${encodeURIComponent(sessionId)}`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ amount }) },
+    report,
+  );
+}
+
 export async function consumeStamina(sessionId: string, amount = 1, report?: DebugReporter): Promise<PlayerStaticData> {
   return requestJson(
     `/player/resources/stamina/consume?session_id=${encodeURIComponent(sessionId)}`,
@@ -2135,7 +2614,7 @@ export async function getTemplateLibraryStatus(
 }
 
 export async function fillTemplateLibrary(
-  payload: { session_id: string; config?: AppConfig },
+  payload: { session_id: string; fill_scope?: 'all' | 'spells'; spell_fill_count?: number; config?: AppConfig },
   report?: DebugReporter,
 ): Promise<TemplateLibraryFillResponse> {
   return requestJson(
@@ -2153,7 +2632,7 @@ export async function fillTemplateLibrary(
 export async function planActionCheck(
   payload: {
     session_id: string;
-    action_type: 'attack' | 'check' | 'item_use';
+    action_type: 'attack' | 'check' | 'item_use' | 'auto';
     check_mode?: 'action' | 'reaction_save';
     action_prompt: string;
     actor_role_id?: string;

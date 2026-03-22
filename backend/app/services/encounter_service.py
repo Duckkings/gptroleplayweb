@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import json
 from math import ceil
 import random
-from typing import Any
+from typing import Any, Iterable
 
 from openai import OpenAI
 
@@ -273,6 +273,79 @@ def _visible_participant_text(save, encounter: EncounterEntry) -> tuple[str, str
     return (" / ".join(team_members) or "none", " / ".join(npc_names) or "none")
 
 
+def _normalize_actor_name_key(name: object) -> str:
+    return "".join(str(name or "").split()).strip().lower()
+
+
+def _encounter_actor_name_suffix(actor_kind: str) -> str:
+    return "新NPC" if actor_kind == "new_npc" else "遭遇NPC"
+
+
+def _coerce_reserved_name_keys(
+    forbidden_names: Iterable[object] | None = None,
+    reserved_name_keys: set[str] | None = None,
+) -> set[str]:
+    keys = reserved_name_keys if reserved_name_keys is not None else set()
+    for item in forbidden_names or []:
+        key = _normalize_actor_name_key(item)
+        if key:
+            keys.add(key)
+    return keys
+
+
+def _make_unique_encounter_actor_name(
+    base_name: object,
+    *,
+    actor_kind: str,
+    forbidden_names: Iterable[object] | None = None,
+    reserved_name_keys: set[str] | None = None,
+    force_annotation: bool = False,
+) -> str:
+    clean = str(base_name or "").strip()
+    if not clean:
+        return ""
+    reserved_keys = _coerce_reserved_name_keys(forbidden_names, reserved_name_keys)
+    base_key = _normalize_actor_name_key(clean)
+    if not force_annotation and base_key and base_key not in reserved_keys:
+        reserved_keys.add(base_key)
+        return clean
+    suffix = _encounter_actor_name_suffix(actor_kind)
+    index = 1
+    while True:
+        label = suffix if index == 1 else f"{suffix}{index}"
+        candidate = f"{clean}（{label}）"
+        candidate_key = _normalize_actor_name_key(candidate)
+        if candidate_key and candidate_key not in reserved_keys:
+            reserved_keys.add(candidate_key)
+            return candidate
+        index += 1
+
+
+def _encounter_forbidden_actor_names(save) -> list[str]:
+    current_sub_zone_id = str(getattr(getattr(save, "area_snapshot", None), "current_sub_zone_id", "") or "")
+    current_sub = next(
+        (item for item in getattr(getattr(save, "area_snapshot", None), "sub_zones", []) if item.sub_zone_id == current_sub_zone_id),
+        None,
+    )
+    names: list[str] = []
+    seen_keys: set[str] = set()
+
+    def add(name: object) -> None:
+        clean = str(name or "").strip()
+        key = _normalize_actor_name_key(clean)
+        if not clean or not key or key in seen_keys:
+            return
+        seen_keys.add(key)
+        names.append(clean)
+
+    add(getattr(getattr(save, "player_static_data", None), "name", ""))
+    for member in getattr(getattr(save, "team_state", None), "members", []) or []:
+        add(getattr(member, "name", ""))
+    for area_npc in getattr(current_sub, "npcs", []) or []:
+        add(getattr(area_npc, "name", ""))
+    return names
+
+
 def _build_encounter_temp_npc(raw: dict[str, object], index: int) -> EncounterTemporaryNpc | None:
     name = _force_chinese_text(raw.get("name"), "", limit=24)
     if not name:
@@ -292,39 +365,73 @@ def _build_encounter_temp_npc(raw: dict[str, object], index: int) -> EncounterTe
     )
 
 
-def _sanitize_temporary_npcs(raw_list: object) -> list[EncounterTemporaryNpc]:
+def _sanitize_temporary_npcs(
+    raw_list: object,
+    *,
+    forbidden_names: Iterable[object] | None = None,
+    reserved_name_keys: set[str] | None = None,
+) -> list[EncounterTemporaryNpc]:
     if not isinstance(raw_list, list):
         return []
+    shared_reserved_keys = _coerce_reserved_name_keys(forbidden_names, reserved_name_keys)
     items: list[EncounterTemporaryNpc] = []
-    seen_names: set[str] = set()
+    name_counts: dict[str, int] = {}
+    for raw in raw_list:
+        if not isinstance(raw, dict):
+            continue
+        key = _normalize_actor_name_key(raw.get("name"))
+        if key:
+            name_counts[key] = name_counts.get(key, 0) + 1
     for index, raw in enumerate(raw_list):
         if len(items) >= 2:
             break
         if not isinstance(raw, dict):
             continue
         built = _build_encounter_temp_npc(raw, index)
-        if built is None or built.name in seen_names:
+        built_key = _normalize_actor_name_key(getattr(built, "name", "")) if built is not None else ""
+        if built is None or not built_key:
             continue
-        seen_names.add(built.name)
-        items.append(built)
+        unique_name = _make_unique_encounter_actor_name(
+            built.name,
+            actor_kind="temporary_npc",
+            forbidden_names=forbidden_names,
+            reserved_name_keys=shared_reserved_keys,
+            force_annotation=name_counts.get(built_key, 0) > 1,
+        )
+        if not unique_name:
+            continue
+        items.append(built.model_copy(update={"name": unique_name}))
     return items
 
 
-def _sanitize_new_npc_seed(raw: object) -> dict[str, object] | None:
+def _sanitize_new_npc_seed(
+    raw: object,
+    *,
+    forbidden_names: Iterable[object] | None = None,
+    reserved_name_keys: set[str] | None = None,
+) -> dict[str, object] | None:
     if not isinstance(raw, dict):
         return None
     name = _force_chinese_text(raw.get("name"), "", limit=24)
     if not name:
         return None
+    unique_name = _make_unique_encounter_actor_name(
+        name,
+        actor_kind="new_npc",
+        forbidden_names=forbidden_names,
+        reserved_name_keys=reserved_name_keys,
+    )
+    if not unique_name:
+        return None
     likes_raw = raw.get("likes") if isinstance(raw.get("likes"), list) else []
     likes = [_force_chinese_text(item, "", limit=32) for item in likes_raw[:6]]
     likes = [item for item in likes if item]
     return {
-        "name": name,
+        "name": unique_name,
         "title": _force_chinese_text(raw.get("title"), "", limit=40),
-        "description": _force_chinese_text(raw.get("description"), f"{name}正被卷进眼前的遭遇。", limit=160),
+        "description": _force_chinese_text(raw.get("description"), f"{unique_name}正被卷进眼前的遭遇。", limit=160),
         "speaking_style": _force_chinese_text(raw.get("speaking_style"), "", limit=80),
-        "agenda": _force_chinese_text(raw.get("agenda"), f"{name}想先处理现场最紧要的部分。", limit=120),
+        "agenda": _force_chinese_text(raw.get("agenda"), f"{unique_name}想先处理现场最紧要的部分。", limit=120),
         "appearance": _force_chinese_text(raw.get("appearance"), "", limit=80),
         "alignment": _force_chinese_text(raw.get("alignment"), "", limit=40),
         "likes": likes,
@@ -1000,6 +1107,7 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
     )
     snapshot = build_global_story_snapshot(save)
     entity_index = build_entity_index(save, scope="current_zone")
+    forbidden_actor_names = _encounter_forbidden_actor_names(save)
     allowed_npc_ids = set(snapshot.available_npc_ids)
     allowed_zone_ids = set(entity_index.zone_ids)
     allowed_sub_zone_ids = set(entity_index.sub_zone_ids)
@@ -1036,11 +1144,18 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
         allowed_fate_phase_ids=_prompt_list(sorted(allowed_fate_phase_ids)),
         visible_npcs=_prompt_list([f"{npc.role_id}:{npc.name}" for npc in snapshot.available_npcs]),
         active_quests=_prompt_list([f"{quest.quest_id}:{quest.title}" for quest in snapshot.active_quests]),
+        team_member_names=_prompt_list([member.name for member in getattr(save.team_state, "members", []) if str(getattr(member, "name", "") or "").strip()]),
+        forbidden_actor_names=_prompt_list(forbidden_actor_names),
     )
     prompt = (
         f"{prompt}\nAllowed enum ids:\n"
         f"{render_enum_pool_text((EnumContractField(field_path='type', allowed_ids=('npc', 'event', 'anomaly')), EnumContractField(field_path='termination_conditions[].kind', allowed_ids=('npc_leaves', 'player_escapes', 'target_resolved', 'time_elapsed', 'manual_custom'), required=False)))}\n"
-        "Use only the allowed stable ids for type and termination_conditions[].kind."
+        "Use only the allowed stable ids for type and termination_conditions[].kind.\n"
+        "Name rules:\n"
+        "- Do not create new_npc or temporary_npcs with the same display name as the player, any active team member, or any currently visible NPC.\n"
+        "- If an existing visible NPC already fits the encounter, use npc_role_id instead of creating a same-name NPC.\n"
+        f"- Active team member names: {_prompt_list([member.name for member in getattr(save.team_state, 'members', []) if str(getattr(member, 'name', '') or '').strip()])}\n"
+        f"- Forbidden display names for new_npc/temporary_npcs: {_prompt_list(forbidden_actor_names)}"
     )
     debug_log = current_generation_debug_log()
     if debug_log is not None:
@@ -1093,8 +1208,17 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
 
         entity_refs: list[EntityRef] = []
         npc_role_id = _sanitize_allowed_id(parsed.get("npc_role_id"), allowed_npc_ids)
-        new_npc = _sanitize_new_npc_seed(parsed.get("new_npc"))
-        temporary_npcs = _sanitize_temporary_npcs(parsed.get("temporary_npcs"))
+        reserved_name_keys = _coerce_reserved_name_keys(forbidden_actor_names)
+        new_npc = _sanitize_new_npc_seed(
+            parsed.get("new_npc"),
+            forbidden_names=forbidden_actor_names,
+            reserved_name_keys=reserved_name_keys,
+        )
+        temporary_npcs = _sanitize_temporary_npcs(
+            parsed.get("temporary_npcs"),
+            forbidden_names=forbidden_actor_names,
+            reserved_name_keys=reserved_name_keys,
+        )
         if debug_log is not None:
             debug_log.record(
                 "encounter_generation_model_parsed",

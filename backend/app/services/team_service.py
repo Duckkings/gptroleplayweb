@@ -131,6 +131,8 @@ def _remove_area_presence(save, role_id: str) -> None:
 
 
 def _restore_area_presence(save, role: NpcRoleCard, member: TeamMember) -> None:
+    if role.state == "dead" or role.profile.dnd5e_sheet.role_action_status == "dead":
+        return
     role.zone_id = member.origin_zone_id
     role.sub_zone_id = member.origin_sub_zone_id
     role.state = "idle"
@@ -863,7 +865,7 @@ def _build_team_profile_from_spec(role_id: str, name: str, spec: dict[str, Any])
     tools = _merge_unique(list(template.get("tools") or []), list(spec["tool_proficiencies"]), 5)
     features = _merge_unique(list(template.get("features") or []), list(spec["features_traits"]), 6)
     spells = _merge_unique(list(template.get("spells") or []), list(spec["spells"]), 6)
-    first_level_slots = max(int(template.get("spell_slots_level_1") or 0), 1 if spells else 0)
+    first_level_slots = max(1, min(int(level or 1), 9)) if spells else 0
     profile = PlayerStaticData(
         player_id=role_id,
         name=name,
@@ -1037,6 +1039,77 @@ def _team_chat_deltas(player_text: str) -> tuple[int, int]:
     if _contains_any([player_text], ["谢谢", "thank", "help", "protect", "合作", "一起", "照应"]):
         return (1, 1)
     return (0, 0)
+
+
+def _private_chat_deltas(player_text: str, relation_tag: str) -> tuple[int, int]:
+    affinity_delta, trust_delta = _team_chat_deltas(player_text)
+    relation_affinity, relation_trust = {
+        "ally": (1, 2),
+        "friendly": (1, 1),
+        "met": (0, 0),
+        "neutral": (0, 0),
+        "wary": (-1, -1),
+        "hostile": (-2, -2),
+    }.get((relation_tag or "").strip().lower(), (0, 0))
+    return (
+        max(-3, min(3, affinity_delta + relation_affinity)),
+        max(-3, min(3, trust_delta + relation_trust)),
+    )
+
+
+def apply_private_chat_feedback_in_save(
+    save,
+    *,
+    session_id: str,
+    role_id: str,
+    player_text: str,
+    reply: str,
+    relation_tag: str,
+) -> TeamReaction | None:
+    state = ensure_team_state(save)
+    member = _find_member(state, role_id)
+    if member is None:
+        return None
+    role = next((item for item in save.role_pool if item.role_id == role_id), None)
+    if role is None:
+        return None
+    affinity_delta, trust_delta = _private_chat_deltas(player_text, relation_tag)
+    preview = (reply or f"{role.name} 对你的单聊做出了回应。").strip()[:120]
+    member.affinity = _clamp_score(member.affinity + affinity_delta)
+    member.trust = _clamp_score(member.trust + trust_delta)
+    member.last_reaction_at = _utc_now()
+    member.last_reaction_preview = preview
+    role.attitude_changes.append(f"{member.last_reaction_at} team:private_chat:{affinity_delta}/{trust_delta}")
+    role.attitude_changes = role.attitude_changes[-50:]
+    role.cognition_changes.append(f"{member.last_reaction_at} 单聊记忆: {player_text[:48]}")
+    role.cognition_changes = role.cognition_changes[-50:]
+    reaction = TeamReaction(
+        reaction_id=_new_id("treact"),
+        member_role_id=member.role_id,
+        member_name=member.name,
+        trigger_kind="npc_chat",
+        content=preview or role.name,
+        affinity_delta=affinity_delta,
+        trust_delta=trust_delta,
+    )
+    state.reactions.append(reaction)
+    state.reactions = state.reactions[-100:]
+    _append_game_log(
+        save,
+        session_id,
+        "team_private_chat",
+        f"{member.name}: {preview}",
+        {
+            "role_id": member.role_id,
+            "affinity_delta": affinity_delta,
+            "trust_delta": trust_delta,
+            "relation_tag": relation_tag,
+        },
+    )
+    if member.affinity <= 0:
+        _remove_member_from_team_in_save(save, member, "affinity_depleted")
+    _touch_state(state)
+    return reaction
 
 
 def _fallback_team_chat_reply(role: NpcRoleCard, player_text: str) -> tuple[str, str]:

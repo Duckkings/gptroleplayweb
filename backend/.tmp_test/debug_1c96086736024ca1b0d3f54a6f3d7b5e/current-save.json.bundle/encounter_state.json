@@ -1,0 +1,9 @@
+{
+  "version": "0.1.0",
+  "pending_ids": [],
+  "active_encounter_id": null,
+  "encounters": [],
+  "history": [],
+  "debug_force_trigger": false,
+  "updated_at": "2026-03-22T07:35:11.483613+00:00"
+}

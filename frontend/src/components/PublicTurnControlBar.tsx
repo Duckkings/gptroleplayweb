@@ -15,14 +15,17 @@ type Props = {
 
 const PHASE_LABELS: Record<PublicTurnPhase, string> = {
   idle: '待命',
-  initiative_declaration: '抢先声明',
-  initiative_execution: '抢先执行',
+  initiative_declaration: '先攻声明',
+  initiative_execution: '先攻执行',
   normal_advancement: '常规推进',
   gm_push: 'GM 推动',
   situation_advancement: '局势推进',
-  awaiting_player_interaction: '等待交互回应',
+  awaiting_player_interaction: '等待互动回应',
   awaiting_player_reaction: '等待反应检定',
   awaiting_player_opposed: '等待对抗回应',
+  awaiting_player_attack_response: '等待攻击回应',
+  awaiting_player_attack_defense: '等待攻击对抗',
+  awaiting_player_death_save: '等待死亡豁免',
 };
 
 const RISK_LABELS: Record<EnvironmentRiskLevel, string> = {
@@ -61,7 +64,7 @@ export function PublicTurnControlBar({
           <button type="button" disabled={busy} onClick={onStartInitiative}>
             优先行动
           </button>
-          {godMode && <span className="hint">God Mode 可在下方直接注入一条自由行动。</span>}
+          {godMode && <span className="hint">God Mode 可以在下方直接注入一条自由行动。</span>}
         </div>
       )}
     </section>

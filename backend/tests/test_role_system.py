@@ -27,7 +27,10 @@ from app.models.schemas import (
     PlayerBuffAddRequest,
     PlayerEquipRequest,
     PlayerItemAddRequest,
+    PlayerMartialPointAdjustRequest,
     PlayerRuntimeData,
+    PlayerSkillSetRequest,
+    PlayerSpellSetRequest,
     PlayerSpellSlotAdjustRequest,
     PlayerStaminaAdjustRequest,
     PlayerStaticData,
@@ -36,6 +39,7 @@ from app.models.schemas import (
     RoleRelationSetRequest,
     SubZoneChatTurn,
     TeamMember,
+    WorldClock,
 )
 from app.services.public_scene_service import get_public_scene_state
 from app.services.chat_service import route_main_turn_intent
@@ -48,16 +52,20 @@ from app.services.world_service import (
     plan_action_check,
     add_player_buff,
     add_player_item,
+    add_player_skill,
+    add_player_spell,
     advance_public_scene_in_save,
     apply_speech_time,
     apply_public_npc_reactions_in_save,
     build_main_turn_context_payload,
     clear_current_save,
+    consume_martial_points,
     consume_spell_slots,
     consume_stamina,
     equip_player_item,
     get_current_save,
     npc_chat,
+    recover_martial_points,
     recover_spell_slots,
     recover_stamina,
     save_current,
@@ -194,6 +202,72 @@ class RoleSystemTests(unittest.TestCase):
                 cognition="values concrete knowledge",
                 likes=["old map", "local rumors"],
                 profile=PlayerStaticData(role_type="npc"),
+            )
+        ]
+        save_current(save)
+
+    def _seed_team_private_chat_context(
+        self,
+        session_id: str,
+        *,
+        affinity: int = 50,
+        trust: int = 40,
+    ) -> None:
+        save = clear_current_save(session_id)
+        save.area_snapshot = AreaSnapshot(
+            zones=[
+                AreaZone(zone_id="zone_old", name="Forest", center=Coord3D(x=0, y=0, z=0), sub_zone_ids=["sub_old"]),
+                AreaZone(zone_id="zone_now", name="Harbor", center=Coord3D(x=20, y=0, z=0), sub_zone_ids=["sub_now"]),
+            ],
+            sub_zones=[
+                AreaSubZone(
+                    sub_zone_id="sub_old",
+                    zone_id="zone_old",
+                    name="Camp",
+                    coord=Coord3D(x=0, y=0, z=0),
+                    description="Old camp",
+                ),
+                AreaSubZone(
+                    sub_zone_id="sub_now",
+                    zone_id="zone_now",
+                    name="Dock",
+                    coord=Coord3D(x=20, y=0, z=0),
+                    description="Current dock",
+                ),
+            ],
+            current_zone_id="zone_now",
+            current_sub_zone_id="sub_now",
+            clock=save.area_snapshot.clock,
+        )
+        save.map_snapshot.player_position = Position(x=20, y=0, z=0, zone_id="zone_now")
+        save.player_runtime_data = PlayerRuntimeData(
+            session_id=session_id,
+            current_position=Position(x=20, y=0, z=0, zone_id="zone_now"),
+        )
+        save.role_pool = [
+            NpcRoleCard(
+                role_id="npc_chat",
+                name="KaLu",
+                state="in_team",
+                zone_id="zone_old",
+                sub_zone_id="sub_old",
+                personality="careful",
+                speaking_style="short answers",
+                background="She keeps notes about routes and docks.",
+                cognition="prefers current facts over guesses",
+                likes=["old map", "local rumors"],
+                profile=PlayerStaticData(role_type="npc"),
+            )
+        ]
+        team_state = ensure_team_state(save)
+        team_state.members = [
+            TeamMember(
+                role_id="npc_chat",
+                name="KaLu",
+                origin_zone_id="zone_old",
+                origin_sub_zone_id="sub_old",
+                affinity=affinity,
+                trust=trust,
             )
         ]
         save_current(save)
@@ -346,10 +420,22 @@ class RoleSystemTests(unittest.TestCase):
     def test_spell_slots_and_stamina_consume_recover(self) -> None:
         sid = "sess_role_resource"
         clear_current_save(sid)
-        updated = consume_spell_slots(sid, PlayerSpellSlotAdjustRequest(level=1, amount=1))
+
+        updated = add_player_spell(sid, PlayerSpellSetRequest(value="Magic Missile"))
         self.assertEqual(updated.dnd5e_sheet.spell_slots_current.level_1, 1)
         updated = recover_spell_slots(sid, PlayerSpellSlotAdjustRequest(level=1, amount=1))
-        self.assertEqual(updated.dnd5e_sheet.spell_slots_current.level_1, 2)
+        self.assertEqual(updated.dnd5e_sheet.spell_slots_current.level_1, 1)
+        updated = consume_spell_slots(sid, PlayerSpellSlotAdjustRequest(level=1, amount=1))
+        self.assertEqual(updated.dnd5e_sheet.spell_slots_current.level_1, 0)
+        updated = recover_spell_slots(sid, PlayerSpellSlotAdjustRequest(level=1, amount=1))
+        self.assertEqual(updated.dnd5e_sheet.spell_slots_current.level_1, 1)
+
+        updated = add_player_skill(sid, PlayerSkillSetRequest(value="power_strike"))
+        self.assertEqual(updated.dnd5e_sheet.martial_points_current, 1)
+        updated = consume_martial_points(sid, PlayerMartialPointAdjustRequest(amount=1))
+        self.assertEqual(updated.dnd5e_sheet.martial_points_current, 0)
+        updated = recover_martial_points(sid, PlayerMartialPointAdjustRequest(amount=1))
+        self.assertEqual(updated.dnd5e_sheet.martial_points_current, 1)
 
         updated = consume_stamina(sid, PlayerStaminaAdjustRequest(amount=3))
         self.assertEqual(updated.dnd5e_sheet.stamina_current, 7)
@@ -770,6 +856,132 @@ class RoleSystemTests(unittest.TestCase):
                     player_message='{"input_type":"player_intent_v1","speech_description":"Tell me what you know."}',
                 )
             )
+
+    def test_team_private_chat_prompt_context_uses_current_area_and_team_bond(self) -> None:
+        sid = "sess_team_private_chat_context"
+        self._seed_team_private_chat_context(sid, affinity=68, trust=57)
+        captured: dict[str, object] = {}
+
+        def capture_render(key: str, template: str, **kwargs):
+            if key == PromptKeys.NPC_CHAT_USER:
+                captured.update(kwargs)
+            return template
+
+        with patch("app.services.world_service.prompt_table.render", side_effect=capture_render):
+            with patch(
+                "app.services.world_service.create_sync_client",
+                return_value=self._fake_openai_client(
+                    '{"action_reaction":"She glances toward the pier.","speech_reply":"We are at the dock right now.","relation_tag":"friendly"}'
+                ),
+            ):
+                npc_chat(
+                    NpcChatRequest(
+                        session_id=sid,
+                        npc_role_id="npc_chat",
+                        player_message='{"input_type":"player_intent_v1","speech_description":"Where are we now?"}',
+                        config=self._chat_config(),
+                    )
+                )
+
+        context = str(captured.get("context") or "")
+        self.assertIn("当前地点=Harbor / Dock", context)
+        self.assertIn("玩家关系标签=", context)
+        self.assertIn("队伍状态=当前在玩家队伍中, affinity=68, trust=57", context)
+        updated = get_current_save(sid)
+        role = next(item for item in updated.role_pool if item.role_id == "npc_chat")
+        self.assertEqual(role.zone_id, "zone_now")
+        self.assertEqual(role.sub_zone_id, "sub_now")
+
+    def test_team_private_chat_updates_target_member_affinity_and_trust(self) -> None:
+        sid = "sess_team_private_chat_relation"
+        self._seed_team_private_chat_context(sid, affinity=50, trust=40)
+
+        with patch(
+            "app.services.world_service.create_sync_client",
+            return_value=self._fake_openai_client(
+                '{"action_reaction":"She relaxes a little.","speech_reply":"I heard that, and I will back you up.","relation_tag":"friendly"}'
+            ),
+        ):
+            npc_chat(
+                NpcChatRequest(
+                    session_id=sid,
+                    npc_role_id="npc_chat",
+                    player_message='{"input_type":"player_intent_v1","speech_description":"谢谢你愿意帮我。"}',
+                    config=self._chat_config(),
+                )
+            )
+
+        updated = get_current_save(sid)
+        member = updated.team_state.members[0]
+        self.assertGreater(member.affinity, 50)
+        self.assertGreater(member.trust, 40)
+        self.assertTrue(any(item.trigger_kind == "npc_chat" and item.member_role_id == "npc_chat" for item in updated.team_state.reactions))
+
+    def test_npc_chat_talkative_zero_without_public_rounds_stays_guarded(self) -> None:
+        sid = "sess_npc_chat_guarded_zero"
+        self._seed_private_chat_role(sid)
+        save = get_current_save(sid)
+        role = next(item for item in save.role_pool if item.role_id == "npc_chat")
+        role.talkative_current = 0
+        role.last_private_chat_at = "1024-03-14T08:00:00+00:00"
+        save.area_snapshot.clock = WorldClock(calendar="fantasy_default", year=1024, month=3, day=14, hour=12, minute=0)
+        save_current(save)
+
+        response = npc_chat(
+            NpcChatRequest(
+                session_id=sid,
+                npc_role_id="npc_chat",
+                player_message='{"input_type":"player_intent_v1","speech_description":"Talk to me."}',
+            )
+        )
+
+        self.assertIn("不想理会", response.action_reaction)
+        self.assertEqual(response.talkative_current, 0)
+
+    def test_npc_chat_talkative_recovers_from_public_rounds(self) -> None:
+        sid = "sess_npc_chat_public_turn_restore"
+        self._seed_team_private_chat_context(sid, affinity=50, trust=40)
+        save = get_current_save(sid)
+        role = next(item for item in save.role_pool if item.role_id == "npc_chat")
+        role.talkative_current = 0
+        role.last_private_chat_at = "1024-03-14T09:00:00+00:00"
+        save.area_snapshot.sub_zones[1].chat_context.recent_turns.extend(
+            [
+                SubZoneChatTurn(
+                    turn_id="turn_after_1",
+                    source="main_chat",
+                    world_time_text="1024-03-14 09:05",
+                    world_time={"year": 1024, "month": 3, "day": 14, "hour": 9, "minute": 5},
+                    gm_narration="The dock stays busy.",
+                ),
+                SubZoneChatTurn(
+                    turn_id="turn_after_2",
+                    source="main_chat",
+                    world_time_text="1024-03-14 09:10",
+                    world_time={"year": 1024, "month": 3, "day": 14, "hour": 9, "minute": 10},
+                    gm_narration="Workers keep moving cargo.",
+                ),
+            ]
+        )
+        save_current(save)
+
+        with patch(
+            "app.services.world_service.create_sync_client",
+            return_value=self._fake_openai_client(
+                '{"action_reaction":"She taps the railing.","speech_reply":"Keep it short.","relation_tag":"met"}'
+            ),
+        ):
+            response = npc_chat(
+                NpcChatRequest(
+                    session_id=sid,
+                    npc_role_id="npc_chat",
+                    player_message='{"input_type":"player_intent_v1","speech_description":"Say it plainly."}',
+                    config=self._chat_config(),
+                )
+            )
+
+        self.assertNotIn("不想理会", response.action_reaction)
+        self.assertEqual(response.talkative_current, 2)
 
     def test_npc_chat_invalid_model_output_raises_generation_error(self) -> None:
         sid = "sess_npc_chat_bad_json"

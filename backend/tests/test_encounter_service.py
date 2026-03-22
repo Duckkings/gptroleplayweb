@@ -7,6 +7,7 @@ from unittest.mock import patch
 from app.core.storage import storage_state
 from app.models.schemas import (
     ActionCheckResponse,
+    AreaNpc,
     AreaSnapshot,
     AreaSubZone,
     AreaZone,
@@ -20,8 +21,11 @@ from app.models.schemas import (
     EncounterRejoinRequest,
     EncounterTemporaryNpc,
     EncounterTerminationCondition,
+    PlayerStaticData,
+    TeamMember,
 )
 from app.services.encounter_service import (
+    _sanitize_new_npc_seed,
     _sanitize_temporary_npcs,
     _text_is_too_vague,
     act_on_encounter,
@@ -674,12 +678,12 @@ class EncounterServiceTests(unittest.TestCase):
         self.assertEqual(save.encounter_state.history[-1].player_prompt, "【玩家旁观】玩家本轮选择观察与等待，不主动行动。")
 
 
-    def test_sanitize_temporary_npcs_limits_and_deduplicates(self) -> None:
+    def test_sanitize_temporary_npcs_limits_to_two_entries(self) -> None:
         items = _sanitize_temporary_npcs(
             [
                 {"name": "管理员", "title": "图书馆管理员", "description": "守在倒下的书架旁", "speaking_style": "急促", "agenda": "收拢禁书"},
-                {"name": "管理员", "title": "重复角色", "description": "重复", "speaking_style": "短促", "agenda": "重复"},
                 {"name": "学徒", "title": "抄写学徒", "description": "躲在楼梯口后面", "speaking_style": "发抖", "agenda": "护住账本"},
+                {"name": "信使", "title": "奔跑信使", "description": "正穿过走廊", "speaking_style": "短促", "agenda": "传递消息"},
             ]
         )
         self.assertEqual(len(items), 2)
@@ -732,6 +736,104 @@ class EncounterServiceTests(unittest.TestCase):
         self.assertEqual(len(response.encounter.temporary_npcs), 1)
         self.assertEqual(response.encounter.temporary_npcs[0].name, "管理员")
         self.assertFalse(any(role.name == "管理员" for role in get_current_save(sid).role_pool))
+
+    def test_sanitize_temporary_npcs_renames_forbidden_actor_names(self) -> None:
+        items = _sanitize_temporary_npcs(
+            [
+                {"name": "队友甲", "title": "临时人影", "description": "撞名队友", "speaking_style": "急", "agenda": "混进现场"},
+                {"name": "摊主", "title": "摊位老板", "description": "撞名场景 NPC", "speaking_style": "快", "agenda": "守着摊位"},
+                {"name": "陌客", "title": "灰衣陌客", "description": "真正新来的路人", "speaking_style": "低", "agenda": "观察周围"},
+            ],
+            forbidden_names={"队友甲", "摊主"},
+        )
+        self.assertEqual([item.name for item in items], ["队友甲（遭遇NPC）", "摊主（遭遇NPC）"])
+
+    def test_sanitize_new_npc_seed_renames_forbidden_actor_names(self) -> None:
+        seed = _sanitize_new_npc_seed(
+            {"name": "队友甲", "title": "撞名人", "description": "不该生成"},
+            forbidden_names={"队友甲"},
+        )
+        self.assertIsNotNone(seed)
+        assert seed is not None
+        self.assertEqual(seed["name"], "队友甲（新NPC）")
+
+    def test_sanitize_temporary_npcs_suffixes_repeated_forbidden_names(self) -> None:
+        items = _sanitize_temporary_npcs(
+            [
+                {"name": "队友甲", "title": "第一个", "description": "第一名撞名者", "speaking_style": "急", "agenda": "混进现场"},
+                {"name": "队友甲", "title": "第二个", "description": "第二名撞名者", "speaking_style": "快", "agenda": "继续混进现场"},
+            ],
+            forbidden_names={"队友甲"},
+        )
+        self.assertEqual([item.name for item in items], ["队友甲（遭遇NPC）", "队友甲（遭遇NPC2）"])
+
+    def test_generated_encounter_renames_temp_npc_names_that_collide_with_team_or_visible_npcs(self) -> None:
+        sid = "sess_encounter_name_collision_guard"
+        self._seed_context(sid)
+        save = get_current_save(sid)
+        save.encounter_state.debug_force_trigger = True
+        save.role_pool = [
+            NpcRoleCard(
+                role_id="role_teammate",
+                name="队友甲",
+                zone_id="zone_town",
+                sub_zone_id="sub_town_1",
+                profile=PlayerStaticData(role_type="npc"),
+            )
+        ]
+        save.team_state.members = [
+            TeamMember(
+                role_id="role_teammate",
+                name="队友甲",
+                origin_zone_id="zone_town",
+                origin_sub_zone_id="sub_town_1",
+                affinity=60,
+                trust=60,
+            )
+        ]
+        save.area_snapshot.sub_zones[0].npcs = [AreaNpc(npc_id="npc_vendor", name="摊主", state="idle")]
+        save_current(save)
+        config = ChatConfig(openai_api_key="test-key", model="test-model", stream=False, gm_prompt="gm")
+
+        class _FakeResponse:
+            def __init__(self) -> None:
+                self.choices = [
+                    type(
+                        "Choice",
+                        (),
+                        {
+                            "message": type(
+                                "Message",
+                                (),
+                                {
+                                    "content": '{"type":"event","title":"广场异响","description":"广场上突然响起一阵骚动。","new_npc":{"name":"摊主","title":"撞名常驻","description":"不该创建","speaking_style":"急","agenda":"挡住去路"},"temporary_npcs":[{"name":"队友甲","title":"撞名队友","description":"不该出现","speaking_style":"快","agenda":"混淆现场"},{"name":"摊主","title":"撞名摊主","description":"不该出现","speaking_style":"硬","agenda":"拦下路人"},{"name":"陌客","title":"灰衣陌客","description":"真正闯入现场的人","speaking_style":"冷","agenda":"观察人群"}],"scene_summary":"一名陌客挤进广场边缘，正在观察局势。","termination_conditions":[{"kind":"target_resolved","description":"看清陌客来意并稳住场面。"}],"tags":["square"]}'
+                                },
+                            )()
+                        },
+                    )
+                ]
+
+        fake_client = type(
+            "Client",
+            (),
+            {"chat": type("Chat", (), {"completions": type("Completions", (), {"create": lambda *args, **kwargs: _FakeResponse()})()})()},
+        )()
+
+        with patch("app.services.encounter_service.create_sync_client", return_value=fake_client):
+            response = check_for_encounter(EncounterCheckRequest(session_id=sid, trigger_kind="debug_forced", config=config))
+
+        self.assertTrue(response.generated)
+        self.assertIsNotNone(response.encounter)
+        assert response.encounter is not None
+        self.assertEqual(
+            [item.name for item in response.encounter.temporary_npcs],
+            ["队友甲（遭遇NPC）", "摊主（遭遇NPC）"],
+        )
+        self.assertIsNotNone(response.encounter.npc_role_id)
+        spawned_role = next((role for role in get_current_save(sid).role_pool if role.role_id == response.encounter.npc_role_id), None)
+        self.assertIsNotNone(spawned_role)
+        assert spawned_role is not None
+        self.assertEqual(spawned_role.name, "摊主（新NPC）")
 
 if __name__ == "__main__":
     unittest.main()

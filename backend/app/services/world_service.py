@@ -36,6 +36,7 @@ from app.models.schemas import (
     AreaSubZone,
     AreaZone,
     BehaviorDescribeResponse,
+    CharacterBuildState,
     ChatConfig,
     Coord3D,
     GameLogAddRequest,
@@ -71,6 +72,7 @@ from app.models.schemas import (
     PlayerItemAddRequest,
     PlayerItemRemoveRequest,
     PlayerSkillSetRequest,
+    PlayerMartialPointAdjustRequest,
     PlayerSpellSetRequest,
     PlayerSpellSlotAdjustRequest,
     PlayerStaminaAdjustRequest,
@@ -133,7 +135,7 @@ from app.services.item_instance_service import (
     remove_item_instance,
     resolve_owner_instances,
 )
-from app.services.item_template_service import ensure_definition_for_inventory_item, get_template_library_status, infer_interactable_template_id
+from app.services.item_template_service import ensure_definition_for_inventory_item, get_template_library_status, infer_interactable_template_id, load_template_library
 from app.services.scene_interaction_service import execute_scene_interaction_in_save, list_scene_interactables
 
 
@@ -204,6 +206,31 @@ def _empty_save(session_id: str) -> SaveFile:
         player_runtime_data=_default_runtime(session_id),
         updated_at=_utc_now(),
     )
+
+
+def ensure_character_build_state(save: SaveFile) -> None:
+    state = getattr(save, "character_build_state", None)
+    if state is None:
+        save.character_build_state = CharacterBuildState()
+        state = save.character_build_state
+
+    player = getattr(save, "player_static_data", None)
+    sheet = getattr(player, "dnd5e_sheet", None)
+    heuristics = [
+        bool(player and player.name and player.name != "玩家"),
+        bool(sheet and sheet.race),
+        bool(sheet and sheet.char_class),
+        bool(sheet and sheet.skills_proficient),
+        bool(sheet and sheet.spells),
+        bool(sheet and getattr(getattr(sheet, "backpack", None), "items", [])),
+        bool(getattr(player, "portrait", None)),
+    ]
+    desired = "completed" if any(heuristics) else "uncreated"
+    if state.player_status not in {"uncreated", "completed"}:
+        state.player_status = desired
+    elif state.player_status == "uncreated" and desired == "completed":
+        state.player_status = "completed"
+    state.updated_at = _utc_now()
 
 
 def _new_game_log(session_id: str, kind: str, message: str, payload: dict[str, str | int | float | bool] | None = None) -> GameLogEntry:
@@ -538,6 +565,51 @@ def _spell_slot_field(level: int) -> str:
     return f"level_{max(1, min(int(level), 9))}"
 
 
+def _level_scaled_resource_cap(level: int) -> int:
+    return max(1, min(int(level or 1), 9))
+
+
+def _spell_slots_total_from_sheet(sheet) -> int:
+    return sum(int(getattr(sheet, _spell_slot_field(level))) for level in range(1, 10))
+
+
+def _martial_resource_name(value: str) -> str | None:
+    query = str(value or "").strip().lower()
+    if not query:
+        return None
+    try:
+        library = load_template_library()
+    except Exception:
+        return None
+    for definition in library.war_art_definitions:
+        if definition.name.strip().lower() == query or definition.definition_id.strip().lower() == query:
+            return definition.name
+    return None
+
+
+def _sync_level_scaled_resources(sheet) -> None:
+    if not sheet.war_arts and sheet.skills_proficient:
+        inferred_war_arts = [name for name in (_martial_resource_name(skill) for skill in sheet.skills_proficient) if name]
+        if inferred_war_arts:
+            sheet.war_arts = inferred_war_arts
+
+    spell_cap = _level_scaled_resource_cap(sheet.level) if sheet.spells else 0
+    had_spell_resource = _spell_slots_total_from_sheet(sheet.spell_slots_max) > 0 or _spell_slots_total_from_sheet(sheet.spell_slots_current) > 0
+    current_level_1 = max(0, int(sheet.spell_slots_current.level_1))
+    sheet.spell_slots_max.level_1 = spell_cap
+    sheet.spell_slots_current.level_1 = (spell_cap if spell_cap > 0 and not had_spell_resource else min(current_level_1, spell_cap))
+    for level in range(2, 10):
+        key = _spell_slot_field(level)
+        setattr(sheet.spell_slots_max, key, 0)
+        setattr(sheet.spell_slots_current, key, 0)
+
+    martial_cap = _level_scaled_resource_cap(sheet.level) if sheet.war_arts else 0
+    had_martial_resource = int(sheet.martial_points_maximum or 0) > 0 or int(sheet.martial_points_current or 0) > 0
+    current_martial = max(0, int(sheet.martial_points_current or 0))
+    sheet.martial_points_maximum = martial_cap
+    sheet.martial_points_current = martial_cap if martial_cap > 0 and not had_martial_resource else min(current_martial, martial_cap)
+
+
 def _sum_buff_delta(buffs: list[RoleBuff], key: str) -> int:
     return sum(int(getattr(item.effect, key, 0) or 0) for item in buffs)
 
@@ -546,6 +618,7 @@ def _sanitize_sheet_lists(profile: PlayerStaticData) -> None:
     sheet = profile.dnd5e_sheet
     sheet.skills_proficient = sorted({s.strip() for s in sheet.skills_proficient if s.strip()})
     sheet.spells = sorted({s.strip() for s in sheet.spells if s.strip()})
+    sheet.war_arts = sorted({s.strip() for s in sheet.war_arts if s.strip()})
     sheet.status_flags = sorted({s.strip() for s in sheet.status_flags if s.strip()})
     sheet.equipment = sorted({s.strip() for s in sheet.equipment if s.strip()})
 
@@ -563,6 +636,7 @@ def _recompute_player_derived(profile: PlayerStaticData) -> None:
     sheet = profile.dnd5e_sheet
     _sanitize_sheet_lists(profile)
     _ensure_equipped_item_exists(profile)
+    _sync_level_scaled_resources(sheet)
 
     buffs = sheet.buffs
     base = sheet.ability_scores
@@ -612,13 +686,25 @@ def _recompute_player_derived(profile: PlayerStaticData) -> None:
     hp.current = max(0, min(hp.current, hp.maximum))
 
     sheet.stamina_current = max(0, min(sheet.stamina_current, sheet.stamina_maximum))
-    sheet.is_dead = hp.current <= 0
+    if sheet.death_state.life_status == "dead":
+        sheet.is_dead = True
+        sheet.role_action_status = "dead"
+    else:
+        sheet.is_dead = False
+        if sheet.death_state.life_status == "dying":
+            sheet.role_action_status = "death_saving"
+        elif sheet.death_state.life_status == "stable":
+            if sheet.role_action_status == "dead":
+                sheet.role_action_status = "unable_to_act"
+        elif sheet.role_action_status in {"death_saving", "dead"} and hp.current > 0:
+            sheet.role_action_status = "free_action"
 
     for level in range(1, 10):
         key = _spell_slot_field(level)
         max_val = max(0, int(getattr(sheet.spell_slots_max, key)))
         cur_val = max(0, int(getattr(sheet.spell_slots_current, key)))
         setattr(sheet.spell_slots_current, key, min(cur_val, max_val))
+    sheet.martial_points_current = max(0, min(int(sheet.martial_points_current or 0), int(sheet.martial_points_maximum or 0)))
 
 
 def _pick(seed: str, options: list[str]) -> str:
@@ -781,7 +867,7 @@ def _class_template(char_class: str) -> dict[str, object]:
             "armor": ("鳞甲", "神职护甲", 3),
             "extras": [("圣徽", "misc"), ("香料包", "misc")],
             "spells": ["疗伤术", "祝福术", "神导术"],
-            "spell_slots_level_1": 2,
+            "spell_slots_level_1": 1,
             "hit_dice": "1d8",
         },
         "法师": {
@@ -793,7 +879,7 @@ def _class_template(char_class: str) -> dict[str, object]:
             "armor": ("法袍", "轻便衣袍", 0),
             "extras": [("法术书", "misc"), ("墨水套装", "misc")],
             "spells": ["魔法飞弹", "护盾术", "侦测魔法"],
-            "spell_slots_level_1": 3,
+            "spell_slots_level_1": 1,
             "hit_dice": "1d6",
         },
         "游侠": {
@@ -805,7 +891,7 @@ def _class_template(char_class: str) -> dict[str, object]:
             "armor": ("皮甲", "轻便护甲", 2),
             "extras": [("箭袋", "misc"), ("干粮包", "misc")],
             "spells": ["猎人印记", "疗伤术"],
-            "spell_slots_level_1": 2,
+            "spell_slots_level_1": 1,
             "hit_dice": "1d10",
         },
         "吟游诗人": {
@@ -817,7 +903,7 @@ def _class_template(char_class: str) -> dict[str, object]:
             "armor": ("皮甲", "做工精致的轻甲", 1),
             "extras": [("鲁特琴", "misc"), ("记事册", "misc")],
             "spells": ["魅惑人类", "治疗真言", "塔莎狂笑术"],
-            "spell_slots_level_1": 2,
+            "spell_slots_level_1": 1,
             "hit_dice": "1d8",
         },
         "武僧": {
@@ -841,7 +927,7 @@ def _class_template(char_class: str) -> dict[str, object]:
             "armor": ("皮甲", "缝着叶片的轻甲", 1),
             "extras": [("草药袋", "misc"), ("种子囊", "misc")],
             "spells": ["纠缠术", "疗伤术", "造水术"],
-            "spell_slots_level_1": 2,
+            "spell_slots_level_1": 1,
             "hit_dice": "1d8",
         },
     }
@@ -914,7 +1000,7 @@ def _build_npc_profile(npc_id: str, npc_name: str) -> PlayerStaticData:
     ]
     all_items = [weapon_item, armor_item, *extra_items]
     spell_list = list(template.get("spells") or [])
-    first_level_slots = int(template.get("spell_slots_level_1") or 0)
+    first_level_slots = _level_scaled_resource_cap(level) if spell_list else 0
     armor_class = 10 + int(armor_bonus) + _ability_mod(dexterity)
 
     profile = PlayerStaticData(
@@ -1086,7 +1172,7 @@ def _ensure_npc_role_complete(save: SaveFile, role: NpcRoleCard) -> bool:
     if not sheet.spells and template_sheet.spells:
         sheet.spells = list(template_sheet.spells)
         changed = True
-    if (_spell_slots_total(sheet.spell_slots_max) == 2 and not sheet.spells and template_sheet.spells) or _spell_slots_total(sheet.spell_slots_max) == 0:
+    if (_spell_slots_total(sheet.spell_slots_max) <= 1 and not sheet.spells and template_sheet.spells) or _spell_slots_total(sheet.spell_slots_max) == 0:
         if _spell_slots_total(template_sheet.spell_slots_max) >= 0:
             sheet.spell_slots_max = template_sheet.spell_slots_max.model_copy(deep=True)
             sheet.spell_slots_current = template_sheet.spell_slots_current.model_copy(deep=True)
@@ -1836,6 +1922,7 @@ def _load_current_save(default_session_id: str = "sess_default") -> SaveFile:
 
     save = SaveFile.model_validate(payload)
     ensure_world_state(save)
+    ensure_character_build_state(save)
     if not save.player_runtime_data.session_id:
         save.player_runtime_data.session_id = save.session_id
     _recompute_player_derived(save.player_static_data)
@@ -1873,6 +1960,7 @@ def _load_current_save(default_session_id: str = "sess_default") -> SaveFile:
 
 def _persist_save(save: SaveFile) -> None:
     ensure_world_state(save)
+    ensure_character_build_state(save)
     save.updated_at = _utc_now()
     save.player_runtime_data.updated_at = save.updated_at
     write_save_payload(storage_state.save_path, save.model_dump(mode="json"))
@@ -1898,6 +1986,7 @@ def get_current_save(default_session_id: str = "sess_default") -> SaveFile:
     if txn is not None:
         save = txn.save
         ensure_world_state(save)
+        ensure_character_build_state(save)
         if not save.player_runtime_data.session_id:
             save.player_runtime_data.session_id = save.session_id
         _recompute_player_derived(save.player_static_data)
@@ -1913,6 +2002,7 @@ def get_current_save(default_session_id: str = "sess_default") -> SaveFile:
 def save_current(save: SaveFile) -> None:
     txn = current_save_transaction()
     ensure_item_system(save)
+    ensure_character_build_state(save)
     if txn is not None:
         ensure_world_state(save)
         save.updated_at = _utc_now()
@@ -2603,7 +2693,11 @@ def remove_player_spell(session_id: str, payload: PlayerSpellSetRequest) -> Play
 def add_player_skill(session_id: str, payload: PlayerSkillSetRequest) -> PlayerStaticData:
     save = get_current_save(default_session_id=session_id)
     save.session_id = session_id
-    save.player_static_data.dnd5e_sheet.skills_proficient.append(payload.value)
+    sheet = save.player_static_data.dnd5e_sheet
+    sheet.skills_proficient.append(payload.value)
+    war_art_name = _martial_resource_name(payload.value)
+    if war_art_name:
+        sheet.war_arts.append(war_art_name)
     _recompute_player_derived(save.player_static_data)
     save_current(save)
     return save.player_static_data
@@ -2613,9 +2707,12 @@ def remove_player_skill(session_id: str, payload: PlayerSkillSetRequest) -> Play
     save = get_current_save(default_session_id=session_id)
     save.session_id = session_id
     value = payload.value.strip().lower()
-    save.player_static_data.dnd5e_sheet.skills_proficient = [
-        s for s in save.player_static_data.dnd5e_sheet.skills_proficient if s.strip().lower() != value
-    ]
+    sheet = save.player_static_data.dnd5e_sheet
+    sheet.skills_proficient = [s for s in sheet.skills_proficient if s.strip().lower() != value]
+    war_art_name = _martial_resource_name(payload.value)
+    if war_art_name:
+        target = war_art_name.strip().lower()
+        sheet.war_arts = [s for s in sheet.war_arts if s.strip().lower() != target and s.strip().lower() != value]
     _recompute_player_derived(save.player_static_data)
     save_current(save)
     return save.player_static_data
@@ -2643,6 +2740,28 @@ def recover_spell_slots(session_id: str, payload: PlayerSpellSlotAdjustRequest) 
     cur = int(getattr(sheet.spell_slots_current, key))
     max_val = int(getattr(sheet.spell_slots_max, key))
     setattr(sheet.spell_slots_current, key, min(max_val, cur + payload.amount))
+    _recompute_player_derived(save.player_static_data)
+    save_current(save)
+    return save.player_static_data
+
+
+def consume_martial_points(session_id: str, payload: PlayerMartialPointAdjustRequest) -> PlayerStaticData:
+    save = get_current_save(default_session_id=session_id)
+    save.session_id = session_id
+    sheet = save.player_static_data.dnd5e_sheet
+    if sheet.martial_points_current < payload.amount:
+        raise ValueError("MARTIAL_POINTS_NOT_ENOUGH")
+    sheet.martial_points_current -= payload.amount
+    _recompute_player_derived(save.player_static_data)
+    save_current(save)
+    return save.player_static_data
+
+
+def recover_martial_points(session_id: str, payload: PlayerMartialPointAdjustRequest) -> PlayerStaticData:
+    save = get_current_save(default_session_id=session_id)
+    save.session_id = session_id
+    sheet = save.player_static_data.dnd5e_sheet
+    sheet.martial_points_current = min(sheet.martial_points_maximum, sheet.martial_points_current + payload.amount)
     _recompute_player_derived(save.player_static_data)
     save_current(save)
     return save.player_static_data
@@ -3783,6 +3902,17 @@ def _build_npc_prompt_context(role: NpcRoleCard, clock: WorldClock | None, recen
         lines.append(f"当前世界时间={world_time_text}")
     lines.append(_npc_conversation_state_summary(role))
     if save is not None:
+        zone_id, sub_zone_id = _effective_npc_area_ids(save, role)
+        zone_name = next((item.name for item in save.area_snapshot.zones if item.zone_id == zone_id), zone_id or "未知区域")
+        sub_zone_name = next((item.name for item in save.area_snapshot.sub_zones if item.sub_zone_id == sub_zone_id), sub_zone_id or "附近")
+        lines.append(f"当前地点={zone_name} / {sub_zone_name}")
+        lines.append(f"玩家关系标签={_npc_player_relation_tag(role, save.player_static_data.player_id)}")
+        team_member = _team_member_for_role(save, role.role_id)
+        if team_member is not None or role.state == "in_team":
+            affinity = team_member.affinity if team_member is not None else 50
+            trust = team_member.trust if team_member is not None else 40
+            join_reason = (team_member.join_reason if team_member is not None else "").strip() or "已随玩家同行"
+            lines.append(f"队伍状态=当前在玩家队伍中, affinity={affinity}, trust={trust}, join_reason={join_reason}")
         active_encounter = _active_encounter_for_current_sub_zone(save)
         if active_encounter is not None:
             lines.append(
@@ -3983,20 +4113,96 @@ def _world_clock_iso(clock: WorldClock | None) -> str | None:
     return _clock_to_datetime(clock).isoformat()
 
 
-def _restore_npc_talkative(role: NpcRoleCard, clock: WorldClock | None) -> int:
-    if clock is None or not role.last_private_chat_at:
+def _team_member_for_role(save: SaveFile | None, role_id: str):
+    if save is None:
+        return None
+    state = getattr(save, "team_state", None)
+    members = getattr(state, "members", None) or []
+    return next((item for item in members if item.role_id == role_id), None)
+
+
+def _sync_team_role_before_private_chat(save: SaveFile, role: NpcRoleCard) -> None:
+    member = _team_member_for_role(save, role.role_id)
+    if role.state != "in_team" and member is None:
+        return
+    try:
+        from app.services.team_service import sync_team_members_with_player_in_save
+
+        sync_team_members_with_player_in_save(save)
+    except Exception:
+        return
+
+
+def _effective_npc_area_ids(save: SaveFile | None, role: NpcRoleCard) -> tuple[str | None, str | None]:
+    zone_id = role.zone_id
+    sub_zone_id = role.sub_zone_id
+    if save is None:
+        return zone_id, sub_zone_id
+    member = _team_member_for_role(save, role.role_id)
+    if role.state == "in_team" or member is not None:
+        zone_id = save.area_snapshot.current_zone_id or zone_id
+        sub_zone_id = save.area_snapshot.current_sub_zone_id or sub_zone_id
+    return zone_id, sub_zone_id
+
+
+def _npc_player_relation_tag(role: NpcRoleCard, player_id: str) -> str:
+    relation = next((item for item in role.relations if item.target_role_id == player_id), None)
+    return (relation.relation_tag or "neutral") if relation is not None else "neutral"
+
+
+def _world_time_dict_to_datetime(world_time: dict[str, str | int] | None) -> datetime | None:
+    if not world_time:
+        return None
+    try:
+        return datetime(
+            year=max(int(world_time.get("year") or 1), 1),
+            month=min(max(int(world_time.get("month") or 1), 1), 12),
+            day=min(max(int(world_time.get("day") or 1), 1), 28),
+            hour=min(max(int(world_time.get("hour") or 0), 0), 23),
+            minute=min(max(int(world_time.get("minute") or 0), 0), 59),
+            tzinfo=timezone.utc,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _count_public_turns_since_last_private_chat(save: SaveFile, role: NpcRoleCard) -> int:
+    if not role.last_private_chat_at:
         return 0
     try:
-        delta = _clock_to_datetime(clock) - datetime.fromisoformat(role.last_private_chat_at)
+        cutoff = datetime.fromisoformat(role.last_private_chat_at)
     except ValueError:
         return 0
-    delta_min = max(0, int(delta.total_seconds() // 60))
-    recovered = max(0, (delta_min // 20) * 4)
+    seen_turn_ids: set[str] = set()
+    public_turns = 0
+    for sub_zone in save.area_snapshot.sub_zones:
+        context = getattr(sub_zone, "chat_context", None)
+        if context is None:
+            continue
+        for turn in context.recent_turns:
+            if turn.turn_id in seen_turn_ids or turn.source != "main_chat":
+                continue
+            turn_time = _world_time_dict_to_datetime(turn.world_time)
+            if turn_time is None or turn_time <= cutoff:
+                continue
+            seen_turn_ids.add(turn.turn_id)
+            public_turns += 1
+    return public_turns
+
+
+def _restore_npc_talkative(role: NpcRoleCard, clock: WorldClock | None, save: SaveFile | None = None) -> int:
+    if clock is None or save is None or not role.last_private_chat_at:
+        return 0
+    recovered = _count_public_turns_since_last_private_chat(save, role) * 4
     if recovered <= 0:
         return 0
     before = role.talkative_current
     role.talkative_current = min(role.talkative_maximum, role.talkative_current + recovered)
     return max(0, role.talkative_current - before)
+
+
+def _npc_private_chat_ignore_action(role: NpcRoleCard) -> str:
+    return f"{role.name} 明显不想理会你，只是把视线挪开，没有接话。"
 
 
 def _npc_talkative_delta(role: NpcRoleCard, action_text: str, speech_text: str) -> int:
@@ -4446,7 +4652,20 @@ def _visible_public_roles(save: SaveFile) -> list[NpcRoleCard]:
     if current_sub is None:
         return []
     visible_ids = {npc.npc_id for npc in current_sub.npcs}
-    return [role for role in save.role_pool if role.role_id in visible_ids and role.state != "in_team" and role.sub_zone_id == current_sub.sub_zone_id]
+    dead_ids = {
+        str(getattr(record, "role_id", "") or "")
+        for record in getattr(getattr(current_sub, "state", None), "dead_npc_records", [])
+    }
+    return [
+        role
+        for role in save.role_pool
+        if role.role_id in visible_ids
+        and role.role_id not in dead_ids
+        and role.state not in {"in_team", "dead"}
+        and role.sub_zone_id == current_sub.sub_zone_id
+        and role.profile.dnd5e_sheet.role_action_status != "dead"
+        and not role.profile.dnd5e_sheet.is_dead
+    ]
 
 
 def _public_npc_reaction(role: NpcRoleCard, player_text: str, gm_summary: str) -> tuple[str, str]:
@@ -4770,6 +4989,7 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
     if role is None:
         raise KeyError("ROLE_NOT_FOUND")
     _ensure_npc_role_complete(save, role)
+    _sync_team_role_before_private_chat(save, role)
     player = save.player_static_data
     intent = _parse_player_intent(req.player_message)
     action_text = str(intent["action_text"])
@@ -4786,7 +5006,7 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
         clock=save.area_snapshot.clock,
     )
 
-    recovered_talkative = _restore_npc_talkative(role, save.area_snapshot.clock)
+    recovered_talkative = _restore_npc_talkative(role, save.area_snapshot.clock, save)
     action_reaction = ""
     speech_reply = ""
     relation_tag = "met"
@@ -4795,7 +5015,7 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
     scene_events: list[SceneEvent] = []
     knowledge = build_npc_knowledge_snapshot(save, role.role_id)
     if role.talkative_current <= 0:
-        action_reaction = f"{role.name} 明显不想继续交谈，只是移开了视线。"
+        action_reaction = _npc_private_chat_ignore_action(role)
     elif player_mentions_unknown_npc(save, role.role_id, player_text):
         action_reaction = f"{role.name} 皱起眉，像是在确认你提到的是谁。"
         speech_reply = npc_guard_reply()
@@ -4966,6 +5186,19 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
         )
     )
     try:
+        from app.services.team_service import apply_private_chat_feedback_in_save
+
+        apply_private_chat_feedback_in_save(
+            save,
+            session_id=req.session_id,
+            role_id=role.role_id,
+            player_text=player_text,
+            reply=reply,
+            relation_tag=relation_tag,
+        )
+    except Exception:
+        pass
+    try:
         from app.services.team_service import apply_team_reactions_in_save
 
         apply_team_reactions_in_save(
@@ -5128,6 +5361,13 @@ _ABILITY_USED_CONTRACT_FIELDS = (
         allowed_ids=("strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"),
     ),
 )
+_ACTION_TYPE_CONTRACT_FIELDS = (
+    EnumContractField(
+        field_path="action_type",
+        allowed_ids=("attack", "check", "item_use"),
+        required=False,
+    ),
+)
 _RELATION_TAG_CONTRACT_FIELDS = (
     EnumContractField(
         field_path="relation_tag",
@@ -5142,18 +5382,22 @@ def _normalize_action_plan(
     raw_plan: dict[str, object] | None,
 ) -> dict[str, int | bool | str]:
     raw_plan = raw_plan or {}
+    normalized_action_type = str(raw_plan.get("action_type") or action_type).strip().lower()
+    if normalized_action_type not in {"attack", "check", "item_use"}:
+        normalized_action_type = "check" if action_type == "auto" else action_type
     ability = str(raw_plan.get("ability_used") or "").strip().lower()
     if ability not in {"strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"}:
         ability = "wisdom"
     dc = int(raw_plan.get("dc") or 12)
     dc = max(5, min(30, dc))
-    time_spent_min = int(raw_plan.get("time_spent_min") or (3 if action_type == "item_use" else 5))
+    time_spent_min = int(raw_plan.get("time_spent_min") or (3 if normalized_action_type == "item_use" else 5))
     time_spent_min = max(1, min(180, time_spent_min))
     requires_check = bool(raw_plan.get("requires_check"))
-    if action_type in {"attack", "check"}:
+    if normalized_action_type in {"attack", "check"}:
         requires_check = True
-    check_task = str(raw_plan.get("check_task") or "").strip() or _default_check_task(action_type, action_prompt)
+    check_task = str(raw_plan.get("check_task") or "").strip() or _default_check_task(normalized_action_type, action_prompt)
     return {
+        "action_type": normalized_action_type,
         "ability_used": ability,
         "dc": dc,
         "time_spent_min": time_spent_min,
@@ -5163,6 +5407,7 @@ def _normalize_action_plan(
 
 
 def _fallback_action_plan(action_type: str, action_prompt: str) -> dict[str, int | bool | str]:
+    normalized_action_type = "check" if action_type == "auto" else action_type
     text = action_prompt.lower()
     ability = "wisdom"
     if any(k in text for k in ["attack", "strike", "hit", "砍", "攻击"]):
@@ -5173,21 +5418,22 @@ def _fallback_action_plan(action_type: str, action_prompt: str) -> dict[str, int
         ability = "intelligence"
     elif any(k in text for k in ["persuade", "deceive", "intimidate", "说服", "威吓"]):
         ability = "charisma"
-    requires_check = action_type in {"attack", "check"}
+    requires_check = normalized_action_type in {"attack", "check"}
     if not requires_check:
         if any(token in text for token in ["尝试", "试图", "强行", "撬", "逃离", "说服", "威胁", "潜行", "偷", "骗", "拆", "破解"]):
             requires_check = True
         elif any(token in text for token in ["观察", "看看", "检查标签", "阅读", "打招呼", "问好", "listen", "look"]):
             requires_check = False
     return _normalize_action_plan(
-        action_type,
+        normalized_action_type,
         action_prompt,
         {
+            "action_type": normalized_action_type,
             "ability_used": ability,
             "dc": 12,
-            "time_spent_min": 5 if action_type != "item_use" else 3,
+            "time_spent_min": 5 if normalized_action_type != "item_use" else 3,
             "requires_check": requires_check,
-            "check_task": _default_check_task(action_type, action_prompt),
+            "check_task": _default_check_task(normalized_action_type, action_prompt),
         },
     )
 
@@ -5545,12 +5791,15 @@ def _ai_action_plan(
     try:
         default_prompt = (
             "你是跑团行动判定助手。基于玩家行动，返回JSON。"
+            "字段: action_type(attack|check|item_use),"
             "字段: ability_used(strength|dexterity|constitution|intelligence|wisdom|charisma),"
             "dc(5-30),time_spent_min(>=1),requires_check(boolean),check_task(string)。"
             "规则: 任何结果不明确、存在风险、需要说服/潜行/逃脱/破解/攻击/强行尝试的行为，都应 requires_check=true。"
             "只有结果明显、无需悬念或风险的简单行为，才允许 requires_check=false。"
+            "如果传入的 action_type=auto，你必须先判断这次行为属于 attack/check/item_use 中哪一类，并返回该稳定 id。"
+            "如果行为明显是 DND 风格的武器攻击、伤害法术、范围法术或直接制造伤害/爆炸/击飞，也应判为 attack。"
             "check_task 要写清楚这次到底在判定什么。"
-            "action_type=attack/check/item_use。"
+            "action_type=attack/check/item_use/auto。"
             "action_type=$action_type, action_prompt=$action_prompt"
         )
         prompt = prompt_table.render(
@@ -5560,8 +5809,8 @@ def _ai_action_plan(
             action_prompt=action_prompt,
         )
         prompt = (
-            f"{prompt}\nAllowed enum ids:\n{render_enum_pool_text(_ABILITY_USED_CONTRACT_FIELDS)}\n"
-            "Use only the allowed stable ids for ability_used."
+            f"{prompt}\nAllowed enum ids:\n{render_enum_pool_text((*_ACTION_TYPE_CONTRACT_FIELDS, *_ABILITY_USED_CONTRACT_FIELDS))}\n"
+            "Use only the allowed stable ids for action_type and ability_used."
         )
         client = create_sync_client(config, client_cls=OpenAI)
         resp = client.chat.completions.create(
@@ -5579,7 +5828,7 @@ def _ai_action_plan(
             parsed = validate_or_repair_json_payload(
                 parsed=parsed,
                 raw_json=content,
-                fields=_ABILITY_USED_CONTRACT_FIELDS,
+                fields=(*_ACTION_TYPE_CONTRACT_FIELDS, *_ABILITY_USED_CONTRACT_FIELDS),
                 config=config,
                 system_prompt=prompt_table.get_text("action.plan.system", "你只输出JSON。"),
                 original_prompt=prompt,
@@ -5619,6 +5868,9 @@ def plan_action_check(req: ActionCheckPlanRequest) -> ActionCheckPlanResponse:
     actor_role_id, profile = _get_actor_profile(save, req.actor_role_id)
     actor_kind = _actor_kind(save, actor_role_id)
     plan = _ai_action_plan(req.action_type, req.action_prompt, req.config)
+    resolved_action_type = str(plan.get("action_type") or ("check" if req.action_type == "auto" else req.action_type)).strip().lower()
+    if resolved_action_type not in {"attack", "check", "item_use"}:
+        resolved_action_type = "check"
     resolution_rule: Literal["static_dc", "opposed_actor"] = "static_dc"
     target_role_id: str | None = None
     target_name: str | None = None
@@ -5629,7 +5881,7 @@ def plan_action_check(req: ActionCheckPlanRequest) -> ActionCheckPlanResponse:
         opposed = _build_public_turn_opposed_plan(
             save,
             actor_role_id=actor_role_id,
-            action_type=req.action_type,
+            action_type=resolved_action_type,
             action_prompt=req.action_prompt,
             planned_ability_used=str(plan.get("ability_used") or "strength"),
             planned_requires_check=bool(plan.get("requires_check")),
@@ -5654,7 +5906,7 @@ def plan_action_check(req: ActionCheckPlanRequest) -> ActionCheckPlanResponse:
         actor_role_id=actor_role_id,
         actor_name=profile.name,
         actor_kind=actor_kind,  # type: ignore[arg-type]
-        action_type=req.action_type,
+        action_type=resolved_action_type,  # type: ignore[arg-type]
         check_mode=req.check_mode,
         source_context=req.source_context,
         resolution_rule=resolution_rule,
@@ -6019,7 +6271,7 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
             else:
                 success = total_score >= dc
 
-    if not success:
+    if not success and not uses_public_turn_embedded_resolution:
         if resolution_rule == "opposed_actor" and target_total_score is not None:
             fail_gap = max(1, target_total_score - (total_score if total_score is not None else target_total_score))
         else:

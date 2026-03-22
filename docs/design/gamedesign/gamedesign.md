@@ -26,6 +26,7 @@
 - 角色系统：`docs/design/gamedesign/roledesign.md`
 - 遭遇系统：`docs/design/gamedesign/encounterdesign.md`
 - 互动对象：`docs/design/gamedesign/interactitemdesign.md`
+- 法术/武装/道具使用：`docs/design/gamedesign/spellgearitemdesign.md`
 - 任务系统：`docs/design/gamedesign/questdesign.md`
 - 世界地图 UI：`docs/design/gamedesign/worldmapdesign.md`
 - 存档与路径：`docs/design/gamedesign/savedesign.md`

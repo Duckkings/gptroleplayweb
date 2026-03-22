@@ -84,10 +84,17 @@ def hidden_actor_rows(save: SaveFile, *, player_text: str, config: ChatConfig | 
     current_sub_zone_id = save.area_snapshot.current_sub_zone_id
     if not current_sub_zone_id:
         return []
+    current_sub_zone = world._current_sub_zone(save)
+    dead_ids = {
+        str(getattr(record, "role_id", "") or "")
+        for record in getattr(getattr(current_sub_zone, "state", None), "dead_npc_records", [])
+    }
     visible_ids = {role.role_id for role in world._visible_public_roles(save)}
     team_ids = {item.role_id for item in getattr(save.team_state, "members", [])}
     rows: list[dict[str, object]] = []
     for role in save.role_pool:
+        if role.role_id in dead_ids or role.state == "dead" or role.profile.dnd5e_sheet.role_action_status == "dead":
+            continue
         if role.role_id in visible_ids or role.role_id in team_ids:
             continue
         if role.sub_zone_id != current_sub_zone_id:

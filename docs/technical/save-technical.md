@@ -1,268 +1,292 @@
 # 存档系统技术文档
+更新时间: `2026-03-22`
 
-更新日期：`2026-03-09`
+## 1. 范围
 
-## 1. 目标
-- 业务层统一以 `SaveFile` 为逻辑对象。
-- 物理层采用 pointer + bundle 分片。
-- 旧存档通过默认值和服务层补齐兼容，不要求人工迁移。
+本文档描述当前与公开回合死亡设计、玩家与随从构筑相关的存档形状和恢复规则。
 
-## 2. SaveFile 当前关键字段
-- `world_state`
-- `map_snapshot`
-- `area_snapshot`
-- `game_logs`
-- `game_log_settings`
-- `player_static_data`
-- `player_runtime_data`
-- `role_pool`
-- `team_state`
-- `quest_state`
-- `encounter_state`
-- `fate_state`
-- `reputation_state`
+本轮新增独立 shard `character_build_state.json`，同时扩展玩家、NPC 与起始物品来源字段。
 
-## 3. Bundle 分片
-当前 bundle 目录中包含：
-- `manifest.json`
-- `meta.json`
-- `world_state.json`
-- `map_snapshot.json`
-- `area_snapshot.json`
-- `player_data.json`
-- `game_logs.json`
-- `role_pool.json`
-- `team_state.json`
-- `quest_state.json`
-- `encounter_state.json`
-- `fate_state.json`
-- `reputation_state.json`
+## 2. 公开回合持久化位置
 
-## 4. 新增持久化结构
+公开回合状态仍持久化在:
+- `AreaSubZone.chat_context.public_turn_state`
 
-### 4.1 `reputation_state`
-位置：
-- `SaveFile.reputation_state`
-- `current-save.json.bundle/reputation_state.json`
+pending turn 仍持久化在:
+- `pending-turn-state.json`
 
-结构：
-- `version`
-- `entries`
+## 3. 角色状态持久化
+
+### 3.1 `Dnd5eCharacterSheet`
+
+当前已持久化:
+- `hit_points`
+- `death_state`
+- `role_action_status`
+
+其中:
+- `death_state.life_status` 负责生命层状态
+- `role_action_status` 负责行动层状态
+
+### 3.2 当前有效值
+
+`death_state.life_status`:
+- `healthy`
+- `dying`
+- `stable`
+- `dead`
+
+`role_action_status`:
+- `free_action`
+- `death_saving`
+- `dead`
+- `unable_to_act`
+
+## 4. 公开回合轮状态
+
+### 4.1 `PublicTurnRound`
+
+当前关键字段:
+- `phase`
+- `initiative_order`
+- `executed_actor_ids`
+- `pending_interaction_prompt`
+- `pending_attack_prompt`
+- `pending_attack_defense_prompt`
+- `pending_death_save_prompt`
+- `awaiting_player_action`
+- `awaiting_player_action_phase`
+- `impacts`
+- `settlement_entries`
+- `accumulated_narration`
+- `round_narration`
+
+### 4.2 死亡豁免暂停点
+
+玩家在自己回合进入死亡豁免时:
+- `phase = awaiting_player_death_save`
+- `pending_death_save_prompt` 被写入当前轮
+
+这保证了:
+- 刷新前端后可恢复死亡豁免窗口
+- pending turn 恢复时能直接重建 UI
+
+## 5. Pending Turn 持久化
+
+### 5.1 `PendingTurnState.status`
+
+当前公开回合相关状态包括:
+- `awaiting_reaction`
+- `awaiting_opposed`
+- `awaiting_player_attack_response`
+- `awaiting_player_attack_defense`
+- `awaiting_player_death_save`
+- `awaiting_protocol_repair`
+
+### 5.2 当前新增字段
+
+`PendingTurnState` / `PendingTurnContinueResponse` 新增:
+- `death_save_prompt`
+
+恢复逻辑:
+- `public_turn_state_store.sync_pending_public_turn_in_save()` 会把 `awaiting_player_death_save` 同步回当前公开回合轮状态
+- 前端 `getCurrentPendingTurn()` 恢复后会重建 `PublicTurnDeathSaveModal`
+
+## 6. 子区块死亡记录
+
+### 6.1 存储位置
+
+当前在 `AreaSubZone.state` 下新增:
+- `dead_npc_records`
+
+### 6.2 记录结构
+
+每条记录至少包含:
+- `role_id`
+- `name`
+- `death_at`
+- `death_cause`
+- `was_team_member`
+
+### 6.3 语义
+
+`dead_npc_records` 不是单纯叙事日志，它是恢复时的过滤依据。
+
+具体效果:
+- 死亡 NPC 不再重新注入 `AreaSubZone.npcs`
+- 不再恢复成 `visible_npcs`
+- 不再成为公开回合候选角色
+
+## 7. 非队友 NPC 与队友 NPC 的差异
+
+### 7.1 非队友 NPC
+
+`HP <= 0` 时:
+- `NpcRoleCard.state = "dead"`
+- `role_action_status = "dead"`
+- 立刻写入 `dead_npc_records`
+
+### 7.2 队友 NPC
+
+`HP <= 0` 时:
+- 进入 `dying + death_saving`
+- 不立即写入 `dead_npc_records`
+- 只有真正死亡后才记录
+
+## 8. Scene Event 与结算落档
+
+当前新增事件会跟随回合正常落档:
+- `player_entered_death_save`
+- `player_death_save_result`
+- `player_died`
+- `team_npc_entered_death_save`
+- `team_npc_death_save_result`
+- `team_npc_died`
+- `sub_zone_dead_npc_recorded`
+
+同时结算仍写入:
+- `PublicTurnImpact.hp_changes`
+- `PublicTurnSettlementEntry.hp_changes`
+
+## 9. 前端恢复规则
+
+刷新页面后，前端按以下优先级恢复:
+1. `pending-turn-state.json`
+2. 当前子区块的 `public_turn_state.current_round`
+
+死亡豁免相关恢复条件:
+- 若 pending turn 为 `awaiting_player_death_save`，直接恢复死亡豁免弹窗
+- 若当前轮 `phase = awaiting_player_death_save` 且 `pending_death_save_prompt` 存在，也可直接恢复
+
+## 10. 兼容策略
+
+本轮兼容原则:
+- 不新增独立 death shard
+- 旧存档读取时，若没有 `role_action_status`，默认按当前模型默认值补齐
+- 旧存档若没有 `dead_npc_records`，按空数组处理
+- 旧公开回合历史记录仍可读，但不会自动补写新死亡字段
+
+## 11. Debug Reset 影响面
+
+调试重置会清理:
+- 当前子区块 `public_turn_state.current_round`
+- 当前子区块 `public_turn_state.round_history`
+- `pending-turn-state.json`
+
+本轮额外要求:
+- 若本地 UI 仍保留死亡豁免弹窗状态，前端也必须同步清空
+- 但 `dead_npc_records` 是否保留，应以 debug reset 服务当前实现为准，不能在前端假设
+
+## 12. 角色构筑持久化
+
+### 12.1 Save Bundle
+
+当前 save bundle 新增:
+- `character_build_state.json`
+
+当前 shard 字段:
+- `player_status`
+- `initial_companion_offer_seen`
 - `updated_at`
 
-每条 `SubZoneReputationEntry` 包含：
-- `sub_zone_id`
-- `zone_id`
-- `score`
-- `band`
-- `recent_reasons`
-- `updated_at`
+语义:
+- `player_status=uncreated` 时，新存档必须先完成玩家构筑
+- `initial_companion_offer_seen=false` 且队伍为空时，前端会在玩家建成后弹一次首个随从提示
 
-### 4.2 `NpcRoleCard`
-新增持久化字段：
-- `desires`
-- `story_beats`
-- `last_public_turn_at`
+### 12.2 玩家与随从资料
 
-### 4.3 `EncounterEntry`
-新增持久化字段：
-- `participant_role_ids`
-- `situation_start_value`
-- `situation_value`
-- `situation_trend`
-- `last_outcome_package`
+`PlayerStaticData` 新增:
+- `age`
+- `height_cm`
+- `body_type`
+- `appearance`
+- `portrait`
+- `build_archive_id`
 
-### 4.4 `EncounterResolution`
-新增结算字段：
-- `situation_delta`
-- `situation_value_after`
-- `reputation_delta`
-- `applied_outcome_summaries`
+`NpcRoleCard` 新增:
+- `portrait`
+- `retained_id`
 
-## 5. 兼容策略
+`portrait` 使用 `PortraitAssetRef`:
+- `asset_id`
+- `relative_path`
+- `variant_kind`
+- `derived_from_asset_id`
+- `provider`
+- `model`
 
-### 5.1 Pydantic 默认补齐
-当前兼容策略优先依赖 schema 默认值：
-- 旧存档缺 `reputation_state` 时自动补空结构
-- 旧角色缺 `desires/story_beats` 时自动补空列表
-- 旧遭遇缺 `situation_value` 等字段时自动补默认值
+其中 `variant_kind` 当前有效值:
+- `uploaded_raw`
+- `generated_raw`
+- `bg_removed`
+- `final_portrait`
 
-### 5.2 服务层补齐
-仅靠默认值不够的结构，由服务层在读写或运行时补齐：
-- `ensure_reputation_state(...)`
-- `ensure_roleplay_state_for_save(...)`
-- `_initialize_encounter_state(...)`
+### 12.3 用户级构筑留档
 
-这类补齐会在首次运行相关功能时把旧档升级到当前逻辑状态。
+当前新增用户目录:
+- `data/users/<username>/build-temp/portrait_assets/`
+- `data/users/<username>/player-builds/<archive_id>/`
+- `data/users/<username>/retained-builds/<retained_id>/`
 
-## 6. 读写策略
+其中:
+- `build-temp/portrait_assets/` 保存临时原图、去背景图和最终图元数据
+- `player-builds/<archive_id>/manifest.json` 保存玩家构筑 seed
+- `player-builds/<archive_id>/portrait.png` 保存玩家归档立绘
+- `retained-builds/<retained_id>/portrait.png` 保存随从归档立绘
 
-### 6.1 读取
-- 优先读取 bundle manifest，再组装 `SaveFile`
-- 若没有 bundle，则回退读取旧版单文件存档
-- 若当前文件是 pointer，则先解析 `bundle_dir`
+### 12.4 起始授予来源
 
-### 6.2 写入
-- 将 `SaveFile` 拆分为逻辑分片
-- 按分片 hash 判断是否重写
-- 更新 manifest 后再回写 pointer 文件
+`InventoryItem.origin` 新增 `OriginStamp`:
+- `origin_kind`
+- `origin_ref`
 
-## 7. 存档与玩法系统的关系
-- `role_pool` 既承载 NPC 基础卡，也承载 desire/story、对话日志和公开轮次记忆
-- `team_state` 持久化队友关系快照和队伍反应
-- `encounter_state` 持久化活跃遭遇、局势值、历史记录
-- `reputation_state` 持久化子区块声望
+`Dnd5eCharacterSheet` 新增:
+- `spell_origins`
+- `skill_origins`
+- `war_arts`
+- `war_art_origins`
+- `martial_points_current`
+- `martial_points_maximum`
 
-## 8. 当前风险与防线
+当前首发规则里，构筑系统授予的起始法术、武技、武装、药水都写:
+- `origin_kind=starting_build`
+- `origin_ref=<archive_id or role_id>`
 
-### 8.1 风险
-- 新分片遗漏写入
-- 旧档读取后状态不完整
-- 角色或遭遇字段补齐只做了 schema，未做运行时初始化
+### 12.5 Spell And War Art Resources
 
-### 8.2 防线
-- `backend/app/core/storage.py` 统一管理 bundle 读写
-- 关键系统在进入运行逻辑前显式调用初始化函数
-- 单测覆盖旧档兼容、运行时补齐和新字段落库
+Current runtime rule:
+- spell slots use a fee model
+- war arts use a fee model
+- base spell slot cap is `1` when the sheet has spells
+- base martial-point cap is `1` when the sheet has war arts
+- both caps scale with `Dnd5eCharacterSheet.level`, currently clamped to `1..9`
 
-## 9. 回归测试
-- `backend/tests/test_role_system.py`
-- `backend/tests/test_encounter_service.py`
-- `backend/tests/test_team_service.py`
-- `backend/tests/test_inventory_interaction.py`
+Recompute behavior:
+- `spell_slots_max.level_1` is derived from level
+- `spell_slots_current` is clamped to the derived max
+- `martial_points_maximum` is derived from level
+- `martial_points_current` is clamped to the derived max
+- first acquisition of spells or war arts initializes the current resource to the derived max
+- `origin_ref=<本次构筑 archive_id 或随从 role_id>`
 
-## 10. Public Turn Persistence (2026-03-18)
+## 13. 玩家输入校验与存档
 
-- `AreaSubZone.chat_context` now includes `public_turn_state`.
-- `SubZoneChatContext.version` is upgraded to `0.2.0` when public turn state is injected.
-- `SubZoneChatTurn` now persists:
-  - `public_round_id`
-  - `public_round_number`
-  - `public_phase`
-- `PendingTurnState` now persists:
-  - `public_round_id`
-  - `public_phase_before_pause`
-- `PublicSceneState` is now a derived read model and exposes `public_turn_state`.
-- Public turn round history is stored in the existing per-sub-zone chat context rather than a new top-level save shard.
+`/player-input/validate` 是纯读取型预校验接口，不新增 save shard，也不新增 pending turn 持久化字段。
 
-## 11. Public Turn 4.2 Save Fields (2026-03-18)
+当前约束:
+- 不写 `world_state.json`
+- 不写 `pending-turn-state.json`
+- 不写任何 validation ticket
+- 不记录前端“一次性绕过再次校验”状态
 
-- `PublicTurnImpact.relation_deltas` is stored as structured rows:
-  - `role_id`
-  - `name`
-  - `before_tag`
-  - `after_tag`
-  - `relation_delta`
-  - `reaction_text`
-- `PublicTurnImpact.team_affinity_deltas` is stored as structured rows:
-  - `member_role_id`
-  - `name`
-  - `affinity_before`
-  - `affinity_after`
-  - `affinity_delta`
-  - `trust_before`
-  - `trust_after`
-  - `trust_delta`
-  - `reaction_text`
-- `PublicTurnContinueRequest` persists the optional `player_action_check` payload during request handling but does not add a new save shard.
-- `PublicTurnRound` now persists presentation-facing fields inside `public_turn_state` instead of a new shard:
-  - `initiative_order`
-  - `settlement_entries`
-  - `round_narration`
-  - `round_narration_status`
+当前接口会读取:
+- 当前 `SaveFile`
+- 角色自身 `Dnd5eCharacterSheet`
+- 模板库中的 `spell_definitions.csv`
+- 模板库中的 `war_art_definitions.csv`
+- 背包物品对应的 definition 映射
 
-## Public Turn Scheme A Persistence Note (2026-03-19)
-
-- No new save shard was introduced for Scheme A.
-- Segment planner/narrator models remain runtime-only and are reconstructed per request.
-- Persisted public-turn data still lives under `AreaSubZone.chat_context.public_turn_state`.
-- The persisted round payload continues to expose presentation fields only:
-  - `initiative_order`
-  - `settlement_entries`
-  - `narrative_entries`
-  - `accumulated_narration`
-  - `gm_push_summary`
-  - `round_narration` as compatibility mirror of accumulated narration
-
-## Public Turn GM Push Persistence Note (2026-03-20)
-
-- No new save shard was introduced for the GM push / deterministic narration revision.
-- The updated data remains persisted inside `AreaSubZone.chat_context.public_turn_state`.
-- `PublicTurnSettlementEntry` now persists:
-  - `entry_kind`
-  - `gm_push_result`
-- `PublicTurnRound` now persists:
-  - `gm_push_result`
-- Persisted actor settlement constraints:
-  - actor entries keep `gm_resolution_summary=""`
-  - empty actor output is still stored as a valid settlement entry
-- Persisted GM settlement constraints:
-  - exactly one GM push settlement is appended at round end
-  - the GM entry carries the round `1d6` outcome and optional spawned NPC metadata
-- The deterministic narration cache is now derived from stored settlements rather than from a separate AI narration artifact.
-
-## Public Turn Reaction Persistence Note (2026-03-20 v3)
-
-- Player-side public reactions are persisted inside the same settlement/impact payloads; no new shard was added.
-- `PublicTurnRelationDelta` persisted fields now include:
-  - `reaction_action`
-  - `reaction_speech`
-  - `reaction_text` compatibility mirror
-- `PublicTurnTeamAffinityDelta` persisted fields now include:
-  - `reaction_action`
-  - `reaction_speech`
-  - `reaction_text` compatibility mirror
-- Non-player settlements should persist empty:
-  - `relation_deltas`
-  - `team_affinity_deltas`
-- `zone_reputation_delta` in persisted public-turn impacts now reflects player-side ownership only and should remain `0` for non-player non-team actor entries.
-## 2026-03-20 Public-Turn Save Shape Addendum
-
-- `PublicTurnSettlementEntry` now persists explicit target/addressee fields:
-  - `action_target_actor_id`
-  - `action_target_name`
-  - `action_target_kind`
-  - `speech_target_actor_id`
-  - `speech_target_name`
-  - `speech_target_kind`
-  - `opposed_target_speech_target_name`
-- `PublicTurnInteractionPrompt` and `PublicTurnOpposedPrompt` now persist:
-  - `source_action_target_name`
-  - `source_speech_target_name`
-- `PublicTurnRelationDelta` and `PublicTurnTeamAffinityDelta` now persist:
-  - `reaction_tone`
-  - `reaction_focus_actor_id`
-  - `reaction_focus_actor_name`
-  - `reaction_speech_target_id`
-  - `reaction_speech_target_name`
-- `reaction_text` remains as a compatibility mirror, but new readers should prefer structured reaction fields.
-## 2026-03-20 Public-Turn Interaction Persistence v7
-
-- Public-turn interaction save payloads no longer persist `stakes_summary` on `PublicTurnInteractionPrompt`.
-- Persisted interaction prompt fields now include:
-  - `source_world_impact_type`
-  - `alternation_depth`
-  - `interaction_mode`
-- Persisted settlement fields now include:
-  - `source_world_impact_type`
-  - `target_response_world_impact_type`
-  - `interaction_exchange_kind`
-  - `alternation_depth`
-  - `target_response_kind`
-- Persisted target semantics are now locked:
-  - prompt `target_actor_*` is the real action target / responding actor
-  - `speech_target_*` is auxiliary narration metadata only
-- `response_kind="no_action"` persists as a normal resolved interaction outcome rather than a canceled / interrupted state.
-
-## 2026-03-20 Public-Turn Protocol Repair Persistence
-
-- `PendingTurnState.status` now allows `awaiting_protocol_repair`.
-- `PendingTurnContinueResponse.status` now allows `awaiting_protocol_repair`.
-- `PendingTurnState` may now persist:
-  - `public_turn_protocol_repair_notice`
-  - `public_turn_protocol_repair_request`
-- `PendingTurnContinueResponse` may now mirror:
-  - `public_turn_protocol_repair_notice`
-  - `public_turn_protocol_repair_request`
-- No new save shard was added for protocol repair.
-- The repair checkpoint still reuses the staged pending-turn save snapshot and original request payload.
+因此本轮与玩家输入校验相关的持久化结论只有:
+- 无新 shard
+- 无新恢复阶段
+- 页面刷新后，前端确认态与一次性绕过态都会失效

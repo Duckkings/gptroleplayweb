@@ -98,6 +98,26 @@ def _player_relation_tag(role, player_id: str) -> str | None:
     return rel.relation_tag if rel is not None else None
 
 
+def _current_player_area(save) -> tuple[str | None, str | None]:
+    zone_id = save.area_snapshot.current_zone_id
+    sub_zone_id = save.area_snapshot.current_sub_zone_id
+    runtime_position = getattr(save.player_runtime_data, "current_position", None)
+    if not zone_id and runtime_position is not None:
+        zone_id = runtime_position.zone_id
+    return zone_id, sub_zone_id
+
+
+def _effective_role_area(save, role) -> tuple[str | None, str | None]:
+    zone_id = role.zone_id
+    sub_zone_id = role.sub_zone_id
+    members = getattr(getattr(save, "team_state", None), "members", None) or []
+    if role.state == "in_team" or any(item.role_id == role.role_id for item in members):
+        player_zone_id, player_sub_zone_id = _current_player_area(save)
+        zone_id = player_zone_id or zone_id
+        sub_zone_id = player_sub_zone_id or sub_zone_id
+    return zone_id, sub_zone_id
+
+
 def _current_local_roles(save) -> list:
     current_sub_zone_id = save.area_snapshot.current_sub_zone_id
     current_zone_id = save.area_snapshot.current_zone_id
@@ -170,28 +190,33 @@ def build_npc_knowledge_snapshot(save, npc_role_id: str) -> NpcKnowledgeSnapshot
     role = next((item for item in save.role_pool if item.role_id == npc_role_id), None)
     if role is None:
         raise KeyError("ROLE_NOT_FOUND")
-    local_roles = [item for item in save.role_pool if item.zone_id == role.zone_id]
+    effective_zone_id, effective_sub_zone_id = _effective_role_area(save, role)
+    local_roles = []
+    if effective_sub_zone_id:
+        local_roles = [item for item in save.role_pool if _effective_role_area(save, item)[1] == effective_sub_zone_id]
+    if not local_roles and effective_zone_id:
+        local_roles = [item for item in save.role_pool if _effective_role_area(save, item)[0] == effective_zone_id]
     local_role_ids = [item.role_id for item in local_roles if item.role_id != role.role_id]
-    local_zone_ids = sorted({item.zone_id for item in local_roles if item.zone_id})
+    local_zone_ids = sorted({_effective_role_area(save, item)[0] for item in local_roles if _effective_role_area(save, item)[0]})
     forbidden_role_ids = [item.role_id for item in save.role_pool if item.role_id not in local_role_ids and item.role_id != role.role_id]
     known_quest_refs: list[EntityRef] = []
     for quest in save.quest_state.quests:
         if quest.status not in {"active", "pending_offer"}:
             continue
-        if quest.zone_id and quest.zone_id == role.zone_id:
+        if quest.zone_id and quest.zone_id == effective_zone_id:
             known_quest_refs.append(EntityRef(entity_type="quest", entity_id=quest.quest_id, label=quest.title))
             continue
         if quest.issuer_role_id and quest.issuer_role_id == role.role_id:
             known_quest_refs.append(EntityRef(entity_type="quest", entity_id=quest.quest_id, label=quest.title))
     relation_tag = _player_relation_tag(role, save.player_static_data.player_id) or "neutral"
-    profile_summary = f"{role.name}，位于{_zone_name(save, role.zone_id)}/{_sub_zone_name(save, role.sub_zone_id)}。{role.background}".strip()
+    profile_summary = f"{role.name}，位于{_zone_name(save, effective_zone_id)}/{_sub_zone_name(save, effective_sub_zone_id)}。{role.background}".strip()
     return NpcKnowledgeSnapshot(
         npc_role_id=role.role_id,
         npc_name=role.name,
         world_revision=world_state.world_revision,
         map_revision=world_state.map_revision,
-        current_zone_id=role.zone_id,
-        current_sub_zone_id=role.sub_zone_id,
+        current_zone_id=effective_zone_id,
+        current_sub_zone_id=effective_sub_zone_id,
         self_profile_summary=profile_summary,
         known_player_relation=relation_tag,
         known_local_npc_ids=local_role_ids,

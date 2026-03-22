@@ -7,6 +7,7 @@ type Props = {
   speechValue: string;
   busy?: boolean;
   errorMessage?: string;
+  speechOnly?: boolean;
   onActionChange: (value: string) => void;
   onSpeechChange: (value: string) => void;
   onSubmit: () => void;
@@ -21,6 +22,7 @@ export function PublicTurnInteractionModal({
   speechValue,
   busy = false,
   errorMessage = '',
+  speechOnly = false,
   onActionChange,
   onSpeechChange,
   onSubmit,
@@ -41,9 +43,9 @@ export function PublicTurnInteractionModal({
       >
         <div className="roll-modal-header modal-header-actions">
           <div>
-            <h3>公开回合交互</h3>
-            <p>先写下你的应对行为，再由系统判断是否升级为对抗。</p>
-            {prompt.alternation_depth > 0 ? <p>这是一段已经反向后的交互。</p> : null}
+            <h3>公开回合互动</h3>
+            <p>先输入你的回应，系统会按当前状态决定是否进入后续结算。</p>
+            {prompt.alternation_depth > 0 ? <p>这是已经往返过一次的互动。</p> : null}
           </div>
           {onMinimize ? (
             <button type="button" onClick={onMinimize} disabled={busy}>
@@ -58,9 +60,7 @@ export function PublicTurnInteractionModal({
           {prompt.source_action_target_name ? <p>动作对象: {prompt.source_action_target_name}</p> : null}
           <p>对方行为: {prompt.source_action_summary}</p>
           {prompt.source_speech_text ? <p>对方语言: {prompt.source_speech_text}</p> : null}
-          {prompt.source_speech_target_name ? (
-            <p>说话对象: {prompt.source_speech_target_name}</p>
-          ) : null}
+          {prompt.source_speech_target_name ? <p>说话对象: {prompt.source_speech_target_name}</p> : null}
         </section>
 
         <section className="chat-interactions">
@@ -73,8 +73,8 @@ export function PublicTurnInteractionModal({
                 rows={4}
                 value={actionValue}
                 onChange={(event) => onActionChange(event.target.value)}
-                placeholder="你打算如何回应这次互动？"
-                disabled={busy}
+                placeholder="描述你如何回应这次互动。"
+                disabled={busy || speechOnly}
               />
             </div>
             <div className="composer-input-block">
@@ -89,7 +89,9 @@ export function PublicTurnInteractionModal({
               />
             </div>
           </div>
-          <p className="roll-modal-caption">只有明确形成互相对抗时，才会进入双方骰点。</p>
+          <p className="roll-modal-caption">
+            {speechOnly ? '当前状态下不能输入世界影响行为，只能输入语言。' : '只有明确形成相互对抗时，才会进入双方检定。'}
+          </p>
         </section>
 
         {errorMessage ? <p className="error">{errorMessage}</p> : null}
@@ -98,7 +100,7 @@ export function PublicTurnInteractionModal({
           <button type="button" onClick={onNoAction} disabled={busy}>
             不做任何行动
           </button>
-          <button type="button" onClick={onSubmit} disabled={busy || (!actionValue.trim() && !speechValue.trim())}>
+          <button type="button" onClick={onSubmit} disabled={busy || (!speechOnly && !actionValue.trim() && !speechValue.trim())}>
             {busy ? '提交中...' : '提交回应'}
           </button>
         </div>

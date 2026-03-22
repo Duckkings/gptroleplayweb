@@ -9,6 +9,7 @@ type Props = {
   submitLabel: string;
   busy: boolean;
   disabled?: boolean;
+  speechOnly?: boolean;
   showSpeech?: boolean;
   onActionChange: (value: string) => void;
   onSpeechChange: (value: string) => void;
@@ -26,6 +27,7 @@ export function PublicTurnActionComposer({
   submitLabel,
   busy,
   disabled = false,
+  speechOnly = false,
   showSpeech = true,
   onActionChange,
   onSpeechChange,
@@ -42,7 +44,7 @@ export function PublicTurnActionComposer({
             value={actionValue}
             onChange={(event) => onActionChange(event.target.value)}
             placeholder={actionPlaceholder}
-            disabled={busy || disabled}
+            disabled={busy || disabled || speechOnly}
           />
         </div>
         {showSpeech && (
@@ -58,6 +60,7 @@ export function PublicTurnActionComposer({
           </div>
         )}
       </div>
+      {speechOnly && <p className="hint">当前状态下不能进行可影响世界的行为，只能输入语言。</p>}
       <div className="actions">
         <button type="button" disabled={busy || disabled} onClick={onSubmit}>
           {submitLabel}

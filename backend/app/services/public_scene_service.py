@@ -64,6 +64,43 @@ def _team_role_map(save: SaveFile) -> dict[str, NpcRoleCard]:
     }
 
 
+def _normalize_actor_name_key(name: object) -> str:
+    return "".join(str(name or "").split()).strip().lower()
+
+
+def _alias_encounter_temp_npc_name(base_name: object, *, seen_keys: set[str]) -> str:
+    clean = str(base_name or "").strip()
+    if not clean:
+        return ""
+    base_key = _normalize_actor_name_key(clean)
+    if base_key and base_key not in seen_keys:
+        seen_keys.add(base_key)
+        return clean
+    index = 1
+    while True:
+        suffix = "遭遇NPC" if index == 1 else f"遭遇NPC{index}"
+        candidate = f"{clean}（{suffix}）"
+        candidate_key = _normalize_actor_name_key(candidate)
+        if candidate_key and candidate_key not in seen_keys:
+            seen_keys.add(candidate_key)
+            return candidate
+        index += 1
+
+
+def _encounter_temp_npcs_for_candidates(save: SaveFile, *, existing_names: set[str] | None = None) -> list[EncounterTemporaryNpc]:
+    seen_keys = {key for key in (existing_names or set()) if key}
+    filtered: list[EncounterTemporaryNpc] = []
+    for temp_npc in _encounter_temp_npcs(save):
+        unique_name = _alias_encounter_temp_npc_name(getattr(temp_npc, "name", ""), seen_keys=seen_keys)
+        if not unique_name:
+            continue
+        if unique_name == getattr(temp_npc, "name", ""):
+            filtered.append(temp_npc)
+            continue
+        filtered.append(temp_npc.model_copy(update={"name": unique_name}))
+    return filtered
+
+
 def _team_member_by_role_id(save: SaveFile, role_id: str):
     return next((item for item in getattr(save.team_state, "members", []) if item.role_id == role_id), None)
 
@@ -119,7 +156,15 @@ def _encounter_temp_npcs(save: SaveFile) -> list[EncounterTemporaryNpc]:
 def _find_actor_name_match(name: str, text: str) -> bool:
     clean_name = (name or "").strip()
     clean_text = (text or "").strip()
-    return bool(clean_name and clean_text and clean_name in clean_text)
+    if not clean_name or not clean_text:
+        return False
+    candidate_names = [clean_name]
+    for separator in ("（", "("):
+        if separator in clean_name:
+            raw_name = clean_name.split(separator, 1)[0].strip()
+            if raw_name:
+                candidate_names.append(raw_name)
+    return any(candidate and candidate in clean_text for candidate in candidate_names)
 
 
 def _scene_focus_label(save: SaveFile, player_text: str, gm_summary: str) -> str:
@@ -462,7 +507,10 @@ def _candidate_rows(
     visible_npcs = _visible_public_roles(save)
     team_roles = list(_team_role_map(save).values())
     active_encounter = _active_encounter_for_current_sub_zone(save)
-    temp_npcs = _encounter_temp_npcs(save)
+    reserved_name_keys = {_normalize_actor_name_key(getattr(getattr(save, "player_static_data", None), "name", ""))}
+    reserved_name_keys.update(_normalize_actor_name_key(role.name) for role in visible_npcs)
+    reserved_name_keys.update(_normalize_actor_name_key(role.name) for role in team_roles)
+    temp_npcs = _encounter_temp_npcs_for_candidates(save, existing_names=reserved_name_keys)
     visible_rows: list[dict[str, object]] = [
         {"actor_id": role.role_id, "name": role.name, "actor_type": "npc", "priority_reason": "", "role": role}
         for role in visible_npcs

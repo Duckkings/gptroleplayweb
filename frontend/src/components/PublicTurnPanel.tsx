@@ -1,4 +1,4 @@
-import type { PublicTurnState } from '../types/app';
+import type { PublicTurnState, RoleActionStatus } from '../types/app';
 import { PublicTurnActionComposer } from './PublicTurnActionComposer';
 import { PublicTurnControlBar } from './PublicTurnControlBar';
 
@@ -10,6 +10,7 @@ type Props = {
   speechValue: string;
   busy: boolean;
   godMode: boolean;
+  playerActionStatus: RoleActionStatus;
   onActionChange: (value: string) => void;
   onSpeechChange: (value: string) => void;
   onStartNextRound: () => void;
@@ -26,6 +27,7 @@ export function PublicTurnPanel({
   speechValue,
   busy,
   godMode,
+  playerActionStatus,
   onActionChange,
   onSpeechChange,
   onStartNextRound,
@@ -37,6 +39,7 @@ export function PublicTurnPanel({
   const phase = currentRound?.phase ?? 'idle';
   const awaitingPlayerAction = Boolean(currentRound?.awaiting_player_action);
   const awaitingPlayerEntry = Boolean(state.awaiting_player_entry && !currentRound);
+  const speechOnly = playerActionStatus === 'death_saving' || playerActionStatus === 'unable_to_act';
 
   return (
     <>
@@ -55,13 +58,14 @@ export function PublicTurnPanel({
 
       {awaitingPlayerAction && (
         <PublicTurnActionComposer
-          title="提交本阶段行动"
+          title={playerActionStatus === 'death_saving' ? '提交语言并进入死亡豁免' : '提交本阶段行动'}
           actionValue={actionValue}
           speechValue={speechValue}
-          actionPlaceholder="例如：我快步抢到前排，用盾牌压住混乱的缺口。"
-          speechPlaceholder="例如：先稳住阵线，别让局势继续失控。"
-          submitLabel="提交行动"
+          actionPlaceholder={speechOnly ? '当前状态下不能输入可影响世界的行为。' : '例如：我快步抢到前排，用盾牌压住缺口。'}
+          speechPlaceholder={playerActionStatus === 'death_saving' ? '例如：我咬牙说：“我还没倒下。”' : '例如：先稳住阵线，别让局势继续失控。'}
+          submitLabel={playerActionStatus === 'death_saving' ? '提交语言并掷死亡豁免' : '提交行动'}
           busy={busy}
+          speechOnly={speechOnly}
           onActionChange={onActionChange}
           onSpeechChange={onSpeechChange}
           onSubmit={onSubmitAction}
@@ -87,7 +91,7 @@ export function PublicTurnPanel({
 
       {!awaitingPlayerEntry && !awaitingPlayerAction && (
         <section className="chat-interactions">
-          <p className="hint">当前阶段不接受玩家输入，请等待本轮推进或反应检定。</p>
+          <p className="hint">当前阶段不接受玩家输入，请等待本轮推进或弹窗处理。</p>
         </section>
       )}
     </>

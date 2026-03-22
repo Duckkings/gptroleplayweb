@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from app.models.schemas import AreaSubZone, PublicTurnPhase, PublicTurnState, SaveFile, SubZoneChatContext
-from app.services.pending_turn_service import load_pending_turn
+from app.services.pending_turn_service import clear_pending_turn, load_pending_turn
 from app.services import world_service as world
 
 
@@ -63,8 +63,31 @@ def sync_pending_public_turn_in_save(save: SaveFile, session_id: str) -> PublicT
         return state
     if state.current_round is None or state.current_round.round_id != pending.public_round_id:
         return state
+    if (
+        pending.status in {"awaiting_reaction", "awaiting_opposed"}
+        and state.current_round.pending_interaction_prompt is not None
+        and state.current_round.pending_interaction_prompt.source_action_type == "attack"
+        and pending.public_attack_prompt is None
+        and pending.public_attack_defense_prompt is None
+    ):
+        clear_pending_turn(session_id)
+        state.current_round.pending_interaction_prompt = None
+        state.current_round.awaiting_player_action = False
+        state.current_round.awaiting_player_action_phase = None
+        state.current_round.phase = PublicTurnPhase.NORMAL_ADVANCEMENT
+        state.updated_at = world._utc_now()
+        return save_public_turn_state_in_save(save, state)
     if pending.status == "awaiting_opposed":
         state.current_round.phase = PublicTurnPhase.AWAITING_PLAYER_OPPOSED
+    elif pending.status == "awaiting_player_attack_response":
+        state.current_round.phase = PublicTurnPhase.AWAITING_PLAYER_ATTACK_RESPONSE
+        state.current_round.pending_attack_prompt = pending.public_attack_prompt
+    elif pending.status == "awaiting_player_attack_defense":
+        state.current_round.phase = PublicTurnPhase.AWAITING_PLAYER_ATTACK_DEFENSE
+        state.current_round.pending_attack_defense_prompt = pending.public_attack_defense_prompt
+    elif pending.status == "awaiting_player_death_save":
+        state.current_round.phase = PublicTurnPhase.AWAITING_PLAYER_DEATH_SAVE
+        state.current_round.pending_death_save_prompt = pending.death_save_prompt
     elif pending.pending_reaction is not None:
         state.current_round.pending_reaction_check_id = pending.pending_reaction.reaction_id
         state.current_round.phase = PublicTurnPhase.AWAITING_PLAYER_REACTION
