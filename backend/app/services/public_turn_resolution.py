@@ -48,6 +48,7 @@ from app.services import public_scene_runtime_v2 as public_scene_runtime
 from app.services import public_scene_service as public_scene_legacy
 from app.services import reaction_check_service
 from app.services import world_service as world
+from app.services.actor_resource_service import consume_submission_resources_in_save
 from app.services.encounter_service import apply_active_encounter_situation_delta_in_save
 from app.services.public_turn_interaction_service import build_ai_interaction_response
 from app.services.public_turn_interaction_service import classify_player_interaction_response
@@ -184,6 +185,16 @@ def _public_turn_combat_target_candidates(save: SaveFile) -> list[ResolvedIntera
     for candidate in candidates:
         unique.setdefault(candidate.actor_id, candidate)
     return list(unique.values())
+
+
+def _attack_target_as_interaction_target(target: PublicTurnResolvedAttackTarget) -> ResolvedInteractionTarget:
+    return ResolvedInteractionTarget(
+        actor_id=target.actor_id,
+        name=target.actor_name,
+        actor_kind="player" if target.actor_type == PublicTurnActorType.PLAYER else "npc",
+        actor_type=target.actor_type,
+        role=target.role,
+    )
 
 
 def _resolve_public_turn_damage_targets(
@@ -1699,6 +1710,14 @@ def resolve_player_submission(
         action_check=action_check,
         config=config,
     )
+    consume_submission_resources_in_save(
+        save,
+        actor_role_id=save.player_static_data.player_id,
+        action_text=action_text,
+        speech_text=speech_text,
+        entry_point="public_turn_action",
+        config=config,
+    )
     structured_situation_hint = 4 if action_check is not None and action_check.planned_requires_check else 0
     situation_delta = max(-20, min(20, structured_situation_hint + check_bonus(action_result)))
     relation_delta = relation_delta_from_result(action_result, situation_delta)
@@ -1967,7 +1986,7 @@ def _auto_attack_response_for_target(
 ) -> tuple[str, str]:
     response = build_ai_interaction_response(
         save,
-        target=_to_interaction_target(target, save),
+        target=_attack_target_as_interaction_target(target),
         source_actor_id=source_actor_id,
         source_actor_name=source_actor_name,
         source_world_impact_type=PublicTurnWorldImpactType.WORLD,
@@ -2082,7 +2101,7 @@ def _resolve_attack_damage_to_targets(
             save,
             source_actor_id=source_actor_id,
             source_actor_name=source_actor_name,
-            target=_to_interaction_target(target, save),
+            target=_attack_target_as_interaction_target(target),
             damage=damage,
             damage_type=resolved_damage_type,
             round_id=round_state.round_id,
@@ -2958,6 +2977,19 @@ def resolve_player_attack_submission(
             config=config,
         )
         return events, impact, settlement, action_result, None
+    attack_resource_text = action_text
+    if str(attack_assessment.get("attack_basis") or "") in {"spell", "war_art"}:
+        attack_resource_text = str(
+            attack_assessment.get("attack_definition_name") or attack_assessment.get("attack_definition_id") or action_text
+        ).strip() or action_text
+    consume_submission_resources_in_save(
+        save,
+        actor_role_id=save.player_static_data.player_id,
+        action_text=attack_resource_text,
+        speech_text=speech_text,
+        entry_point="public_turn_action",
+        config=config,
+    )
 
     hit_targets: list[PublicTurnResolvedAttackTarget] = []
     avoided_targets: list[PublicTurnResolvedAttackTarget] = []
@@ -3236,6 +3268,14 @@ def resolve_attack_prompt_submission(
             config=config,
         )
     )
+    consume_submission_resources_in_save(
+        save,
+        actor_role_id=prompt.current_target_actor_id,
+        action_text=target_action_summary,
+        speech_text=target_speech_text,
+        entry_point="public_turn_attack_response",
+        config=config,
+    )
     base_events = [
         world._new_scene_event(
             "public_turn_actor_action",
@@ -3331,6 +3371,14 @@ def resolve_attack_defense_prompt_submission(
     config: ChatConfig | None,
 ) -> tuple[list[SceneEvent], PublicTurnImpact, PublicTurnSettlementEntry, ActionCheckResponse]:
     metadata = dict(prompt.metadata or {})
+    consume_submission_resources_in_save(
+        save,
+        actor_role_id=prompt.target_actor_id,
+        action_text=prompt.target_action_summary,
+        speech_text=prompt.target_speech_text,
+        entry_point="public_turn_attack_response",
+        config=config,
+    )
     attack_assessment = dict(metadata.get("attack_assessment") or {})
     threatened_targets = _attack_targets_from_metadata(
         save,
@@ -3489,6 +3537,14 @@ def resolve_interaction_prompt_submission(
         and response_target.actor_id != prompt.source_actor_id
     ):
         raise ValueError("PUBLIC_TURN_ALTERNATION_TARGET_MISMATCH")
+    consume_submission_resources_in_save(
+        save,
+        actor_role_id=prompt.target_actor_id,
+        action_text=target_action_summary,
+        speech_text=target_speech_text,
+        entry_point="public_turn_interaction_response",
+        config=config,
+    )
     action_content = "\n".join(
         part for part in (prompt.source_action_summary.strip(), prompt.source_speech_text.strip()) if part
     ).strip() or prompt.source_action_summary.strip() or prompt.source_action_prompt.strip() or prompt.source_actor_name

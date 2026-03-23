@@ -324,6 +324,30 @@ class TeamServiceTests(unittest.TestCase):
         self.assertEqual(len(reactions), 1)
         self.assertTrue(any(token in reactions[0].content for token in ["看", "点头", "侧过脸", "手", "目光", "收紧"]))
 
+    def test_team_public_reaction_consumes_spell_slots(self) -> None:
+        sid = "sess_team_public_reaction_spell_cost"
+        self._seed_context(sid)
+        invite_npc_to_team(TeamInviteRequest(session_id=sid, npc_role_id="npc_local", player_prompt="一起行动吧。"))
+        save = get_current_save(sid)
+        role = next(item for item in save.role_pool if item.role_id == "npc_local")
+        role.profile.dnd5e_sheet.spells = ["Fireball"]
+        role.profile.dnd5e_sheet.spell_slots_current.level_1 = 1
+
+        with patch(
+            "app.services.team_service._ai_team_public_reply",
+            return_value=("casts Fireball", "", "casts Fireball", "action", 0, 0),
+        ):
+            reactions = generate_team_public_replies_in_save(
+                save,
+                session_id=sid,
+                player_text='{"input_type":"player_intent_v1","action_description":"I cast Fireball","speech_description":""}',
+                scene_summary="Player opens with a spell.",
+                config=None,
+            )
+
+        self.assertEqual(len(reactions), 1)
+        self.assertEqual(role.profile.dnd5e_sheet.spell_slots_current.level_1, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

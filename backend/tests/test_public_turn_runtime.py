@@ -49,7 +49,12 @@ from app.services.public_turn_narration_formatter import build_settlement_fragme
 from app.services.public_turn_interaction_service import InteractionResponseClassification, ResolvedInteractionTarget
 from app.services import reaction_check_service
 from app.services.team_service import ensure_team_state
-from app.services.public_turn_resolution import _apply_public_turn_hp_damage, build_initiative_declarations, resolve_player_submission
+from app.services.public_turn_resolution import (
+    _apply_public_turn_hp_damage,
+    build_initiative_declarations,
+    resolve_player_attack_submission,
+    resolve_player_submission,
+)
 from app.services.public_turn_runtime import (
     _resolve_initiative_actor_row,
     continue_round_in_save,
@@ -2373,6 +2378,87 @@ class PublicTurnRuntimeTests(unittest.TestCase):
         self.assertEqual(assessment["attack_basis"], "other")
         self.assertEqual(assessment["attack_definition_id"], "")
         self.assertEqual(assessment["candidate_target_names"], [])
+
+    def test_attack_assessment_recognizes_war_art_attack(self) -> None:
+        save = self._seed_public_turn_scene("sess_public_turn_war_art_assessment")
+
+        with patch(
+            "app.services.public_turn_attack_service.create_sync_client",
+            return_value=_FakeSyncClient(
+                (
+                    '{"attack_kind":"targeted_attack","attack_basis":"war_art","attack_definition_id":"power_strike",'
+                    '"attack_definition_name":"强力斩","attack_area_shape":"none","self_target_policy":"never",'
+                    '"attack_ability_used":"strength","candidate_target_names":["瀹堝崼"]}'
+                )
+            ),
+        ):
+            assessment = assess_public_turn_attack(
+                save,
+                actor_role_id=save.player_static_data.player_id,
+                actor_name=save.player_static_data.name,
+                action_summary="我使用强力斩劈向守卫。",
+                speech_text="",
+                action_prompt="玩家使用强力斩攻击守卫。",
+                fallback_target_name="瀹堝崼",
+                config=self._ai_config(),
+            )
+
+        basis, definition = resolve_attack_definition(
+            save,
+            actor_role_id=save.player_static_data.player_id,
+            attack_definition_id=str(assessment.get("attack_definition_id") or ""),
+            attack_basis_hint=str(assessment.get("attack_basis") or ""),
+        )
+        self.assertEqual(assessment["attack_kind"], "targeted_attack")
+        self.assertEqual(assessment["attack_basis"], "war_art")
+        self.assertEqual(assessment["attack_definition_id"], "power_strike")
+        self.assertEqual(basis, "war_art")
+        self.assertIsNotNone(definition)
+        self.assertEqual(definition.definition_id, "power_strike")  # type: ignore[union-attr]
+        return
+        self.assertEqual(assessment["candidate_target_names"], ["瀹堝崼"])
+        self.assertEqual(basis, "war_art")
+        self.assertIsNotNone(definition)
+        self.assertEqual(definition.definition_id, "power_strike")  # type: ignore[union-attr]
+
+    def test_resolve_player_attack_submission_consumes_war_art_points(self) -> None:
+        save = self._seed_public_turn_scene("sess_public_turn_war_art_cost")
+        save.player_static_data.dnd5e_sheet.war_arts = ["power_strike"]
+        save.player_static_data.dnd5e_sheet.martial_points_current = 2
+        guard = next(item for item in save.role_pool if item.role_id == "npc_guard")
+
+        with patch(
+            "app.services.public_turn_resolution.assess_public_turn_attack",
+            return_value={
+                "attack_kind": "targeted_attack",
+                "attack_basis": "war_art",
+                "attack_definition_id": "power_strike",
+                "attack_definition_name": "power_strike",
+                "attack_area_shape": "none",
+                "attack_area_radius_m": 0.0,
+                "attack_area_length_m": 0.0,
+                "self_target_policy": "never",
+                "candidate_target_names": [guard.name],
+                "attack_ability_used": "strength",
+            },
+        ):
+            events, impact, settlement, action_result, attack_prompt = resolve_player_attack_submission(
+                save,
+                session_id=save.session_id,
+                action_text="鎴戜娇鐢ㄥ己鍔涙柀鍔堝悜瀹堝崼銆?",
+                speech_text="",
+                round_state=PublicTurnRound(round_id="round_war_art_cost"),
+                action_check=None,
+                config=None,
+            )
+
+        self.assertIsNone(attack_prompt)
+        self.assertIsNotNone(settlement)
+        self.assertEqual(settlement.attack_basis, "war_art")
+        self.assertEqual(save.player_static_data.dnd5e_sheet.martial_points_current, 1)
+        self.assertTrue(events)
+        self.assertIsNotNone(impact)
+        self.assertIsNone(action_result)
 
     def test_attack_response_without_ai_does_not_guess_effective_defense_from_text(self) -> None:
         classification = classify_attack_response(

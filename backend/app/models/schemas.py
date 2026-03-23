@@ -1042,7 +1042,7 @@ class PublicTurnSettlementEntry(BaseModel):
         "attack_flow",
     ] = "non_interactive"
     attack_kind: Literal["ordinary_action", "targeted_attack", "aoe_attack"] | None = None
-    attack_basis: Literal["weapon", "spell", "other"] | None = None
+    attack_basis: Literal["weapon", "spell", "war_art", "other"] | None = None
     attack_definition_id: str | None = None
     attack_definition_name: str | None = None
     attack_area_shape: Literal["none", "sphere", "cone", "line", "burst", "emanation"] | None = None
@@ -1256,7 +1256,7 @@ class PublicTurnAttackPrompt(BaseModel):
     source_action_summary: str = Field(default="", min_length=0)
     source_speech_text: str = Field(default="", min_length=0)
     attack_kind: Literal["targeted_attack", "aoe_attack"] = "targeted_attack"
-    attack_basis: Literal["weapon", "spell", "other"] = "other"
+    attack_basis: Literal["weapon", "spell", "war_art", "other"] = "other"
     attack_definition_id: str | None = None
     attack_definition_name: str | None = None
     attack_area_shape: Literal["none", "sphere", "cone", "line", "burst", "emanation"] = "none"

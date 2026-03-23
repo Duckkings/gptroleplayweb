@@ -24,7 +24,7 @@ from app.services.public_turn_interaction_service import ResolvedInteractionTarg
 
 _PUBLIC_TURN_ATTACK_ASSESSMENT_FIELDS = (
     EnumContractField(field_path="attack_kind", allowed_ids=("ordinary_action", "targeted_attack", "aoe_attack")),
-    EnumContractField(field_path="attack_basis", allowed_ids=("weapon", "spell", "other")),
+    EnumContractField(field_path="attack_basis", allowed_ids=("weapon", "spell", "war_art", "other")),
     EnumContractField(field_path="attack_area_shape", allowed_ids=("none", "sphere", "cone", "line", "burst", "emanation")),
     EnumContractField(field_path="self_target_policy", allowed_ids=("never", "can_include_self", "always_include_self")),
     EnumContractField(
@@ -80,10 +80,14 @@ def resolve_attack_profile(save: SaveFile, actor_role_id: str) -> Any:
     return profile
 
 
-def _attack_definition_pools(save: SaveFile, actor_role_id: str) -> tuple[list[dict[str, object]], list[dict[str, object]], list[str], str]:
+def _attack_definition_pools(
+    save: SaveFile,
+    actor_role_id: str,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]], list[str], list[str], str]:
     library = load_template_library()
     profile = resolve_attack_profile(save, actor_role_id)
     known_spells = [str(item or "").strip() for item in getattr(profile.dnd5e_sheet, "spells", []) or [] if str(item or "").strip()]
+    known_war_arts = [str(item or "").strip() for item in getattr(profile.dnd5e_sheet, "war_arts", []) or [] if str(item or "").strip()]
     equipped_weapon_name = actor_equipped_weapon_name(save, actor_role_id)
     spell_pool = [
         {
@@ -106,7 +110,19 @@ def _attack_definition_pools(save: SaveFile, actor_role_id: str) -> tuple[list[d
         for definition in library.equipment_definitions
         if str(getattr(definition, "slot_type", "") or "") == "weapon"
     ]
-    return spell_pool, equipment_pool, known_spells, equipped_weapon_name
+    war_art_pool = [
+        {
+            "definition_id": definition.definition_id,
+            "name": definition.name,
+            "attack_mode": definition.attack_mode,
+            "scaling_ability": definition.scaling_ability,
+            "martial_cost": definition.martial_cost,
+            "cooldown_rounds": definition.cooldown_rounds,
+            "area_shape": definition.area_shape,
+        }
+        for definition in library.war_art_definitions
+    ]
+    return spell_pool, equipment_pool, war_art_pool, known_spells, known_war_arts, equipped_weapon_name
 
 
 def _default_attack_assessment(save: SaveFile, *, actor_role_id: str) -> dict[str, object]:
@@ -131,6 +147,7 @@ def _coerce_attack_ability_used(save: SaveFile, actor_role_id: str, *, basis: st
         attack_ability_used = str(
             getattr(definition, "casting_ability", None)
             or getattr(definition, "attack_ability_mode", None)
+            or getattr(definition, "scaling_ability", None)
             or attack_ability_used
             or "strength"
         ).strip().lower()
@@ -275,13 +292,18 @@ def resolve_attack_definition(
             return "spell", _definition_by_id(library.spell_definitions).get(definition_id)
         if basis_hint == "weapon":
             return "weapon", _definition_by_id(library.equipment_definitions).get(definition_id)
+        if basis_hint == "war_art":
+            return "war_art", _definition_by_id(library.war_art_definitions).get(definition_id)
         spell_definition = _definition_by_id(library.spell_definitions).get(definition_id)
         if spell_definition is not None:
             return "spell", spell_definition
         equipment_definition = _definition_by_id(library.equipment_definitions).get(definition_id)
         if equipment_definition is not None:
             return "weapon", equipment_definition
-    if basis_hint in {"spell", "weapon"}:
+        war_art_definition = _definition_by_id(library.war_art_definitions).get(definition_id)
+        if war_art_definition is not None:
+            return "war_art", war_art_definition
+    if basis_hint in {"spell", "weapon", "war_art"}:
         return basis_hint, None
     return "other", None
 
@@ -302,23 +324,24 @@ def assess_public_turn_attack(
     if not has_ai_config(config):
         return result
     candidate_names = [item.actor_name for item in resolve_attack_candidates(save, include_hidden=False)]
-    spell_pool, equipment_pool, known_spells, equipped_weapon_name = _attack_definition_pools(save, actor_role_id)
+    spell_pool, equipment_pool, war_art_pool, known_spells, known_war_arts, equipped_weapon_name = _attack_definition_pools(save, actor_role_id)
     spell_definition_ids = {str(item.get("definition_id") or "") for item in spell_pool}
     equipment_definition_ids = {str(item.get("definition_id") or "") for item in equipment_pool}
+    war_art_definition_ids = {str(item.get("definition_id") or "") for item in war_art_pool}
     try:
         prompt = prompt_table.render(
             "public.turn.attack_assessment.user",
             (
                 "Return one JSON object only. Decide whether a public-turn attack is ordinary_action, targeted_attack, or aoe_attack. "
-                "If this is a DND 5e style spell or weapon attack, prefer spell/weapon basis and use matching area semantics. "
+                "If this is a DND 5e style spell, weapon, or war art attack, prefer spell/weapon/war_art basis and use matching area semantics. "
                 "You must resolve attack_definition_id yourself from the provided template pools. "
-                "The backend will not infer spell or weapon definitions from action text, aliases, Chinese names, or keywords. "
+                "The backend will not infer spell, weapon, or war art definitions from action text, aliases, Chinese names, or keywords. "
                 "candidate_target_names must only use exact names from visible_target_names_json. "
-                "attack_definition_id must be one exact id from spell_definition_pool_json or weapon_definition_pool_json, or an empty string if no listed template matches. "
+                "attack_definition_id must be one exact id from spell_definition_pool_json, weapon_definition_pool_json, or war_art_definition_pool_json, or an empty string if no listed template matches. "
                 "actor_name=$actor_name; action_summary=$action_summary; speech_text=$speech_text; action_prompt=$action_prompt; "
                 "fallback_target_name=$fallback_target_name; visible_target_names_json=$visible_target_names_json; "
-                "known_spell_names_json=$known_spell_names_json; equipped_weapon_name=$equipped_weapon_name; "
-                "spell_definition_pool_json=$spell_definition_pool_json; weapon_definition_pool_json=$weapon_definition_pool_json"
+                "known_spell_names_json=$known_spell_names_json; known_war_art_names_json=$known_war_art_names_json; equipped_weapon_name=$equipped_weapon_name; "
+                "spell_definition_pool_json=$spell_definition_pool_json; weapon_definition_pool_json=$weapon_definition_pool_json; war_art_definition_pool_json=$war_art_definition_pool_json"
             ),
             actor_name=actor_name,
             action_summary=action_summary[:240],
@@ -327,9 +350,11 @@ def assess_public_turn_attack(
             fallback_target_name=str(fallback_target_name or "")[:120],
             visible_target_names_json=json.dumps(candidate_names, ensure_ascii=False),
             known_spell_names_json=json.dumps(known_spells, ensure_ascii=False),
+            known_war_art_names_json=json.dumps(known_war_arts, ensure_ascii=False),
             equipped_weapon_name=equipped_weapon_name[:120],
             spell_definition_pool_json=json.dumps(spell_pool, ensure_ascii=False),
             weapon_definition_pool_json=json.dumps(equipment_pool, ensure_ascii=False),
+            war_art_definition_pool_json=json.dumps(war_art_pool, ensure_ascii=False),
         )
         prompt = (
             f"{prompt}\nAllowed enum ids:\n{render_enum_pool_text(_PUBLIC_TURN_ATTACK_ASSESSMENT_FIELDS)}\n"
@@ -364,8 +389,17 @@ def assess_public_turn_attack(
             parsed_definition_id = parsed_definition_id if parsed_definition_id in spell_definition_ids else ""
         elif result["attack_basis"] == "weapon":
             parsed_definition_id = parsed_definition_id if parsed_definition_id in equipment_definition_ids else ""
+        elif result["attack_basis"] == "war_art":
+            parsed_definition_id = parsed_definition_id if parsed_definition_id in war_art_definition_ids else ""
         else:
-            parsed_definition_id = ""
+            if parsed_definition_id in war_art_definition_ids:
+                result["attack_basis"] = "war_art"
+            elif parsed_definition_id in spell_definition_ids:
+                result["attack_basis"] = "spell"
+            elif parsed_definition_id in equipment_definition_ids:
+                result["attack_basis"] = "weapon"
+            else:
+                parsed_definition_id = ""
         result["attack_definition_id"] = parsed_definition_id
         result["attack_area_shape"] = str(parsed.get("attack_area_shape") or result["attack_area_shape"]).strip()
         result["attack_area_radius_m"] = max(0.0, float(parsed.get("attack_area_radius_m") or result.get("attack_area_radius_m") or 0))
@@ -459,16 +493,15 @@ def select_aoe_threatened_targets(
     self_policy = str(attack_assessment.get("self_target_policy") or "never").strip()
     basis = str(attack_assessment.get("attack_basis") or "other").strip()
     source_target = next((item for item in candidates if item.actor_id == actor_role_id), None)
-    if source_target is not None:
-        if self_policy == "always_include_self" and source_target.actor_name not in selected_names:
-            selected_names.append(source_target.actor_name)
+    if source_target is not None and self_policy == "always_include_self" and source_target.actor_name not in selected_names:
+        selected_names.append(source_target.actor_name)
     selected_targets: list[PublicTurnResolvedAttackTarget] = []
     revealed_names: list[str] = []
     for name in selected_names:
         target = by_name.get(name)
         if target is None:
             continue
-        if target.actor_id == actor_role_id and basis != "spell" and self_policy != "always_include_self":
+        if target.actor_id == actor_role_id and basis not in {"spell", "war_art"} and self_policy != "always_include_self":
             continue
         selected_targets.append(target)
         if target.is_hidden:

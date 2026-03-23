@@ -37,6 +37,7 @@ from app.services.ai_protocol_contract_service import (
     require_ai_config,
     validate_or_repair_json_payload,
 )
+from app.services.actor_resource_service import consume_submission_resources_in_save
 from app.services.consistency_service import build_npc_knowledge_snapshot
 from app.services.world_service import (
     _ability_mod,
@@ -1352,7 +1353,14 @@ def _build_reaction(role: NpcRoleCard, trigger_kind: str, player_text: str, summ
         return (f"{role.name} 点了点头，似乎更愿意继续跟着你。", 1, 1)
     return (f"{role.name} 记下了这件事，但暂时没有多说什么。", 0, 0)
 
-def _ai_team_public_reply(save, role: NpcRoleCard, player_text: str, scene_summary: str, scene_context, config) -> tuple[str, str, int, int] | None:
+def _ai_team_public_reply(
+    save,
+    role: NpcRoleCard,
+    player_text: str,
+    scene_summary: str,
+    scene_context,
+    config,
+) -> tuple[str, str, str, str, int, int] | None:
     if config is None:
         return None
     api_key = (config.openai_api_key or "").strip()
@@ -1399,7 +1407,7 @@ def _ai_team_public_reply(save, role: NpcRoleCard, player_text: str, scene_summa
         response_mode = "speech" if speech_reply else "action"
         affinity_delta = max(-3, min(3, int(parsed.get("affinity_delta") or 0)))
         trust_delta = max(-3, min(3, int(parsed.get("trust_delta") or 0)))
-        return content[:120], response_mode, affinity_delta, trust_delta
+        return action_reaction, speech_reply, content[:120], response_mode, affinity_delta, trust_delta
     except Exception:
         return None
 
@@ -1436,7 +1444,15 @@ def generate_team_public_replies_in_save(
             affinity_delta = 0
             trust_delta = 0
         else:
-            content, response_mode, affinity_delta, trust_delta = generated
+            action_reaction, speech_reply, content, response_mode, affinity_delta, trust_delta = generated
+            consume_submission_resources_in_save(
+                save,
+                actor_role_id=role.role_id,
+                action_text=action_reaction,
+                speech_text=speech_reply,
+                entry_point="teammate_chat",
+                config=config,
+            )
         member.affinity = _clamp_score(member.affinity + affinity_delta)
         member.trust = _clamp_score(member.trust + trust_delta)
         member.last_reaction_at = _utc_now()
