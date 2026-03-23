@@ -53,6 +53,7 @@ from app.services.public_turn_resolution import (
     _apply_public_turn_hp_damage,
     _extract_resolution_summary_text,
     build_initiative_declarations,
+    prepare_npc_attack_prompt,
     resolve_player_attack_submission,
     resolve_player_submission,
 )
@@ -2483,6 +2484,45 @@ class PublicTurnRuntimeTests(unittest.TestCase):
 
         self.assertEqual(classification["world_impact_type"], "non_world")
         self.assertFalse(classification["effective_against_attack"])
+
+    def test_prepare_npc_attack_prompt_uses_fallback_target_name_when_ai_misses_candidate_target(self) -> None:
+        save = self._seed_public_turn_scene("sess_public_turn_npc_attack_fallback_target")
+        guard = next(item for item in save.role_pool if item.role_id == "npc_guard")
+
+        with patch(
+            "app.services.public_turn_resolution.assess_public_turn_attack",
+            return_value={
+                "attack_kind": "targeted_attack",
+                "attack_basis": "weapon",
+                "attack_definition_id": "",
+                "attack_definition_name": "",
+                "attack_area_shape": "none",
+                "attack_area_radius_m": 0.0,
+                "attack_area_length_m": 0.0,
+                "self_target_policy": "never",
+                "candidate_target_names": [],
+                "attack_ability_used": "strength",
+            },
+        ):
+            prompt = prepare_npc_attack_prompt(
+                save,
+                source_actor_id=guard.role_id,
+                source_actor_name=guard.name,
+                source_actor_type="npc",
+                source_action_summary="Guard lunges toward the player.",
+                source_speech_text="",
+                source_action_prompt="Guard attacks the player directly.",
+                source_action_target_name=save.player_static_data.name,
+                round_state=PublicTurnRound(round_id="round_npc_attack_fallback"),
+                situation_delta_hint=0,
+                reputation_delta_hint=0,
+                config=None,
+            )
+
+        self.assertIsNotNone(prompt)
+        assert prompt is not None
+        self.assertEqual(prompt.current_target_actor_id, save.player_static_data.player_id)
+        self.assertIn(save.player_static_data.name, prompt.threatened_target_names)
 
     def test_resolve_player_submission_applies_ai_aoe_damage_to_multiple_targets(self) -> None:
         save = self._seed_public_turn_scene("sess_public_turn_player_aoe_damage")

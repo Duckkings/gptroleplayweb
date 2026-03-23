@@ -2264,6 +2264,28 @@ def _attack_targets_from_metadata(
     return resolved
 
 
+def _attack_targets_with_fallback(
+    save: SaveFile,
+    *,
+    actor_ids: list[str] | None = None,
+    actor_names: list[str] | None = None,
+    fallback_actor_name: str | None = None,
+) -> list[PublicTurnResolvedAttackTarget]:
+    targets = _attack_targets_from_metadata(save, actor_ids=actor_ids, actor_names=actor_names)
+    fallback_name = str(fallback_actor_name or "").strip()
+    if not fallback_name:
+        return targets
+    fallback_targets = _attack_targets_from_metadata(save, actor_names=[fallback_name])
+    if not fallback_targets:
+        return targets
+    seen_ids = {item.actor_id for item in targets}
+    for target in fallback_targets:
+        if target.actor_id not in seen_ids:
+            targets.append(target)
+            seen_ids.add(target.actor_id)
+    return targets
+
+
 def _build_attack_prompt(
     *,
     round_state: PublicTurnRound,
@@ -2980,9 +3002,10 @@ def resolve_player_attack_submission(
             config=config,
         )
     else:
-        threatened_targets = _attack_targets_from_metadata(
+        threatened_targets = _attack_targets_with_fallback(
             save,
             actor_names=list(attack_assessment.get("candidate_target_names") or []),
+            fallback_actor_name=(action_check.target_name if action_check is not None else None),
         )
     if not threatened_targets:
         events, impact, settlement, action_result = resolve_player_submission(
@@ -3152,9 +3175,10 @@ def prepare_npc_attack_prompt(
             config=config,
         )
     else:
-        threatened_targets = _attack_targets_from_metadata(
+        threatened_targets = _attack_targets_with_fallback(
             save,
             actor_names=list(attack_assessment.get("candidate_target_names") or []),
+            fallback_actor_name=source_action_target_name,
         )
     player_target = next((item for item in threatened_targets if item.actor_id == save.player_static_data.player_id), None)
     if player_target is None:
