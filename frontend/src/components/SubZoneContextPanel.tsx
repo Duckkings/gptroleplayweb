@@ -114,7 +114,7 @@ export function SubZoneContextPanel({ subZone }: Props) {
               {presentation ? (
                 <div className="public-turn-output-layout compact">
                   <PublicTurnSettlementPane presentation={presentation} />
-                  <PublicTurnNarrativePane presentation={presentation} />
+                  <PublicTurnNarrativePane presentation={presentation} variant="history" sceneEvents={[]} />
                 </div>
               ) : null}
               {visibleEvents.length > 0 && (

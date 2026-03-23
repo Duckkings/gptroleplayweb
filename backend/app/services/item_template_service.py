@@ -76,6 +76,9 @@ SPELL_DEFINITION_COLUMNS = [
     "self_target_policy",
     "description",
     "resolution_notes",
+    "recommended_classes",
+    "min_level",
+    "npc_priority",
 ]
 
 WAR_ART_DEFINITION_COLUMNS = [
@@ -94,6 +97,9 @@ WAR_ART_DEFINITION_COLUMNS = [
     "self_target_policy",
     "description",
     "resolution_notes",
+    "recommended_classes",
+    "min_level",
+    "npc_priority",
 ]
 
 INTERACTABLE_TEMPLATE_COLUMNS = [
@@ -347,7 +353,7 @@ def _default_spell_rows() -> list[dict[str, object]]:
     return [
         {
             "definition_id": "fire_bolt",
-            "name": "Fire Bolt",
+            "name": "火焰箭",
             "attack_mode": "targeted_attack",
             "casting_ability": "intelligence",
             "spell_cost": 1,
@@ -358,12 +364,15 @@ def _default_spell_rows() -> list[dict[str, object]]:
             "area_radius_m": 0,
             "area_length_m": 0,
             "self_target_policy": "never",
-            "description": "A ranged fire cantrip that strikes a single visible target.",
-            "resolution_notes": "Single target spell attack in public turn.",
+            "description": "一道射向单体目标的炽热火焰箭，适合中距离压制。",
+            "resolution_notes": "单体法术攻击，适合公开回合中的直接点杀。",
+            "recommended_classes": "法师|术士|邪术师",
+            "min_level": 1,
+            "npc_priority": 80,
         },
         {
             "definition_id": "fireball",
-            "name": "Fireball",
+            "name": "火球术",
             "attack_mode": "aoe_attack",
             "casting_ability": "intelligence",
             "spell_cost": 1,
@@ -374,8 +383,11 @@ def _default_spell_rows() -> list[dict[str, object]]:
             "area_radius_m": 5,
             "area_length_m": 0,
             "self_target_policy": "can_include_self",
-            "description": "A classic explosive fire spell that fills a wide area.",
-            "resolution_notes": "If cast at point-blank range, the caster can be inside the blast radius.",
+            "description": "经典的爆裂火焰法术，会在一片区域内炸开灼热冲击。",
+            "resolution_notes": "范围法术；近距离施放时，施法者也可能被卷入爆炸范围。",
+            "recommended_classes": "法师|术士",
+            "min_level": 3,
+            "npc_priority": 95,
         },
     ]
 
@@ -384,7 +396,7 @@ def _default_war_art_rows() -> list[dict[str, object]]:
     return [
         {
             "definition_id": "power_strike",
-            "name": "Power Strike",
+            "name": "强力斩",
             "attack_mode": "targeted_attack",
             "scaling_ability": "strength",
             "martial_cost": 1,
@@ -396,12 +408,15 @@ def _default_war_art_rows() -> list[dict[str, object]]:
             "area_radius_m": 0,
             "area_length_m": 0,
             "self_target_policy": "never",
-            "description": "A heavy melee technique that converts momentum into extra damage.",
-            "resolution_notes": "Single-target martial technique with a flat damage rider.",
+            "description": "把全身冲势压进一击中的重型近战武技。",
+            "resolution_notes": "单体武技，命中后附带稳定的额外伤害。",
+            "recommended_classes": "战士|圣武士|野蛮人",
+            "min_level": 1,
+            "npc_priority": 85,
         },
         {
             "definition_id": "shield_bash",
-            "name": "Shield Bash",
+            "name": "盾击",
             "attack_mode": "targeted_attack",
             "scaling_ability": "strength",
             "martial_cost": 1,
@@ -413,12 +428,15 @@ def _default_war_art_rows() -> list[dict[str, object]]:
             "area_radius_m": 0,
             "area_length_m": 0,
             "self_target_policy": "never",
-            "description": "A shield-led strike used to stagger or create space.",
-            "resolution_notes": "Can carry shove or stagger flavor if the turn resolver supports it.",
+            "description": "以盾面抢位冲撞，常用于打乱对手重心或逼退目标。",
+            "resolution_notes": "适合表现推撞、逼退或打断节奏的武技。",
+            "recommended_classes": "战士|圣武士",
+            "min_level": 1,
+            "npc_priority": 70,
         },
         {
             "definition_id": "parry",
-            "name": "Parry",
+            "name": "格挡",
             "attack_mode": "targeted_attack",
             "scaling_ability": "dexterity",
             "martial_cost": 1,
@@ -430,12 +448,15 @@ def _default_war_art_rows() -> list[dict[str, object]]:
             "area_radius_m": 0,
             "area_length_m": 0,
             "self_target_policy": "never",
-            "description": "A defensive technique that turns timing and weapon control into protection.",
-            "resolution_notes": "Primarily defensive; resolver may translate this into AC or reaction flavor.",
+            "description": "以时机和兵器控制化解来袭攻势的防守型武技。",
+            "resolution_notes": "偏防御，可表现为格开、卸力或短暂压制对手攻势。",
+            "recommended_classes": "战士|游荡者|武僧",
+            "min_level": 1,
+            "npc_priority": 75,
         },
         {
             "definition_id": "sweeping_slash",
-            "name": "Sweeping Slash",
+            "name": "横扫斩",
             "attack_mode": "aoe_attack",
             "scaling_ability": "strength",
             "martial_cost": 1,
@@ -447,12 +468,15 @@ def _default_war_art_rows() -> list[dict[str, object]]:
             "area_radius_m": 0,
             "area_length_m": 3,
             "self_target_policy": "never",
-            "description": "A wide horizontal cut meant to pressure adjacent enemies.",
-            "resolution_notes": "Short-range martial sweep for clustered melee targets.",
+            "description": "大幅横斩逼迫近身多个目标后退的范围武技。",
+            "resolution_notes": "短距扇形横扫，适合面对贴身成群目标。",
+            "recommended_classes": "战士|野蛮人|游侠",
+            "min_level": 2,
+            "npc_priority": 78,
         },
         {
             "definition_id": "battle_focus",
-            "name": "Battle Focus",
+            "name": "战意凝神",
             "attack_mode": "targeted_attack",
             "scaling_ability": "wisdom",
             "martial_cost": 1,
@@ -464,8 +488,11 @@ def _default_war_art_rows() -> list[dict[str, object]]:
             "area_radius_m": 0,
             "area_length_m": 0,
             "self_target_policy": "always_include_self",
-            "description": "A disciplined breathing sequence that steadies the fighter under pressure.",
-            "resolution_notes": "Self-buff or concentration-like martial setup.",
+            "description": "通过呼吸与步伐调整，让自己在压力中重新稳住节奏。",
+            "resolution_notes": "偏自强化或蓄势类武技，适合表现专注与蓄力。",
+            "recommended_classes": "武僧|战士|游侠",
+            "min_level": 1,
+            "npc_priority": 65,
         },
     ]
 
@@ -685,6 +712,9 @@ def _load_spell_definitions() -> list[SpellDefinition]:
                 self_target_policy=_default_self_target_policy(row),  # type: ignore[arg-type]
                 description=row.get("description", "").strip(),
                 resolution_notes=row.get("resolution_notes", "").strip(),
+                recommended_classes=_parse_tags(row.get("recommended_classes", "")),
+                min_level=max(1, _parse_int(row.get("min_level", ""), 1)),
+                npc_priority=max(0, min(100, _parse_int(row.get("npc_priority", ""), 0))),
             )
         )
     return items
@@ -718,6 +748,9 @@ def _load_war_art_definitions() -> list[WarArtDefinition]:
                 self_target_policy=_default_self_target_policy(row),  # type: ignore[arg-type]
                 description=row.get("description", "").strip(),
                 resolution_notes=row.get("resolution_notes", "").strip(),
+                recommended_classes=_parse_tags(row.get("recommended_classes", "")),
+                min_level=max(1, _parse_int(row.get("min_level", ""), 1)),
+                npc_priority=max(0, min(100, _parse_int(row.get("npc_priority", ""), 0))),
             )
         )
     return items

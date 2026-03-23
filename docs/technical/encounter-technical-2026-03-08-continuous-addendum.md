@@ -1,34 +1,19 @@
-# Encounter Technical Addendum
+# Encounter Continuous Addendum Retired
 
-更新日期：2026-03-08
+更新时间：`2026-03-23`
 
-## 持续遭遇状态机
-- 状态从旧的 `queued/presented/resolved` 扩展为：
-  - `queued`
-  - `active`
-  - `escaped`
-  - `resolved`
-  - `expired`
-  - `invalidated`
-- 旧存档中的 `presented` 会在读取时兼容为 `active`。
+这份 2026-03-08 连续后台推进补丁文档已退役，不再代表当前实现。
 
-## 新增字段
-- `encounter_mode`
-- `npc_role_id`
-- `player_presence`
-- `termination_conditions`
-- `steps`
-- `scene_summary`
-- `latest_outcome_summary`
-- `background_tick_count`
-- `last_advanced_at`
+## 已退役内容
+- `escaped / away` 作为现行运行时状态
+- 玩家离场后后台持续推进遭遇
+- `background_tick` / `encounter_background` 事件作为正常玩法输出
+- `escape / rejoin` 作为正式遭遇流程
 
-## 新行为
-- 地图移动离开遭遇现场前会先做逃离检定。
-- 逃离成功后，遭遇保持可见并进入 `escaped + away`。
-- 玩家后续任何会推进时间的行为，都可能推动后台遭遇继续发展。
-- 玩家回到原遭遇地点后，可执行 `rejoin` 重新介入。
+## 现行文档
+- 主文档改为 [encounter-technical.md](./encounter-technical.md)
 
-## 前端展示
-- 遭遇改为并行栏，不再使用阻塞式遭遇模态。
-- Quest / Fate 仍保留更高优先级的阻塞行为。
+## 现行口径
+- 遭遇采用 `goal / scene_summary / secret`
+- `scene_summary` 是唯一公开局势摘要
+- 后台推进与逃离/重返仅作 legacy read，不再作现行设计

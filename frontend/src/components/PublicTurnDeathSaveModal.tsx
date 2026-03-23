@@ -56,7 +56,7 @@ export function PublicTurnDeathSaveModal({
         <div className="roll-modal-header modal-header-actions">
           <div>
             <h3>死亡豁免</h3>
-            <p>你当前只能说话，随后必须进行一次死亡豁免掷骰。</p>
+            <p>角色当前已进入濒死状态，必须进行一次死亡豁免检定。</p>
           </div>
           {onMinimize ? (
             <button type="button" onClick={onMinimize} disabled={phase === 'rolling' || phase === 'resolving'}>
@@ -71,7 +71,7 @@ export function PublicTurnDeathSaveModal({
             当前进度: 成功 {prompt.successes}/3, 失败 {prompt.failures}/3
           </p>
           <p>判定 DC: {prompt.dc}</p>
-          <p>重伤阈值: 单次再受伤达到 {prompt.severe_wound_threshold} HP 将直接死亡</p>
+          <p>重伤阈值: 单次再受伤达到 {prompt.severe_wound_threshold} HP 将直接死亡。</p>
         </section>
 
         <div className="roll-modal-stage">
@@ -90,7 +90,7 @@ export function PublicTurnDeathSaveModal({
           </button>
         </div>
 
-        {phase === 'ready' ? <p className="roll-modal-caption">点击骰子，进行这次死亡豁免。</p> : null}
+        {phase === 'ready' ? <p className="roll-modal-caption">点击骰子，开始本次死亡豁免。</p> : null}
         {phase === 'rolling' ? <p className="roll-modal-caption">骰子滚动中...</p> : null}
         {phase === 'resolving' ? <p className="roll-modal-caption">点数已锁定为 {rollValue ?? '?'}，正在结算死亡豁免...</p> : null}
         {phase === 'error' ? <p className="error">{errorMessage}</p> : null}
@@ -98,17 +98,17 @@ export function PublicTurnDeathSaveModal({
         {phase === 'resolved' && summaryText ? (
           <section className="roll-result-card">
             <p>{summaryText}</p>
-            <p>关闭后继续公开回合。</p>
+            <p>关闭后继续当前流程。</p>
           </section>
         ) : null}
 
-        {(phase === 'resolved' || phase === 'error') && (
+        {(phase === 'resolved' || phase === 'error') ? (
           <div className="actions">
             <button type="button" onClick={onClose}>
               {phase === 'resolved' ? '继续' : '重试'}
             </button>
           </div>
-        )}
+        ) : null}
       </div>
     </div>
   );

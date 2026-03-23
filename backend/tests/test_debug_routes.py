@@ -132,7 +132,7 @@ class DebugRouteTests(unittest.TestCase):
             return_value=_FakeSyncClient(
                 (
                     '{"item_definitions":[],"equipment_definitions":[],'
-                    '"spell_definitions":["{\\"definition_id\\":\\"lightning_bolt\\",\\"name\\":\\"Lightning Bolt\\",\\"attack_mode\\":\\"aoe_attack\\"}"],'
+                    '"spell_definitions":["{\\"definition_id\\":\\"lightning_bolt\\",\\"name\\":\\"闪电束\\",\\"attack_mode\\":\\"aoe_attack\\"}"],'
                     '"interactable_templates":[]}'
                 )
             ),
@@ -153,7 +153,7 @@ class DebugRouteTests(unittest.TestCase):
             return_value=_FakeSyncClient(
                 (
                     '{"item_definitions":["bad-row"],'
-                    '"spell_definitions":[{"definition_id":"spell_fireball","name":"Fireball","attack_mode":"aoe_attack"}]}'
+                    '"spell_definitions":[{"definition_id":"spell_fireball","name":"火焰爆裂","attack_mode":"aoe_attack"}]}'
                 )
             ),
         ):
@@ -177,11 +177,11 @@ class DebugRouteTests(unittest.TestCase):
             return_value=_FakeSyncClient(
                 (
                     '{"spell_definitions":['
-                    '{"id":"fire_bolt","name":"Fire Bolt","damage_type":"fire"},'
-                    '{"id":"fireball","name":"Fireball","damage_type":"fire"},'
-                    '{"id":"cure_wounds","name":"Cure Wounds","damage_type":"healing"},'
-                    '{"id":"mage_hand","name":"Mage Hand"},'
-                    '{"id":"shield","name":"Shield"}'
+                    '{"id":"fire_bolt","name":"火焰箭","damage_type":"fire"},'
+                    '{"id":"fireball","name":"火球术","damage_type":"fire"},'
+                    '{"id":"cure_wounds","name":"治疗伤口","damage_type":"healing"},'
+                    '{"id":"mage_hand","name":"法师之手"},'
+                    '{"id":"shield","name":"护盾术"}'
                     ']}'
                 )
             ),
@@ -203,8 +203,8 @@ class DebugRouteTests(unittest.TestCase):
             return_value=_FakeSyncClient(
                 (
                     '{"spell_definitions":['
-                    '"{\\"definition_id\\":\\"thunder_step\\",\\"name\\":\\"Thunder Step\\",\\"attack_mode\\":\\"aoe_attack\\"}",'
-                    '"{\\"spell_id\\":\\"counterspell\\",\\"name\\":\\"Counterspell\\"}"'
+                    '"{\\"definition_id\\":\\"thunder_step\\",\\"name\\":\\"雷霆步\\",\\"attack_mode\\":\\"aoe_attack\\"}",'
+                    '"{\\"spell_id\\":\\"counterspell\\",\\"name\\":\\"法术反制\\"}"'
                     ']}'
                 )
             ),
@@ -225,8 +225,8 @@ class DebugRouteTests(unittest.TestCase):
             return_value=_FakeSyncClient(
                 (
                     '{"spell_definitions":"['
-                    '{\\"definition_id\\":\\"misty_step\\",\\"name\\":\\"Misty Step\\",\\"attack_mode\\":\\"targeted_attack\\"},'
-                    '{\\"id\\":\\"guiding_bolt\\",\\"name\\":\\"Guiding Bolt\\",\\"attack_mode\\":\\"targeted_attack\\"}'
+                    '{\\"definition_id\\":\\"misty_step\\",\\"name\\":\\"雾步\\",\\"attack_mode\\":\\"targeted_attack\\"},'
+                    '{\\"id\\":\\"guiding_bolt\\",\\"name\\":\\"引导箭\\",\\"attack_mode\\":\\"targeted_attack\\"}'
                     ']"}'
                 )
             ),

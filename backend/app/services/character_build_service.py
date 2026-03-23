@@ -208,11 +208,11 @@ def _skill_options() -> dict[str, CharacterBuildChoiceOption]:
 def _war_art_options() -> dict[str, CharacterBuildChoiceOption]:
     _, war_arts, _, _ = _library_indexes()
     defaults = {
-        "power_strike": ("Power Strike", "A heavy melee technique that converts momentum into extra damage."),
-        "shield_bash": ("Shield Bash", "A shield-led strike used to stagger or create space."),
-        "parry": ("Parry", "A defensive technique that turns timing and weapon control into protection."),
-        "sweeping_slash": ("Sweeping Slash", "A wide horizontal cut meant to pressure adjacent enemies."),
-        "battle_focus": ("Battle Focus", "A disciplined breathing sequence that steadies the fighter under pressure."),
+        "power_strike": ("强力斩", "将重心与爆发力集中到一次沉重斩击中的武技。"),
+        "shield_bash": ("盾击", "以盾牌正面撞击目标，打乱其动作与站位。"),
+        "parry": ("格挡", "依靠时机与武器控制化解对手攻势的防御武技。"),
+        "sweeping_slash": ("横扫斩", "以大幅横斩压迫周边近距离敌人的群体武技。"),
+        "battle_focus": ("战意凝神", "通过呼吸、步伐与意志调整，将自身状态稳固到最佳节奏。"),
     }
     options: dict[str, CharacterBuildChoiceOption] = {}
     for war_art_id, (fallback_name, fallback_desc) in defaults.items():

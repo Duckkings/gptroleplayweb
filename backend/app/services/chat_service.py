@@ -14,8 +14,6 @@ from app.models.schemas import (
     AreaMoveSubZoneRequest,
     ChatRequest,
     EncounterActRequest,
-    EncounterEscapeRequest,
-    EncounterRejoinRequest,
     InventoryEquipRequest,
     InventoryConsumeRequest,
     InventoryGrantRequest,
@@ -38,13 +36,16 @@ from app.models.schemas import (
     PlayerUnequipRequest,
     RoleBuff,
     RoleRelationSetRequest,
+    TemplateLibraryDefinitionsRequest,
     TeamDebugGenerateRequest,
     TeamInviteRequest,
     TeamLeaveRequest,
     ToolEvent,
     Usage,
 )
+from app.services.actor_capability_service import build_role_capability_response
 from app.services.ai_adapter import build_completion_options, create_async_client
+from app.services.template_library_query_service import query_template_library_definitions
 from app.services.world_service import (
     _active_encounter_for_current_sub_zone,
     _build_scene_context_payload,
@@ -88,7 +89,7 @@ from app.services.world_service import (
     move_to_zone,
     save_current,
 )
-from app.services.encounter_service import act_on_encounter, advance_active_encounter_from_main_chat_in_save, advance_active_encounter_in_save, escape_encounter, get_encounter_debug_overview, rejoin_encounter
+from app.services.encounter_service import act_on_encounter, advance_active_encounter_from_main_chat_in_save, get_encounter_debug_overview
 from app.services.consistency_service import (
     build_entity_index,
     build_global_story_snapshot,
@@ -361,28 +362,6 @@ def route_main_turn_intent(session_id: str, parsed_intent: dict[str, object], co
             }
 
     if active_encounter is not None:
-        if active_encounter.player_presence == "away" and _contains_any_token(merged, ["回去", "返回遭遇", "重新加入", "rejoin"]):
-            result = rejoin_encounter(active_encounter.encounter_id, EncounterRejoinRequest(session_id=session_id, config=config))
-            tool_events.append(ToolEvent(tool_name="encounter_rejoin", ok=True, summary=f"rejoined {result.encounter_id}"))
-            return {
-                "handled": True,
-                "reply": Message(role="assistant", content=result.reply),
-                "tool_events": tool_events,
-                "scene_events": _encounter_scene_events(result.encounter, reply=result.reply),
-                "time_spent_min": 1,
-                "skip_encounter_main_chat_advance": True,
-            }
-        if active_encounter.player_presence == "engaged" and _contains_any_token(merged, ["离开", "逃离", "脱身", "撤退", "escape"]):
-            result = escape_encounter(active_encounter.encounter_id, EncounterEscapeRequest(session_id=session_id, config=config))
-            tool_events.append(ToolEvent(tool_name="encounter_escape", ok=True, summary=f"escape {'ok' if result.escape_success else 'failed'}"))
-            return {
-                "handled": True,
-                "reply": Message(role="assistant", content=result.reply),
-                "tool_events": tool_events,
-                "scene_events": _encounter_scene_events(result.encounter, reply=result.reply),
-                "time_spent_min": result.time_spent_min,
-                "skip_encounter_main_chat_advance": True,
-            }
         if active_encounter.player_presence == "engaged" and merged:
             result = act_on_encounter(
                 active_encounter.encounter_id,
@@ -860,36 +839,6 @@ def _tools_schema() -> list[dict[str, Any]]:
         {
             "type": "function",
             "function": {
-                "name": "encounter_escape",
-                "description": "Attempt to escape from the current active encounter.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "encounter_id": {"type": "string"},
-                    },
-                    "required": ["encounter_id"],
-                    "additionalProperties": False,
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "encounter_rejoin",
-                "description": "Rejoin an escaped encounter after returning to its original location.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "encounter_id": {"type": "string"},
-                    },
-                    "required": ["encounter_id"],
-                    "additionalProperties": False,
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
                 "name": "quest_track",
                 "description": "Set one active quest as the tracked quest.",
                 "parameters": {
@@ -967,6 +916,40 @@ def _tools_schema() -> list[dict[str, Any]]:
                 "name": "get_template_library_status",
                 "description": "Return current account template-library counts for item/equipment/interactable definitions.",
                 "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_template_library_definitions",
+                "description": "Return spell or war art definition rows from the current template library.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["spell", "war_art", "all"]},
+                        "definition_ids": {"type": "array", "items": {"type": "string"}},
+                        "recommended_class": {"type": "string"},
+                        "min_level": {"type": "integer", "minimum": 1, "maximum": 20},
+                        "for_role_id": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_role_capability_snapshot",
+                "description": "Return one role capability snapshot, including known spells, war arts, and current resources.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "role_id": {"type": "string"},
+                    },
+                    "required": ["role_id"],
+                    "additionalProperties": False,
+                },
             },
         },
         {
@@ -1110,11 +1093,11 @@ def _tools_schema() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "player_adjust_resource",
-                "description": "Consume/recover spell slots or stamina.",
+                "description": "Consume/recover spell slots, martial points, or stamina.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "kind": {"type": "string", "enum": ["spell_slot", "stamina"]},
+                        "kind": {"type": "string", "enum": ["spell_slot", "martial_point", "stamina"]},
                         "mode": {"type": "string", "enum": ["consume", "recover"], "default": "consume"},
                         "level": {"type": "integer", "minimum": 1, "maximum": 9},
                         "amount": {"type": "integer", "minimum": 1, "default": 1},
@@ -2020,64 +2003,6 @@ async def _handle_tool_call(payload: ChatRequest, tool_call: Any) -> tuple[dict[
             event,
         )
 
-    if tool_name == "encounter_escape":
-        try:
-            args = json.loads(arg_text)
-            encounter_id = str(args.get("encounter_id") or "").strip()
-            response = escape_encounter(
-                encounter_id,
-                EncounterEscapeRequest(
-                    session_id=payload.session_id,
-                ),
-            )
-            result = {"ok": True, **response.model_dump(mode="json")}
-            event = ToolEvent(
-                tool_name="encounter_escape",
-                ok=True,
-                summary=f"escape {'ok' if response.escape_success else 'failed'}",
-                payload={"encounter_id": response.encounter_id, "escape_success": response.escape_success},
-            )
-        except Exception as exc:
-            result = {"ok": False, "error": str(exc)}
-            event = ToolEvent(tool_name="encounter_escape", ok=False, summary=f"encounter escape failed: {exc}")
-        return (
-            {
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": json.dumps(result, ensure_ascii=False),
-            },
-            event,
-        )
-
-    if tool_name == "encounter_rejoin":
-        try:
-            args = json.loads(arg_text)
-            encounter_id = str(args.get("encounter_id") or "").strip()
-            response = rejoin_encounter(
-                encounter_id,
-                EncounterRejoinRequest(
-                    session_id=payload.session_id,
-                ),
-            )
-            result = {"ok": True, **response.model_dump(mode="json")}
-            event = ToolEvent(
-                tool_name="encounter_rejoin",
-                ok=True,
-                summary=f"rejoin {response.status}",
-                payload={"encounter_id": response.encounter_id},
-            )
-        except Exception as exc:
-            result = {"ok": False, "error": str(exc)}
-            event = ToolEvent(tool_name="encounter_rejoin", ok=False, summary=f"encounter rejoin failed: {exc}")
-        return (
-            {
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": json.dumps(result, ensure_ascii=False),
-            },
-            event,
-        )
-
     if tool_name == "quest_track":
         try:
             args = json.loads(arg_text)
@@ -2238,6 +2163,76 @@ async def _handle_tool_call(payload: ChatRequest, tool_call: Any) -> tuple[dict[
                 "role": "tool",
                 "tool_call_id": tool_call_id,
                 "content": json.dumps({"ok": True, **status}, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "get_template_library_definitions":
+        try:
+            args = json.loads(arg_text) if arg_text else {}
+        except Exception:
+            args = {}
+        save = get_current_save(default_session_id=payload.session_id)
+        req = TemplateLibraryDefinitionsRequest(
+            session_id=payload.session_id,
+            kind=str(args.get("kind") or "all"),  # type: ignore[arg-type]
+            definition_ids=[str(item).strip() for item in list(args.get("definition_ids") or []) if str(item).strip()],
+            recommended_class=(str(args.get("recommended_class") or "").strip() or None),
+            min_level=(int(args.get("min_level")) if args.get("min_level") is not None else None),
+            for_role_id=(str(args.get("for_role_id") or "").strip() or None),
+            limit=max(1, min(int(args.get("limit") or 20), 200)),
+        )
+        response = query_template_library_definitions(req, save=save)
+        event = ToolEvent(
+            tool_name="get_template_library_definitions",
+            ok=True,
+            summary="template library definitions returned",
+            payload={"spell_count": len(response.spell_definitions), "war_art_count": len(response.war_art_definitions)},
+        )
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps({"ok": True, **response.model_dump(mode="json")}, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "get_role_capability_snapshot":
+        try:
+            args = json.loads(arg_text) if arg_text else {}
+        except Exception:
+            args = {}
+        role_id = str(args.get("role_id") or "").strip()
+        if not role_id:
+            event = ToolEvent(tool_name="get_role_capability_snapshot", ok=False, summary="role_id is required")
+            return (
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps({"ok": False, "error": "role_id_required"}, ensure_ascii=False),
+                },
+                event,
+            )
+        save = get_current_save(default_session_id=payload.session_id)
+        try:
+            response = build_role_capability_response(save, session_id=payload.session_id, role_id=role_id)
+        except KeyError:
+            event = ToolEvent(tool_name="get_role_capability_snapshot", ok=False, summary="role not found")
+            return (
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps({"ok": False, "error": "role_not_found"}, ensure_ascii=False),
+                },
+                event,
+            )
+        event = ToolEvent(tool_name="get_role_capability_snapshot", ok=True, summary="role capability returned")
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps({"ok": True, **response.model_dump(mode="json")}, ensure_ascii=False),
             },
             event,
         )
@@ -2515,6 +2510,12 @@ async def _handle_tool_call(payload: ChatRequest, tool_call: Any) -> tuple[dict[
             if kind == "spell_slot":
                 req = PlayerSpellSlotAdjustRequest(level=max(1, int(args.get("level") or 1)), amount=amount)
                 updated = recover_spell_slots(payload.session_id, req) if mode == "recover" else consume_spell_slots(payload.session_id, req)
+            elif kind == "martial_point":
+                from app.models.schemas import PlayerMartialPointAdjustRequest
+                from app.services.world_service import consume_martial_points, recover_martial_points
+
+                req = PlayerMartialPointAdjustRequest(amount=amount)
+                updated = recover_martial_points(payload.session_id, req) if mode == "recover" else consume_martial_points(payload.session_id, req)
             else:
                 req = PlayerStaminaAdjustRequest(amount=amount)
                 updated = recover_stamina(payload.session_id, req) if mode == "recover" else consume_stamina(payload.session_id, req)
@@ -3144,20 +3145,6 @@ async def resolve_main_chat_turn(payload: ChatRequest) -> tuple[Message, Usage, 
             config=payload.config,
         )
         scene_events.extend(public_events)
-        background_advanced = advance_active_encounter_in_save(
-            save,
-            session_id=payload.session_id,
-            minutes_elapsed=time_spent_min,
-            config=payload.config,
-        )
-        if background_advanced is not None:
-            scene_events.append(
-                _new_scene_event(
-                    "encounter_background",
-                    background_advanced.latest_outcome_summary or background_advanced.scene_summary or background_advanced.description,
-                    metadata={"encounter_id": background_advanced.encounter_id, "encounter_title": background_advanced.title},
-                )
-            )
         archived_sub_zone_turn_id = _record_sub_zone_chat_turn(
             save,
             source="main_chat",

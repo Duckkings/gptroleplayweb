@@ -15,6 +15,7 @@ from app.services.ai_protocol_contract_service import (
     AI_PROVIDER_CALL_FAILED,
     EnumContractField,
     allow_protocol_repair,
+    has_ai_config,
     render_enum_pool_text,
     require_ai_config,
     validate_or_repair_json_payload,
@@ -366,6 +367,75 @@ def apply_active_encounter_situation_delta_in_save(
     if applied == 0:
         return []
 
+    if encounter.status == "active":
+        team_member = next((item for item in getattr(save.team_state, "members", []) if item.role_id == actor_role_id), None)
+        temp_npc = next((item for item in getattr(encounter, "temporary_npcs", []) or [] if item.encounter_npc_id == actor_role_id), None)
+        if team_member is not None:
+            step_kind = "team_reaction"
+            actor_type = "team"
+        elif temp_npc is not None:
+            step_kind = "temp_npc_action"
+            actor_type = "encounter_temp_npc"
+            actor_name = actor_name or temp_npc.name
+        elif actor_role_id:
+            step_kind = "npc_reaction"
+            actor_type = "npc"
+        else:
+            step_kind = "gm_update"
+            actor_type = "system"
+
+        assessment = _update_encounter_state_with_delta(encounter, applied)
+        concrete_summary = " ".join(str(summary or "").split()).strip()[:240] or encounter.scene_summary or encounter.description
+        encounter.scene_summary = concrete_summary
+        encounter.last_advanced_at = legacy._utc_now()
+        legacy._append_step(
+            encounter,
+            kind=step_kind,
+            actor_type=actor_type,
+            actor_id=actor_role_id,
+            actor_name=actor_name,
+            content=concrete_summary,
+        )
+        outcome_package, _ = legacy._finalize_encounter_if_needed(save, state, encounter, session_id=session_id)
+        legacy._append_game_log(
+            save,
+            session_id,
+            "encounter_situation_update",
+            concrete_summary,
+            {
+                "encounter_id": encounter.encounter_id,
+                "situation_value": encounter.situation_value,
+                "situation_delta": applied,
+            },
+        )
+        events = [
+            _new_scene_event(
+                "encounter_situation_update",
+                concrete_summary,
+                actor_role_id=actor_role_id,
+                actor_name=actor_name,
+                metadata={
+                    "encounter_id": encounter.encounter_id,
+                    "encounter_title": encounter.title,
+                    "situation_value": encounter.situation_value,
+                    "situation_delta": applied,
+                    "direction": assessment.direction,
+                    "trend": assessment.trend,
+                    "summary_basis": "ai_summary",
+                    "actor_type": actor_type,
+                },
+            )
+        ]
+        if outcome_package is not None:
+            events.append(
+                _new_scene_event(
+                    "encounter_resolution",
+                    outcome_package.narrative_summary or encounter.scene_summary or encounter.description,
+                    metadata={"encounter_id": encounter.encounter_id, "encounter_title": encounter.title, "status": encounter.status},
+                )
+            )
+        return events
+
     team_member = next((item for item in getattr(save.team_state, "members", []) if item.role_id == actor_role_id), None)
     temp_npc = next((item for item in getattr(encounter, "temporary_npcs", []) or [] if item.encounter_npc_id == actor_role_id), None)
     if team_member is not None:
@@ -667,15 +737,14 @@ def _apply_background_world_pushes(
 
 def advance_active_encounter_in_save(save, *, session_id: str, minutes_elapsed: int, config: ChatConfig | None = None) -> EncounterEntry | None:
     legacy = _legacy()
-    config = require_ai_config(config)
     state = legacy._state(save)
     encounter = legacy._current_active_encounter(state)
-    if encounter is None or encounter.player_presence != "away" or encounter.status not in {"active", "escaped"}:
+    if encounter is None:
         return None
     if minutes_elapsed <= 0:
         return None
-    if encounter.presented_at is None:
-        legacy._initialize_encounter_state(save, encounter)
+    # Retired: encounters no longer advance in the background while the player is elsewhere.
+    return None
 
     background_delta = -legacy._clamp(max(1, minutes_elapsed // 10), 1, 6)
     assessment = assess_situation_change(encounter.situation_value, background_delta, legacy._clamp(encounter.situation_value + background_delta, 0, 100))
@@ -781,6 +850,116 @@ def advance_active_encounter_from_main_chat_in_save(
         return []
     if encounter.presented_at is None:
         legacy._initialize_encounter_state(save, encounter)
+
+    def summarize_public_turn_scene() -> str:
+        fallback = " ".join((gm_narration or encounter.scene_summary or encounter.description).split()).strip()[:240]
+        if not config or not has_ai_config(config):
+            return fallback
+        try:
+            configured = require_ai_config(config)
+            team_members, visible_npcs = legacy._visible_participant_text(save, encounter)
+            prompt = prompt_table.render(
+                PromptKeys.ENCOUNTER_PUBLIC_TURN_SUMMARY_USER,
+                "",
+                title=encounter.title,
+                description=encounter.description,
+                goal=encounter.goal or "",
+                scene_summary=encounter.scene_summary or encounter.description,
+                gm_narration=gm_narration[:800],
+                player_text=player_text[:400],
+                direction="hold",
+                visible_npcs=visible_npcs,
+                team_members=team_members,
+                termination_conditions=legacy._termination_conditions_text(encounter),
+            )
+            client = create_sync_client(configured, client_cls=OpenAI)
+            resp = client.chat.completions.create(
+                model=configured.model,
+                **build_completion_options(configured),
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": prompt_table.get_text("encounter.public_turn.summary.system", "你只输出 JSON。")},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            parsed = legacy._extract_json_content((resp.choices[0].message.content or "").strip())
+            summary = " ".join(str(parsed.get("scene_summary") or "").split()).strip()[:240]
+            return summary or fallback
+        except Exception:
+            return fallback
+
+    if save.area_snapshot.clock is None:
+        save.area_snapshot.clock = legacy._default_world_clock()
+    save.area_snapshot.clock = legacy._advance_clock(save.area_snapshot.clock, max(1, time_spent_min))
+    parsed_intent = _parse_player_intent(player_text)
+    passive_turn = bool(parsed_intent.get("passive_turn"))
+    display_text = str(parsed_intent.get("display_text") or player_text).strip()
+    if passive_turn:
+        display_text = "【玩家旁观】玩家本轮选择观察与等待，不主动介入。"
+    legacy._append_step(
+        encounter,
+        kind="player_action",
+        actor_type="player",
+        actor_id=save.player_static_data.player_id,
+        actor_name=save.player_static_data.name,
+        content=display_text or gm_narration or "玩家继续应对当前遭遇。",
+    )
+    situation_delta = legacy._clamp(legacy._check_bonus_from_player_prompt(player_text), -20, 20)
+    assessment = assess_situation_change(encounter.situation_value, situation_delta, legacy._clamp(encounter.situation_value + situation_delta, 0, 100))
+    summary_text = summarize_public_turn_scene()
+    encounter.scene_summary = summary_text
+    encounter.last_advanced_at = legacy._utc_now()
+    legacy._append_step(encounter, kind="gm_update", content=summary_text)
+    _update_encounter_state_with_delta(encounter, situation_delta)
+    event_kind = "encounter_progress"
+    outcome_package, applied_outcome_summaries = legacy._finalize_encounter_if_needed(save, state, encounter, session_id=session_id)
+    if outcome_package is not None:
+        event_kind = "encounter_resolution"
+    else:
+        encounter.status = "active"
+        state.active_encounter_id = encounter.encounter_id
+    state.history.append(
+        EncounterResolution(
+            encounter_id=encounter.encounter_id,
+            player_prompt=display_text or player_text,
+            reply=summary_text,
+            time_spent_min=max(1, time_spent_min),
+            quest_updates=[f"{quest_id}:progress" for quest_id in encounter.related_quest_ids],
+            situation_delta=situation_delta,
+            situation_value_after=encounter.situation_value,
+            reputation_delta=(outcome_package.reputation_delta if outcome_package is not None else 0),
+            applied_outcome_summaries=applied_outcome_summaries,
+        )
+    )
+    state.history = state.history[-80:]
+    legacy._append_game_log(
+        save,
+        session_id,
+        ("encounter_resolved" if event_kind == "encounter_resolution" else "encounter_progress"),
+        summary_text,
+        {"encounter_id": encounter.encounter_id, "from_main_chat": True, "time_spent_min": time_spent_min},
+    )
+    legacy._touch_state(state)
+    return [
+        _new_scene_event(
+            "encounter_situation_update",
+            summary_text,
+            metadata={
+                "encounter_id": encounter.encounter_id,
+                "encounter_title": encounter.title,
+                "situation_value": encounter.situation_value,
+                "situation_delta": situation_delta,
+                "direction": assessment.direction,
+                "trend": assessment.trend,
+                "summary_basis": "ai_summary",
+            },
+        ),
+        _new_scene_event(
+            event_kind,
+            summary_text,
+            metadata={"encounter_id": encounter.encounter_id, "encounter_title": encounter.title, "status": encounter.status},
+        ),
+    ]
 
     parsed_intent = _parse_player_intent(player_text)
     passive_turn = bool(parsed_intent.get("passive_turn"))
@@ -1149,6 +1328,18 @@ def get_encounter_debug_overview(session_id: str) -> EncounterDebugOverviewRespo
     state = legacy._state(save)
     active = legacy._current_active_encounter(state)
     queued = legacy._pending_entries(state)
+    if active is not None:
+        summary = f"当前活跃遭遇: {active.title} / {active.status} / 局势 {active.situation_value}/100"
+    elif queued:
+        summary = f"待处理遭遇数: {len(queued)}"
+    else:
+        summary = "当前没有活跃或待处理遭遇。"
+    return EncounterDebugOverviewResponse(
+        session_id=session_id,
+        active_encounter=(legacy.serialize_public_encounter(active) if active is not None else None),
+        queued_encounters=[legacy.serialize_public_encounter(item) for item in queued],
+        summary=summary,
+    )
     if active is not None:
         summary = f"当前活跃遭遇: {active.title} / {active.status} / {active.player_presence} / 局势 {active.situation_value}/100"
     elif queued:

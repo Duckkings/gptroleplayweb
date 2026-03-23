@@ -29,6 +29,7 @@ from app.models.schemas import (
     Usage,
 )
 from app.services import chat_service as chat_legacy
+from app.services.chat_damage_flow_service import continue_main_chat_death_save
 from app.services import encounter_runtime_v2 as encounter_runtime
 from app.services import encounter_service as encounter_legacy
 from app.services import map_flow_service
@@ -81,6 +82,8 @@ _PLANNER_TOOLS: dict[str, str] = {
     "get_current_sub_zone": "Return the current sub-zone state.",
     "get_scene_interactables": "Return the current or target sub-zone scene interactables from the formal persistent interactable state.",
     "get_template_library_status": "Return the current account template-library status and definition counts.",
+    "get_template_library_definitions": "Return spell or war art definition rows from the current account template library.",
+    "get_role_capability_snapshot": "Return one role capability snapshot, including known spells, war arts, and current resources.",
     "spawn_scene_npc": "Create one persistent NPC in the current sub-zone when a new role must immediately join the current scene. Requires args.name.",
     "inventory_grant_item": "Grant one item into player or role inventory when the scene should hand out an item. Requires args.owner_type, args.item_id, and args.name.",
     "inventory_consume_item": "Consume one item from player or role inventory when the scene spends or uses a consumable. Requires args.owner_type and args.item_id.",
@@ -1526,36 +1529,6 @@ async def _run_deterministic_intent_route(payload: ChatRequest, parsed_intent: d
                 "current_zone_metric": moved.current_zone_metric,
             }
 
-    if active_encounter is not None:
-        if active_encounter.player_presence == "away" and chat_legacy._contains_any_token(merged, ["回去", "返回遭遇", "重新加入", "rejoin"]):
-            result = chat_legacy.rejoin_encounter(
-                active_encounter.encounter_id,
-                chat_legacy.EncounterRejoinRequest(session_id=payload.session_id, config=payload.config),
-            )
-            tool_events.append(ToolEvent(tool_name="encounter_rejoin", ok=True, summary=f"rejoined {result.encounter_id}"))
-            return {
-                "handled": True,
-                "reply": Message(role="assistant", content=result.reply),
-                "tool_events": tool_events,
-                "scene_events": chat_legacy._encounter_scene_events(result.encounter, reply=result.reply),
-                "time_spent_min": 1,
-                "skip_encounter_main_chat_advance": True,
-            }
-        if active_encounter.player_presence == "engaged" and chat_legacy._contains_any_token(merged, ["离开", "逃离", "脱身", "撤退", "escape"]):
-            result = chat_legacy.escape_encounter(
-                active_encounter.encounter_id,
-                chat_legacy.EncounterEscapeRequest(session_id=payload.session_id, config=payload.config),
-            )
-            tool_events.append(ToolEvent(tool_name="encounter_escape", ok=True, summary=f"escape {'ok' if result.escape_success else 'failed'}"))
-            return {
-                "handled": True,
-                "reply": Message(role="assistant", content=result.reply),
-                "tool_events": tool_events,
-                "scene_events": chat_legacy._encounter_scene_events(result.encounter, reply=result.reply),
-                "time_spent_min": result.time_spent_min,
-                "skip_encounter_main_chat_advance": True,
-            }
-
     if chat_legacy._contains_any_token(merged, ["装备", "穿上", "拿上", "equip", "卸下", "脱下", "unequip"]):
         owner = chat_legacy.InventoryOwnerRef(owner_type="player")
         owner_role = chat_legacy._find_named_role(save, merged, team_only=True)
@@ -2185,20 +2158,6 @@ def _apply_structured_main_turn_bundle_result(
             )
         )
 
-    advanced = encounter_runtime.advance_active_encounter_in_save(
-        save,
-        session_id=session_id,
-        minutes_elapsed=time_spent_min,
-        config=config,
-    )
-    if advanced is not None:
-        scene_events.append(
-            world._new_scene_event(
-                "encounter_background",
-                advanced.latest_outcome_summary or advanced.scene_summary or advanced.description,
-                metadata={"encounter_id": advanced.encounter_id, "encounter_title": advanced.title},
-            )
-        )
     return BundleApplyResult(scene_events=scene_events, pending_reaction=pending_reaction)
 
 
@@ -2339,20 +2298,6 @@ def _apply_structured_npc_bundle_result(
     scene_events: list[SceneEvent] = []
     if pending_reaction is not None:
         scene_events.append(reaction_check_service.build_reaction_trigger_event(pending_reaction))
-    advanced = encounter_runtime.advance_active_encounter_in_save(
-        save,
-        session_id=req.session_id,
-        minutes_elapsed=time_spent_min,
-        config=req.config,
-    )
-    if advanced is not None:
-        scene_events.append(
-            world._new_scene_event(
-                "encounter_background",
-                advanced.latest_outcome_summary or advanced.scene_summary or advanced.description,
-                metadata={"encounter_id": advanced.encounter_id},
-            )
-        )
     response_time_spent_min = max(1, time_spent_min)
     response = NpcChatResponse(
         session_id=req.session_id,
@@ -2486,20 +2431,6 @@ async def run_main_turn_stream(
                                 config=payload.config,
                             )
                         )
-                        advanced = encounter_runtime.advance_active_encounter_in_save(
-                            save,
-                            session_id=payload.session_id,
-                            minutes_elapsed=time_spent_min,
-                            config=None,
-                        )
-                        if advanced is not None:
-                            scene_events.append(
-                                world._new_scene_event(
-                                    "encounter_background",
-                                    advanced.latest_outcome_summary or advanced.scene_summary or advanced.description,
-                                    metadata={"encounter_id": advanced.encounter_id, "encounter_title": advanced.title},
-                                )
-                            )
                     else:
                         await _emit_phase(emit, "intent_route", "done", "requires model turn")
                         time_spent_min = world.apply_speech_time(payload.session_id, last_user.content, payload.config)
@@ -3336,6 +3267,8 @@ async def run_pending_turn_stream(
         raise ValueError("PENDING_TURN_NOT_FOUND")
     lock = get_session_lock(req.session_id)
     async with lock:
+        if state.flow_kind == "main_chat" and state.status == "awaiting_player_death_save":
+            return continue_main_chat_death_save(state, forced_dice_roll=req.forced_dice_roll)
         if state.flow_kind == "main_chat":
             payload = ChatRequest.model_validate(state.original_request)
             return await _continue_main_turn_state(

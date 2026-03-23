@@ -46,9 +46,7 @@
   EncounterCheckResponse,
   EncounterDebugOverviewResponse,
   EncounterEntry,
-  EncounterEscapeResponse,
   EncounterPendingResponse,
-  EncounterRejoinResponse,
   FateCurrentResponse,
   FateEvaluateResponse,
   FateGenerateResponse,
@@ -74,6 +72,7 @@
   PublicTurnAttackDefensePrompt,
   PublicTurnAttackPrompt,
   PublicTurnAttackResponseSubmission,
+  PublicTurnInformationCheckPrompt,
   PublicTurnOpposedPlanResponse,
   PublicTurnInteractionPrompt,
   PublicTurnOpposedPrompt,
@@ -108,8 +107,11 @@
   SceneEvent,
   StorySnapshotResponse,
   TeamMutationResponse,
+  TeamPrivateChatMemoryGenerateResponse,
   TeamChatResponse,
+  RoleCapabilityResponse,
   TeamStateResponse,
+  TemplateLibraryDefinitionsResponse,
   TemplateLibraryFillResponse,
   TemplateLibraryStatusResponse,
   LiveToolEvent,
@@ -1271,36 +1273,6 @@ export async function actEncounter(
   );
 }
 
-export async function escapeEncounter(
-  payload: { session_id: string; encounter_id: string; config?: AppConfig },
-  report?: DebugReporter,
-): Promise<EncounterEscapeResponse> {
-  return requestJson(
-    `/encounters/${encodeURIComponent(payload.encounter_id)}/escape`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: payload.session_id, config: payload.config }),
-    },
-    report,
-  );
-}
-
-export async function rejoinEncounter(
-  payload: { session_id: string; encounter_id: string },
-  report?: DebugReporter,
-): Promise<EncounterRejoinResponse> {
-  return requestJson(
-    `/encounters/${encodeURIComponent(payload.encounter_id)}/rejoin`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: payload.session_id }),
-    },
-    report,
-  );
-}
-
 export async function getEncounterDebugOverview(sessionId: string, report?: DebugReporter): Promise<EncounterDebugOverviewResponse> {
   return requestJson(`/encounters/debug/overview?session_id=${encodeURIComponent(sessionId)}`, { method: 'GET' }, report);
 }
@@ -1471,6 +1443,26 @@ export async function resolvePublicTurnOpposedCheck(
   );
 }
 
+export async function resolvePublicTurnInformationCheck(
+  payload: {
+    session_id: string;
+    prompt_id: string;
+    forced_dice_roll: number;
+    config?: AppConfig;
+  },
+  report?: DebugReporter,
+): Promise<PublicTurnResponse | PendingTurnContinueResponse> {
+  return requestJson(
+    '/public-turn/information-check',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
 export async function resolvePublicTurnAttackDefense(
   payload: {
     session_id: string;
@@ -1546,6 +1538,16 @@ async function consumePublicTurnStream(
       reply_so_far: string;
       scene_events_so_far: SceneEvent[];
       public_opposed_prompt: PublicTurnOpposedPrompt | null;
+      npc_role_id?: string | null;
+      public_turn_state?: PublicTurnState | null;
+      public_turn_presentation?: PublicTurnPresentation | null;
+    }) => void;
+    onInformationCheckRequired?: (payload: {
+      pending_turn_id: string;
+      flow_kind: PendingTurnContinueResponse['flow_kind'];
+      reply_so_far: string;
+      scene_events_so_far: SceneEvent[];
+      public_information_check_prompt: PublicTurnInformationCheckPrompt | null;
       npc_role_id?: string | null;
       public_turn_state?: PublicTurnState | null;
       public_turn_presentation?: PublicTurnPresentation | null;
@@ -1654,6 +1656,7 @@ async function consumePublicTurnStream(
           public_attack_prompt?: PublicTurnAttackPrompt | null;
           public_attack_defense_prompt?: PublicTurnAttackDefensePrompt | null;
           public_opposed_prompt?: PublicTurnOpposedPrompt | null;
+          public_information_check_prompt?: PublicTurnInformationCheckPrompt | null;
           death_save_prompt?: DeathSavePrompt | null;
           npc_role_id?: string | null;
           archived_sub_zone_turn_id?: string | null;
@@ -1711,6 +1714,18 @@ async function consumePublicTurnStream(
             reply_so_far: data.reply_so_far ?? '',
             scene_events_so_far: data.scene_events_so_far ?? [],
             public_opposed_prompt: data.public_opposed_prompt ?? null,
+            npc_role_id: data.npc_role_id ?? null,
+            public_turn_state: data.public_turn_state ?? null,
+            public_turn_presentation: data.presentation ?? (data as { public_turn_presentation?: PublicTurnPresentation | null }).public_turn_presentation ?? null,
+          });
+        } else if (event === 'information_check_required') {
+          terminalEventReceived = true;
+          handlers.onInformationCheckRequired?.({
+            pending_turn_id: data.pending_turn_id ?? '',
+            flow_kind: data.flow_kind ?? 'public_turn',
+            reply_so_far: data.reply_so_far ?? '',
+            scene_events_so_far: data.scene_events_so_far ?? [],
+            public_information_check_prompt: data.public_information_check_prompt ?? null,
             npc_role_id: data.npc_role_id ?? null,
             public_turn_state: data.public_turn_state ?? null,
             public_turn_presentation: data.presentation ?? (data as { public_turn_presentation?: PublicTurnPresentation | null }).public_turn_presentation ?? null,
@@ -2011,6 +2026,21 @@ export async function sendTeamChat(
 ): Promise<TeamChatResponse> {
   return requestJson(
     '/team/chat',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function generateTeammatePrivateChatMemory(
+  payload: { session_id: string; npc_role_id: string; source_dialogue_ids: string[]; config?: AppConfig },
+  report?: DebugReporter,
+): Promise<TeamPrivateChatMemoryGenerateResponse> {
+  return requestJson(
+    '/team/private-chat-memory/generate',
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2613,12 +2643,62 @@ export async function getTemplateLibraryStatus(
   return requestJson(`/debug/template-library/status?session_id=${encodeURIComponent(sessionId)}`, { method: 'GET' }, report);
 }
 
+export async function getTemplateLibraryDefinitions(
+  payload: {
+    session_id: string;
+    kind?: 'spell' | 'war_art';
+    definition_ids?: string[];
+    recommended_class?: string;
+    min_level?: number;
+    for_role_id?: string;
+    limit?: number;
+  },
+  report?: DebugReporter,
+): Promise<TemplateLibraryDefinitionsResponse> {
+  const params = new URLSearchParams({ session_id: payload.session_id });
+  if (payload.kind) params.set('kind', payload.kind);
+  for (const definitionId of payload.definition_ids ?? []) {
+    params.append('definition_ids', definitionId);
+  }
+  if (payload.recommended_class) params.set('recommended_class', payload.recommended_class);
+  if (typeof payload.min_level === 'number') params.set('min_level', String(payload.min_level));
+  if (payload.for_role_id) params.set('for_role_id', payload.for_role_id);
+  if (typeof payload.limit === 'number') params.set('limit', String(payload.limit));
+  return requestJson(`/template-library/definitions?${params.toString()}`, { method: 'GET' }, report);
+}
+
+export async function getRoleCapabilitySnapshot(
+  payload: { session_id: string; role_id: string },
+  report?: DebugReporter,
+): Promise<RoleCapabilityResponse> {
+  return requestJson(
+    `/roles/${encodeURIComponent(payload.role_id)}/capabilities?session_id=${encodeURIComponent(payload.session_id)}`,
+    { method: 'GET' },
+    report,
+  );
+}
+
 export async function fillTemplateLibrary(
   payload: { session_id: string; fill_scope?: 'all' | 'spells'; spell_fill_count?: number; config?: AppConfig },
   report?: DebugReporter,
 ): Promise<TemplateLibraryFillResponse> {
   return requestJson(
     '/debug/template-library/fill',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+    report,
+  );
+}
+
+export async function debugZeroPlayerHp(
+  payload: { session_id: string },
+  report?: DebugReporter,
+): Promise<PendingTurnContinueResponse> {
+  return requestJson(
+    '/debug/player/zero-hp',
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

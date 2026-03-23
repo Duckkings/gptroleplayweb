@@ -1,3 +1,5 @@
+import type { RefObject } from 'react';
+
 type Props = {
   title: string;
   actionLabel?: string;
@@ -11,6 +13,7 @@ type Props = {
   disabled?: boolean;
   speechOnly?: boolean;
   showSpeech?: boolean;
+  actionInputRef?: RefObject<HTMLTextAreaElement | null>;
   onActionChange: (value: string) => void;
   onSpeechChange: (value: string) => void;
   onSubmit: () => void;
@@ -29,6 +32,7 @@ export function PublicTurnActionComposer({
   disabled = false,
   speechOnly = false,
   showSpeech = true,
+  actionInputRef,
   onActionChange,
   onSpeechChange,
   onSubmit,
@@ -41,6 +45,7 @@ export function PublicTurnActionComposer({
           <label htmlFor="public-turn-action-input">{actionLabel}</label>
           <textarea
             id="public-turn-action-input"
+            ref={actionInputRef}
             value={actionValue}
             onChange={(event) => onActionChange(event.target.value)}
             placeholder={actionPlaceholder}

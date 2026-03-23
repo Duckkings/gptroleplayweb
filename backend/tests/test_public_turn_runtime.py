@@ -2349,7 +2349,7 @@ class PublicTurnRuntimeTests(unittest.TestCase):
             attack_basis_hint=str(assessment.get("attack_basis") or ""),
         )
         self.assertEqual(assessment["attack_definition_id"], "fireball")
-        self.assertEqual(assessment["attack_definition_name"], "Fireball")
+        self.assertEqual(assessment["attack_definition_name"], "火球术")
         self.assertEqual(assessment["candidate_target_names"], ["守卫", "布莱姆"])
         self.assertEqual(basis, "spell")
         self.assertIsNotNone(definition)

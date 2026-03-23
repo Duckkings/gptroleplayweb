@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from app.models.schemas import (
     PublicTurnNarrativeEntry,
     PublicTurnNarrationInputItem,
@@ -16,172 +18,109 @@ def _clean(text: str | None) -> str:
     return " ".join(str(text or "").split()).strip()
 
 
-def _contains_target(text: str, target_name: str | None) -> bool:
-    clean_text = _clean(text)
-    clean_target = _clean(target_name)
-    return bool(clean_text and clean_target and clean_target in clean_text)
-
-
-def _format_action_fragment(actor_name: str, action: str, target_name: str | None) -> str:
-    clean_action = _clean(action)
-    if not clean_action:
+def _clean_resolution_text(text: str | None) -> str:
+    clean = _clean(text)
+    if not clean:
         return ""
-    clean_target = _clean(target_name)
-    if clean_target and not _contains_target(clean_action, clean_target):
-        return f"{actor_name}对{clean_target}{clean_action}"
-    return f"{actor_name}{clean_action}"
+    if clean.startswith("```"):
+        clean = clean.removeprefix("```json").removeprefix("```JSON").removeprefix("```").strip()
+        if clean.endswith("```"):
+            clean = clean[:-3].strip()
+    try:
+        parsed = json.loads(clean)
+    except json.JSONDecodeError:
+        return clean
+    if isinstance(parsed, dict):
+        for key in ("outcome", "outcome_description", "outcome_narration", "summary", "text"):
+            value = parsed.get(key)
+            if isinstance(value, str) and value.strip():
+                return _clean(value)
+    return clean
 
 
-def _format_speech_fragment(actor_name: str, speech: str, speech_target_name: str | None, fallback_target_name: str | None = None) -> str:
-    clean_speech = _clean(speech)
-    if not clean_speech:
-        return ""
-    clean_target = _clean(speech_target_name) or _clean(fallback_target_name)
-    if clean_target:
-        return f'{actor_name}朝{clean_target}说：“{clean_speech}”'
-    return f'{actor_name}说：“{clean_speech}”'
-
-
-def _reaction_body(name: str, action: str | None, speech: str | None, focus_name: str | None, speech_target_name: str | None) -> str:
-    clean_action = _clean(action)
-    clean_speech = _clean(speech)
-    clean_focus = _clean(focus_name)
-    clean_speech_target = _clean(speech_target_name)
-    parts: list[str] = [name]
-    if clean_action:
-        if clean_focus and clean_focus not in clean_action:
-            parts.append(f"盯着{clean_focus}{clean_action}")
-        else:
-            parts.append(clean_action)
-    if clean_speech:
-        if clean_speech_target:
-            parts.append(f'朝{clean_speech_target}低声说：“{clean_speech}”')
-        else:
-            parts.append(f'低声说：“{clean_speech}”')
-    return "".join(parts).strip()
-
-
-def format_player_reaction_fragment(row: PublicTurnRelationDelta | PublicTurnTeamAffinityDelta) -> str:
-    focus_name = getattr(row, "reaction_focus_actor_name", None)
-    speech_target_name = getattr(row, "reaction_speech_target_name", None)
-    return _reaction_body(row.name, row.reaction_action, row.reaction_speech, focus_name, speech_target_name)
-
-
-def format_target_response_fragment(
-    target_name: str | None,
-    target_action: str | None,
-    target_speech: str | None,
-    target_speech_target_name: str | None,
-    target_response_kind: str = "explicit_response",
-) -> list[str]:
-    clean_target_name = _clean(target_name) or "对方"
-    fragments: list[str] = []
-    if target_response_kind == "no_action" and not _clean(target_action) and not _clean(target_speech):
-        return [f"{clean_target_name}没有采取任何行动"]
-    if _clean(target_action):
-        if _contains_target(str(target_action or ""), clean_target_name):
-            fragments.append(_clean(target_action))
-        else:
-            fragments.append(f"{clean_target_name}回应时{_clean(target_action)}")
-    if _clean(target_speech):
-        speech_target = _clean(target_speech_target_name)
-        if speech_target:
-            fragments.append(f'{clean_target_name}朝{speech_target}说：“{_clean(target_speech)}”')
-        else:
-            fragments.append(f'{clean_target_name}说：“{_clean(target_speech)}”')
-    return fragments
-
-
-def format_actor_action_fragment(entry: PublicTurnSettlementEntry | PublicTurnNarrationInputItem) -> str:
-    return _format_action_fragment(entry.actor_name, entry.action_summary, getattr(entry, "action_target_name", None))
-
-
-def format_actor_speech_fragment(entry: PublicTurnSettlementEntry | PublicTurnNarrationInputItem) -> str:
-    return _format_speech_fragment(
-        entry.actor_name,
-        entry.speech_text,
-        getattr(entry, "speech_target_name", None),
-        getattr(entry, "action_target_name", None),
-    )
-
-
-def format_pause_preview_fragment(item: PublicTurnNarrationInputItem) -> str:
-    parts: list[str] = []
-    action_fragment = format_actor_action_fragment(item)
-    if action_fragment:
-        parts.append(action_fragment)
-    speech_fragment = format_actor_speech_fragment(item)
-    if speech_fragment:
-        parts.append(speech_fragment)
-    parts.extend(
-        format_target_response_fragment(
-            item.opposed_target_name,
-            item.opposed_target_action,
-            item.opposed_target_speech,
-            item.opposed_target_speech_target_name,
-            "explicit_response",
-        )
-    )
-    return " ".join(part for part in parts if part).strip()
+def _format_actor_action_fallback(entry: PublicTurnSettlementEntry) -> str:
+    actor_action = _clean(entry.action_summary)
+    actor_speech = _clean(entry.speech_text)
+    speech_target = _clean(entry.speech_target_name)
+    if actor_action and actor_speech and speech_target:
+        return f"{actor_action}，朝{speech_target}说：“{actor_speech}”"
+    if actor_action and actor_speech:
+        return f'{actor_action}，“{actor_speech}”'
+    if actor_action:
+        return actor_action
+    if actor_speech and speech_target:
+        return f'{entry.actor_name}朝{speech_target}说：“{actor_speech}”'
+    if actor_speech:
+        return f'{entry.actor_name}说：“{actor_speech}”'
+    return ""
 
 
 def _format_opposed_check_fragment(entry: PublicTurnSettlementEntry) -> str:
     check = entry.check
     if check is None or check.resolution_rule != "opposed_actor":
         return ""
-    actor_name = _clean(entry.actor_name)
-    target_name = _clean(check.target_name or entry.opposed_target_name or "对方")
-    if not actor_name:
-        return ""
-    if check.success:
-        if check.critical == "critical_success":
-            return f"正面对抗的结果立刻分了出来，{actor_name}当场压过了{target_name}。"
-        return f"这次正面对抗里，{actor_name}压过了{target_name}的回应。"
-    if check.critical == "critical_failure":
-        return f"这次正面对抗里，{actor_name}明显慢了一拍，被{target_name}当场顶了回去。"
-    return f"这次正面对抗里，{actor_name}没能压过{target_name}的回应。"
+    target_name = _clean(check.target_name or entry.opposed_target_name or "对手")
+    response_parts = [_clean(entry.opposed_target_action)]
+    target_speech = _clean(entry.opposed_target_speech)
+    if target_speech:
+        response_parts.append(f'“{target_speech}”')
+    outcome = f"{entry.actor_name}在对抗中压过了{target_name}。" if check.success else f"{entry.actor_name}没能压过{target_name}的回应。"
+    return " ".join(part for part in [*response_parts, outcome] if part)
+
+
+def format_player_reaction_fragment(row: PublicTurnRelationDelta | PublicTurnTeamAffinityDelta) -> str:
+    parts = [row.name]
+    reaction_text = _clean(getattr(row, "reaction_text", ""))
+    if reaction_text:
+        parts.append(reaction_text)
+    else:
+        reaction_action = _clean(getattr(row, "reaction_action", ""))
+        reaction_speech = _clean(getattr(row, "reaction_speech", ""))
+        if reaction_action:
+            parts.append(reaction_action)
+        if reaction_speech:
+            parts.append(f'“{reaction_speech}”')
+    return "，".join(part for part in parts if part).strip()
+
+
+def format_pause_preview_fragment(item: PublicTurnNarrationInputItem) -> str:
+    summary = _clean_resolution_text(item.gm_resolution_summary)
+    if summary:
+        return summary
+    target_name = _clean(item.opposed_target_name or item.action_target_name or item.speech_target_name)
+    if target_name:
+        return f"{item.actor_name}已向{target_name}发起交互，等待回应。"
+    return f"{item.actor_name}的行动正在结算。"
 
 
 def build_settlement_fragment(entry: PublicTurnSettlementEntry) -> str:
     if entry.entry_kind == "gm_push":
         parts: list[str] = []
-        gm_text = _clean(entry.gm_resolution_summary)
-        if gm_text:
-            parts.append(gm_text)
+        summary = _clean_resolution_text(entry.gm_resolution_summary)
+        if summary:
+            parts.append(summary)
         result = entry.gm_push_result
         if result is not None:
             label = _clean(result.outcome_label) or result.outcome_kind
-            parts.append(f"d6={result.roll_d6}: {label}")
-            change_text = _clean(result.environment_change_text)
-            if change_text:
-                parts.append(change_text)
-            if result.spawned_npc_name:
-                parts.append(f"{result.spawned_npc_name} joins the scene.")
-        return " ".join(parts).strip()
+            parts.append(f"d6={result.roll_d6}，结果：{label}")
+            if _clean(result.environment_change_text):
+                parts.append(_clean(result.environment_change_text))
+            if _clean(result.spawned_npc_name):
+                parts.append(f"{_clean(result.spawned_npc_name)}进入了场景。")
+        return " ".join(part for part in parts if part).strip()
 
+    summary = _clean_resolution_text(entry.gm_resolution_summary)
     parts: list[str] = []
-    action_fragment = format_actor_action_fragment(entry)
-    if action_fragment:
-        parts.append(action_fragment)
-    speech_fragment = format_actor_speech_fragment(entry)
-    if speech_fragment:
-        parts.append(speech_fragment)
-    parts.extend(
-        format_target_response_fragment(
-            entry.opposed_target_name,
-            entry.opposed_target_action,
-            entry.opposed_target_speech,
-            entry.opposed_target_speech_target_name,
-            entry.target_response_kind,
-        )
-    )
-    resolution_fragment = _clean(entry.gm_resolution_summary)
-    if resolution_fragment:
-        parts.append(resolution_fragment)
+    if summary:
+        parts.append(summary)
     else:
-        opposed_check_fragment = _format_opposed_check_fragment(entry)
-        if opposed_check_fragment:
-            parts.append(opposed_check_fragment)
+        actor_fragment = _format_actor_action_fallback(entry)
+        opposed_fragment = _format_opposed_check_fragment(entry)
+        if actor_fragment:
+            parts.append(actor_fragment)
+        if opposed_fragment:
+            parts.append(opposed_fragment)
+
     if entry.actor_type == "player":
         for row in entry.relation_deltas:
             fragment = format_player_reaction_fragment(row)
@@ -191,10 +130,14 @@ def build_settlement_fragment(entry: PublicTurnSettlementEntry) -> str:
             fragment = format_player_reaction_fragment(row)
             if fragment:
                 parts.append(fragment)
+
     return " ".join(part for part in parts if part).strip()
 
 
-def build_round_narration_from_settlements(entries: list[PublicTurnSettlementEntry], preview_entries: list[PublicTurnNarrativeEntry] | None = None) -> str:
+def build_round_narration_from_settlements(
+    entries: list[PublicTurnSettlementEntry],
+    preview_entries: list[PublicTurnNarrativeEntry] | None = None,
+) -> str:
     fragments = [build_settlement_fragment(entry) for entry in entries]
     fragments.extend(_clean(item.text) for item in (preview_entries or []) if _clean(item.text))
     return "\n\n".join(fragment for fragment in fragments if fragment).strip()
@@ -257,7 +200,9 @@ def sync_round_narration_from_settlements(round_state: PublicTurnRound) -> None:
             status = PublicTurnRoundNarrationStatus.PAUSED
         else:
             status = PublicTurnRoundNarrationStatus.READY
-    else:
+    elif round_state.awaiting_player_action:
         status = PublicTurnRoundNarrationStatus.PENDING
-    round_state.narrative_status = status
+    else:
+        status = PublicTurnRoundNarrationStatus.EMPTY
     round_state.round_narration_status = status
+    round_state.narrative_status = status

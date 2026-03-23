@@ -23,11 +23,14 @@ type Props = {
   onOpenInventory: () => void;
   onOpenProfile: () => void;
   onRetain: () => void;
+  memorySummaryBusy: boolean;
+  memorySummaryAvailable: boolean;
+  onGenerateMemorySummary: () => void;
   onClose: () => void;
 };
 
 const ROLE_STATUS_LABELS: Record<Exclude<RoleActionStatus, 'free_action'>, string> = {
-  death_saving: '濒死',
+  death_saving: '死亡豁免',
   dead: '死亡',
   unable_to_act: '无法行动',
 };
@@ -63,6 +66,9 @@ export function TeammateChatModal({
   onOpenInventory,
   onOpenProfile,
   onRetain,
+  memorySummaryBusy,
+  memorySummaryAvailable,
+  onGenerateMemorySummary,
   onClose,
 }: Props) {
   if (!open) return null;
@@ -98,7 +104,7 @@ export function TeammateChatModal({
                       {sheet.hit_points.temporary > 0 ? ` (+${sheet.hit_points.temporary})` : ''}
                     </p>
                     <p>法术位 {sumSpellSlots(sheet.spell_slots_current)}/{sumSpellSlots(sheet.spell_slots_max)}</p>
-                    <p>武技位 {sheet.martial_points_current}/{sheet.martial_points_maximum}</p>
+                    <p>武技点 {sheet.martial_points_current}/{sheet.martial_points_maximum}</p>
                     <p>健谈值 {role.talkative_current}/{role.talkative_maximum}</p>
                     <p>好感度 {typeof affinity === 'number' ? affinity : '-'}</p>
                     <p>信任度 {typeof trust === 'number' ? trust : '-'}</p>
@@ -127,14 +133,17 @@ export function TeammateChatModal({
                 <button type="button" onClick={onRetain} disabled={!role || Boolean(role?.retained_id)}>
                   {role?.retained_id ? '已保留' : '保留'}
                 </button>
-                <button type="button" onClick={onClose}>
+                <button type="button" onClick={onGenerateMemorySummary} disabled={!memorySummaryAvailable || memorySummaryBusy || busy}>
+                  {memorySummaryBusy ? '生成中...' : '生成记忆摘要'}
+                </button>
+                <button type="button" onClick={onClose} disabled={busy || memorySummaryBusy}>
                   关闭
                 </button>
               </div>
             </header>
 
             <section className="messages teammate-chat-messages">
-              {messages.length === 0 && <p className="hint">你已接近该队友，可输入动作或语言开始交互。</p>}
+              {messages.length === 0 && <p className="hint">你已接近该队友，可以只输入动作或只输入语言开始交互。</p>}
               {messages.map((message, index) => (
                 <article key={`${message.role}_${index}`} className={`msg ${message.role}`}>
                   <strong>{message.role === 'user' ? '你' : message.role === 'assistant' ? 'GM' : 'System'}</strong>
@@ -147,7 +156,7 @@ export function TeammateChatModal({
             <footer className="composer teammate-chat-composer">
               <div className="actions">
                 <button type="button" onClick={onRetry} disabled={busy}>
-                  重新生成
+                  重新填回
                 </button>
               </div>
 

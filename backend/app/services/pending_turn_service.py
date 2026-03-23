@@ -27,6 +27,7 @@ def load_pending_turn(session_id: str) -> PendingTurnState | None:
         "awaiting_opposed",
         "awaiting_player_attack_response",
         "awaiting_player_attack_defense",
+        "awaiting_player_death_save",
         "awaiting_protocol_repair",
     }:
         return None

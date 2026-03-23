@@ -377,6 +377,22 @@ def _issues_for_fate(save, fate: FateLine | None) -> list[ConsistencyIssue]:
 def collect_consistency_issues(save) -> list[ConsistencyIssue]:
     issues: list[ConsistencyIssue] = []
     ensure_world_state(save)
+    player_sheet = save.player_static_data.dnd5e_sheet
+    if (
+        int(player_sheet.hit_points.current or 0) <= 0
+        and player_sheet.death_state.life_status == "healthy"
+        and not bool(player_sheet.is_dead)
+    ):
+        issues.append(
+            ConsistencyIssue(
+                issue_id=_new_id("ci"),
+                severity="warning",
+                issue_type="invalid_player_hp_death_state",
+                entity_type="player",
+                entity_id=save.player_static_data.player_id,
+                message="玩家生命值已归零，但死亡状态仍为 healthy。",
+            )
+        )
     issues.extend(_issues_for_fate(save, save.fate_state.current_fate))
     for quest in save.quest_state.quests:
         issues.extend(_issues_for_quest(save, quest))
@@ -405,6 +421,32 @@ def collect_consistency_issues(save) -> list[ConsistencyIssue]:
 def reconcile_consistency(save, *, session_id: str, reason: str = "manual") -> tuple[list[ConsistencyIssue], bool]:
     changed = False
     world_state = ensure_world_state(save)
+    player_sheet = save.player_static_data.dnd5e_sheet
+
+    if (
+        int(player_sheet.hit_points.current or 0) <= 0
+        and player_sheet.death_state.life_status == "healthy"
+        and not bool(player_sheet.is_dead)
+    ):
+        player_sheet.hit_points.current = max(1, int(player_sheet.hit_points.maximum or 1))
+        player_sheet.hit_points.temporary = 0
+        player_sheet.death_state.life_status = "healthy"
+        player_sheet.death_state.death_save_successes = 0
+        player_sheet.death_state.death_save_failures = 0
+        player_sheet.role_action_status = "free_action"
+        player_sheet.status_flags = [
+            flag
+            for flag in list(player_sheet.status_flags or [])
+            if flag not in {"dying", "unconscious", "prone", "dead", "stable", "downed"}
+        ]
+        append_consistency_log(
+            save,
+            session_id,
+            "consistency_repaired_invalid_player_hp_state",
+            "检测到玩家 HP=0 但死亡状态无效，已恢复到有效满血状态。",
+            {"reason": reason},
+        )
+        changed = True
 
     valid_role_ids = {item.role_id for item in save.role_pool}
     for role in save.role_pool:

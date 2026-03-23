@@ -20,6 +20,7 @@ export type PartyPreviewEntry = {
 
 type Props = {
   entries: PartyPreviewEntry[];
+  damagedIds?: ReadonlySet<string>;
   onOpenPlayerPanel: () => void;
   onOpenTeamPanel: () => void;
   onSelectPlayer: () => void;
@@ -40,6 +41,7 @@ function initialsFromName(name: string): string {
 
 export function PartyPreviewRail({
   entries,
+  damagedIds,
   onOpenPlayerPanel,
   onOpenTeamPanel,
   onSelectPlayer,
@@ -65,18 +67,16 @@ export function PartyPreviewRail({
       <div className="party-preview-list">
         {entries.map((entry) => {
           const backgroundImage = entry.portraitAssetId ? `url(${getCharacterBuildAssetUrl(entry.portraitAssetId)})` : undefined;
-          const actionLabel = entry.kind === 'player' ? '打开玩家快捷操作' : `打开 ${entry.name} 的队友单聊`;
-          const statusLabel =
-            entry.roleActionStatus === 'free_action' ? null : ROLE_STATUS_LABELS[entry.roleActionStatus];
+          const actionLabel = entry.kind === 'player' ? '打开玩家快捷操作' : `打开 ${entry.name} 的队友面板`;
+          const statusLabel = entry.roleActionStatus === 'free_action' ? null : ROLE_STATUS_LABELS[entry.roleActionStatus];
+          const isDamaged = Boolean(damagedIds?.has(entry.id));
 
           return (
             <button
               key={entry.id}
               type="button"
-              className={`party-card ${entry.loading ? 'is-loading' : ''}`}
-              onClick={() =>
-                entry.kind === 'player' ? onSelectPlayer() : onSelectTeammate(entry.id, entry.name)
-              }
+              className={`party-card ${entry.loading ? 'is-loading' : ''} ${isDamaged ? 'is-damaged' : ''}`.trim()}
+              onClick={() => (entry.kind === 'player' ? onSelectPlayer() : onSelectTeammate(entry.id, entry.name))}
               aria-label={actionLabel}
             >
               {backgroundImage ? (
@@ -88,20 +88,21 @@ export function PartyPreviewRail({
               <div className="party-card-overlay">
                 <div className="party-card-topline">
                   <span className="party-card-kind">{entry.kind === 'player' ? '玩家' : '队友'}</span>
-                  {entry.retained && <span className="party-card-tag">已保留</span>}
-                  {statusLabel && <span className="party-card-tag is-warning">{statusLabel}</span>}
+                  {entry.retained ? <span className="party-card-tag">已保留</span> : null}
+                  {statusLabel ? <span className="party-card-tag is-warning">{statusLabel}</span> : null}
+                  {isDamaged ? <span className="party-card-tag is-danger">受伤</span> : null}
                 </div>
 
                 <strong className="party-card-name">{entry.name}</strong>
 
                 <div className="party-card-stats">
                   <span>HP {entry.hpCurrent}/{entry.hpMax}</span>
-                  <span>法 {entry.spellSlotsCurrent}/{entry.spellSlotsMax}</span>
-                  <span>武 {entry.martialPointsCurrent}/{entry.martialPointsMax}</span>
-                  {entry.tempHp > 0 && <span>+{entry.tempHp} 临时</span>}
+                  <span>法术位 {entry.spellSlotsCurrent}/{entry.spellSlotsMax}</span>
+                  <span>武技点 {entry.martialPointsCurrent}/{entry.martialPointsMax}</span>
+                  {entry.tempHp > 0 ? <span>+{entry.tempHp} 临时</span> : null}
                 </div>
 
-                {entry.loading && <p className="hint">正在补载角色数据...</p>}
+                {entry.loading ? <p className="hint">正在补载角色数据...</p> : null}
               </div>
             </button>
           );

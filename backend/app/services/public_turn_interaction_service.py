@@ -683,7 +683,12 @@ def build_ai_interaction_response(
     resolved_action_target_name = action_target.name if action_target is not None else _clean_line(str(payload.get("target_label") or "")) or None
     consent_state, contest_state = default_interaction_response_states(
         source_world_impact_type=source_world_impact_type,
-        response_world_impact_type=PublicTurnWorldImpactType(str(payload.get("world_impact_type") or PublicTurnWorldImpactType.NON_WORLD.value)),
+        response_world_impact_type=infer_world_impact_type(
+            action_type=str(payload.get("action_type") or ""),
+            action_summary=action_summary,
+            speech_text=speech_text,
+            explicit_value=str(payload.get("world_impact_type") or ""),
+        ),
         source_actor_id=source_actor_id,
         source_actor_name=source_actor_name,
         response_target_actor_id=resolved_action_target_actor_id,
@@ -700,7 +705,12 @@ def build_ai_interaction_response(
         action_target_actor_id=resolved_action_target_actor_id,
         action_target_name=resolved_action_target_name,
         action_target_kind=(action_target.actor_type if action_target is not None else None),
-        world_impact_type=PublicTurnWorldImpactType(str(payload.get("world_impact_type") or PublicTurnWorldImpactType.NON_WORLD.value)),
+        world_impact_type=infer_world_impact_type(
+            action_type=str(payload.get("action_type") or ""),
+            action_summary=action_summary,
+            speech_text=speech_text,
+            explicit_value=str(payload.get("world_impact_type") or ""),
+        ),
         consent_state=(consent_state if parsed_consent == "not_applicable" else parsed_consent),
         contest_state=(contest_state if parsed_contest == "not_applicable" else parsed_contest),
     )
@@ -778,7 +788,12 @@ def classify_player_interaction_response(
         target_label = source_actor_name
     consent_state, contest_state = default_interaction_response_states(
         source_world_impact_type=source_world_impact_type,
-        response_world_impact_type=PublicTurnWorldImpactType(str(parsed.get("world_impact_type") or PublicTurnWorldImpactType.NON_WORLD.value)),
+        response_world_impact_type=infer_world_impact_type(
+            action_type="check",
+            action_summary=clean_action,
+            speech_text=clean_speech,
+            explicit_value=str(parsed.get("world_impact_type") or ""),
+        ),
         source_actor_id=source_actor_id,
         source_actor_name=source_actor_name,
         response_target_actor_id=None,
@@ -793,7 +808,12 @@ def classify_player_interaction_response(
         speech_text=clean_speech,
         speech_target_label=speech_target_label,
         target_label=target_label,
-        world_impact_type=PublicTurnWorldImpactType(str(parsed.get("world_impact_type") or PublicTurnWorldImpactType.NON_WORLD.value)),
+        world_impact_type=infer_world_impact_type(
+            action_type="check",
+            action_summary=clean_action,
+            speech_text=clean_speech,
+            explicit_value=str(parsed.get("world_impact_type") or ""),
+        ),
         consent_state=(consent_state if parsed_consent == "not_applicable" else parsed_consent),
         contest_state=(contest_state if parsed_contest == "not_applicable" else parsed_contest),
     )

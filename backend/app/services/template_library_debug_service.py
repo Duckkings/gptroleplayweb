@@ -123,13 +123,36 @@ def _slugify_identifier(value: Any) -> str:
     return text.strip("_")
 
 
+def _looks_non_chinese_visible_text(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    ascii_letters = len(re.findall(r"[A-Za-z]", text))
+    chinese_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
+    return ascii_letters > 0 and chinese_chars == 0
+
+
+def _normalize_recommended_classes(value: Any) -> str:
+    if isinstance(value, list):
+        items = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        items = [item.strip() for item in str(value or "").replace(",", "|").split("|") if item.strip()]
+    return "|".join(items[:6])
+
+
 def _normalize_spell_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     normalized_rows: list[dict[str, Any]] = []
     for row in rows:
         definition_id = str(row.get("definition_id") or row.get("id") or row.get("spell_id") or "").strip()
         if not definition_id:
-            definition_id = _slugify_identifier(row.get("name"))
+            continue
+        definition_id = _slugify_identifier(definition_id)
         if not definition_id:
+            continue
+        name = str(row.get("name") or "").strip()
+        description = str(row.get("description") or "").strip()
+        resolution_notes = str(row.get("resolution_notes") or row.get("notes") or "").strip()
+        if not name or _looks_non_chinese_visible_text(name) or _looks_non_chinese_visible_text(description) or _looks_non_chinese_visible_text(resolution_notes):
             continue
         attack_mode = str(row.get("attack_mode") or "").strip().lower()
         area_shape = str(row.get("area_shape") or "").strip().lower()
@@ -143,7 +166,7 @@ def _normalize_spell_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         normalized_rows.append(
             {
                 "definition_id": definition_id,
-                "name": str(row.get("name") or definition_id).strip(),
+                "name": name,
                 "attack_mode": attack_mode,
                 "casting_ability": casting_ability,
                 "spell_cost": row.get("spell_cost", 1),
@@ -158,8 +181,11 @@ def _normalize_spell_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     if str(row.get("self_target_policy") or "").strip().lower() in {"never", "can_include_self", "always_include_self"}
                     else ("can_include_self" if attack_mode == "aoe_attack" else "never")
                 ),
-                "description": str(row.get("description") or "").strip(),
-                "resolution_notes": str(row.get("resolution_notes") or row.get("notes") or "").strip(),
+                "description": description,
+                "resolution_notes": resolution_notes,
+                "recommended_classes": _normalize_recommended_classes(row.get("recommended_classes")),
+                "min_level": row.get("min_level", 1),
+                "npc_priority": row.get("npc_priority", 0),
             }
         )
     return normalized_rows
@@ -170,8 +196,14 @@ def _normalize_war_art_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for row in rows:
         definition_id = str(row.get("definition_id") or row.get("id") or row.get("war_art_id") or "").strip()
         if not definition_id:
-            definition_id = _slugify_identifier(row.get("name"))
+            continue
+        definition_id = _slugify_identifier(definition_id)
         if not definition_id:
+            continue
+        name = str(row.get("name") or "").strip()
+        description = str(row.get("description") or "").strip()
+        resolution_notes = str(row.get("resolution_notes") or row.get("notes") or "").strip()
+        if not name or _looks_non_chinese_visible_text(name) or _looks_non_chinese_visible_text(description) or _looks_non_chinese_visible_text(resolution_notes):
             continue
         attack_mode = str(row.get("attack_mode") or "").strip().lower()
         area_shape = str(row.get("area_shape") or "").strip().lower()
@@ -183,7 +215,7 @@ def _normalize_war_art_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         normalized_rows.append(
             {
                 "definition_id": definition_id,
-                "name": str(row.get("name") or definition_id).strip(),
+                "name": name,
                 "attack_mode": attack_mode,
                 "scaling_ability": scaling_ability,
                 "martial_cost": row.get("martial_cost", 1),
@@ -199,8 +231,11 @@ def _normalize_war_art_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     if str(row.get("self_target_policy") or "").strip().lower() in {"never", "can_include_self", "always_include_self"}
                     else "never"
                 ),
-                "description": str(row.get("description") or "").strip(),
-                "resolution_notes": str(row.get("resolution_notes") or row.get("notes") or "").strip(),
+                "description": description,
+                "resolution_notes": resolution_notes,
+                "recommended_classes": _normalize_recommended_classes(row.get("recommended_classes")),
+                "min_level": row.get("min_level", 1),
+                "npc_priority": row.get("npc_priority", 0),
             }
         )
     return normalized_rows
@@ -250,7 +285,9 @@ def fill_template_library(req: TemplateLibraryFillRequest) -> TemplateLibraryFil
         "template.library.fill.system",
         (
             "Return one JSON object only. Add missing RPG item, equipment, spell, war art, and interactable templates. "
-            "Do not overwrite existing non-empty fields."
+            "Do not overwrite existing non-empty fields. "
+            "All player-facing visible text fields must be Simplified Chinese. "
+            "definition_id must remain stable ASCII snake_case."
         ),
     )
     if spell_only_fill:
@@ -262,12 +299,13 @@ def fill_template_library(req: TemplateLibraryFillRequest) -> TemplateLibraryFil
             "spell_definitions must be a JSON array of objects; never return stringified rows. "
             "Each spell_definitions item must use these exact keys: "
             "definition_id, name, attack_mode, casting_ability, spell_cost, damage_dice, damage_bonus, damage_type, "
-            "area_shape, area_radius_m, area_length_m, self_target_policy, description, resolution_notes. "
+            "area_shape, area_radius_m, area_length_m, self_target_policy, description, resolution_notes, recommended_classes, min_level, npc_priority. "
             "Do not use alias keys like id, spell_id, level, or school. "
             "Existing spell definitions: "
             f"{'|'.join(item.definition_id for item in library.spell_definitions[:60])}. "
             "Do not overwrite any existing non-empty field. "
-            "Prefer broadly useful DND-style spells with stable names and structured metadata. "
+            "Visible fields such as name/description/resolution_notes must be Simplified Chinese. "
+            "recommended_classes should use short class labels separated by |. "
             f"Return at most {req.spell_fill_count} spell_definitions."
         )
     else:
@@ -284,7 +322,9 @@ def fill_template_library(req: TemplateLibraryFillRequest) -> TemplateLibraryFil
             "Existing war art definitions: $war_art_defs. "
             "Existing interactable templates: $interactable_defs. "
             "Do not overwrite any existing non-empty field. "
-            "Prefer common consumables, weapons, armor, DND-style spells, martial techniques, containers, doors, mechanisms, hazards, and clues. "
+            "Prefer common consumables, weapons, armor, spells, martial techniques, containers, doors, mechanisms, hazards, and clues. "
+            "All visible text fields must be Simplified Chinese. "
+            "Spell and war art rows must include recommended_classes, min_level, npc_priority. "
             "Return at most $spell_fill_count spell_definitions."
         ),
         item_defs="|".join(item.definition_id for item in library.item_definitions[:40]),

@@ -55,6 +55,7 @@ from app.services.world_service import (
     _ensure_npc_role_complete,
     _extract_json_content,
     _make_npc_item,
+    _npc_template_ability_names,
     _pick_many,
     _recompute_player_derived,
     _stable_int,
@@ -713,6 +714,7 @@ def _sanitize_team_role_spec(raw: dict[str, Any], fallback: dict[str, Any]) -> d
         "skills_proficient": _merge_unique(_normalize_text_list(raw.get("skills_proficient"), limit=5), _normalize_text_list(fallback.get("skills_proficient"), limit=5), 5),
         "features_traits": _merge_unique(_normalize_text_list(raw.get("features_traits"), limit=6), _normalize_text_list(fallback.get("features_traits"), limit=6), 6),
         "spells": _merge_unique(_normalize_text_list(raw.get("spells"), limit=5), _normalize_text_list(fallback.get("spells"), limit=5), 5),
+        "war_arts": _merge_unique(_normalize_text_list(raw.get("war_arts"), limit=5), _normalize_text_list(fallback.get("war_arts"), limit=5), 5),
         "preferred_weapon": preferred_weapon,
         "preferred_armor": preferred_armor,
         "inventory_items": inventory_items,
@@ -733,10 +735,10 @@ def _ai_team_role_spec(save, prompt: str, config, source: str) -> dict[str, Any]
         "team.teammate_concept.user",
         "You generate one teammate concept for a fantasy RPG. Return JSON only.\n"
         "Use this exact schema keys only: "
-        "{\"display_name\":\"\",\"race\":\"\",\"char_class\":\"\",\"sheet_background\":\"\",\"alignment\":\"\"," 
-        "\"personality\":\"\",\"speaking_style\":\"\",\"appearance\":\"\",\"background\":\"\",\"cognition\":\"\"," 
-        "\"secret\":\"\",\"likes\":[],\"languages\":[],\"tool_proficiencies\":[],\"skills_proficient\":[]," 
-        "\"features_traits\":[],\"spells\":[],\"preferred_weapon\":\"\",\"preferred_armor\":\"\"," 
+        "{\"display_name\":\"\",\"race\":\"\",\"char_class\":\"\",\"sheet_background\":\"\",\"alignment\":\"\","
+        "\"personality\":\"\",\"speaking_style\":\"\",\"appearance\":\"\",\"background\":\"\",\"cognition\":\"\","
+        "\"secret\":\"\",\"likes\":[],\"languages\":[],\"tool_proficiencies\":[],\"skills_proficient\":[],"
+        "\"features_traits\":[],\"spells\":[],\"war_arts\":[],\"preferred_weapon\":\"\",\"preferred_armor\":\"\","
         "\"inventory_items\":[],\"notes\":\"\",\"ability_bias\":\"\"}.\n"
         "Allowed race=$allowed_race. Allowed char_class=$allowed_class. Allowed alignment=$allowed_alignment. Allowed ability_bias=[strength,dexterity,constitution,intelligence,wisdom,charisma].\n"
         "Keep array items short. Use Chinese strings. Do not output markdown.\n"
@@ -864,8 +866,13 @@ def _build_team_profile_from_spec(role_id: str, name: str, spec: dict[str, Any])
     skills = _merge_unique(list(template.get("skills") or []), list(spec["skills_proficient"]), 6)
     tools = _merge_unique(list(template.get("tools") or []), list(spec["tool_proficiencies"]), 5)
     features = _merge_unique(list(template.get("features") or []), list(spec["features_traits"]), 6)
-    spells = _merge_unique(list(template.get("spells") or []), list(spec["spells"]), 6)
+    template_spells, template_war_arts = _npc_template_ability_names(char_class, level)
+    if not template_spells:
+        template_spells = list(template.get("spells") or [])
+    spells = _merge_unique(template_spells, list(spec["spells"]), 6)
+    war_arts = _merge_unique(template_war_arts, list(spec.get("war_arts") or []), 6)
     first_level_slots = max(1, min(int(level or 1), 9)) if spells else 0
+    martial_points = max(1, min(int(level or 1), 9)) if war_arts else 0
     profile = PlayerStaticData(
         player_id=role_id,
         name=name,
@@ -899,6 +906,7 @@ def _build_team_profile_from_spec(role_id: str, name: str, spec: dict[str, Any])
             },
             "features_traits": features,
             "spells": spells,
+            "war_arts": war_arts,
             "spell_slots_max": {
                 "level_1": first_level_slots,
                 "level_2": 0,
@@ -921,6 +929,9 @@ def _build_team_profile_from_spec(role_id: str, name: str, spec: dict[str, Any])
                 "level_8": 0,
                 "level_9": 0,
             },
+            "martial_points_current": martial_points,
+            "martial_points_maximum": martial_points,
+            "war_art_cooldowns": {},
             "notes": _limit_text(spec["notes"] or f"由prompt生成的队友：{spec['sheet_background']}", 160),
         },
     )
@@ -1135,6 +1146,7 @@ def _ai_team_chat_reply(save, role: NpcRoleCard, player_text: str, config) -> tu
         world_time_text, _ = _world_time_payload(save.area_snapshot.clock)
         context = _build_npc_context(role, recent_count=10)
         zone_name, sub_name = _current_player_area_names(save)
+        active_encounter = next((item for item in save.encounter_state.encounters if item.encounter_id == save.encounter_state.active_encounter_id), None)
         default_prompt = (
             "你要扮演跑团中的队友 NPC，在队伍聊天里回应玩家。"
             "只返回 JSON，不要输出额外解释。"
@@ -1304,12 +1316,6 @@ def team_chat(req: TeamChatRequest) -> TeamChatResponse:
         _remove_member_from_team_in_save(save, member, "affinity_depleted")
     if replies or leave_ids:
         _touch_state(state)
-    try:
-        from app.services.encounter_service import advance_active_encounter_in_save
-
-        advance_active_encounter_in_save(save, session_id=req.session_id, minutes_elapsed=time_spent_min, config=req.config)
-    except Exception:
-        pass
     save_current(save)
     return TeamChatResponse(
         session_id=req.session_id,
@@ -1362,6 +1368,7 @@ def _ai_team_public_reply(save, role: NpcRoleCard, player_text: str, scene_summa
             roleplay_brief=_build_npc_roleplay_brief(role),
             scene_summary=scene_summary or "公开区域中的即时互动",
             player_text=player_text,
+            encounter_goal=(active_encounter.goal if active_encounter is not None else ""),
             gm_summary=scene_summary,
             area_text=f"{zone_name} / {sub_name}",
             context=_build_npc_prompt_context(role, save.area_snapshot.clock, recent_count=8, save=save),

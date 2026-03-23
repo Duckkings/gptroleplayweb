@@ -18,6 +18,7 @@ from app.services.ai_protocol_contract_service import (
 )
 from app.services.ai_adapter import build_completion_options, create_sync_client
 from app.services import zone_metric_service
+from app.services.teammate_memory_service import build_private_chat_memory_context
 
 
 def _legacy():
@@ -451,12 +452,18 @@ def _ai_actor_action(
         world_time_text, _ = legacy._world_time_payload(scene_context.get("world_time") if isinstance(scene_context, dict) else None)  # type: ignore[arg-type]
     except Exception:
         world_time_text = ""
+    private_chat_memory_context = (
+        build_private_chat_memory_context(actor.get("role"))
+        if str(actor.get("actor_type") or "npc") == "team" and actor.get("role") is not None
+        else "[]"
+    )
     prompt = prompt_table.render(
         PromptKeys.SCENE_ACTOR_ACTION_USER,
         "",
         role_name=str(actor.get("name") or ""),
         actor_type=str(actor.get("actor_type") or "npc"),
         roleplay_brief=legacy._actor_roleplay_brief(actor),
+        private_chat_memory_context=private_chat_memory_context,
         player_text=player_text,
         gm_summary=gm_summary,
         world_time_text=world_time_text,
@@ -473,9 +480,12 @@ def _ai_actor_action(
         "Do not use gaze targets, wink targets, gesture targets, or silent coordination partners as speech_target_label.\n"
         "If the narration mentions looking at actor A but the spoken line is addressed to actor B, speech_target_label must be actor B.\n"
         "If there is no spoken addressee, return an empty speech_target_label.\n"
+        f"private_chat_memory_context={private_chat_memory_context}\n"
         "When the action is a recognizable DND-style spell or weapon attack, classify it using DND-style intent rather than surface wording.\n"
         "Recognizable direct-damage spells, explosive spells, and area spells such as Fireball must use action_type=attack even if they affect multiple visible targets.\n"
         "Do not collapse an obvious AOE spell into a harmless single-target check.\n"
+        "If private_chat_memory_context is not empty for a team actor, use those memory summaries as the primary reference for the teammate's tone, attitude, and player-facing preference in public turn.\n"
+        "Newer memory summaries should usually weigh more, but they must not override urgent live threats, legal targets, or formal check/resource rules.\n"
         "situation_delta_hint must be an integer between -8 and 8.\n"
         "reputation_delta_hint must be an integer between -3 and 3 and represents direct public reputation impact in the current zone.\n"
         "If there is no clear public reputation impact, return reputation_delta_hint as 0.\n"

@@ -27,6 +27,7 @@ type Props = {
   onShowConsistencyStatus: () => void;
   onRunConsistencyCheck: () => void;
   onGenerateEncounter: () => void;
+  onZeroPlayerHp: () => void;
   onSelectSaveFile: (file: File) => void;
   onClearSave: () => void;
   onDebugSaveReset: () => void;
@@ -60,6 +61,7 @@ export function DebugPanel({
   onShowConsistencyStatus,
   onRunConsistencyCheck,
   onGenerateEncounter,
+  onZeroPlayerHp,
   onSelectSaveFile,
   onClearSave,
   onDebugSaveReset,
@@ -86,7 +88,7 @@ export function DebugPanel({
           <button onClick={runAndClose(onEnableMap)}>世界地图</button>
           <button onClick={runAndClose(onOpenPlayerPanel)}>玩家数据</button>
           <button onClick={runAndClose(onOpenInventory)}>物品栏</button>
-          <button onClick={runAndClose(onOpenNpcPool)}>NPC角色池</button>
+          <button onClick={runAndClose(onOpenNpcPool)}>NPC 角色池</button>
           <button onClick={runAndClose(onOpenTeamPanel)}>当前队伍</button>
           <button onClick={runAndClose(onOpenCharacterBuildPlayer)} disabled={playerBuildCompleted}>
             创建玩家角色
@@ -99,14 +101,15 @@ export function DebugPanel({
           <button onClick={runAndClose(onFillTemplateLibrary)}>AI 填充模板库</button>
           <button onClick={runAndClose(onFillSpellLibrary)}>AI 填充法术表</button>
           <button onClick={runAndClose(onOpenActionPanel)}>行为检定</button>
-          <button onClick={runAndClose(onOpenPlayerInputValidationPanel)}>玩家行为校验测试</button>
+          <button onClick={runAndClose(onOpenPlayerInputValidationPanel)}>玩家输入校验测试</button>
           <button onClick={runAndClose(onGenerateQuest)}>生成任务</button>
           <button onClick={runAndClose(onGenerateFate)}>生成命运线</button>
-          <button onClick={runAndClose(onRegenerateFate)}>重生成命运线</button>
+          <button onClick={runAndClose(onRegenerateFate)}>重新生成命运线</button>
           <button onClick={runAndClose(onOpenFatePanel)}>查看命运</button>
           <button onClick={runAndClose(onShowConsistencyStatus)}>一致性状态</button>
           <button onClick={runAndClose(onRunConsistencyCheck)}>执行一致性校验</button>
           <button onClick={runAndClose(onGenerateEncounter)}>立刻生成遭遇</button>
+          <button onClick={runAndClose(onZeroPlayerHp)}>玩家HP归零（测试死亡流程）</button>
           <button onClick={() => saveInputRef.current?.click()}>选择存档文件</button>
           <input
             ref={saveInputRef}
@@ -130,33 +133,32 @@ export function DebugPanel({
         <div className="debug-paths">
           <p>配置路径: {configPath?.path ?? '未加载'}</p>
           <p>存档路径: {savePath?.path ?? '未加载'}</p>
-          {templateLibraryStatus && (
+          {templateLibraryStatus ? (
             <>
               <p>
-                {`模板库: 物品 ${templateLibraryStatus.item_definition_count} / 装备 ${templateLibraryStatus.equipment_definition_count} / 法术 ${templateLibraryStatus.spell_definition_count} / 武技 ${templateLibraryStatus.war_art_definition_count} / 交互 ${templateLibraryStatus.interactable_template_count}`}
-              </p>
-              <p>
-                模板库: 物品 {templateLibraryStatus.item_definition_count} / 装备 {templateLibraryStatus.equipment_definition_count} / 法术 {templateLibraryStatus.spell_definition_count} / 交互 {templateLibraryStatus.interactable_template_count}
+                模板库: 物品 {templateLibraryStatus.item_definition_count} / 装备 {templateLibraryStatus.equipment_definition_count} / 法术{' '}
+                {templateLibraryStatus.spell_definition_count} / 武技 {templateLibraryStatus.war_art_definition_count} / 交互{' '}
+                {templateLibraryStatus.interactable_template_count}
               </p>
               <p>模板库目录: {templateLibraryStatus.template_dir}</p>
             </>
-          )}
+          ) : null}
         </div>
 
         <section className="debug-entries">
-          {entries.length === 0 && <p className="hint">暂无 API 摘要。</p>}
+          {entries.length === 0 ? <p className="hint">暂无 API 摘要。</p> : null}
           {entries.map((entry, idx) => (
             <article key={`${entry.endpoint}-${idx}`} className="debug-entry">
               <strong>{entry.endpoint}</strong>
               <p>
-                状态: {entry.status} | {entry.ok ? 'ok' : 'error'} | 时间: {entry.at}
+                状态 {entry.status} | {entry.ok ? 'ok' : 'error'} | 时间: {entry.at}
               </p>
-              {entry.usage && (
+              {entry.usage ? (
                 <p>
                   token in/out: {entry.usage.input_tokens}/{entry.usage.output_tokens}
                 </p>
-              )}
-              {entry.detail && <p className="error">{entry.detail}</p>}
+              ) : null}
+              {entry.detail ? <p className="error">{entry.detail}</p> : null}
             </article>
           ))}
         </section>

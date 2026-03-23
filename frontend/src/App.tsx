@@ -2,6 +2,7 @@
 import './App.css';
 import { useEffectEvent } from 'react';
 import { DebugPanel } from './components/DebugPanel';
+import { DamageResolutionInlineCard, isDamageResolutionEvent } from './components/DamageResolutionInlineCard';
 import { ConsistencyPanel } from './components/ConsistencyPanel';
 import { EncounterLane } from './components/EncounterLane';
 import { EncounterModal } from './components/EncounterModal';
@@ -18,9 +19,9 @@ import { PlayerInputValidationPanel } from './components/PlayerInputValidationPa
 import { PlayerQuickActionModal, type PlayerQuickActionMode } from './components/PlayerQuickActionModal';
 import { PublicTurnImpactList } from './components/PublicTurnImpactList';
 import { PublicTurnAttackDefenseModal } from './components/PublicTurnAttackDefenseModal';
-import { PublicTurnAttackModal } from './components/PublicTurnAttackModal';
+import { PublicTurnControlBar } from './components/PublicTurnControlBar';
 import { PublicTurnDeathSaveModal } from './components/PublicTurnDeathSaveModal';
-import { PublicTurnInteractionModal } from './components/PublicTurnInteractionModal';
+import { PublicTurnInlinePromptPanel, type PublicTurnInlinePromptState } from './components/PublicTurnInlinePromptPanel';
 import { PublicTurnNarrativePane } from './components/PublicTurnNarrativePane';
 import { PublicTurnOpposedModal } from './components/PublicTurnOpposedModal';
 import { PublicTurnPanel } from './components/PublicTurnPanel';
@@ -33,6 +34,7 @@ import { SceneEventCard } from './components/SceneEventCard';
 import { SubZoneContextPanel } from './components/SubZoneContextPanel';
 import { TeamPanel } from './components/TeamPanel';
 import { TeammateChatModal } from './components/TeammateChatModal';
+import { TeammateMemorySummaryPromptModal } from './components/TeammateMemorySummaryPromptModal';
 import { ActionCheckPanel } from './components/ActionCheckPanel';
 import { ActionCheckRollModal } from './components/ActionCheckRollModal';
 import { AuthPanel } from './components/AuthPanel';
@@ -52,6 +54,7 @@ import {
   continuePendingTurnStream,
   clearSave,
   debugSaveReset,
+  debugZeroPlayerHp,
   debugGenerateQuest,
   getCharacterBuildState,
   markCharacterBuildCompanionOfferSeen,
@@ -64,6 +67,7 @@ import {
   fillTemplateLibrary,
   generateFate,
   generateDebugTeammate,
+  generateTeammatePrivateChatMemory,
   getCurrentDebugBattle,
   getConsistencyStatus,
   getGameLogs,
@@ -102,8 +106,8 @@ import {
   presentEncounter,
   regenerateFate,
   rejectQuest,
-  rejoinEncounter,
   resolveBattleRoll,
+  resolvePublicTurnInformationCheck,
   resolvePublicTurnReaction,
   resolvePublicTurnAttackDefense,
   resolvePublicTurnDeathSave,
@@ -187,10 +191,12 @@ import {
   type NpcRoleCard,
   type TemplateLibraryStatusResponse,
   type NpcChatResponse,
+  type NpcDialogueEntry,
   type Position,
   type PublicTurnEntryType,
   type PublicTurnAttackDefensePrompt,
   type PublicTurnAttackPrompt,
+  type PublicTurnInformationCheckPrompt,
   type PublicTurnImpact,
   type PublicTurnInteractionPrompt,
   type PublicTurnOpposedPlanResponse,
@@ -232,6 +238,7 @@ type ChatState =
   | 'awaiting_interaction'
   | 'awaiting_attack_response'
   | 'awaiting_attack_defense'
+  | 'awaiting_information_check'
   | 'awaiting_death_save'
   | 'awaiting_reaction'
   | 'awaiting_opposed'
@@ -244,6 +251,7 @@ type MainOutputStatus =
   | 'awaiting_interaction'
   | 'awaiting_attack_response'
   | 'awaiting_attack_defense'
+  | 'awaiting_information_check'
   | 'awaiting_death_save'
   | 'awaiting_reaction'
   | 'awaiting_opposed'
@@ -308,6 +316,13 @@ type PendingAttackDefenseState = {
 };
 type PendingDeathSaveState = {
   prompt: DeathSavePrompt;
+  flowKind?: PendingTurnContinueResponse['flow_kind'];
+  pendingTurnId?: string | null;
+};
+type PendingInformationCheckState = {
+  prompt: PublicTurnInformationCheckPrompt;
+  flowKind?: PendingTurnContinueResponse['flow_kind'];
+  pendingTurnId?: string | null;
 };
 type PendingOpposedState = {
   pending_turn_id: string;
@@ -334,8 +349,7 @@ type BlockingModalKey =
   | 'quest'
   | 'encounter'
   | 'public_turn_action_roll'
-  | 'public_turn_interaction'
-  | 'public_turn_attack_response'
+  | 'public_turn_information_check'
   | 'public_turn_attack_defense'
   | 'public_turn_death_save'
   | 'public_turn_opposed'
@@ -346,6 +360,13 @@ type BlockingModalKey =
 type ActiveTeammateChat = {
   npcId: string;
   npcName: string;
+  sessionOpenedAtDialogueId: string | null;
+  lastSummarizedDialogueId: string | null;
+};
+type TeammateMemorySummaryPromptState = {
+  npcId: string;
+  npcName: string;
+  sourceDialogueIds: string[];
 };
 type ValidatedPlayerInput = {
   actionText: string;
@@ -358,6 +379,42 @@ type PlayerInputValidationModalState = {
   originalSpeechText: string;
   response: PlayerInputValidationResponse;
 };
+
+function latestPrivateChatDialogueId(logs: NpcDialogueEntry[] | undefined): string | null {
+  const privateLogs = (logs ?? []).filter((item) => item.context_kind === 'private_chat');
+  return privateLogs.length > 0 ? privateLogs[privateLogs.length - 1].id : null;
+}
+
+function collectSummarizablePrivateChatDialogueIds(
+  logs: NpcDialogueEntry[] | undefined,
+  lastSummarizedDialogueId: string | null,
+): string[] {
+  const privateLogs = (logs ?? []).filter((item) => item.context_kind === 'private_chat');
+  if (privateLogs.length === 0) return [];
+  const anchorIndex = lastSummarizedDialogueId ? privateLogs.findIndex((item) => item.id === lastSummarizedDialogueId) : -1;
+  const pendingLogs = privateLogs.slice(anchorIndex >= 0 ? anchorIndex + 1 : 0);
+  if (pendingLogs.length === 0) return [];
+
+  const collectedIds: string[] = [];
+  let currentExchange: NpcDialogueEntry[] = [];
+  for (const item of pendingLogs) {
+    if (item.speaker === 'player') {
+      if (currentExchange.length > 1 && currentExchange.some((entry) => entry.speaker === 'npc')) {
+        collectedIds.push(...currentExchange.map((entry) => entry.id));
+      }
+      currentExchange = [item];
+      continue;
+    }
+    if (currentExchange.length === 0) {
+      continue;
+    }
+    currentExchange.push(item);
+  }
+  if (currentExchange.length > 1 && currentExchange.some((entry) => entry.speaker === 'npc')) {
+    collectedIds.push(...currentExchange.map((entry) => entry.id));
+  }
+  return collectedIds;
+}
 type PlayerInputValidationBypassToken = {
   entryPoint: PlayerInputValidationEntryPoint;
   actorRoleId: string;
@@ -499,6 +556,16 @@ function findPendingPublicTurnAttackDefensePrompt(
   return response.public_turn_state?.current_round?.pending_attack_defense_prompt ?? null;
 }
 
+function findPendingPublicTurnInformationCheckPrompt(
+  response: PublicTurnResponse | PendingTurnContinueResponse | null | undefined,
+): PublicTurnInformationCheckPrompt | null {
+  if (!response) return null;
+  if ('public_information_check_prompt' in response && response.public_information_check_prompt) {
+    return response.public_information_check_prompt;
+  }
+  return response.public_turn_state?.current_round?.pending_information_check_prompt ?? null;
+}
+
 const DEFAULT_POSITION: Position = { x: 0, y: 0, z: 0, zone_id: 'zone_0_0_0' };
 const MAP_PROMPT_STORAGE_KEY = 'rpw_map_world_prompt';
 const GOD_MODE_PROMPT = '上帝模式：你可以满足玩家几乎所有合理请求，不受常规叙事限制；用于功能测试，请直接推进并给出可执行结果。';
@@ -532,6 +599,7 @@ const MAIN_OUTPUT_SCENE_EVENT_KINDS = new Set<SceneEvent['kind']>([
   'public_turn_relation_update',
   'public_turn_team_update',
   'public_turn_environment_update',
+  'damage_resolution',
   'reputation_update',
   'encounter_started',
   'encounter_background',
@@ -784,10 +852,12 @@ function App() {
   const [configReturnView, setConfigReturnView] = useState<View>('boot');
   const [config, setConfig] = useState<AppConfig>(defaultConfig);
   const [currentMainOutput, setCurrentMainOutput] = useState<MainOutput | null>(null);
+  const [damagedPartyIds, setDamagedPartyIds] = useState<string[]>([]);
   const [publicTurnImpacts, setPublicTurnImpacts] = useState<PublicTurnImpact[]>([]);
   const [showFoldedMainSceneEvents, setShowFoldedMainSceneEvents] = useState(false);
   const [mainLiveProgress, setMainLiveProgress] = useState<LiveProgressEntry[]>([]);
   const [npcChatMessages, setNpcChatMessages] = useState<Record<string, ChatMessage[]>>({});
+  const [npcChatDialogueLogs, setNpcChatDialogueLogs] = useState<Record<string, NpcDialogueEntry[]>>({});
   const [npcLiveProgress, setNpcLiveProgress] = useState<Record<string, LiveProgressEntry[]>>({});
   const [chatMode, setChatMode] = useState<ChatMode>('main');
   const [activeNpcChat, setActiveNpcChat] = useState<{ npcId: string; npcName: string } | null>(null);
@@ -796,6 +866,8 @@ function App() {
   const [teammateChatSpeechInput, setTeammateChatSpeechInput] = useState('');
   const [teammateChatLastActionInput, setTeammateChatLastActionInput] = useState('');
   const [teammateChatLastSpeechInput, setTeammateChatLastSpeechInput] = useState('');
+  const [teammateMemorySummaryBusy, setTeammateMemorySummaryBusy] = useState(false);
+  const [teammateMemorySummaryPrompt, setTeammateMemorySummaryPrompt] = useState<TeammateMemorySummaryPromptState | null>(null);
   const [lastActionInput, setLastActionInput] = useState('');
   const [lastSpeechInput, setLastSpeechInput] = useState('');
   const [actionInput, setActionInput] = useState('');
@@ -895,6 +967,8 @@ function App() {
   const [publicTurnAttackError, setPublicTurnAttackError] = useState('');
   const [pendingAttackDefenseState, setPendingAttackDefenseState] = useState<PendingAttackDefenseState | null>(null);
   const [publicTurnAttackDefenseRollState, setPublicTurnAttackDefenseRollState] = useState<ActionCheckRollState>(DEFAULT_ACTION_CHECK_ROLL_STATE);
+  const [pendingInformationCheckState, setPendingInformationCheckState] = useState<PendingInformationCheckState | null>(null);
+  const [publicTurnInformationCheckRollState, setPublicTurnInformationCheckRollState] = useState<ActionCheckRollState>(DEFAULT_ACTION_CHECK_ROLL_STATE);
   const [pendingDeathSaveState, setPendingDeathSaveState] = useState<PendingDeathSaveState | null>(null);
   const [publicTurnDeathSaveRollState, setPublicTurnDeathSaveRollState] = useState<PublicTurnDeathSaveRollState>(DEFAULT_PUBLIC_TURN_DEATH_SAVE_ROLL_STATE);
   const [publicTurnDeathSaveSummary, setPublicTurnDeathSaveSummary] = useState('');
@@ -903,6 +977,7 @@ function App() {
   const [publicTurnOpposedActionInput, setPublicTurnOpposedActionInput] = useState('');
   const [publicTurnOpposedSpeechInput, setPublicTurnOpposedSpeechInput] = useState('');
   const [publicTurnOpposedRollState, setPublicTurnOpposedRollState] = useState<PublicTurnOpposedRollState>(DEFAULT_PUBLIC_TURN_OPPOSED_ROLL_STATE);
+  const [publicTurnOpposedRollModalOpen, setPublicTurnOpposedRollModalOpen] = useState(false);
   const [timeNotices, setTimeNotices] = useState<Array<{ id: number; text: string }>>([]);
   const [playerStatic, setPlayerStaticState] = useState<PlayerStaticData>(defaultPlayerStaticData);
   const [playerRuntime, setPlayerRuntimeState] = useState<PlayerRuntimeData>({
@@ -920,18 +995,23 @@ function App() {
   const [activeBattle, setActiveBattle] = useState<BattleSandboxState | null>(null);
   const [battleBusy, setBattleBusy] = useState(false);
   const [battleRollState, setBattleRollState] = useState<ActionCheckRollState>(DEFAULT_ACTION_CHECK_ROLL_STATE);
+  const [encounterLaneCollapsed, setEncounterLaneCollapsed] = useState(true);
   const [minimizedBlockingModal, setMinimizedBlockingModal] = useState<BlockingModalKey | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
-  const activeStreamRef = useRef<{ kind: 'main' } | { kind: 'npc'; npcId: string; previousMessages: ChatMessage[] } | null>(null);
+  const activeStreamRef = useRef<
+    | { kind: 'main' }
+    | { kind: 'npc'; npcId: string; npcName: string; previousMessages: ChatMessage[]; previousDialogueLogs: NpcDialogueEntry[] }
+    | null
+  >(null);
   const announcedEncounterIdsRef = useRef<Set<string>>(new Set());
-  const autoRejoinEncounterIdRef = useRef<string | null>(null);
   const pendingActionCheckRef = useRef<ActionCheckPayload | null>(null);
   const actionCheckPromiseRef = useRef<{ resolve: (result: ActionCheckResult | null) => void; reject: (error: Error) => void } | null>(null);
   const playerInputValidationPromiseRef = useRef<{ resolve: (result: ValidatedPlayerInput | null) => void; reject: (error: Error) => void } | null>(null);
   const playerInputValidationBypassRef = useRef<PlayerInputValidationBypassToken | null>(null);
   const pendingPublicTurnActionRef = useRef<PendingPublicTurnAction | null>(null);
   const publicTurnActionResponseRef = useRef<PublicTurnResponse | PendingTurnContinueResponse | null>(null);
+  const pendingInformationCheckResponseRef = useRef<PendingTurnContinueResponse | PublicTurnResponse | null>(null);
   const pendingDeathSaveResponseRef = useRef<PendingTurnContinueResponse | PublicTurnResponse | null>(null);
   const pendingReactionResponseRef = useRef<PendingTurnContinueResponse | PublicTurnResponse | null>(null);
   const pendingOpposedResponseRef = useRef<PendingTurnContinueResponse | PublicTurnResponse | null>(null);
@@ -943,6 +1023,7 @@ function App() {
     if (chatState === 'awaiting_interaction') return '等待交互回应...';
     if (chatState === 'awaiting_attack_response') return '等待攻击回应...';
     if (chatState === 'awaiting_attack_defense') return '等待攻击对抗掷骰...';
+    if (chatState === 'awaiting_information_check') return '等待信息检定...';
     if (chatState === 'awaiting_death_save') return '等待死亡豁免...';
     if (chatState === 'awaiting_reaction') return '等待反应检定...';
     if (chatState === 'awaiting_opposed') return '等待对抗回应...';
@@ -1242,7 +1323,7 @@ function App() {
     const active = encounterState.active_encounter_id
       ? encounterState.encounters.find((item) => item.encounter_id === encounterState.active_encounter_id) ?? null
       : null;
-    if (active && (active.status === 'active' || active.status === 'escaped')) return active;
+    if (active && active.status === 'active') return active;
     return null;
   }, [encounterState]);
   const queuedEncounters = useMemo(() => {
@@ -1254,13 +1335,8 @@ function App() {
     return queued;
   }, [encounterState]);
   const pendingEncounter = activeEncounter ?? queuedEncounters[0] ?? null;
-  const encounterEngaged = Boolean(activeEncounter && activeEncounter.status === 'active' && activeEncounter.player_presence === 'engaged');
-  const canRejoinActiveEncounter = Boolean(
-    activeEncounter &&
-      activeEncounter.player_presence === 'away' &&
-      activeEncounter.zone_id === areaSnapshot?.current_zone_id &&
-      (activeEncounter.sub_zone_id ? activeEncounter.sub_zone_id === areaSnapshot?.current_sub_zone_id : true),
-  );
+  const encounterEngaged = Boolean(activeEncounter && activeEncounter.status === 'active');
+  const showEncounterLane = Boolean(activeEncounter || queuedEncounters.length > 0);
   const encounterModalEncounter = useMemo(() => {
     if (!encounterModalEncounterId) return null;
     return encounterState.encounters.find((item) => item.encounter_id === encounterModalEncounterId) ?? null;
@@ -1269,15 +1345,18 @@ function App() {
   const visibleQuestModal = Boolean(pendingQuest && minimizedBlockingModal !== 'quest');
   const visibleEncounterModal = Boolean(encounterModalOpen && minimizedBlockingModal !== 'encounter');
   const visiblePublicTurnActionRoll = Boolean(publicTurnActionRollState.open && minimizedBlockingModal !== 'public_turn_action_roll');
-  const visiblePublicTurnInteraction = Boolean(pendingInteractionState && minimizedBlockingModal !== 'public_turn_interaction');
-  const visiblePublicTurnAttackResponse = Boolean(pendingAttackState && minimizedBlockingModal !== 'public_turn_attack_response');
+  const visiblePublicTurnInformationCheck = Boolean(
+    pendingInformationCheckState && publicTurnInformationCheckRollState.open && minimizedBlockingModal !== 'public_turn_information_check',
+  );
   const visiblePublicTurnAttackDefense = Boolean(
     pendingAttackDefenseState && publicTurnAttackDefenseRollState.open && minimizedBlockingModal !== 'public_turn_attack_defense',
   );
   const visiblePublicTurnDeathSave = Boolean(
     pendingDeathSaveState && publicTurnDeathSaveRollState.open && minimizedBlockingModal !== 'public_turn_death_save',
   );
-  const visiblePublicTurnOpposed = Boolean(pendingOpposedState && minimizedBlockingModal !== 'public_turn_opposed');
+  const visiblePublicTurnOpposed = Boolean(
+    pendingOpposedState && publicTurnOpposedRollModalOpen && minimizedBlockingModal !== 'public_turn_opposed',
+  );
   const visibleReactionRoll = Boolean(reactionCheckRollState.open && minimizedBlockingModal !== 'reaction_roll');
   const visibleBattleModal = Boolean(activeBattle && minimizedBlockingModal !== 'battle');
   const visibleBattleRoll = Boolean(battleRollState.open && minimizedBlockingModal !== 'battle_roll');
@@ -1290,12 +1369,13 @@ function App() {
       companionBuildOfferOpen ||
       actionCheckRollState.open ||
       publicTurnActionRollState.open ||
+      publicTurnInformationCheckRollState.open ||
       pendingInteractionState ||
       pendingAttackState ||
       publicTurnAttackDefenseRollState.open ||
       publicTurnDeathSaveRollState.open ||
       pendingOpposedState ||
-      publicTurnOpposedRollState.open ||
+      publicTurnOpposedRollModalOpen ||
       reactionCheckRollState.open ||
       playerInputValidationModalState ||
       battleRollState.open ||
@@ -1311,6 +1391,7 @@ function App() {
     (chatState === 'idle' || chatState === 'error') &&
     !blockingWorkflowActive;
   const canAutoAdvance = chatMode === 'main' && encounterEngaged && (chatState === 'idle' || chatState === 'error') && !blockingWorkflowActive;
+  const currentPublicTurnSituationValue = activeEncounter?.situation_value ?? null;
 
   useEffect(() => {
     if (!minimizedBlockingModal) return;
@@ -1318,11 +1399,10 @@ function App() {
       (minimizedBlockingModal === 'quest' && Boolean(pendingQuest)) ||
       (minimizedBlockingModal === 'encounter' && encounterModalOpen) ||
       (minimizedBlockingModal === 'public_turn_action_roll' && publicTurnActionRollState.open) ||
-      (minimizedBlockingModal === 'public_turn_interaction' && Boolean(pendingInteractionState)) ||
-      (minimizedBlockingModal === 'public_turn_attack_response' && Boolean(pendingAttackState)) ||
+      (minimizedBlockingModal === 'public_turn_information_check' && publicTurnInformationCheckRollState.open) ||
       (minimizedBlockingModal === 'public_turn_attack_defense' && publicTurnAttackDefenseRollState.open) ||
       (minimizedBlockingModal === 'public_turn_death_save' && publicTurnDeathSaveRollState.open) ||
-      (minimizedBlockingModal === 'public_turn_opposed' && Boolean(pendingOpposedState)) ||
+      (minimizedBlockingModal === 'public_turn_opposed' && publicTurnOpposedRollModalOpen) ||
       (minimizedBlockingModal === 'reaction_roll' && reactionCheckRollState.open) ||
       (minimizedBlockingModal === 'battle_start' && battleStartDialogOpen) ||
       (minimizedBlockingModal === 'battle' && Boolean(activeBattle)) ||
@@ -1335,11 +1415,10 @@ function App() {
     pendingQuest,
     encounterModalOpen,
     publicTurnActionRollState.open,
-    pendingInteractionState,
-    pendingAttackState,
+    publicTurnInformationCheckRollState.open,
     publicTurnAttackDefenseRollState.open,
     publicTurnDeathSaveRollState.open,
-    pendingOpposedState,
+    publicTurnOpposedRollModalOpen,
     reactionCheckRollState.open,
     battleStartDialogOpen,
     activeBattle,
@@ -1347,6 +1426,7 @@ function App() {
   ]);
 
   const tokenTotal = tokenUsage.total.total_tokens;
+  const damagedPartyIdSet = useMemo(() => new Set(damagedPartyIds), [damagedPartyIds]);
   const partyPreviewEntries = useMemo(
     () => buildPartyPreviewEntries(playerStatic, teamState, npcPoolItems),
     [npcPoolItems, playerStatic, teamState],
@@ -1361,7 +1441,15 @@ function App() {
     [activeTeammateChat?.npcId, teamState.members],
   );
   const activeTeammateMessages = activeTeammateChat ? (npcChatMessages[activeTeammateChat.npcId] ?? []) : [];
+  const activeTeammateDialogueLogs = activeTeammateChat ? (npcChatDialogueLogs[activeTeammateChat.npcId] ?? []) : [];
   const activeTeammateLiveProgress = activeTeammateChat ? (npcLiveProgress[activeTeammateChat.npcId] ?? []) : [];
+  const activeTeammatePendingMemoryDialogueIds = useMemo(
+    () =>
+      activeTeammateChat
+        ? collectSummarizablePrivateChatDialogueIds(activeTeammateDialogueLogs, activeTeammateChat.lastSummarizedDialogueId)
+        : [],
+    [activeTeammateChat, activeTeammateDialogueLogs],
+  );
   const teammateChatHasInput = teammateChatActionInput.trim().length > 0 || teammateChatSpeechInput.trim().length > 0;
   const teammateChatInputDisabled =
     !activeTeammateRole ||
@@ -1377,6 +1465,8 @@ function App() {
       : blockingWorkflowActive
         ? '当前存在未完成流程，需先处理后才能继续与队友单聊。'
         : '';
+  const teammateMemorySummaryAvailable =
+    !teammateChatInputDisabled && activeTeammatePendingMemoryDialogueIds.length > 0 && !teammateMemorySummaryBusy;
   const setNpcDisplayedMessages = (next: ChatMessage[] | ((prev: ChatMessage[]) => ChatMessage[])) => {
     const npcId = activeNpcChat?.npcId;
     if (!npcId) return;
@@ -1428,6 +1518,10 @@ function App() {
       ...prev,
       [activeStream.npcId]: activeStream.previousMessages,
     }));
+    setNpcChatDialogueLogs((prev) => ({
+      ...prev,
+      [activeStream.npcId]: activeStream.previousDialogueLogs,
+    }));
     clearNpcLiveProgress(activeStream.npcId);
     activeStreamRef.current = null;
   };
@@ -1448,6 +1542,26 @@ function App() {
   };
   const filterMainOutputSceneEvents = (sceneEvents: SceneEvent[] = []): SceneEvent[] =>
     sceneEvents.filter((event) => MAIN_OUTPUT_SCENE_EVENT_KINDS.has(event.kind));
+  const collectDamagedPartyIds = (sceneEvents: SceneEvent[] = []): string[] =>
+    Array.from(
+      new Set(
+        sceneEvents
+          .filter((event) => isDamageResolutionEvent(event))
+          .map((event) => {
+            const target = event.metadata?.target_actor_id;
+            return typeof target === 'string' ? target.trim() : '';
+          })
+          .filter(Boolean),
+      ),
+    );
+  const pushDamageHighlights = (sceneEvents: SceneEvent[] = []) => {
+    const nextIds = collectDamagedPartyIds(sceneEvents);
+    if (nextIds.length === 0) return;
+    setDamagedPartyIds((prev) => Array.from(new Set([...prev, ...nextIds])));
+  };
+  const clearDamageHighlights = () => {
+    setDamagedPartyIds([]);
+  };
   const setMainOutput = (
     sourceKind: MainOutput['source_kind'],
     replyText: string,
@@ -1460,6 +1574,7 @@ function App() {
       return;
     }
     const visibleSceneEvents = filterMainOutputSceneEvents(sceneEvents);
+    pushDamageHighlights(visibleSceneEvents);
     if (!trimmedReply && visibleSceneEvents.length === 0) {
       setCurrentMainOutput(null);
       return;
@@ -1487,13 +1602,6 @@ function App() {
     }
     setMainOutput('system_output', text);
   };
-  const setMainAssistantOnly = (text: string): void => {
-    if (isAlreadyThereHint(text)) {
-      showAlreadyTherePopup(text);
-      return;
-    }
-    setMainOutput('system_output', text);
-  };
   const forceReturnToMainChat = (reason: 'encounter_interrupt' | 'manual' | 'narrative_switch') => {
     void reason;
     setChatMode('main');
@@ -1516,6 +1624,7 @@ function App() {
     setNpcSelected((prev) => (prev?.role_id === role.role_id ? role : prev));
     setTeamInventoryRole((prev) => (prev?.role_id === role.role_id ? role : prev));
     setTeamProfileRole((prev) => (prev?.role_id === role.role_id ? role : prev));
+    setNpcChatDialogueLogs((prev) => ({ ...prev, [role.role_id]: role.dialogue_logs ?? [] }));
   };
   const pushTimeNotice = (minutes: number, reason: string) => {
     if (minutes <= 0) return;
@@ -1532,23 +1641,28 @@ function App() {
       setTimeNotices((prev) => prev.filter((n) => n.id !== id));
     }, 3200);
   };
-  const dialogueLogsToMessages = (role: NpcRoleCard): ChatMessage[] =>
-    (role.dialogue_logs ?? []).map((item) => ({
+  const dialogueLogsToMessages = (logs: NpcDialogueEntry[]): ChatMessage[] =>
+    logs.map((item) => ({
       role: item.speaker === 'player' ? 'user' : 'assistant',
       content: `[${item.world_time_text}] ${item.speaker_name}: ${item.content}`,
     }));
+  const applyNpcDialogueLogs = (npcId: string, npcName: string, logs: NpcDialogueEntry[] | undefined) => {
+    const nextLogs = logs ?? [];
+    setNpcChatDialogueLogs((prev) => ({ ...prev, [npcId]: nextLogs }));
+    const nextMessages = dialogueLogsToMessages(nextLogs);
+    setNpcChatMessages((prev) => ({
+      ...prev,
+      [npcId]:
+        nextMessages.length > 0
+          ? nextMessages
+          : [{ role: 'system', content: `你已接近 ${npcName}，可以只输入动作或只输入语言开始交互。` }],
+    }));
+  };
   const ensureNpcChatHistoryLoaded = async (npcId: string, npcName: string): Promise<NpcRoleCard | null> => {
     try {
       const role = await getRoleCard(sessionId, npcId, report);
       replaceCachedRoleCard(role);
-      const fromSave = dialogueLogsToMessages(role);
-      setNpcChatMessages((prev) => ({
-        ...prev,
-        [npcId]:
-          fromSave.length > 0
-            ? fromSave
-            : [{ role: 'system', content: `你已接近 ${npcName}，可以只输入动作或只输入语言开始交互。` }],
-      }));
+      applyNpcDialogueLogs(npcId, npcName, role.dialogue_logs ?? []);
       return role;
     } catch (e) {
       setError(e instanceof Error ? e.message : '进入 NPC 单聊失败');
@@ -1637,15 +1751,31 @@ function App() {
     setActionInput('');
     setSpeechInput('');
   };
-  const closeTeammateChatModal = () => {
+  const finalizeCloseTeammateChatModal = () => {
     if (activeTeammateChat) {
       clearNpcLiveProgress(activeTeammateChat.npcId);
     }
+    setTeammateMemorySummaryPrompt(null);
+    setTeammateMemorySummaryBusy(false);
     setActiveTeammateChat(null);
     setTeammateChatActionInput('');
     setTeammateChatSpeechInput('');
     setTeammateChatLastActionInput('');
     setTeammateChatLastSpeechInput('');
+  };
+  const requestCloseTeammateChatModal = () => {
+    if (chatState === 'sending' || chatState === 'streaming' || teammateMemorySummaryBusy) {
+      return;
+    }
+    if (!activeTeammateChat || activeTeammatePendingMemoryDialogueIds.length === 0) {
+      finalizeCloseTeammateChatModal();
+      return;
+    }
+    setTeammateMemorySummaryPrompt({
+      npcId: activeTeammateChat.npcId,
+      npcName: activeTeammateChat.npcName,
+      sourceDialogueIds: activeTeammatePendingMemoryDialogueIds,
+    });
   };
   const prefillPlayerActionWithAbility = (name: string) => {
     if (chatMode === 'npc') {
@@ -1680,6 +1810,11 @@ function App() {
     setPendingAttackDefenseState(null);
     setPublicTurnAttackDefenseRollState(DEFAULT_ACTION_CHECK_ROLL_STATE);
   };
+  const resetPublicTurnInformationCheckState = () => {
+    setPendingInformationCheckState(null);
+    setPublicTurnInformationCheckRollState(DEFAULT_ACTION_CHECK_ROLL_STATE);
+    pendingInformationCheckResponseRef.current = null;
+  };
   const resetPublicTurnDeathSaveRollState = () => {
     setPublicTurnDeathSaveRollState(DEFAULT_PUBLIC_TURN_DEATH_SAVE_ROLL_STATE);
     setPublicTurnDeathSaveSummary('');
@@ -1694,6 +1829,7 @@ function App() {
     setPublicTurnOpposedPlan(null);
     setPublicTurnOpposedActionInput('');
     setPublicTurnOpposedSpeechInput('');
+    setPublicTurnOpposedRollModalOpen(false);
     setPublicTurnOpposedRollState(DEFAULT_PUBLIC_TURN_OPPOSED_ROLL_STATE);
   };
   const resetReactionCheckRollState = () => {
@@ -1712,6 +1848,7 @@ function App() {
     resetPublicTurnInteractionState();
     resetPublicTurnAttackState();
     resetPublicTurnAttackDefenseState();
+    resetPublicTurnInformationCheckState();
     clearPendingDeathSaveState();
     resetPublicTurnOpposedState();
     setPendingReactionState(null);
@@ -1760,7 +1897,40 @@ function App() {
     target_actor_kind: plan.target_actor_kind ?? null,
     target_ability_used: plan.target_ability_used ?? null,
     target_ability_modifier: plan.target_ability_modifier ?? null,
+    public_turn_interaction_kind: plan.public_turn_interaction_kind ?? null,
+    public_turn_notice_state: plan.public_turn_notice_state ?? null,
+    public_turn_resolution_mode: plan.public_turn_resolution_mode ?? null,
+    followup_ability_used: plan.followup_ability_used ?? null,
+    followup_dc: plan.followup_dc ?? null,
+    followup_check_task: plan.followup_check_task ?? null,
   });
+  const buildPublicTurnInformationCheckPlan = (prompt: PublicTurnInformationCheckPrompt): ActionCheckPlan => ({
+    ok: true,
+    session_id: sessionId,
+    actor_role_id: prompt.actor_id,
+    actor_name: prompt.actor_name,
+    actor_kind: 'player',
+    action_type: 'check',
+    source_context: 'public_turn',
+    resolution_rule: 'static_dc',
+    requires_check: true,
+    ability_used: prompt.ability_used,
+    ability_modifier: prompt.ability_modifier,
+    dc: prompt.dc,
+    time_spent_min: 1,
+    check_task: prompt.check_task || '获取当前线索',
+    source_label: prompt.source_actor_name ?? null,
+    threatened_consequence: prompt.stakes_summary || null,
+    public_turn_interaction_kind: prompt.source_interaction_kind,
+    public_turn_notice_state: prompt.notice_state,
+    public_turn_resolution_mode: 'static_dc',
+  });
+  const getPublicTurnInformationCheckTitle = (prompt: PublicTurnInformationCheckPrompt | null | undefined): string => {
+    const text = `${prompt?.check_task ?? ''} ${prompt?.stakes_summary ?? ''}`;
+    if (/(觉察|发现|洞察|观察|偷听)/.test(text)) return '觉察检定';
+    if (/(识别|辨认|分析|推理)/.test(text)) return '识别检定';
+    return '信息检定';
+  };
   const buildReactionCheckResult = (reaction: PlayerReactionCheck, forcedRoll: number): ActionCheckResult => {
     const abilityModifier = playerStatic.dnd5e_sheet.current_ability_modifiers[reaction.ability_used];
     const totalScore = forcedRoll + abilityModifier;
@@ -1905,6 +2075,52 @@ function App() {
   ): ActionCheckResult | null =>
     buildPublicTurnOpposedResult(prompt, plan, presentation) ??
     normalizePublicTurnOpposedResult(prompt, plan, result);
+  const resolvePublicTurnInformationCheckResult = (
+    prompt: PublicTurnInformationCheckPrompt,
+    response: PublicTurnResponse | PendingTurnContinueResponse,
+  ): ActionCheckResult | null => {
+    const presentation = isPublicTurnResponse(response) ? response.presentation : response.public_turn_presentation;
+    const settlementId = String(prompt.metadata?.settlement_entry_id ?? '');
+    const entries = presentation?.settlement_entries ?? [];
+    let match = entries.find((entry) => entry.entry_id === settlementId && entry.followup_check);
+    if (!match) {
+      for (let index = entries.length - 1; index >= 0; index -= 1) {
+        const entry = entries[index];
+        if (entry.actor_id === prompt.actor_id && entry.followup_check) {
+          match = entry;
+          break;
+        }
+      }
+    }
+    const check = match?.followup_check;
+    if (!check) return null;
+    return {
+      ok: true,
+      session_id: sessionId,
+      actor_role_id: prompt.actor_id,
+      actor_name: prompt.actor_name,
+      actor_kind: 'player',
+      action_type: 'check',
+      check_mode: 'action',
+      source_context: 'public_turn',
+      resolution_rule: 'static_dc',
+      requires_check: true,
+      ability_used: check.ability_used,
+      ability_modifier: check.ability_modifier,
+      dc: check.dc ?? prompt.dc,
+      check_task: prompt.check_task,
+      dice_roll: check.dice_roll ?? null,
+      total_score: check.total_score ?? null,
+      success: check.success,
+      critical: check.critical,
+      time_spent_min: 1,
+      narrative: match?.gm_resolution_summary || check.outcome_text || check.comparison_text,
+      applied_effects: [],
+      relation_tag_suggestion: null,
+      source_label: prompt.source_actor_name ?? null,
+      threatened_consequence: prompt.stakes_summary || null,
+    };
+  };
   const buildBattleRollPlan = (prompt: BattleRollPrompt): ActionCheckPlan => ({
     ok: true,
     session_id: sessionId,
@@ -1978,9 +2194,33 @@ function App() {
     });
     setChatState('awaiting_attack_defense');
   };
-  const openPendingDeathSave = (prompt: DeathSavePrompt) => {
+  const openPendingInformationCheck = (
+    prompt: PublicTurnInformationCheckPrompt,
+    options?: { flowKind?: PendingTurnContinueResponse['flow_kind']; pendingTurnId?: string | null },
+  ) => {
+    pendingInformationCheckResponseRef.current = null;
+    setPendingInformationCheckState({
+      prompt,
+      flowKind: options?.flowKind,
+      pendingTurnId: options?.pendingTurnId ?? null,
+    });
+    setPublicTurnInformationCheckRollState({
+      ...DEFAULT_ACTION_CHECK_ROLL_STATE,
+      open: true,
+      plan: buildPublicTurnInformationCheckPlan(prompt),
+    });
+    setChatState('awaiting_information_check');
+  };
+  const openPendingDeathSave = (
+    prompt: DeathSavePrompt,
+    options?: { flowKind?: PendingTurnContinueResponse['flow_kind']; pendingTurnId?: string | null },
+  ) => {
     pendingDeathSaveResponseRef.current = null;
-    setPendingDeathSaveState({ prompt });
+    setPendingDeathSaveState({
+      prompt,
+      flowKind: options?.flowKind,
+      pendingTurnId: options?.pendingTurnId ?? null,
+    });
     setPublicTurnDeathSaveRollState({
       ...DEFAULT_PUBLIC_TURN_DEATH_SAVE_ROLL_STATE,
       open: true,
@@ -2077,6 +2317,7 @@ function App() {
     setPublicTurnOpposedPlan(null);
     setPublicTurnOpposedActionInput(prefill?.action ?? '');
     setPublicTurnOpposedSpeechInput(prefill?.speech ?? '');
+    setPublicTurnOpposedRollModalOpen(false);
     setPublicTurnOpposedRollState({
       ...DEFAULT_PUBLIC_TURN_OPPOSED_ROLL_STATE,
       open: true,
@@ -2099,6 +2340,7 @@ function App() {
     setPublicTurnOpposedPlan(null);
     setPublicTurnOpposedActionInput(prefill?.action ?? '');
     setPublicTurnOpposedSpeechInput(prefill?.speech ?? '');
+    setPublicTurnOpposedRollModalOpen(false);
     setPublicTurnOpposedRollState({
       ...DEFAULT_PUBLIC_TURN_OPPOSED_ROLL_STATE,
       open: true,
@@ -2119,14 +2361,16 @@ function App() {
       pendingInteractionState ||
       pendingAttackState ||
       pendingAttackDefenseState ||
+      pendingInformationCheckState ||
       pendingDeathSaveState ||
       pendingReactionState ||
       pendingOpposedState ||
       actionCheckRollState.open ||
       publicTurnActionRollState.open ||
+      publicTurnInformationCheckRollState.open ||
       publicTurnAttackDefenseRollState.open ||
       publicTurnDeathSaveRollState.open ||
-      publicTurnOpposedRollState.open ||
+      publicTurnOpposedRollModalOpen ||
       reactionCheckRollState.open
     ) {
       return;
@@ -2139,6 +2383,7 @@ function App() {
           (
             pending.status !== 'awaiting_reaction' &&
             pending.status !== 'awaiting_opposed' &&
+            pending.status !== 'awaiting_player_information_check' &&
             pending.status !== 'awaiting_player_attack_response' &&
             pending.status !== 'awaiting_player_attack_defense' &&
             pending.status !== 'awaiting_player_death_save' &&
@@ -2157,6 +2402,8 @@ function App() {
                   ? 'awaiting_death_save'
                 : pending.status === 'awaiting_opposed'
                   ? 'awaiting_opposed'
+                  : pending.status === 'awaiting_player_information_check'
+                    ? 'awaiting_information_check'
                   : pending.status === 'awaiting_protocol_repair'
                     ? 'awaiting_protocol_repair'
                     : 'awaiting_reaction';
@@ -2182,7 +2429,10 @@ function App() {
           return;
         }
         if (pending.status === 'awaiting_player_death_save' && pending.death_save_prompt) {
-          openPendingDeathSave(pending.death_save_prompt);
+          openPendingDeathSave(pending.death_save_prompt, {
+            flowKind: pending.flow_kind,
+            pendingTurnId: pending.pending_turn_id ?? null,
+          });
           return;
         }
         if (pending.status === 'awaiting_player_attack_response' && pending.public_attack_prompt) {
@@ -2191,6 +2441,13 @@ function App() {
         }
         if (pending.status === 'awaiting_opposed') {
           openPendingOpposed(pending);
+          return;
+        }
+        if (pending.status === 'awaiting_player_information_check' && pending.public_information_check_prompt) {
+          openPendingInformationCheck(pending.public_information_check_prompt, {
+            flowKind: pending.flow_kind,
+            pendingTurnId: pending.pending_turn_id ?? null,
+          });
           return;
         }
         if (pending.pending_reaction) {
@@ -2205,14 +2462,16 @@ function App() {
     pendingInteractionState,
     pendingAttackState,
     pendingAttackDefenseState,
+    pendingInformationCheckState,
     pendingDeathSaveState,
     pendingReactionState,
     pendingOpposedState,
     actionCheckRollState.open,
     publicTurnActionRollState.open,
+    publicTurnInformationCheckRollState.open,
     publicTurnAttackDefenseRollState.open,
     publicTurnDeathSaveRollState.open,
-    publicTurnOpposedRollState.open,
+    publicTurnOpposedRollModalOpen,
     reactionCheckRollState.open,
   ]);
 
@@ -2241,11 +2500,19 @@ function App() {
   }, [publicTurnState, pendingAttackDefenseState]);
 
   useEffect(() => {
+    const prompt = publicTurnState.current_round?.pending_information_check_prompt ?? null;
+    if (!prompt) return;
+    if (pendingInformationCheckState?.prompt.prompt_id === prompt.prompt_id) return;
+    if (publicTurnState.current_round?.phase !== 'awaiting_player_information_check') return;
+    openPendingInformationCheck(prompt, { flowKind: 'public_turn' });
+  }, [publicTurnState, pendingInformationCheckState]);
+
+  useEffect(() => {
     const prompt = publicTurnState.current_round?.pending_death_save_prompt ?? null;
     if (!prompt) return;
     if (pendingDeathSaveState?.prompt.prompt_id === prompt.prompt_id) return;
     if (publicTurnState.current_round?.phase !== 'awaiting_player_death_save') return;
-    openPendingDeathSave(prompt);
+    openPendingDeathSave(prompt, { flowKind: 'public_turn' });
   }, [publicTurnState, pendingDeathSaveState]);
 
   useEffect(() => {
@@ -2268,6 +2535,11 @@ function App() {
     if (!sessionId) return;
     void refreshTemplateLibraryStatus();
   }, [sessionId]);
+
+  useEffect(() => {
+    if (!currentMainOutput?.scene_events?.length) return;
+    pushDamageHighlights(currentMainOutput.scene_events);
+  }, [currentMainOutput?.scene_events]);
 
   const refreshTokenUsage = async (sid: string = sessionId) => {
     try {
@@ -2625,7 +2897,6 @@ function App() {
 
   useEffect(() => {
     announcedEncounterIdsRef.current = new Set();
-    autoRejoinEncounterIdRef.current = null;
   }, [sessionId]);
 
   const presentPendingEncounterEvent = useEffectEvent(async (encounterId: string) => {
@@ -2642,26 +2913,10 @@ function App() {
     }
   });
 
-  const autoRejoinEncounterEvent = useEffectEvent(async (encounter: EncounterEntry) => {
-    try {
-      setEncounterModalBusy(true);
-      forceReturnToMainChat('encounter_interrupt');
-      const response = await rejoinEncounter({ session_id: sessionId, encounter_id: encounter.encounter_id }, report);
-      setEncounterState(response.encounter_state ?? defaultEncounterState);
-      setMainAssistantOnly(response.reply);
-      await refreshGameLogs(sessionId);
-      await syncStateFromSave(sessionId);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : '自动重返遭遇失败');
-    } finally {
-      setEncounterModalBusy(false);
-    }
-  });
-
   useEffect(() => {
     if (pendingQuest || !pendingEncounter) return;
     const encounterId = pendingEncounter.encounter_id;
-    if (pendingEncounter.status === 'active' || pendingEncounter.status === 'escaped') {
+    if (pendingEncounter.status === 'active') {
       if (announcedEncounterIdsRef.current.has(encounterId) || encounterModalEncounterId === encounterId) return;
       forceReturnToMainChatEvent('encounter_interrupt');
       setEncounterModalEncounterId(encounterId);
@@ -2671,37 +2926,6 @@ function App() {
     if (activeEncounter?.encounter_id) return;
     void presentPendingEncounterEvent(encounterId);
   }, [pendingQuest, pendingEncounter, activeEncounter?.encounter_id, encounterModalEncounterId]);
-
-  useEffect(() => {
-    if (!canRejoinActiveEncounter || !activeEncounter) {
-      autoRejoinEncounterIdRef.current = null;
-      return;
-    }
-    if (
-      pendingQuest ||
-      mapPromptDialogOpen ||
-      aiWaiting ||
-      actionCheckRollState.open ||
-      publicTurnActionRollState.open ||
-      encounterModalBusy ||
-      encounterModalOpen
-    ) {
-      return;
-    }
-    if (autoRejoinEncounterIdRef.current === activeEncounter.encounter_id) return;
-    autoRejoinEncounterIdRef.current = activeEncounter.encounter_id;
-    void autoRejoinEncounterEvent(activeEncounter);
-  }, [
-    canRejoinActiveEncounter,
-    activeEncounter,
-    pendingQuest,
-    mapPromptDialogOpen,
-    aiWaiting,
-    actionCheckRollState.open,
-    publicTurnActionRollState.open,
-    encounterModalBusy,
-    encounterModalOpen,
-  ]);
 
   const formatValidateErrors = (errors: Array<{ field: string; message: string }>) =>
     errors.map((e) => `${e.field}: ${e.message}`).join('; ');
@@ -3624,6 +3848,8 @@ function App() {
           ? 'awaiting_attack_defense'
           : response.public_attack_prompt
             ? 'awaiting_attack_response'
+            : response.public_information_check_prompt
+              ? 'awaiting_information_check'
             : response.death_save_prompt
               ? 'awaiting_death_save'
             : response.public_interaction_prompt
@@ -3647,6 +3873,8 @@ function App() {
           ? 'awaiting_attack_response'
           : response.status === 'awaiting_player_attack_defense'
             ? 'awaiting_attack_defense'
+            : response.status === 'awaiting_player_information_check'
+              ? 'awaiting_information_check'
             : response.status === 'awaiting_player_death_save'
               ? 'awaiting_death_save'
             : response.status === 'awaiting_opposed'
@@ -3699,6 +3927,29 @@ function App() {
     scene_events: payload.scene_events_so_far,
     tool_events: [],
     public_attack_defense_prompt: payload.public_attack_defense_prompt,
+    public_turn_state: payload.public_turn_state ?? null,
+    public_turn_presentation: payload.public_turn_presentation ?? null,
+    npc_role_id: payload.npc_role_id ?? null,
+  });
+
+  const buildPendingInformationCheckFromStream = (payload: {
+    pending_turn_id: string;
+    flow_kind: PendingTurnContinueResponse['flow_kind'];
+    reply_so_far: string;
+    scene_events_so_far: SceneEvent[];
+    public_information_check_prompt: PublicTurnInformationCheckPrompt | null;
+    npc_role_id?: string | null;
+    public_turn_state?: PublicTurnState | null;
+    public_turn_presentation?: PublicTurnPresentation | null;
+  }): PendingTurnContinueResponse => ({
+    session_id: sessionId,
+    pending_turn_id: payload.pending_turn_id,
+    flow_kind: payload.flow_kind,
+    status: 'awaiting_player_information_check',
+    reply_text: payload.reply_so_far,
+    scene_events: payload.scene_events_so_far,
+    tool_events: [],
+    public_information_check_prompt: payload.public_information_check_prompt,
     public_turn_state: payload.public_turn_state ?? null,
     public_turn_presentation: payload.public_turn_presentation ?? null,
     npc_role_id: payload.npc_role_id ?? null,
@@ -3849,7 +4100,22 @@ function App() {
       applyPendingPublicTurnState(response);
     }
     if (response.death_save_prompt) {
-      openPendingDeathSave(response.death_save_prompt);
+      openPendingDeathSave(response.death_save_prompt, {
+        flowKind: response.flow_kind,
+        pendingTurnId: response.pending_turn_id ?? null,
+      });
+    }
+  };
+
+  const handlePendingInformationCheckRequired = (response: PendingTurnContinueResponse) => {
+    if (response.flow_kind === 'public_turn') {
+      applyPendingPublicTurnState(response);
+    }
+    if (response.public_information_check_prompt) {
+      openPendingInformationCheck(response.public_information_check_prompt, {
+        flowKind: response.flow_kind,
+        pendingTurnId: response.pending_turn_id ?? null,
+      });
     }
   };
 
@@ -3887,6 +4153,10 @@ function App() {
       handlePendingAttackResponseRequired(response);
       return;
     }
+    if (response.status === 'awaiting_player_information_check' && response.public_information_check_prompt) {
+      handlePendingInformationCheckRequired(response);
+      return;
+    }
     if (response.status === 'awaiting_player_death_save' && response.death_save_prompt) {
       handlePendingDeathSaveRequired(response);
       return;
@@ -3901,6 +4171,7 @@ function App() {
   };
 
   const onSubmitPublicTurnInteraction = async () => {
+    clearDamageHighlights();
     const pending = pendingInteractionState;
     if (!pending) return;
     const actionText = publicTurnInteractionActionInput.trim();
@@ -4081,6 +4352,7 @@ function App() {
   };
 
   const onSubmitPublicTurnAttackResponse = async () => {
+    clearDamageHighlights();
     const pending = pendingAttackState;
     if (!pending) return;
     const actionText = publicTurnAttackActionInput.trim();
@@ -4554,6 +4826,7 @@ function App() {
   };
 
   const onPlanPublicTurnOpposed = async () => {
+    clearDamageHighlights();
     const pending = pendingOpposedState;
     if (!pending) return;
     await planPublicTurnOpposedForPrompt(
@@ -4568,6 +4841,7 @@ function App() {
     const pending = pendingOpposedState;
     const plan = publicTurnOpposedPlan;
     if (!pending || !plan) return;
+    setPublicTurnOpposedRollModalOpen(true);
     const rollValue = Math.floor(Math.random() * 20) + 1;
     const rotation = {
       x: 1080 + Math.floor(Math.random() * 720),
@@ -4892,6 +5166,7 @@ function App() {
   const onClosePublicTurnOpposedModal = () => {
     const pending = pendingOpposedState;
     const response = pendingOpposedResponseRef.current;
+    setPublicTurnOpposedRollModalOpen(false);
     resetPublicTurnOpposedState();
     pendingOpposedResponseRef.current = null;
     if (response) {
@@ -4912,6 +5187,12 @@ function App() {
       if (attackPrompt) {
         applyPublicTurnResponse(response, { status: 'awaiting_attack_response', mergeImpacts: true });
         openPendingAttackResponse(attackPrompt);
+        return;
+      }
+      const informationCheckPrompt = findPendingPublicTurnInformationCheckPrompt(response);
+      if (informationCheckPrompt) {
+        applyPublicTurnResponse(response, { status: 'awaiting_information_check', mergeImpacts: true });
+        openPendingInformationCheck(informationCheckPrompt, { flowKind: 'public_turn' });
         return;
       }
       const interactionPrompt = findPendingPublicTurnInteractionPrompt(response);
@@ -5034,11 +5315,114 @@ function App() {
       openPendingAttackResponse(findPendingPublicTurnAttackPrompt(response)!);
       return;
     }
+    if (findPendingPublicTurnInformationCheckPrompt(response)) {
+      applyPublicTurnResponse(response, { status: 'awaiting_information_check', mergeImpacts: true });
+      openPendingInformationCheck(findPendingPublicTurnInformationCheckPrompt(response)!, { flowKind: 'public_turn' });
+      return;
+    }
     if (findPendingPublicTurnInteractionPrompt(response)) {
       handlePublicTurnInteractionRequired(response);
       return;
     }
     applyPublicTurnResponse(response, { status: response.round_completed ? 'awaiting_archive' : 'idle' });
+    void (async () => {
+      await syncEncounterLaneAfterSceneEvents(response.scene_events ?? []);
+      await refreshAreaSnapshot();
+      await refreshGameLogs(sessionId);
+      await syncStateFromSave(sessionId);
+    })();
+  };
+
+  const onTriggerPublicTurnInformationCheckRoll = () => {
+    if (publicTurnInformationCheckRollState.phase !== 'ready') return;
+    const pending = pendingInformationCheckState;
+    const plan = publicTurnInformationCheckRollState.plan;
+    if (!pending || !plan) return;
+    const rollValue = Math.floor(Math.random() * 20) + 1;
+    const rotation = {
+      x: 1080 + Math.floor(Math.random() * 720),
+      y: 1440 + Math.floor(Math.random() * 720),
+      z: 900 + Math.floor(Math.random() * 720),
+    };
+    setPublicTurnInformationCheckRollState((current) => ({
+      ...current,
+      phase: 'rolling',
+      rollValue,
+      result: null,
+      errorMessage: '',
+      rotation,
+    }));
+    window.setTimeout(() => {
+      void (async () => {
+        setPublicTurnInformationCheckRollState((current) => ({ ...current, phase: 'resolving', rollValue }));
+        try {
+          const response = await resolvePublicTurnInformationCheck(
+            {
+              session_id: sessionId,
+              prompt_id: pending.prompt.prompt_id,
+              forced_dice_roll: rollValue,
+              config: buildEffectivePublicTurnConfig(),
+            },
+            report,
+          );
+          pendingInformationCheckResponseRef.current = response;
+          const result = resolvePublicTurnInformationCheckResult(pending.prompt, response);
+          if (!result) {
+            throw new Error('信息检定结果缺失');
+          }
+          setPublicTurnInformationCheckRollState((current) => ({
+            ...current,
+            phase: 'resolved',
+            rollValue: result.dice_roll ?? rollValue,
+            result,
+            errorMessage: '',
+          }));
+        } catch (e) {
+          const message = e instanceof Error ? e.message : '信息检定失败';
+          setPublicTurnInformationCheckRollState((current) => ({ ...current, phase: 'error', errorMessage: message }));
+          setChatState('error');
+        }
+      })();
+    }, 1650);
+  };
+
+  const onClosePublicTurnInformationCheckModal = () => {
+    const response = pendingInformationCheckResponseRef.current;
+    resetPublicTurnInformationCheckState();
+    if (!response) {
+      setChatState('idle');
+      return;
+    }
+    abortRef.current = null;
+    activeStreamRef.current = null;
+    setChatState('idle');
+    if (isPendingTurnContinueResponse(response) && response.status !== 'completed') {
+      handlePublicTurnPendingResponse(response);
+      return;
+    }
+    if (!isPublicTurnResponse(response)) {
+      setError('公开回合信息检定响应类型异常');
+      setChatState('error');
+      return;
+    }
+    const attackDefensePrompt = findPendingPublicTurnAttackDefensePrompt(response);
+    if (attackDefensePrompt) {
+      applyPublicTurnResponse(response, { status: 'awaiting_attack_defense', mergeImpacts: true });
+      openPendingAttackDefense(attackDefensePrompt);
+      return;
+    }
+    const attackPrompt = findPendingPublicTurnAttackPrompt(response);
+    if (attackPrompt) {
+      applyPublicTurnResponse(response, { status: 'awaiting_attack_response', mergeImpacts: true });
+      openPendingAttackResponse(attackPrompt);
+      return;
+    }
+    const interactionPrompt = findPendingPublicTurnInteractionPrompt(response);
+    if (interactionPrompt) {
+      handlePublicTurnInteractionRequired(response);
+      return;
+    }
+    applyPublicTurnResponse(response, { status: response.round_completed ? 'awaiting_archive' : 'idle', mergeImpacts: true });
     void (async () => {
       await syncEncounterLaneAfterSceneEvents(response.scene_events ?? []);
       await refreshAreaSnapshot();
@@ -5069,6 +5453,36 @@ function App() {
         setPublicTurnDeathSaveRollState((current) => ({ ...current, phase: 'resolving', rollValue }));
         try {
           const effectiveConfig = buildEffectivePublicTurnConfig();
+          if (pending.flowKind === 'main_chat' && pending.pendingTurnId) {
+            const response = await continuePendingTurn(
+              {
+                session_id: sessionId,
+                pending_turn_id: pending.pendingTurnId,
+                forced_dice_roll: rollValue,
+                config: effectiveConfig,
+              },
+              report,
+            );
+            pendingDeathSaveResponseRef.current = response;
+            setCurrentMainOutput({
+              source_kind: 'main_turn',
+              reply_text: response.reply_text,
+              scene_events: filterMainOutputSceneEvents(response.scene_events),
+              archived_sub_zone_turn_id: response.archived_sub_zone_turn_id ?? null,
+              main_turn_summary: response.main_turn_summary ?? null,
+              public_turn_state: null,
+              public_turn_presentation: null,
+              status: response.status === 'completed' ? 'awaiting_archive' : 'awaiting_death_save',
+            });
+            setPublicTurnDeathSaveSummary(extractDeathSaveSummary(response));
+            setPublicTurnDeathSaveRollState((current) => ({
+              ...current,
+              phase: 'resolved',
+              rollValue,
+              errorMessage: '',
+            }));
+            return;
+          }
           let response: PendingTurnContinueResponse | PublicTurnResponse;
           if (config.stream) {
             const controller = new AbortController();
@@ -5322,11 +5736,34 @@ function App() {
       return;
     }
     const response = pendingDeathSaveResponseRef.current;
+    const pending = pendingDeathSaveState;
     clearPendingDeathSaveState();
     abortRef.current = null;
     activeStreamRef.current = null;
     setChatState('idle');
     if (!response) {
+      return;
+    }
+    if (pending?.flowKind === 'main_chat' && isPendingTurnContinueResponse(response)) {
+      if (response.status === 'awaiting_player_death_save' && response.death_save_prompt) {
+        openPendingDeathSave(response.death_save_prompt, {
+          flowKind: response.flow_kind,
+          pendingTurnId: response.pending_turn_id ?? null,
+        });
+        return;
+      }
+      if (response.flow_kind === 'main_chat') {
+        setCurrentMainOutput({
+          source_kind: 'main_turn',
+          reply_text: response.reply_text,
+          scene_events: filterMainOutputSceneEvents(response.scene_events),
+          archived_sub_zone_turn_id: response.archived_sub_zone_turn_id ?? null,
+          main_turn_summary: response.main_turn_summary ?? null,
+          public_turn_state: null,
+          public_turn_presentation: null,
+          status: response.status === 'completed' ? 'awaiting_archive' : 'awaiting_death_save',
+        });
+      }
       return;
     }
     if (isPendingTurnContinueResponse(response) && response.status !== 'completed') {
@@ -6127,7 +6564,8 @@ function App() {
       const controller = new AbortController();
       abortRef.current = controller;
       const previousNpcMessages = npcChatMessages[npcId] ?? [];
-      activeStreamRef.current = { kind: 'npc', npcId, previousMessages: previousNpcMessages };
+      const previousNpcDialogueLogs = npcChatDialogueLogs[npcId] ?? [];
+      activeStreamRef.current = { kind: 'npc', npcId, npcName, previousMessages: previousNpcMessages, previousDialogueLogs: previousNpcDialogueLogs };
       let rolledBack = false;
       let streamedNpcSceneEvents: SceneEvent[] = [];
       setNpcLiveProgress((prev) => ({ ...prev, [npcId]: [] }));
@@ -6204,13 +6642,7 @@ function App() {
             },
             onDialogueLogs: (logs) => {
               if (rolledBack) return;
-              setNpcChatMessages((prev) => ({
-                ...prev,
-                [npcId]: (logs ?? []).map((item) => ({
-                  role: item.speaker === 'player' ? 'user' : 'assistant',
-                  content: `[${item.world_time_text}] ${item.speaker_name}: ${item.content}`,
-                })),
-              }));
+              applyNpcDialogueLogs(npcId, npcName, logs ?? []);
             },
             onSceneEvents: (events) => {
               streamedNpcSceneEvents = events;
@@ -6270,13 +6702,7 @@ function App() {
       if (!isNpcTurnResponse(response)) {
         throw new Error('NPC 单聊响应类型异常');
       }
-      setNpcChatMessages((prev) => ({
-        ...prev,
-        [npcId]: (response.dialogue_logs ?? []).map((item) => ({
-          role: item.speaker === 'player' ? 'user' : 'assistant',
-          content: `[${item.world_time_text}] ${item.speaker_name}: ${item.content}`,
-        })),
-      }));
+      applyNpcDialogueLogs(npcId, npcName, response.dialogue_logs ?? []);
       clearDraft();
       pushTimeNotice(response.time_spent_min, speakReason);
       await refreshTokenUsage(sessionId);
@@ -6293,6 +6719,7 @@ function App() {
   };
 
   const onSend = async () => {
+    clearDamageHighlights();
     if (blockingWorkflowActive) return;
     const actionDescription = actionInput.trim();
     const speechDescription = speechInput.trim();
@@ -6566,6 +6993,13 @@ function App() {
           clearPlayerInput();
           return;
         }
+        const informationCheckPrompt = findPendingPublicTurnInformationCheckPrompt(response);
+        if (informationCheckPrompt) {
+          applyPublicTurnResponse(response, { status: 'awaiting_information_check', mergeImpacts: true });
+          openPendingInformationCheck(informationCheckPrompt, { flowKind: 'public_turn' });
+          clearPlayerInput();
+          return;
+        }
         if (findPendingPublicTurnInteractionPrompt(response)) {
           handlePublicTurnInteractionRequired(response);
         } else {
@@ -6583,6 +7017,7 @@ function App() {
     };
 
     const onSubmitPublicTurnAction = async () => {
+      clearDamageHighlights();
       const speechOnlySubmission = playerSpeechOnlyInPublicTurn;
       if (!speechOnlySubmission && !actionDescription && !speechDescription) {
         setError('当前回合至少需要输入行为或语言。');
@@ -6767,6 +7202,22 @@ function App() {
                     reply_so_far: payload.reply_so_far,
                     scene_events_so_far: payload.scene_events_so_far,
                     public_attack_defense_prompt: payload.public_attack_defense_prompt,
+                    npc_role_id: payload.npc_role_id ?? null,
+                    public_turn_state: payload.public_turn_state ?? streamedTurnState,
+                    public_turn_presentation: payload.public_turn_presentation ?? streamedPresentation,
+                  }),
+                );
+              },
+              onInformationCheckRequired: (payload) => {
+                abortRef.current = null;
+                activeStreamRef.current = null;
+                handlePendingInformationCheckRequired(
+                  buildPendingInformationCheckFromStream({
+                    pending_turn_id: payload.pending_turn_id,
+                    flow_kind: payload.flow_kind,
+                    reply_so_far: payload.reply_so_far,
+                    scene_events_so_far: payload.scene_events_so_far,
+                    public_information_check_prompt: payload.public_information_check_prompt,
                     npc_role_id: payload.npc_role_id ?? null,
                     public_turn_state: payload.public_turn_state ?? streamedTurnState,
                     public_turn_presentation: payload.public_turn_presentation ?? streamedPresentation,
@@ -7035,7 +7486,54 @@ function App() {
     setTeammateChatSpeechInput(teammateChatLastSpeechInput);
   };
 
+  const runGenerateTeammateMemorySummary = async ({ closeAfter }: { closeAfter: boolean }) => {
+    if (!activeTeammateChat || teammateMemorySummaryBusy) return false;
+    const sourceDialogueIds = activeTeammatePendingMemoryDialogueIds;
+    if (sourceDialogueIds.length === 0) {
+      if (closeAfter) {
+        finalizeCloseTeammateChatModal();
+      }
+      return true;
+    }
+    try {
+      setTeammateMemorySummaryBusy(true);
+      setError('');
+      const response = await generateTeammatePrivateChatMemory(
+        {
+          session_id: sessionId,
+          npc_role_id: activeTeammateChat.npcId,
+          source_dialogue_ids: sourceDialogueIds,
+          config,
+        },
+        report,
+      );
+      replaceCachedRoleCard(response.role);
+      applyNpcDialogueLogs(activeTeammateChat.npcId, activeTeammateChat.npcName, response.role.dialogue_logs ?? []);
+      const latestSummarizedId =
+        response.memory.source_dialogue_ids.length > 0
+          ? response.memory.source_dialogue_ids[response.memory.source_dialogue_ids.length - 1]
+          : activeTeammateChat.lastSummarizedDialogueId;
+      setActiveTeammateChat((prev) =>
+        prev?.npcId === activeTeammateChat.npcId ? { ...prev, lastSummarizedDialogueId: latestSummarizedId } : prev,
+      );
+      setTeammateMemorySummaryPrompt(null);
+      pushSystemNotice(response.deduped_existing ? '已复用已有队友记忆摘要。' : '已生成队友记忆摘要。');
+      if (closeAfter) {
+        finalizeCloseTeammateChatModal();
+      }
+      return true;
+    } catch (e) {
+      const message = e instanceof Error ? e.message : '队友记忆摘要生成失败';
+      setError(message);
+      window.alert(message);
+      return false;
+    } finally {
+      setTeammateMemorySummaryBusy(false);
+    }
+  };
+
   const onSendTeammateChat = async () => {
+    clearDamageHighlights();
     if (!activeTeammateChat || teammateChatSendDisabled) return;
     await submitNpcChatTurn({
       npcId: activeTeammateChat.npcId,
@@ -7051,7 +7549,7 @@ function App() {
         setTeammateChatActionInput('');
         setTeammateChatSpeechInput('');
       },
-      closeConversation: closeTeammateChatModal,
+      closeConversation: requestCloseTeammateChatModal,
     });
   };
 
@@ -7064,9 +7562,10 @@ function App() {
     setCurrentMainOutput(null);
     clearLiveProgress();
     setNpcChatMessages({});
+    setNpcChatDialogueLogs({});
     setChatMode('main');
     setActiveNpcChat(null);
-    closeTeammateChatModal();
+    finalizeCloseTeammateChatModal();
     setPlayerInputValidationPanelOpen(false);
     setPlayerInputValidationModalState(null);
     playerInputValidationPromiseRef.current = null;
@@ -7394,12 +7893,29 @@ function App() {
       onLeaveNpcChat();
     }
     setError('');
-    setActiveTeammateChat({ npcId, npcName });
+    const cachedLatestDialogueId = latestPrivateChatDialogueId(npcChatDialogueLogs[npcId] ?? []);
+    setTeammateMemorySummaryPrompt(null);
+    setActiveTeammateChat({
+      npcId,
+      npcName,
+      sessionOpenedAtDialogueId: cachedLatestDialogueId,
+      lastSummarizedDialogueId: cachedLatestDialogueId,
+    });
     setTeammateChatActionInput('');
     setTeammateChatSpeechInput('');
     setTeammateChatLastActionInput('');
     setTeammateChatLastSpeechInput('');
-    await ensureNpcChatHistoryLoaded(npcId, npcName);
+    const role = await ensureNpcChatHistoryLoaded(npcId, npcName);
+    const latestDialogueId = latestPrivateChatDialogueId(role?.dialogue_logs ?? []);
+    setActiveTeammateChat((prev) =>
+      prev?.npcId === npcId
+        ? {
+            ...prev,
+            sessionOpenedAtDialogueId: latestDialogueId,
+            lastSummarizedDialogueId: latestDialogueId,
+          }
+        : prev,
+    );
   };
 
   const onOpenActionPanel = async () => {
@@ -7707,6 +8223,9 @@ function App() {
         role_type: next.role_type || defaultPlayerStaticData.role_type,
         dnd5e_sheet: next.dnd5e_sheet || defaultPlayerStaticData.dnd5e_sheet,
       };
+      if ((payload.dnd5e_sheet.hit_points.current ?? 0) <= 0) {
+        throw new Error('玩家当前 HP 不能直接保存为 0 或更低。请使用 Debug 面板的“玩家HP归零（测试死亡流程）”按钮。');
+      }
       const saved = await setPlayerStatic(sessionId, payload, report);
       setPlayerStaticState(saved);
 
@@ -7829,6 +8348,37 @@ function App() {
       );
     } catch (e) {
       setError(e instanceof Error ? e.message : 'AI 填充法术表失败');
+    } finally {
+      setAiWaiting(false);
+    }
+  };
+
+  const onZeroPlayerHp = async () => {
+    setAiWaitingText('正在将玩家生命值归零并进入死亡流程...');
+    setAiWaiting(true);
+    clearDamageHighlights();
+    try {
+      const response = await debugZeroPlayerHp({ session_id: sessionId }, report);
+      setCurrentMainOutput({
+        source_kind: 'main_turn',
+        reply_text: response.reply_text,
+        scene_events: filterMainOutputSceneEvents(response.scene_events),
+        archived_sub_zone_turn_id: response.archived_sub_zone_turn_id ?? null,
+        main_turn_summary: response.main_turn_summary ?? null,
+        public_turn_state: null,
+        public_turn_presentation: null,
+        status: response.status === 'completed' ? 'awaiting_archive' : 'awaiting_death_save',
+      });
+      if (response.death_save_prompt) {
+        openPendingDeathSave(response.death_save_prompt, {
+          flowKind: response.flow_kind,
+          pendingTurnId: response.pending_turn_id ?? null,
+        });
+      }
+      await syncStateFromSave(sessionId);
+      await refreshGameLogs(sessionId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '调试死亡流程启动失败');
     } finally {
       setAiWaiting(false);
     }
@@ -8146,8 +8696,10 @@ function App() {
       setMapPromptDialogOpen(false);
       setCurrentMainOutput(null);
       setNpcChatMessages({});
+      setNpcChatDialogueLogs({});
       setChatMode('main');
       setActiveNpcChat(null);
+      finalizeCloseTeammateChatModal();
       setQuestInspectOpen(false);
       setEncounterModalBusy(false);
       setEncounterModalEncounterId(null);
@@ -8709,13 +9261,170 @@ function App() {
   const mainOutputVisibleEvents = (currentMainOutput?.scene_events ?? []).filter(
     (event) => !FOLDED_MAIN_SCENE_EVENT_KINDS.has(event.kind),
   );
+  const mainOutputDamageEvents = mainOutputVisibleEvents.filter((event) => isDamageResolutionEvent(event));
+  const mainOutputNonDamageEvents = mainOutputVisibleEvents.filter((event) => !isDamageResolutionEvent(event));
   const mainOutputFoldedEvents = (currentMainOutput?.scene_events ?? []).filter((event) =>
     FOLDED_MAIN_SCENE_EVENT_KINDS.has(event.kind),
   );
   const restoredPublicTurnPresentation = publicTurnPresentationFromRound(publicTurnRound);
   const structuredPublicTurnOutput =
     currentMainOutput?.public_turn_presentation ?? livePublicTurnPresentation ?? restoredPublicTurnPresentation ?? null;
+  const publicTurnSummary = useMemo(
+    () => ({
+      phase: publicTurnPhase,
+      roundNumber: publicTurnRound?.round_number ?? null,
+      currentActorName: currentPublicTurnActorName,
+      riskLevel: publicTurnRound?.environment_risk_level ?? publicTurnState.environment_risk_level,
+      situationValue: currentPublicTurnSituationValue,
+    }),
+    [
+      currentPublicTurnActorName,
+      currentPublicTurnSituationValue,
+      publicTurnPhase,
+      publicTurnRound?.environment_risk_level,
+      publicTurnRound?.round_number,
+      publicTurnState.environment_risk_level,
+    ],
+  );
+  const activeInlinePublicTurnPrompt = useMemo<PublicTurnInlinePromptState | null>(() => {
+    if (chatMode !== 'main') {
+      return null;
+    }
+
+    if (pendingInteractionState) {
+      return {
+        kind: 'interaction_response',
+        prompt: pendingInteractionState.prompt,
+        busy: publicTurnInteractionBusy,
+        errorMessage: publicTurnInteractionError,
+        speechOnly: playerSpeechOnlyInPublicTurn,
+        actionValue: publicTurnInteractionActionInput,
+        speechValue: publicTurnInteractionSpeechInput,
+        actionInputRef,
+        onActionChange: setPublicTurnInteractionActionInput,
+        onSpeechChange: setPublicTurnInteractionSpeechInput,
+        onSubmit: () => void onSubmitPublicTurnInteraction(),
+        onNoAction: () => void onSubmitPublicTurnInteractionNoAction(),
+      };
+    }
+
+    if (pendingAttackState) {
+      return {
+        kind: 'attack_response',
+        prompt: pendingAttackState.prompt,
+        busy: publicTurnAttackBusy,
+        errorMessage: publicTurnAttackError,
+        speechOnly: playerSpeechOnlyInPublicTurn,
+        actionValue: publicTurnAttackActionInput,
+        speechValue: publicTurnAttackSpeechInput,
+        actionInputRef,
+        onActionChange: setPublicTurnAttackActionInput,
+        onSpeechChange: setPublicTurnAttackSpeechInput,
+        onSubmit: () => void onSubmitPublicTurnAttackResponse(),
+        onNoAction: () => void onSubmitPublicTurnAttackNoAction(),
+      };
+    }
+
+    if (pendingOpposedState) {
+      return {
+        kind: 'opposed_planning',
+        prompt: pendingOpposedState.prompt,
+        plan: publicTurnOpposedPlan,
+        phase: publicTurnOpposedRollState.phase,
+        rollModalOpen: publicTurnOpposedRollModalOpen,
+        errorMessage: publicTurnOpposedRollState.errorMessage,
+        actionValue: publicTurnOpposedActionInput,
+        speechValue: publicTurnOpposedSpeechInput,
+        actionInputRef,
+        onActionChange: setPublicTurnOpposedActionInput,
+        onSpeechChange: setPublicTurnOpposedSpeechInput,
+        onPlan: () => void onPlanPublicTurnOpposed(),
+        onTriggerRoll: () => onTriggerPublicTurnOpposedRoll(),
+      };
+    }
+
+    if (pendingInformationCheckState) {
+      return {
+        kind: 'information_check_pending',
+        prompt: pendingInformationCheckState.prompt,
+      };
+    }
+
+    if (publicTurnAwaitingPlayerAction) {
+      return {
+        kind: 'awaiting_player_action',
+        ...publicTurnSummary,
+        busy: chatState === 'sending' || chatState === 'streaming' || publicTurnActionRollState.open,
+        playerActionStatus: playerPublicTurnActionStatus,
+        actionValue: actionInput,
+        speechValue: speechInput,
+        actionInputRef,
+        onActionChange: setActionInput,
+        onSpeechChange: setSpeechInput,
+        onSubmit: () => void onSend(),
+      };
+    }
+
+    if (publicTurnAwaitingEntry) {
+      return {
+        kind: 'awaiting_entry_controls',
+        ...publicTurnSummary,
+        busy: chatState === 'sending' || chatState === 'streaming',
+        onStartNextRound: () => void onStartNextPublicTurnRound(),
+        onStartInitiative: () => void onStartPublicTurnInitiative(),
+      };
+    }
+
+    return null;
+  }, [
+    actionInput,
+    chatMode,
+    chatState,
+    currentPublicTurnActorName,
+    currentPublicTurnSituationValue,
+    onPlanPublicTurnOpposed,
+    onSend,
+    onStartNextPublicTurnRound,
+    onStartPublicTurnInitiative,
+    onSubmitPublicTurnAttackNoAction,
+    onSubmitPublicTurnAttackResponse,
+    onSubmitPublicTurnInteraction,
+    onSubmitPublicTurnInteractionNoAction,
+    onTriggerPublicTurnOpposedRoll,
+    pendingAttackState,
+    pendingInformationCheckState,
+    pendingInteractionState,
+    pendingOpposedState,
+    playerPublicTurnActionStatus,
+    playerSpeechOnlyInPublicTurn,
+    publicTurnSummary,
+    publicTurnActionRollState.open,
+    publicTurnAttackActionInput,
+    publicTurnAttackBusy,
+    publicTurnAttackError,
+    publicTurnAttackSpeechInput,
+    publicTurnAwaitingEntry,
+    publicTurnAwaitingPlayerAction,
+    publicTurnInteractionActionInput,
+    publicTurnInteractionBusy,
+    publicTurnInteractionError,
+    publicTurnInteractionSpeechInput,
+    publicTurnOpposedActionInput,
+    publicTurnOpposedPlan,
+    publicTurnOpposedRollModalOpen,
+    publicTurnOpposedRollState.errorMessage,
+    publicTurnOpposedRollState.phase,
+    publicTurnOpposedSpeechInput,
+    speechInput,
+  ]);
   const visiblePublicTurnImpacts = structuredPublicTurnOutput ? (publicTurnImpacts.length > 0 ? publicTurnImpacts : publicTurnRound?.impacts ?? []) : publicTurnImpacts;
+  const publicTurnInlinePanel = activeInlinePublicTurnPrompt ? <PublicTurnInlinePromptPanel state={activeInlinePublicTurnPrompt} /> : null;
+  const shouldRenderNarrativePane = Boolean(structuredPublicTurnOutput || publicTurnInlinePanel);
+  const showPublicTurnSummaryStrip = Boolean(publicTurnEnabled && (publicTurnRound || publicTurnState.awaiting_player_entry));
+  const chatGridClassName = [
+    'chat-grid',
+    showEncounterLane ? (encounterLaneCollapsed ? 'is-encounter-collapsed' : 'has-encounter-lane') : 'is-single-column',
+  ].join(' ');
 
   return (
     <main className="app-shell chat-shell">
@@ -8747,6 +9456,7 @@ function App() {
             onShowConsistencyStatus={() => void onShowConsistencyStatus()}
             onRunConsistencyCheck={() => void onRunConsistencyCheck()}
             onGenerateEncounter={() => void onGenerateEncounter()}
+            onZeroPlayerHp={() => void onZeroPlayerHp()}
             onSelectSaveFile={(file) => void onSelectSaveFile(file)}
             onClearSave={() => void onClearSave()}
             onDebugSaveReset={() => void onDebugSaveReset()}
@@ -8783,6 +9493,7 @@ function App() {
 
       <PartyPreviewRail
         entries={partyPreviewEntries}
+        damagedIds={damagedPartyIdSet}
         onOpenPlayerPanel={onOpenPlayerPanel}
         onOpenTeamPanel={() => void onOpenTeamPanel()}
         onSelectPlayer={onOpenPlayerQuickAction}
@@ -8827,9 +9538,16 @@ function App() {
           </div>
         </header>
 
-        <div className="chat-grid">
+        <div className={chatGridClassName}>
           <div className="chat-main-column">
             {chatMode === 'main' && <SubZoneContextPanel subZone={currentSubZone} />}
+            {showPublicTurnSummaryStrip ? <PublicTurnControlBar {...publicTurnSummary} /> : null}
+            {chatMode === 'main' && activeEncounter?.goal ? (
+              <section className="card encounter-goal-banner">
+                <strong>遭遇目标</strong>
+                <p>{activeEncounter.goal}</p>
+              </section>
+            ) : null}
 
             {chatMode === 'main' ? (
               <section className="messages current-output-panel">
@@ -8843,35 +9561,51 @@ function App() {
                         : '当前轮公开回合输出'}
                   </p>
                 </header>
-                {!structuredPublicTurnOutput &&
+                {!shouldRenderNarrativePane &&
                   !currentMainOutput?.reply_text.trim() &&
                   (currentMainOutput?.scene_events.length ?? 0) === 0 && (
                   <p className="hint">主聊天历史已经收进上方地区上下文，这里只显示当前轮输出或系统反馈。</p>
                 )}
-                {structuredPublicTurnOutput ? (
-                  <div className="public-turn-output-layout">
-                    <PublicTurnSettlementPane presentation={structuredPublicTurnOutput} roundActive={Boolean(publicTurnRound)} />
-                    <PublicTurnNarrativePane presentation={structuredPublicTurnOutput} />
+                {shouldRenderNarrativePane ? (
+                  <div className={`public-turn-output-layout ${structuredPublicTurnOutput ? '' : 'inline-only'}`.trim()}>
+                    {structuredPublicTurnOutput ? (
+                      <PublicTurnSettlementPane presentation={structuredPublicTurnOutput} roundActive={Boolean(publicTurnRound)} />
+                    ) : null}
+                    <PublicTurnNarrativePane
+                      presentation={structuredPublicTurnOutput}
+                      variant="main_output"
+                      sceneEvents={currentMainOutput?.scene_events ?? []}
+                      inlinePanel={publicTurnInlinePanel}
+                    />
                   </div>
                 ) : (
                   currentMainOutput?.reply_text.trim() && (
-                  <article className="msg assistant">
-                    <strong>GM</strong>
-                    <p>{currentMainOutput.reply_text}</p>
-                    {currentMainOutput.source_kind === 'main_turn' &&
-                      typeof currentMainOutput.main_turn_summary?.player_situation_delta === 'number' && (
-                        <p className="hint">
-                          玩家本轮局势变化：
-                          {currentMainOutput.main_turn_summary.player_situation_delta >= 0
-                            ? `+${currentMainOutput.main_turn_summary.player_situation_delta}`
-                            : currentMainOutput.main_turn_summary.player_situation_delta}
-                        </p>
-                      )}
-                  </article>
+                    <>
+                      <article className="msg assistant main-output-narrative-card">
+                        <strong>GM</strong>
+                        <p>{currentMainOutput.reply_text}</p>
+                        {currentMainOutput.source_kind === 'main_turn' &&
+                          typeof currentMainOutput.main_turn_summary?.player_situation_delta === 'number' && (
+                            <p className="hint">
+                              玩家本轮局势变化：
+                              {currentMainOutput.main_turn_summary.player_situation_delta >= 0
+                                ? `+${currentMainOutput.main_turn_summary.player_situation_delta}`
+                                : currentMainOutput.main_turn_summary.player_situation_delta}
+                            </p>
+                          )}
+                      </article>
+                      {mainOutputDamageEvents.length > 0 ? (
+                        <div className="main-output-damage-list">
+                          {mainOutputDamageEvents.map((event) => (
+                            <DamageResolutionInlineCard key={event.event_id} event={event} />
+                          ))}
+                        </div>
+                      ) : null}
+                    </>
                   )
                 )}
                 {!structuredPublicTurnOutput &&
-                  mainOutputVisibleEvents.map((event) => <SceneEventCard key={event.event_id} event={event} />)}
+                  mainOutputNonDamageEvents.map((event) => <SceneEventCard key={event.event_id} event={event} />)}
                 {structuredPublicTurnOutput && (visiblePublicTurnImpacts.length > 0 || mainOutputFoldedEvents.length > 0) && (
                   <div className="scene-event-fold-group">
                     <button
@@ -8976,18 +9710,13 @@ function App() {
               {chatMode === 'main' ? (
                 <PublicTurnPanel
                   state={publicTurnState}
-                  currentActorName={currentPublicTurnActorName}
-                  currentSituationValue={activeEncounter?.situation_value ?? null}
                   actionValue={actionInput}
                   speechValue={speechInput}
                   busy={chatState === 'sending' || chatState === 'streaming' || blockingWorkflowActive}
                   godMode={godMode}
-                  playerActionStatus={playerPublicTurnActionStatus}
+                  actionInputRef={actionInputRef}
                   onActionChange={setActionInput}
                   onSpeechChange={setSpeechInput}
-                  onStartNextRound={() => void onStartNextPublicTurnRound()}
-                  onStartInitiative={() => void onStartPublicTurnInitiative()}
-                  onSubmitAction={() => void onSend()}
                   onSubmitGodOverride={() => void onSend()}
                 />
               ) : (
@@ -9035,7 +9764,8 @@ function App() {
             roleCards={npcPoolItems}
             areaSnapshot={areaSnapshot}
             busy={encounterModalBusy}
-            canRejoin={canRejoinActiveEncounter}
+            collapsed={encounterLaneCollapsed}
+            onToggle={() => setEncounterLaneCollapsed((prev) => !prev)}
           />
         </div>
       </section>
@@ -9169,7 +9899,19 @@ function App() {
           if (!activeTeammateChat) return;
           void onRetainTeamMember(activeTeammateChat.npcId, activeTeammateChat.npcName);
         }}
-        onClose={closeTeammateChatModal}
+        memorySummaryBusy={teammateMemorySummaryBusy}
+        memorySummaryAvailable={teammateMemorySummaryAvailable}
+        onGenerateMemorySummary={() => void runGenerateTeammateMemorySummary({ closeAfter: false })}
+        onClose={requestCloseTeammateChatModal}
+      />
+
+      <TeammateMemorySummaryPromptModal
+        open={Boolean(teammateMemorySummaryPrompt)}
+        npcName={teammateMemorySummaryPrompt?.npcName ?? ''}
+        busy={teammateMemorySummaryBusy}
+        onGenerateAndClose={() => void runGenerateTeammateMemorySummary({ closeAfter: true })}
+        onCloseDirect={finalizeCloseTeammateChatModal}
+        onContinue={() => setTeammateMemorySummaryPrompt(null)}
       />
 
       <FatePanel open={fatePanelOpen} state={fateState} onClose={() => setFatePanelOpen(false)} />
@@ -9378,34 +10120,21 @@ function App() {
         onMinimize={() => setMinimizedBlockingModal('public_turn_action_roll')}
       />
 
-      <PublicTurnInteractionModal
-        open={visiblePublicTurnInteraction}
-        prompt={pendingInteractionState?.prompt ?? null}
-        actionValue={publicTurnInteractionActionInput}
-        speechValue={publicTurnInteractionSpeechInput}
-        busy={publicTurnInteractionBusy}
-        errorMessage={publicTurnInteractionError}
-        speechOnly={playerSpeechOnlyInPublicTurn}
-        onActionChange={setPublicTurnInteractionActionInput}
-        onSpeechChange={setPublicTurnInteractionSpeechInput}
-        onSubmit={() => void onSubmitPublicTurnInteraction()}
-        onNoAction={() => void onSubmitPublicTurnInteractionNoAction()}
-        onMinimize={() => setMinimizedBlockingModal('public_turn_interaction')}
-      />
-
-      <PublicTurnAttackModal
-        open={visiblePublicTurnAttackResponse}
-        prompt={pendingAttackState?.prompt ?? null}
-        actionValue={publicTurnAttackActionInput}
-        speechValue={publicTurnAttackSpeechInput}
-        busy={publicTurnAttackBusy}
-        errorMessage={publicTurnAttackError}
-        speechOnly={playerSpeechOnlyInPublicTurn}
-        onActionChange={setPublicTurnAttackActionInput}
-        onSpeechChange={setPublicTurnAttackSpeechInput}
-        onSubmit={() => void onSubmitPublicTurnAttackResponse()}
-        onNoAction={() => void onSubmitPublicTurnAttackNoAction()}
-        onMinimize={() => setMinimizedBlockingModal('public_turn_attack_response')}
+      <ActionCheckRollModal
+        open={visiblePublicTurnInformationCheck}
+        phase={publicTurnInformationCheckRollState.phase}
+        plan={publicTurnInformationCheckRollState.plan}
+        rollValue={publicTurnInformationCheckRollState.rollValue}
+        result={publicTurnInformationCheckRollState.result}
+        errorMessage={publicTurnInformationCheckRollState.errorMessage}
+        rotation={publicTurnInformationCheckRollState.rotation}
+        title={getPublicTurnInformationCheckTitle(pendingInformationCheckState?.prompt)}
+        subtitle={`先掷出这次${getPublicTurnInformationCheckTitle(pendingInformationCheckState?.prompt)}的 d20，再继续本轮结算。`}
+        sourceLabel={pendingInformationCheckState?.prompt.source_actor_name ?? undefined}
+        threatenedConsequence={pendingInformationCheckState?.prompt.stakes_summary ?? undefined}
+        onTrigger={onTriggerPublicTurnInformationCheckRoll}
+        onClose={onClosePublicTurnInformationCheckModal}
+        onMinimize={() => setMinimizedBlockingModal('public_turn_information_check')}
       />
 
       <PublicTurnAttackDefenseModal
@@ -9443,11 +10172,6 @@ function App() {
         result={publicTurnOpposedRollState.result}
         errorMessage={publicTurnOpposedRollState.errorMessage}
         rotation={publicTurnOpposedRollState.rotation}
-        actionValue={publicTurnOpposedActionInput}
-        speechValue={publicTurnOpposedSpeechInput}
-        onActionChange={setPublicTurnOpposedActionInput}
-        onSpeechChange={setPublicTurnOpposedSpeechInput}
-        onPlan={() => void onPlanPublicTurnOpposed()}
         onTrigger={onTriggerPublicTurnOpposedRoll}
         onClose={onClosePublicTurnOpposedModal}
         onMinimize={() => setMinimizedBlockingModal('public_turn_opposed')}

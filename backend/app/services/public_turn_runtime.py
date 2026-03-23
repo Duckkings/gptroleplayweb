@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Iterable
 
 from app.models.schemas import (
+    ActionCheckRequest,
     ActionCheckResponse,
     ChatConfig,
     DeathSavePrompt,
@@ -14,6 +15,7 @@ from app.models.schemas import (
     PublicTurnActionSubmission,
     PublicTurnAttackDefensePrompt,
     PublicTurnAttackPrompt,
+    PublicTurnInformationCheckPrompt,
     PublicTurnAttackResponseSubmission,
     PublicTurnEntryType,
     PublicTurnImpact,
@@ -41,6 +43,7 @@ from app.services.public_turn_narration_formatter import format_pause_preview_fr
 from app.services.public_turn_resolution import (
     build_initiative_declarations,
     build_initiative_order,
+    build_settlement_check,
     build_player_initiative_declaration,
     finalize_initiative_totals,
     resolve_ai_round,  # compatibility import for tests that patch this symbol
@@ -84,6 +87,7 @@ class PublicTurnRunResult:
     public_attack_prompt: PublicTurnAttackPrompt | None = None
     public_attack_defense_prompt: PublicTurnAttackDefensePrompt | None = None
     public_opposed_prompt: PublicTurnOpposedPrompt | None = None
+    public_information_check_prompt: PublicTurnInformationCheckPrompt | None = None
     death_save_prompt: DeathSavePrompt | None = None
     player_action_check_result: ActionCheckResponse | None = None
 
@@ -177,6 +181,7 @@ def _sync_compat_narration(round_state: PublicTurnRound) -> None:
         PublicTurnPhase.AWAITING_PLAYER_OPPOSED,
         PublicTurnPhase.AWAITING_PLAYER_ATTACK_RESPONSE,
         PublicTurnPhase.AWAITING_PLAYER_ATTACK_DEFENSE,
+        PublicTurnPhase.AWAITING_PLAYER_INFORMATION_CHECK,
         PublicTurnPhase.AWAITING_PLAYER_DEATH_SAVE,
     }:
         round_state.narrative_status = PublicTurnRoundNarrationStatus.PAUSED
@@ -228,6 +233,7 @@ def _clear_player_pause(round_state: PublicTurnRound) -> None:
     round_state.pending_interaction_prompt = None
     round_state.pending_attack_prompt = None
     round_state.pending_attack_defense_prompt = None
+    round_state.pending_information_check_prompt = None
     round_state.pending_death_save_prompt = None
     round_state.narrative_entries = [item for item in round_state.narrative_entries if item.settlement_entry_id is not None]
 
@@ -409,6 +415,7 @@ def _complete_round(
     public_phase: PublicTurnPhase,
 ) -> str:
     round_state.completed_at = world._utc_now()
+    world.restore_npc_talkative_from_public_round(save, round_id=round_state.round_id)
     state.environment_risk_level = round_state.environment_risk_level
     state.round_history.append(round_state.model_copy(deep=True))
     state.round_history = state.round_history[-state.max_history :]
@@ -446,6 +453,7 @@ def _build_result(
     public_attack_prompt: PublicTurnAttackPrompt | None = None,
     public_attack_defense_prompt: PublicTurnAttackDefensePrompt | None = None,
     public_opposed_prompt: PublicTurnOpposedPrompt | None = None,
+    public_information_check_prompt: PublicTurnInformationCheckPrompt | None = None,
     death_save_prompt: DeathSavePrompt | None = None,
     player_action_check_result: ActionCheckResponse | None = None,
 ) -> PublicTurnRunResult:
@@ -464,6 +472,7 @@ def _build_result(
         public_attack_prompt=public_attack_prompt,
         public_attack_defense_prompt=public_attack_defense_prompt,
         public_opposed_prompt=public_opposed_prompt,
+        public_information_check_prompt=public_information_check_prompt,
         death_save_prompt=death_save_prompt,
         player_action_check_result=player_action_check_result,
     )
@@ -1077,6 +1086,7 @@ def _run_segment_step(
             PublicTurnPhase.AWAITING_PLAYER_OPPOSED,
             PublicTurnPhase.AWAITING_PLAYER_ATTACK_RESPONSE,
             PublicTurnPhase.AWAITING_PLAYER_ATTACK_DEFENSE,
+            PublicTurnPhase.AWAITING_PLAYER_INFORMATION_CHECK,
             PublicTurnPhase.AWAITING_PLAYER_DEATH_SAVE,
         }:
             raise ValueError("PUBLIC_TURN_AWAITING_REACTION")
@@ -1096,6 +1106,7 @@ def _merge_run_results(results: list[PublicTurnRunResult]) -> PublicTurnRunResul
     public_attack_prompt: PublicTurnAttackPrompt | None = None
     public_attack_defense_prompt: PublicTurnAttackDefensePrompt | None = None
     public_opposed_prompt: PublicTurnOpposedPrompt | None = None
+    public_information_check_prompt: PublicTurnInformationCheckPrompt | None = None
     death_save_prompt: DeathSavePrompt | None = None
     player_action_check_result: ActionCheckResponse | None = None
     archived_turn_id: str | None = None
@@ -1108,6 +1119,7 @@ def _merge_run_results(results: list[PublicTurnRunResult]) -> PublicTurnRunResul
         public_attack_prompt = item.public_attack_prompt or public_attack_prompt
         public_attack_defense_prompt = item.public_attack_defense_prompt or public_attack_defense_prompt
         public_opposed_prompt = item.public_opposed_prompt or public_opposed_prompt
+        public_information_check_prompt = item.public_information_check_prompt or public_information_check_prompt
         death_save_prompt = item.death_save_prompt or death_save_prompt
         player_action_check_result = item.player_action_check_result or player_action_check_result
         archived_turn_id = item.archived_sub_zone_turn_id or archived_turn_id
@@ -1125,6 +1137,7 @@ def _merge_run_results(results: list[PublicTurnRunResult]) -> PublicTurnRunResul
         public_attack_prompt=public_attack_prompt,
         public_attack_defense_prompt=public_attack_defense_prompt,
         public_opposed_prompt=public_opposed_prompt,
+        public_information_check_prompt=public_information_check_prompt,
         death_save_prompt=death_save_prompt,
         player_action_check_result=player_action_check_result,
     )
@@ -1167,6 +1180,7 @@ def _iter_until_pause_or_end(
             or step.reaction_check is not None
             or step.public_interaction_prompt is not None
             or step.public_opposed_prompt is not None
+            or step.public_information_check_prompt is not None
         ):
             break
         if current_round is None:
@@ -1177,6 +1191,7 @@ def _iter_until_pause_or_end(
             PublicTurnPhase.AWAITING_PLAYER_INTERACTION,
             PublicTurnPhase.AWAITING_PLAYER_REACTION,
             PublicTurnPhase.AWAITING_PLAYER_OPPOSED,
+            PublicTurnPhase.AWAITING_PLAYER_INFORMATION_CHECK,
         }:
             break
         player_action_check_result = None
@@ -1485,6 +1500,16 @@ def iter_round_continue_steps_in_save(
             raise ValueError("PUBLIC_TURN_DEATH_SAVE_REQUIRED")
         raise ValueError("PUBLIC_TURN_DEATH_SAVE_REQUIRED")
 
+    if round_state.phase == PublicTurnPhase.AWAITING_PLAYER_INFORMATION_CHECK:
+        prompt = round_state.pending_information_check_prompt
+        if prompt is None:
+            raise ValueError("PUBLIC_TURN_INFORMATION_CHECK_NOT_FOUND")
+        if submission is not None:
+            raise ValueError("PUBLIC_TURN_INFORMATION_CHECK_REQUIRED")
+        if interaction_response is not None or attack_response is not None:
+            raise ValueError("PUBLIC_TURN_INFORMATION_CHECK_REQUIRED")
+        raise ValueError("PUBLIC_TURN_INFORMATION_CHECK_REQUIRED")
+
     if round_state.awaiting_player_action:
         if submission is None:
             raise ValueError("PUBLIC_TURN_ACTION_REQUIRED")
@@ -1579,7 +1604,7 @@ def iter_round_continue_steps_in_save(
                 seed_beats.append(_make_seed_beat(scene_events=player_events, settlement=player_settlement, impact=player_impact))
                 gm_summary = player_settlement.gm_resolution_summary
         else:
-            player_events, player_impact, player_settlement, player_action_check_result = resolve_player_submission(
+            player_events, player_impact, player_settlement, player_action_check_result, information_check_prompt = resolve_player_submission(
                 save,
                 session_id=save.session_id,
                 action_text=submission.action_text,
@@ -1587,6 +1612,7 @@ def iter_round_continue_steps_in_save(
                 round_state=round_state,
                 action_check=action_check,
                 config=config,
+                include_information_check_prompt=True,
             )
             round_state.impacts.append(player_impact)
             _append_settlement(round_state, player_settlement)
@@ -1596,6 +1622,30 @@ def iter_round_continue_steps_in_save(
             seed_beats.append(_make_seed_beat(scene_events=player_events, settlement=player_settlement, impact=player_impact))
             context_text = _normalize_narration([submission.action_text, submission.speech_text])
             gm_summary = player_settlement.gm_resolution_summary
+            if information_check_prompt is not None:
+                information_check_prompt.metadata["settlement_entry_id"] = player_settlement.entry_id
+                information_check_prompt.metadata["impact_index"] = len(round_state.impacts) - 1
+                round_state.awaiting_player_action = False
+                round_state.awaiting_player_action_phase = phase_before_pause
+                round_state.phase = PublicTurnPhase.AWAITING_PLAYER_INFORMATION_CHECK
+                round_state.pending_information_check_prompt = information_check_prompt
+                round_state.narrative_status = PublicTurnRoundNarrationStatus.PAUSED
+                state.awaiting_player_entry = False
+                _sync_compat_narration(round_state)
+                save_public_turn_state_in_save(save, state)
+                return [
+                    _build_result(
+                        state=state,
+                        round_state=round_state,
+                        narration=round_state.accumulated_narration,
+                        scene_events=seed_scene_events,
+                        impacts=seed_impacts,
+                        settlements=[player_settlement],
+                        round_completed=False,
+                        public_information_check_prompt=information_check_prompt,
+                        player_action_check_result=player_action_check_result,
+                    )
+                ]
     else:
         if submission is not None:
             raise ValueError("PUBLIC_TURN_NOT_AWAITING_PLAYER_ACTION")
@@ -1609,6 +1659,7 @@ def iter_round_continue_steps_in_save(
             PublicTurnPhase.AWAITING_PLAYER_OPPOSED,
             PublicTurnPhase.AWAITING_PLAYER_ATTACK_RESPONSE,
             PublicTurnPhase.AWAITING_PLAYER_ATTACK_DEFENSE,
+            PublicTurnPhase.AWAITING_PLAYER_INFORMATION_CHECK,
             PublicTurnPhase.AWAITING_PLAYER_DEATH_SAVE,
         }:
             raise ValueError("PUBLIC_TURN_AWAITING_REACTION")
@@ -1802,6 +1853,137 @@ def resume_round_after_opposed_in_save(
             prompt=prompt,
             target_action_summary=target_action_summary,
             target_speech_text=target_speech_text,
+            forced_dice_roll=forced_dice_roll,
+            config=config,
+        )
+    )
+
+
+def run_round_after_information_check_steps_in_save(
+    save: SaveFile,
+    *,
+    phase_before_pause: PublicTurnPhase | None,
+    prompt: PublicTurnInformationCheckPrompt,
+    forced_dice_roll: int,
+    config: ChatConfig | None,
+) -> list[PublicTurnRunResult]:
+    return list(
+        iter_round_after_information_check_steps_in_save(
+            save,
+            phase_before_pause=phase_before_pause,
+            prompt=prompt,
+            forced_dice_roll=forced_dice_roll,
+            config=config,
+        )
+    )
+
+
+def iter_round_after_information_check_steps_in_save(
+    save: SaveFile,
+    *,
+    phase_before_pause: PublicTurnPhase | None,
+    prompt: PublicTurnInformationCheckPrompt,
+    forced_dice_roll: int,
+    config: ChatConfig | None,
+) -> Iterable[PublicTurnRunResult]:
+    state = get_public_turn_state_in_save(save)
+    if state.current_round is None:
+        raise ValueError("PUBLIC_TURN_NOT_ACTIVE")
+    round_state = state.current_round
+    _coerce_runtime_phase(round_state)
+    round_state.phase = phase_before_pause or PublicTurnPhase.NORMAL_ADVANCEMENT
+    round_state.pending_information_check_prompt = None
+    round_state.awaiting_player_action = False
+    round_state.awaiting_player_action_phase = None
+    action_result = world.action_check(
+        ActionCheckRequest(
+            session_id=save.session_id,
+            actor_role_id=prompt.actor_id,
+            action_type="check",
+            action_prompt="\n".join(
+                part
+                for part in (
+                    str(prompt.metadata.get("action_text") or "").strip(),
+                    str(prompt.metadata.get("speech_text") or "").strip(),
+                    prompt.check_task.strip(),
+                    prompt.stakes_summary.strip(),
+                )
+                if part
+            ).strip()
+            or prompt.check_task.strip()
+            or prompt.stakes_summary.strip()
+            or prompt.actor_name,
+            source_context="public_turn",
+            resolution_rule="static_dc",
+            forced_dice_roll=forced_dice_roll,
+            resolution_context="embedded",
+            planned_ability_used=prompt.ability_used,
+            planned_dc=prompt.dc,
+            planned_time_spent_min=1,
+            planned_requires_check=True,
+            planned_check_task=prompt.check_task,
+            config=config,
+        )
+    )
+    settlement_id = str(prompt.metadata.get("settlement_entry_id") or "").strip()
+    if settlement_id:
+        settlement = next((item for item in round_state.settlement_entries if item.entry_id == settlement_id), None)
+        if settlement is not None:
+            settlement.followup_check = build_settlement_check(action_result)
+            summary = str(action_result.narrative or "").strip()
+            if summary:
+                previous = settlement.gm_resolution_summary.strip()
+                settlement.gm_resolution_summary = f"{previous}\n{summary}".strip() if previous else summary
+    info_summary = str(action_result.narrative or "").strip() or prompt.check_task or prompt.stakes_summary
+    save_public_turn_state_in_save(save, state)
+    resume_event = _phase_event(round_state, label="Information check resolved, public turn resumes")
+    info_event = world._new_scene_event(
+        "public_turn_information_check",
+        info_summary,
+        actor_role_id=prompt.actor_id,
+        actor_name=prompt.actor_name,
+        metadata={
+            "round_id": round_state.round_id,
+            "phase": round_state.phase.value,
+            "ability_used": prompt.ability_used,
+            "dc": prompt.dc,
+            "success": action_result.success,
+            "critical": action_result.critical,
+            "notice_state": prompt.notice_state,
+            "check_task": prompt.check_task,
+        },
+    )
+    return _iter_until_pause_or_end(
+        save,
+        state=state,
+        context_text="\n".join(
+            part
+            for part in (
+                str(prompt.metadata.get("action_text") or "").strip(),
+                str(prompt.metadata.get("speech_text") or "").strip(),
+                prompt.check_task.strip(),
+            )
+            if part
+        ),
+        gm_summary=info_summary,
+        config=config,
+        seed_scene_events=[info_event, resume_event],
+    )
+
+
+def resume_round_after_information_check_in_save(
+    save: SaveFile,
+    *,
+    phase_before_pause: PublicTurnPhase | None,
+    prompt: PublicTurnInformationCheckPrompt,
+    forced_dice_roll: int,
+    config: ChatConfig | None,
+) -> PublicTurnRunResult:
+    return _merge_run_results(
+        run_round_after_information_check_steps_in_save(
+            save,
+            phase_before_pause=phase_before_pause,
+            prompt=prompt,
             forced_dice_roll=forced_dice_roll,
             config=config,
         )

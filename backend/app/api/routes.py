@@ -95,6 +95,7 @@ from app.models.schemas import (
     ConsistencyRunRequest,
     ConsistencyRunResponse,
     ConsistencyStatusResponse,
+    DebugPlayerZeroHpRequest,
     EntityIndexResponse,
     InventoryEquipRequest,
     InventoryConsumeRequest,
@@ -142,6 +143,7 @@ from app.models.schemas import (
     PublicTurnContinueRequest,
     PublicTurnDeathSaveResolveRequest,
     PublicTurnEntryRequest,
+    PublicTurnInformationCheckResolveRequest,
     PublicTurnOpposedPlanRequest,
     PublicTurnOpposedPlanResponse,
     PublicTurnOpposedResolveRequest,
@@ -155,6 +157,7 @@ from app.models.schemas import (
     RegionGenerateRequest,
     RegionGenerateResponse,
     RoleDrivesResponse,
+    RoleCapabilityResponse,
     QuestEvaluateAllRequest,
     QuestActionRequest,
     QuestEvaluateRequest,
@@ -177,10 +180,14 @@ from app.models.schemas import (
     TeamLeaveRequest,
     TeamChatRequest,
     TeamChatResponse,
+    TeamPrivateChatMemoryGenerateRequest,
+    TeamPrivateChatMemoryGenerateResponse,
     TeamMutationResponse,
     TeamStateResponse,
     TemplateLibraryFillRequest,
     TemplateLibraryFillResponse,
+    TemplateLibraryDefinitionsRequest,
+    TemplateLibraryDefinitionsResponse,
     TemplateLibraryStatusResponse,
     TokenUsageResponse,
     ValidateConfigResponse,
@@ -220,7 +227,10 @@ from app.services.map_flow_service import (
 )
 from app.services.pending_turn_service import cancel_pending_turn, load_pending_turn
 from app.services.debug_save_reset_service import reset_debug_test_state
+from app.services.chat_damage_flow_service import zero_player_hp_for_debug
+from app.services.actor_capability_service import build_role_capability_response
 from app.services.template_library_debug_service import fill_template_library, get_template_library_status_response
+from app.services.template_library_query_service import query_template_library_definitions
 from app.services.character_build_service import (
     build_portrait_generation_prompt,
     complete_companion_build,
@@ -326,6 +336,7 @@ from app.services.public_turn_service import (
     run_public_turn_death_save_stream,
     run_public_turn_entry_once,
     run_public_turn_entry_stream,
+    run_public_turn_information_check_once,
     run_public_turn_attack_defense_once,
     run_public_turn_attack_defense_stream,
     run_public_turn_opposed_once,
@@ -363,6 +374,11 @@ from app.services.team_service import (
     invite_npc_to_team,
     leave_npc_from_team,
     team_chat,
+)
+from app.services.teammate_memory_service import (
+    TeammatePrivateChatMemoryError,
+    TeammatePrivateChatMemoryGenerationError,
+    generate_teammate_private_chat_memory,
 )
 
 from app.services.retained_npc_service import retained_npc_service
@@ -775,6 +791,20 @@ async def public_turn_opposed_check_plan(payload: PublicTurnOpposedPlanRequest) 
 async def public_turn_opposed_check(payload: PublicTurnOpposedResolveRequest) -> PublicTurnResponse | PendingTurnContinueResponse:
     try:
         return run_public_turn_opposed_once(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=_public_turn_status_code(str(exc)), detail=str(exc))
+    except RateLimitError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except APIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.post("/public-turn/information-check", response_model=PublicTurnResponse | PendingTurnContinueResponse)
+async def public_turn_information_check(
+    payload: PublicTurnInformationCheckResolveRequest,
+) -> PublicTurnResponse | PendingTurnContinueResponse:
+    try:
+        return run_public_turn_information_check_once(payload)
     except ValueError as exc:
         raise HTTPException(status_code=_public_turn_status_code(str(exc)), detail=str(exc))
     except RateLimitError as exc:
@@ -1763,22 +1793,12 @@ async def encounter_act(encounter_id: str, payload: EncounterActRequest) -> Enco
 
 @router.post("/encounters/{encounter_id}/escape", response_model=EncounterEscapeResponse)
 async def encounter_escape(encounter_id: str, payload: EncounterEscapeRequest) -> EncounterEscapeResponse:
-    try:
-        return escape_encounter(encounter_id, payload)
-    except KeyError:
-        raise HTTPException(status_code=404, detail="encounter not found")
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+    raise HTTPException(status_code=410, detail="encounter escape has been retired")
 
 
 @router.post("/encounters/{encounter_id}/rejoin", response_model=EncounterRejoinResponse)
 async def encounter_rejoin(encounter_id: str, payload: EncounterRejoinRequest) -> EncounterRejoinResponse:
-    try:
-        return rejoin_encounter(encounter_id, payload)
-    except KeyError:
-        raise HTTPException(status_code=404, detail="encounter not found")
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+    raise HTTPException(status_code=410, detail="encounter rejoin has been retired")
 
 
 @router.post("/encounters/debug/force-toggle", response_model=EncounterForceToggleResponse)
@@ -2135,6 +2155,18 @@ async def npc_knowledge_get(npc_role_id: str, session_id: str) -> NpcKnowledgeRe
     return NpcKnowledgeResponse(session_id=session_id, npc_role_id=npc_role_id, snapshot=snapshot)
 
 
+@router.get("/roles/{role_id}/capabilities", response_model=RoleCapabilityResponse)
+async def role_capabilities_get(role_id: str, session_id: str) -> RoleCapabilityResponse:
+    save = get_current_save(default_session_id=session_id)
+    if save.session_id != session_id:
+        save.session_id = session_id
+        save_current(save)
+    try:
+        return build_role_capability_response(save, session_id=session_id, role_id=role_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="role not found")
+
+
 @router.get("/team", response_model=TeamStateResponse)
 async def team_state_get(session_id: str) -> TeamStateResponse:
     try:
@@ -2177,6 +2209,20 @@ async def team_chat_run(payload: TeamChatRequest) -> TeamChatResponse:
         return team_chat(payload)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/team/private-chat-memory/generate", response_model=TeamPrivateChatMemoryGenerateResponse)
+async def team_private_chat_memory_generate(
+    payload: TeamPrivateChatMemoryGenerateRequest,
+) -> TeamPrivateChatMemoryGenerateResponse:
+    try:
+        return generate_teammate_private_chat_memory(payload)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="role not found")
+    except TeammatePrivateChatMemoryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except TeammatePrivateChatMemoryGenerationError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
 
 
 # Retained NPC endpoints
@@ -2399,6 +2445,32 @@ async def debug_template_library_status(session_id: str) -> TemplateLibraryStatu
         raise HTTPException(status_code=409, detail=str(exc))
 
 
+@router.get("/template-library/definitions", response_model=TemplateLibraryDefinitionsResponse)
+async def template_library_definitions_get(
+    session_id: str,
+    kind: str = "all",
+    definition_ids: str | None = None,
+    recommended_class: str | None = None,
+    min_level: int | None = None,
+    for_role_id: str | None = None,
+    limit: int = 20,
+) -> TemplateLibraryDefinitionsResponse:
+    save = get_current_save(default_session_id=session_id)
+    if save.session_id != session_id:
+        save.session_id = session_id
+        save_current(save)
+    req = TemplateLibraryDefinitionsRequest(
+        session_id=session_id,
+        kind=kind,  # type: ignore[arg-type]
+        definition_ids=[item.strip() for item in str(definition_ids or "").split(",") if item.strip()],
+        recommended_class=recommended_class,
+        min_level=min_level,
+        for_role_id=for_role_id,
+        limit=limit,
+    )
+    return query_template_library_definitions(req, save=save)
+
+
 @router.post("/debug/template-library/fill", response_model=TemplateLibraryFillResponse)
 async def debug_template_library_fill(payload: TemplateLibraryFillRequest) -> TemplateLibraryFillResponse:
     try:
@@ -2411,6 +2483,14 @@ async def debug_template_library_fill(payload: TemplateLibraryFillRequest) -> Te
     except Exception as exc:
         logger.exception("template library fill failed for session %s", payload.session_id)
         raise HTTPException(status_code=500, detail="template library fill failed") from exc
+
+
+@router.post("/debug/player/zero-hp", response_model=PendingTurnContinueResponse)
+async def debug_player_zero_hp(payload: DebugPlayerZeroHpRequest) -> PendingTurnContinueResponse:
+    try:
+        return zero_player_hp_for_debug(payload.session_id)
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 @router.post("/actions/check/plan", response_model=ActionCheckPlanResponse)

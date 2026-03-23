@@ -118,6 +118,7 @@ def _clear_team_memory_logs(save: SaveFile) -> list[str]:
         if role.role_id not in active_role_ids:
             continue
         role.dialogue_logs = []
+        role.private_chat_memories = []
         role.cognition_changes = []
         role.attitude_changes = []
         role.last_private_chat_at = None

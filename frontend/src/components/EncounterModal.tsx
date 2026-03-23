@@ -36,17 +36,17 @@ export function EncounterModal({ encounter, roleCards = [], busy = false, onCont
         </div>
         <strong>{encounter.title}</strong>
         <p>{encounter.description}</p>
+        {encounter.goal ? <p>遭遇目标: {encounter.goal}</p> : null}
         <p>
-          局势值: {encounter.situation_value}/100
+          局势值 {encounter.situation_value}/100
           {encounter.situation_start_value ? ` (起始 ${encounter.situation_start_value})` : ''}
         </p>
         <p>趋势: {TREND_LABEL[encounter.situation_trend]}</p>
-        {encounter.scene_summary && <p>当前局势: {encounter.scene_summary}</p>}
-        {encounter.latest_outcome_summary && <p>最近进展: {encounter.latest_outcome_summary}</p>}
-        {(mainNpcName || encounter.temporary_npcs.length > 0) && (
+        {encounter.scene_summary ? <p>当前局势: {encounter.scene_summary}</p> : null}
+        {(mainNpcName || encounter.temporary_npcs.length > 0) ? (
           <div>
-            <strong>遭遇可互动 NPC</strong>
-            {mainNpcName && <p>{mainNpcName}</p>}
+            <strong>遭遇相关角色</strong>
+            {mainNpcName ? <p>{mainNpcName}</p> : null}
             {encounter.temporary_npcs.map((item) => (
               <p key={item.encounter_npc_id}>
                 {item.name}
@@ -54,8 +54,8 @@ export function EncounterModal({ encounter, roleCards = [], busy = false, onCont
               </p>
             ))}
           </div>
-        )}
-        {encounter.last_outcome_package?.narrative_summary && <p>上次结果: {encounter.last_outcome_package.narrative_summary}</p>}
+        ) : null}
+        {encounter.last_outcome_package?.narrative_summary ? <p>结果摘要: {encounter.last_outcome_package.narrative_summary}</p> : null}
         <p>关闭后请在主聊天中描述你的动作或发言。</p>
         <div className="actions">
           <button onClick={onContinue} disabled={busy}>

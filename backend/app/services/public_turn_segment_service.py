@@ -57,6 +57,7 @@ from app.services.public_turn_resolution import (
     normalize_public_turn_ai_payload,
     settlement_actor_type,
 )
+from app.services.teammate_memory_service import build_private_chat_memory_context
 
 
 @dataclass
@@ -315,29 +316,17 @@ def _planned_directive_values(
                     resolution_rule = "static_dc"
                     consent_state = "ambiguous" if consent_state == "not_applicable" else consent_state
                     contest_state = "non_opposed" if contest_state == "not_applicable" else contest_state
-                    if interaction_exchange_kind == "non_world_exchange":
-                        planned_requires_check = False
-                        resolution_mode = "none"
-                    else:
-                        resolution_mode = "static_dc" if planned_requires_check else "none"
+                    resolution_mode = "static_dc" if planned_requires_check else "none"
         else:
             interaction_exchange_kind = (
                 "non_world_exchange" if world_impact_type == PublicTurnWorldImpactType.NON_WORLD else "world_exchange"
             )
-            if world_impact_type == PublicTurnWorldImpactType.NON_WORLD:
-                planned_requires_check = False
-                resolution_mode = "none"
-            else:
-                resolution_mode = "static_dc" if planned_requires_check else "none"
+            resolution_mode = "static_dc" if planned_requires_check else "none"
     else:
         interaction_exchange_kind = (
             "non_world_exchange" if world_impact_type == PublicTurnWorldImpactType.NON_WORLD else "world_exchange"
         )
-        if world_impact_type == PublicTurnWorldImpactType.NON_WORLD:
-            planned_requires_check = False
-            resolution_mode = "none"
-        else:
-            resolution_mode = "static_dc" if planned_requires_check else "none"
+        resolution_mode = "static_dc" if planned_requires_check else "none"
 
     if interaction_target is None and pause_kind in {"player_interaction", "player_opposed"}:
         pause_kind = "none"
@@ -503,6 +492,11 @@ def _planner_prompt_payload(
                 "actor_type": directive.actor_type.value,
                 "priority_reason": str(actor.get("priority_reason") or ""),
                 "roleplay_brief": public_scene_legacy._actor_roleplay_brief(actor),
+                "private_chat_memory_context": (
+                    build_private_chat_memory_context(actor.get("role"))
+                    if directive.actor_type.value == "team" and actor.get("role") is not None
+                    else "[]"
+                ),
                 "fallback_action_summary": directive.action_summary,
                 "fallback_speech_text": directive.speech_text,
                 "fallback_specific_threat": directive.specific_threat,
@@ -668,6 +662,9 @@ def _planner_overrides(
             f"{prompt}\nAllowed enum ids:\n"
             f"{render_enum_pool_text((EnumContractField(field_path='actors[].action_type', allowed_ids=('check', 'attack', 'item_use')), EnumContractField(field_path='actors[].pause_kind', allowed_ids=('none', 'player_interaction', 'player_reaction', 'player_opposed'))))}\n"
             "Use only the allowed stable ids for action_type and pause_kind.\n"
+            "If actors_json[].private_chat_memory_context is not empty for a team actor, treat it as the primary memory source for that actor's public-turn tone, attitude, and player-facing preference.\n"
+            "Those memory summaries may influence wording, body language, and whether the teammate leans toward protecting, supporting, avoiding, or distancing from the player.\n"
+            "Do not let private_chat_memory_context override urgent scene threats, legal targets, or the formal check/resource rules.\n"
             "speech_target_label must identify only the listener of the spoken line.\n"
             "Do not use gaze targets, wink targets, gesture targets, or silent coordination partners as speech_target_label.\n"
             "If an actor looks at player A but the spoken line is directed at actor B, speech_target_label must be actor B.\n"

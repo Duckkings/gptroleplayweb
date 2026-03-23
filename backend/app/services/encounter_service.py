@@ -31,6 +31,10 @@ from app.models.schemas import (
     EncounterPendingResponse,
     EncounterPresentRequest,
     EncounterPresentResponse,
+    PublicEncounterEntry,
+    PublicEncounterState,
+    PublicEncounterTemporaryNpc,
+    PublicEncounterTerminationCondition,
     EncounterRejoinRequest,
     EncounterRejoinResponse,
     EncounterResolution,
@@ -99,7 +103,126 @@ def _touch_state(state: EncounterState) -> None:
 def _state(save) -> EncounterState:
     if save.encounter_state is None:
         save.encounter_state = EncounterState()
+    _normalize_legacy_encounter_state(save)
     return save.encounter_state
+
+
+def _normalize_legacy_encounter_state(save) -> None:
+    state = save.encounter_state
+    if state is None:
+        return
+    relocated_zone_id = getattr(save.area_snapshot, "current_zone_id", None)
+    relocated_sub_zone_id = getattr(save.area_snapshot, "current_sub_zone_id", None)
+    for encounter in state.encounters:
+        changed = False
+        if encounter.status == "escaped":
+            encounter.status = "active"
+            changed = True
+        if encounter.player_presence == "away":
+            encounter.player_presence = "engaged"
+            changed = True
+        if changed:
+            if relocated_zone_id:
+                encounter.zone_id = relocated_zone_id
+            if relocated_sub_zone_id:
+                encounter.sub_zone_id = relocated_sub_zone_id
+            for temp_npc in encounter.temporary_npcs or []:
+                if relocated_zone_id:
+                    temp_npc.zone_id = relocated_zone_id
+                if relocated_sub_zone_id:
+                    temp_npc.sub_zone_id = relocated_sub_zone_id
+            if encounter.status == "active":
+                state.active_encounter_id = encounter.encounter_id
+
+
+def encounter_secret_for_actor(save, actor_role_id: str | None) -> str:
+    actor_id = str(actor_role_id or "").strip()
+    if not actor_id:
+        return ""
+    encounter = _current_active_encounter(_state(save))
+    if encounter is None or not encounter.secret.strip():
+        return ""
+    if encounter.npc_role_id and encounter.npc_role_id == actor_id:
+        return encounter.secret
+    temp_npc = next((item for item in encounter.temporary_npcs if item.encounter_npc_id == actor_id), None)
+    if temp_npc is not None and bool(temp_npc.knows_secret):
+        return encounter.secret
+    return ""
+
+
+def serialize_public_encounter(encounter: EncounterEntry) -> PublicEncounterEntry:
+    status = "active" if encounter.status == "escaped" else encounter.status
+    if status not in {"queued", "active", "resolved", "expired", "invalidated"}:
+        status = "active"
+    return PublicEncounterEntry(
+        encounter_id=encounter.encounter_id,
+        type=encounter.type,
+        source_world_revision=encounter.source_world_revision,
+        source_map_revision=encounter.source_map_revision,
+        entity_refs=[item.model_copy(deep=True) for item in encounter.entity_refs],
+        invalidated_reason=encounter.invalidated_reason,
+        status=status,  # type: ignore[arg-type]
+        trigger_kind=encounter.trigger_kind,
+        encounter_mode=encounter.encounter_mode,
+        title=encounter.title,
+        description=encounter.description,
+        goal=encounter.goal,
+        zone_id=encounter.zone_id,
+        sub_zone_id=encounter.sub_zone_id,
+        npc_role_id=encounter.npc_role_id,
+        related_quest_ids=list(encounter.related_quest_ids),
+        related_fate_phase_ids=list(encounter.related_fate_phase_ids),
+        participant_role_ids=list(encounter.participant_role_ids),
+        temporary_npcs=[
+            PublicEncounterTemporaryNpc(
+                encounter_npc_id=item.encounter_npc_id,
+                name=item.name,
+                title=item.title,
+                description=item.description,
+                speaking_style=item.speaking_style,
+                agenda=item.agenda,
+                state=item.state,
+                zone_id=item.zone_id,
+                sub_zone_id=item.sub_zone_id,
+                introduced_at=item.introduced_at,
+            )
+            for item in encounter.temporary_npcs
+        ],
+        generated_prompt_tags=list(encounter.generated_prompt_tags),
+        allow_player_prompt=encounter.allow_player_prompt,
+        termination_conditions=[
+            PublicEncounterTerminationCondition(
+                condition_id=item.condition_id,
+                kind=item.kind,
+                description=item.description,
+                satisfied=item.satisfied,
+                satisfied_at=item.satisfied_at,
+            )
+            for item in encounter.termination_conditions
+        ],
+        steps=[item.model_copy(deep=True) for item in encounter.steps],
+        scene_summary=encounter.scene_summary,
+        situation_start_value=encounter.situation_start_value,
+        situation_value=encounter.situation_value,
+        situation_trend=encounter.situation_trend,
+        last_outcome_package=(encounter.last_outcome_package.model_copy(deep=True) if encounter.last_outcome_package is not None else None),
+        created_at=encounter.created_at,
+        presented_at=encounter.presented_at,
+        resolved_at=encounter.resolved_at,
+        last_advanced_at=encounter.last_advanced_at,
+    )
+
+
+def serialize_public_encounter_state(state: EncounterState) -> PublicEncounterState:
+    return PublicEncounterState(
+        version=state.version,
+        pending_ids=list(state.pending_ids),
+        active_encounter_id=state.active_encounter_id,
+        encounters=[serialize_public_encounter(item) for item in state.encounters],
+        history=[item.model_copy(deep=True) for item in state.history],
+        debug_force_trigger=state.debug_force_trigger,
+        updated_at=state.updated_at,
+    )
 
 
 def _pending_entries(state: EncounterState) -> list[EncounterEntry]:
@@ -361,6 +484,7 @@ def _build_encounter_temp_npc(raw: dict[str, object], index: int) -> EncounterTe
         description=description,
         speaking_style=speaking_style,
         agenda=agenda,
+        knows_secret=bool(raw.get("knows_secret")),
         state="active",
     )
 
@@ -799,6 +923,7 @@ def _default_termination_conditions(encounter_type: str) -> list[EncounterTermin
                 description="遭遇核心目标被处理、确认或排除。",
             ),
         )
+    conditions = [item for item in conditions if item.kind != "player_escapes"]
     return conditions
 
 
@@ -1196,6 +1321,8 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
         typ = str(parsed.get("type") or "").strip().lower()
         title = _force_chinese_text(parsed.get("title"), fallback_encounter.title, limit=80)
         description = _force_chinese_text(parsed.get("description"), fallback_encounter.description, limit=240)
+        goal = _force_chinese_text(parsed.get("goal"), fallback_encounter.goal or "完成眼前遭遇的核心目标。", limit=160)
+        secret = _force_chinese_text(parsed.get("secret"), fallback_encounter.secret or description, limit=240)
         scene_summary = _force_chinese_text(
             parsed.get("scene_summary"),
             fallback_encounter.scene_summary or fallback_encounter.description,
@@ -1291,6 +1418,8 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
             encounter_mode=("npc_initiated_chat" if typ == "npc" and trigger_kind == "random_dialog" else "standard"),
             title=title,
             description=description,
+            goal=goal,
+            secret=secret,
             zone_id=zone_id,
             sub_zone_id=sub_zone_id,
             npc_role_id=npc_role_id or None,
@@ -1322,7 +1451,12 @@ def get_pending_encounters(session_id: str) -> EncounterPendingResponse:
     state = _state(save)
     pending = _pending_entries(state)
     active = _current_active_encounter(state)
-    return EncounterPendingResponse(session_id=session_id, encounter_state=state, pending=pending, active_encounter=active)
+    return EncounterPendingResponse(
+        session_id=session_id,
+        encounter_state=serialize_public_encounter_state(state),
+        pending=[serialize_public_encounter(item) for item in pending],
+        active_encounter=(serialize_public_encounter(active) if active is not None else None),
+    )
 
 
 def get_encounter_history(session_id: str) -> EncounterHistoryResponse:
@@ -1419,7 +1553,7 @@ def check_for_encounter(req: EncounterCheckRequest) -> EncounterCheckResponse:
         generated=True,
         encounter_id=encounter.encounter_id,
         blocked_by_higher_priority_modal=_has_pending_quest(save),
-        encounter=encounter,
+        encounter=serialize_public_encounter(encounter),
     )
 
 
@@ -1434,7 +1568,7 @@ def present_encounter(encounter_id: str, req: EncounterPresentRequest) -> Encoun
     encounter = _find_encounter(state, encounter_id)
     if encounter.invalidated_reason or encounter.status == "invalidated":
         raise ValueError("ENCOUNTER_INVALIDATED")
-    if encounter.status not in {"queued", "active", "escaped"}:
+    if encounter.status not in {"queued", "active"}:
         raise ValueError("ENCOUNTER_INVALID_STATUS")
     if encounter.status == "queued":
         encounter.status = "active"
@@ -1446,7 +1580,7 @@ def present_encounter(encounter_id: str, req: EncounterPresentRequest) -> Encoun
             encounter.termination_conditions = _default_termination_conditions(encounter.type)
         encounter.scene_summary = encounter.scene_summary or encounter.description
         encounter.latest_outcome_summary = f"就在这时，{encounter.description}"
-        _append_step(encounter, kind="announcement", content=encounter.latest_outcome_summary)
+        _append_step(encounter, kind="announcement", content=encounter.scene_summary)
         _append_game_log(
             save,
             req.session_id,
@@ -1466,7 +1600,7 @@ def present_encounter(encounter_id: str, req: EncounterPresentRequest) -> Encoun
         session_id=req.session_id,
         encounter_id=encounter.encounter_id,
         status=encounter.status,
-        encounter=encounter,
+        encounter=serialize_public_encounter(encounter),
     )
 
 
@@ -1719,17 +1853,13 @@ def act_on_encounter(encounter_id: str, req: EncounterActRequest) -> EncounterAc
     encounter = _find_encounter(state, encounter_id)
     if encounter.invalidated_reason or encounter.status == "invalidated":
         raise ValueError("ENCOUNTER_INVALIDATED")
-    if encounter.status not in {"queued", "active", "escaped"}:
+    if encounter.status not in {"queued", "active"}:
         raise ValueError("ENCOUNTER_INVALID_STATUS")
     if encounter.status == "queued":
         encounter.status = "active"
         encounter.presented_at = _utc_now()
         encounter.player_presence = "engaged"
         _initialize_encounter_state(save, encounter)
-    if encounter.status == "escaped":
-        encounter.status = "active"
-        encounter.player_presence = "engaged"
-        state.active_encounter_id = encounter.encounter_id
     if encounter.presented_at is None:
         _initialize_encounter_state(save, encounter)
 
@@ -1752,7 +1882,6 @@ def act_on_encounter(encounter_id: str, req: EncounterActRequest) -> EncounterAc
         save.area_snapshot.clock = _default_world_clock()
     save.area_snapshot.clock = _advance_clock(save.area_snapshot.clock, time_spent_min)
     encounter.scene_summary = next_scene_summary
-    encounter.latest_outcome_summary = reply
     encounter.last_advanced_at = _utc_now()
     _append_step(encounter, kind=step_kind, content=reply)
     _apply_termination_updates(encounter, termination_updates)
@@ -1832,9 +1961,9 @@ def act_on_encounter(encounter_id: str, req: EncounterActRequest) -> EncounterAc
         status=encounter.status,
         reply=reply,
         time_spent_min=time_spent_min,
-        encounter=encounter,
+        encounter=serialize_public_encounter(encounter),
         resolution=resolution,
-        encounter_state=state,
+        encounter_state=serialize_public_encounter_state(state),
     )
 
 

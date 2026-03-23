@@ -11,11 +11,11 @@ export function EncounterDebugPanel({ overview }: Props) {
     <section className="card encounter-debug-panel">
       <h3>遭遇调试概览</h3>
       <p>{overview.summary}</p>
-      {overview.active_encounter && (
+      {overview.active_encounter ? (
         <p>
-          活跃遭遇: {overview.active_encounter.title} / {overview.active_encounter.status} / {overview.active_encounter.player_presence}
+          活跃遭遇: {overview.active_encounter.title} / {overview.active_encounter.status} / 目标 {overview.active_encounter.goal || '未设置'}
         </p>
-      )}
+      ) : null}
       <p>排队遭遇: {overview.queued_encounters.length}</p>
     </section>
   );

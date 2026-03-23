@@ -9,6 +9,7 @@ import type {
   SceneEvent,
   SubZoneChatTurnEvent,
 } from '../types/app';
+import { DamageResolutionInlineCard } from './DamageResolutionInlineCard';
 
 type BaseEvent = Pick<SceneEvent, 'kind' | 'actor_name' | 'content'> & {
   metadata?: Record<string, JsonValue>;
@@ -186,6 +187,10 @@ export function SceneEventCard({ event, compact = false }: Props) {
   const label = LABEL_MAP[kind] ?? kind;
   const actorName = event.actor_name?.trim();
   const metadata = event.metadata ?? {};
+
+  if (kind === 'damage_resolution') {
+    return <DamageResolutionInlineCard event={event} compact={compact} />;
+  }
 
   if (kind === 'public_turn_phase' || kind === 'public_turn_initiative' || kind === 'public_turn_situation' || kind === 'public_turn_round_end') {
     return renderGenericCard({ label, actorName, content: event.content, compact });

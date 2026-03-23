@@ -25,6 +25,7 @@ from app.models.schemas import (
     PublicTurnImpact,
     PublicTurnInteractionPrompt,
     PublicTurnInitiativeEntry,
+    PublicTurnInformationCheckPrompt,
     PublicTurnOpposedPrompt,
     PublicTurnOpposedPlanRequest,
     PublicTurnPhase,
@@ -50,6 +51,7 @@ from app.services import world_service as world
 from app.services.encounter_service import apply_active_encounter_situation_delta_in_save
 from app.services.public_turn_interaction_service import build_ai_interaction_response
 from app.services.public_turn_interaction_service import classify_player_interaction_response
+from app.services.public_turn_interaction_service import infer_world_impact_type
 from app.services.public_turn_interaction_service import InteractionResponseClassification
 from app.services.public_turn_interaction_service import is_direct_world_counter_response
 from app.services.public_turn_interaction_service import public_turn_actor_type
@@ -620,6 +622,51 @@ def resolve_team_npc_death_save_turn(
     return events, impact, settlement
 
 
+def _damage_resolution_scene_event(
+    *,
+    source_actor_id: str,
+    source_actor_name: str,
+    source_actor_type: str,
+    target_actor_id: str,
+    target_actor_name: str,
+    target_actor_type: str,
+    damage: int,
+    damage_type: str,
+    hp_before: int,
+    hp_after: int,
+    temp_hp_absorbed: int,
+    life_status_after: str,
+    round_id: str,
+    phase: PublicTurnPhase,
+) -> SceneEvent:
+    return world._new_scene_event(
+        "damage_resolution",
+        f"{target_actor_name}受到{damage}点{damage_type or '伤害'}伤害，HP {hp_before}->{hp_after}。",
+        actor_role_id=source_actor_id,
+        actor_name=source_actor_name,
+        metadata={
+            "context_kind": "public_turn",
+            "actor_type": source_actor_type,
+            "source_actor_id": source_actor_id,
+            "source_actor_name": source_actor_name,
+            "target_actor_id": target_actor_id,
+            "target_actor_name": target_actor_name,
+            "target_actor_type": target_actor_type,
+            "damage": damage,
+            "damage_type": damage_type or "damage",
+            "hp_before": hp_before,
+            "hp_after": hp_after,
+            "hp_delta": hp_after - hp_before,
+            "temp_hp_absorbed": temp_hp_absorbed,
+            "life_status_after": life_status_after,
+            "triggered_death_save": life_status_after == "dying",
+            "declared_death": life_status_after == "dead",
+            "round_id": round_id,
+            "phase": phase.value,
+        },
+    )
+
+
 def _apply_public_turn_hp_damage(
     save: SaveFile,
     *,
@@ -640,6 +687,7 @@ def _apply_public_turn_hp_damage(
         hp_before = int(sheet.hit_points.current)
         temp_hp = int(sheet.hit_points.temporary)
         remaining_damage = damage
+        absorbed = 0
         if temp_hp > 0:
             absorbed = min(temp_hp, remaining_damage)
             sheet.hit_points.temporary -= absorbed
@@ -671,6 +719,22 @@ def _apply_public_turn_hp_damage(
             event_text += f" {target.name} enters the dying state."
         elif life_status == "dead":
             event_text += f" {target.name} dies on the spot."
+        damage_event = _damage_resolution_scene_event(
+            source_actor_id=source_actor_id,
+            source_actor_name=source_actor_name,
+            source_actor_type=("player" if source_actor_id == save.player_static_data.player_id else "npc"),
+            target_actor_id=target.actor_id,
+            target_actor_name=target.name,
+            target_actor_type="player",
+            damage=damage,
+            damage_type=damage_type_text or "damage",
+            hp_before=hp_before,
+            hp_after=hp_after,
+            temp_hp_absorbed=absorbed,
+            life_status_after=life_status,
+            round_id=round_id,
+            phase=phase,
+        )
         event = world._new_scene_event(
             "public_turn_actor_resolution",
             event_text,
@@ -722,14 +786,14 @@ def _apply_public_turn_hp_damage(
                 )
             )
         if hp_before == hp_after:
-            return None, [event, *extra_events]
+            return None, [damage_event, event, *extra_events]
         return {
             "target_id": target.actor_id,
             "target_name": target.name,
             "hp_before": hp_before,
             "hp_after": hp_after,
             "hp_delta": hp_delta,
-        }, [event, *extra_events]
+        }, [damage_event, event, *extra_events]
 
     if target.actor_type == PublicTurnActorType.ENCOUNTER_TEMP_NPC:
         return None, []
@@ -743,6 +807,7 @@ def _apply_public_turn_hp_damage(
     hp_before = int(sheet.hit_points.current)
     temp_hp = int(sheet.hit_points.temporary)
     remaining_damage = damage
+    absorbed = 0
     if temp_hp > 0:
         absorbed = min(temp_hp, remaining_damage)
         sheet.hit_points.temporary -= absorbed
@@ -795,6 +860,22 @@ def _apply_public_turn_hp_damage(
         event_text += f" {target.name} enters the dying state."
     if life_status == "dead":
         event_text += f" {target.name} is dropped."
+    damage_event = _damage_resolution_scene_event(
+        source_actor_id=source_actor_id,
+        source_actor_name=source_actor_name,
+        source_actor_type=("player" if source_actor_id == save.player_static_data.player_id else "npc"),
+        target_actor_id=target.actor_id,
+        target_actor_name=target.name,
+        target_actor_type=("team" if was_team_member else "npc"),
+        damage=damage,
+        damage_type=damage_type_text or "damage",
+        hp_before=hp_before,
+        hp_after=hp_after,
+        temp_hp_absorbed=absorbed,
+        life_status_after=life_status,
+        round_id=round_id,
+        phase=phase,
+    )
     event = world._new_scene_event(
         "public_turn_actor_resolution",
         event_text,
@@ -846,14 +927,14 @@ def _apply_public_turn_hp_damage(
             )
         )
     if hp_before == hp_after:
-        return None, [event, *extra_events, *record_events]
+        return None, [damage_event, event, *extra_events, *record_events]
     return {
         "target_id": target.actor_id,
         "target_name": target.name,
         "hp_before": hp_before,
         "hp_after": hp_after,
         "hp_delta": hp_delta,
-    }, [event, *extra_events, *record_events]
+    }, [damage_event, event, *extra_events, *record_events]
 
 
 def _ai_public_turn_damage_bundle(
@@ -1106,6 +1187,31 @@ def _default_gm_resolution_summary(actor_name: str, action_summary: str, situati
         return f"{actor_name} follows through on {clean_action[:24]} and shifts the immediate scene response."
     return f"{actor_name} commits to the move and changes the immediate public rhythm."
 
+
+def _clean_json_wrapper_text(text: str) -> str:
+    clean = str(text or "").strip()
+    if clean.startswith("```"):
+        clean = clean.removeprefix("```json").removeprefix("```JSON").removeprefix("```").strip()
+        if clean.endswith("```"):
+            clean = clean[:-3].strip()
+    return clean
+
+
+def _extract_resolution_summary_text(text: str, *, limit: int = 280) -> str:
+    clean = _clean_json_wrapper_text(text)
+    if not clean:
+        return ""
+    try:
+        parsed = json.loads(clean)
+    except json.JSONDecodeError:
+        return _normalize_public_turn_text(clean, limit=limit)
+    if isinstance(parsed, dict):
+        for key in ("outcome", "outcome_description", "outcome_narration", "summary", "text"):
+            value = parsed.get(key)
+            if isinstance(value, str) and value.strip():
+                return _normalize_public_turn_text(value, limit=limit)
+    return _normalize_public_turn_text(clean, limit=limit)
+
 def _default_opposed_resolution_summary(
     *,
     actor_name: str,
@@ -1179,6 +1285,7 @@ def _generate_opposed_resolution_summary(
         resp = client.chat.completions.create(
             model=config.model,
             **build_completion_options(config),
+            response_format={"type": "json_object"},
             messages=[
                 {
                     "role": "system",
@@ -1198,7 +1305,7 @@ def _generate_opposed_resolution_summary(
                 getattr(usage, "prompt_tokens", 0) or 0,
                 getattr(usage, "completion_tokens", 0) or 0,
             )
-        text = _normalize_public_turn_text(resp.choices[0].message.content or "", limit=280)
+        text = _extract_resolution_summary_text(resp.choices[0].message.content or "", limit=280)
         return text or fallback
     except Exception:
         return fallback
@@ -1243,6 +1350,26 @@ def build_settlement_check(action_result: ActionCheckResponse | None) -> PublicT
         comparison_text=comparison_text,
         outcome_text=outcome_text,
     )
+
+
+def _apply_followup_check_to_settlement(
+    settlement: PublicTurnSettlementEntry,
+    impact: PublicTurnImpact,
+    action_result: ActionCheckResponse,
+) -> None:
+    settlement.followup_check = build_settlement_check(action_result)
+    extra_delta = check_bonus(action_result)
+    if extra_delta:
+        settlement.situation_delta += extra_delta
+        impact.situation_delta += extra_delta
+        if public_turn_zone_reputation_allowed(settlement.actor_type.value):
+            reputation_delta = reputation_delta_from_situation(extra_delta)
+            settlement.zone_reputation_delta += reputation_delta
+            impact.zone_reputation_delta += reputation_delta
+    followup_summary = _last_nonempty_line(action_result.narrative)
+    if followup_summary:
+        previous = settlement.gm_resolution_summary.strip()
+        settlement.gm_resolution_summary = f"{previous}\n{followup_summary}".strip() if previous else followup_summary
 
 
 
@@ -1324,7 +1451,7 @@ def build_settlement_entry(
         opposed_target_speech=(opposed_target_speech or "")[:200] or None,
         opposed_target_speech_target_name=(opposed_target_speech_target_name or "")[:120] or None,
         check=build_settlement_check(action_result),
-        gm_resolution_summary=(gm_resolution_summary or "")[:280],
+        gm_resolution_summary=_extract_resolution_summary_text(gm_resolution_summary or "", limit=280),
         gm_push_result=gm_push_result,
         situation_delta=impact.situation_delta,
         zone_reputation_delta=impact.zone_reputation_delta,
@@ -1387,7 +1514,12 @@ def normalize_public_turn_ai_payload(
     action_type = str(source.get("action_type") or "").strip().lower() or "check"
     target_label = _normalize_public_turn_text(str(source.get("target_label") or ""), limit=80)
     speech_target_label = _normalize_public_turn_text(str(source.get("speech_target_label") or ""), limit=80)
-    world_impact_type = str(source.get("world_impact_type") or "").strip().lower() or PublicTurnWorldImpactType.NON_WORLD.value
+    world_impact_type = infer_world_impact_type(
+        action_type=action_type,
+        action_summary=action_summary,
+        speech_text=speech_text,
+        explicit_value=str(source.get("world_impact_type") or ""),
+    ).value
     action_prompt = _normalize_public_turn_text(
         str(source.get("action_prompt") or "") or f"actor={actor_name}; intent={action_summary}; threat={specific_threat}",
         limit=240,
@@ -1542,7 +1674,22 @@ def resolve_player_submission(
     round_state: PublicTurnRound,
     action_check: PublicTurnPlayerActionCheck | None,
     config: ChatConfig | None,
-) -> tuple[list[SceneEvent], PublicTurnImpact, PublicTurnSettlementEntry, ActionCheckResponse | None]:
+    include_information_check_prompt: bool = False,
+) -> (
+    tuple[
+        list[SceneEvent],
+        PublicTurnImpact,
+        PublicTurnSettlementEntry,
+        ActionCheckResponse | None,
+        PublicTurnInformationCheckPrompt | None,
+    ]
+    | tuple[
+        list[SceneEvent],
+        PublicTurnImpact,
+        PublicTurnSettlementEntry,
+        ActionCheckResponse | None,
+    ]
+):
     display_text = _submission_display_text(action_text, speech_text)
     action_result = _player_action_check(
         save,
@@ -1731,6 +1878,42 @@ def resolve_player_submission(
         ),
         opposed_target_name=(action_result.target_name if action_result is not None else None),
     )
+    information_check_prompt: PublicTurnInformationCheckPrompt | None = None
+    if (
+        action_check is not None
+        and action_check.public_turn_resolution_mode == "opposed_then_information_dc"
+        and action_result is not None
+        and action_result.success
+        and action_check.followup_ability_used is not None
+        and action_check.followup_dc is not None
+    ):
+        ability_used = action_check.followup_ability_used
+        ability_modifier = int(getattr(save.player_static_data.dnd5e_sheet.current_ability_modifiers, ability_used))
+        information_check_prompt = PublicTurnInformationCheckPrompt(
+            prompt_id=f"{round_state.round_id}_{save.player_static_data.player_id}_information_check",
+            round_id=round_state.round_id,
+            phase=PublicTurnPhase.AWAITING_PLAYER_INFORMATION_CHECK,
+            actor_id=save.player_static_data.player_id,
+            actor_name=save.player_static_data.name,
+            source_actor_id=(action_result.target_role_id or action_check.target_role_id or None),
+            source_actor_name=(action_result.target_name or action_check.target_name or None),
+            source_interaction_kind=(action_check.public_turn_interaction_kind or "information_gathering"),
+            notice_state=(action_check.public_turn_notice_state or "noticed"),
+            ability_used=ability_used,
+            ability_modifier=ability_modifier,
+            dc=int(action_check.followup_dc),
+            check_task=str(action_check.followup_check_task or action_check.planned_check_task or "获取当前线索"),
+            stakes_summary=settlement.gm_resolution_summary or display_text,
+            metadata={
+                "action_text": action_text,
+                "speech_text": speech_text,
+                "action_result": action_result.model_dump(mode="json"),
+                "settlement_entry_id": settlement.entry_id,
+                "source_phase": round_state.phase.value,
+            },
+        )
+    if include_information_check_prompt:
+        return events, impact, settlement, action_result, information_check_prompt
     return events, impact, settlement, action_result
 
 
@@ -2632,6 +2815,62 @@ def resolve_opposed_prompt_submission(
         opposed_target_speech=target_speech_text,
         gm_resolution_summary=gm_resolution_summary,
     )
+    if (
+        prompt.source_interaction_kind == "information_gathering"
+        and action_result.success
+        and prompt.followup_ability_used is not None
+        and prompt.followup_dc is not None
+        and prompt.source_actor_id != save.player_static_data.player_id
+    ):
+        followup_result = world.action_check(
+            ActionCheckRequest(
+                session_id=session_id,
+                actor_role_id=prompt.source_actor_id,
+                action_type="check",
+                action_prompt="\n".join(
+                    part
+                    for part in (
+                        prompt.source_action_summary.strip(),
+                        prompt.source_speech_text.strip(),
+                        target_action_summary.strip(),
+                        target_speech_text.strip(),
+                        str(prompt.followup_check_task or "").strip(),
+                    )
+                    if part
+                ).strip()
+                or prompt.source_action_summary.strip()
+                or prompt.stakes_summary,
+                source_context="public_turn",
+                resolution_rule="static_dc",
+                allow_backend_roll=True,
+                resolution_context="embedded",
+                planned_ability_used=prompt.followup_ability_used,
+                planned_dc=prompt.followup_dc,
+                planned_time_spent_min=1,
+                planned_requires_check=True,
+                planned_check_task=prompt.followup_check_task or prompt.stakes_summary or "获取当前线索",
+                config=config,
+            )
+        )
+        _apply_followup_check_to_settlement(settlement, impact, followup_result)
+        followup_summary = _last_nonempty_line(followup_result.narrative) or settlement.gm_resolution_summary
+        events.append(
+            world._new_scene_event(
+                "public_turn_information_check",
+                followup_summary,
+                actor_role_id=prompt.source_actor_id,
+                actor_name=prompt.source_actor_name,
+                metadata={
+                    "round_id": round_state.round_id,
+                    "phase": round_state.phase.value,
+                    "ability_used": prompt.followup_ability_used,
+                    "dc": prompt.followup_dc,
+                    "success": followup_result.success,
+                    "critical": followup_result.critical,
+                    "notice_state": prompt.followup_notice_state,
+                },
+            )
+        )
     return events, impact, settlement, action_result
 
 
@@ -3320,6 +3559,10 @@ def resolve_interaction_prompt_submission(
                 target_actor_id=prompt.target_actor_id,
                 target_actor_name=prompt.target_actor_name,
                 stakes_summary=prompt.source_action_summary or prompt.source_action_prompt,
+                followup_notice_state=("noticed" if prompt.source_interaction_kind == "information_gathering" else None),
+                followup_ability_used=prompt.source_planned_ability_used,
+                followup_dc=prompt.source_planned_dc,
+                followup_check_task=prompt.source_planned_check_task,
             )
             return base_events, None, None, None, opposed_prompt
 
@@ -3392,6 +3635,10 @@ def resolve_interaction_prompt_submission(
             target_actor_id=prompt.target_actor_id,
             target_actor_name=prompt.target_actor_name,
             stakes_summary=prompt.source_action_summary or prompt.source_action_prompt,
+            followup_notice_state=("noticed" if prompt.source_interaction_kind == "information_gathering" else None),
+            followup_ability_used=prompt.source_planned_ability_used,
+            followup_dc=prompt.source_planned_dc,
+            followup_check_task=prompt.source_planned_check_task,
         )
         return base_events, None, None, None, opposed_prompt
 

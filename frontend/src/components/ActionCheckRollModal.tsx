@@ -98,14 +98,14 @@ export function ActionCheckRollModal({
           ) : null}
         </div>
 
-        {plan && (
+        {plan ? (
           <section className="roll-result-card">
-            {planSourceLabel && <p>来源: {planSourceLabel}</p>}
+            {planSourceLabel ? <p>来源: {planSourceLabel}</p> : null}
             <p>执行者: {plan.actor_name}</p>
             <p>检定目标: {plan.check_task || '判断当前行动是否顺利完成'}</p>
-            {planThreatenedConsequence && <p>风险: {planThreatenedConsequence}</p>}
+            {planThreatenedConsequence ? <p>风险: {planThreatenedConsequence}</p> : null}
             <p>
-              属性: {plan.ability_used} | 调整值: {formatModifier(plan.ability_modifier)}
+              属性: {plan.ability_used} | 修正值: {formatModifier(plan.ability_modifier)}
             </p>
             {isOpposed ? (
               <p>
@@ -114,10 +114,10 @@ export function ActionCheckRollModal({
             ) : (
               <p>DC: {plan.dc}</p>
             )}
-            {successHint && <p>成功后果: {successHint}</p>}
-            {failureHint && <p>失败后果: {failureHint}</p>}
+            {successHint ? <p>成功后果: {successHint}</p> : null}
+            {failureHint ? <p>失败后果: {failureHint}</p> : null}
           </section>
-        )}
+        ) : null}
 
         <div className="roll-modal-stage">
           <button
@@ -135,12 +135,12 @@ export function ActionCheckRollModal({
           </button>
         </div>
 
-        {phase === 'ready' && <p className="roll-modal-caption">点击骰子开始检定。</p>}
-        {phase === 'rolling' && <p className="roll-modal-caption">骰子滚动中...</p>}
-        {phase === 'resolving' && <p className="roll-modal-caption">点数锁定中 {rollValue ?? '?'}，正在结算...</p>}
-        {phase === 'error' && <p className="error">{errorMessage}</p>}
+        {phase === 'ready' ? <p className="roll-modal-caption">点击骰子开始检定。</p> : null}
+        {phase === 'rolling' ? <p className="roll-modal-caption">骰子滚动中...</p> : null}
+        {phase === 'resolving' ? <p className="roll-modal-caption">点数已锁定为 {rollValue ?? '?'}，正在结算...</p> : null}
+        {phase === 'error' ? <p className="error">{errorMessage}</p> : null}
 
-        {phase === 'resolved' && result && (
+        {phase === 'resolved' && result ? (
           <section className={`roll-result-card ${result.success ? 'is-success' : 'is-failure'}`}>
             <p>
               结果: {result.success ? '成功' : '失败'} | {describeCritical(result.critical)}
@@ -158,7 +158,8 @@ export function ActionCheckRollModal({
                 </div>
               ) : (
                 <p>
-                  d20({result.dice_roll ?? rollValue ?? '-'}) {formatModifier(result.ability_modifier)} = {result.total_score ?? '-'}，对抗 DC {result.dc}
+                  d20({result.dice_roll ?? rollValue ?? '-'}) {formatModifier(result.ability_modifier)} = {result.total_score ?? '-'}，对抗 DC{' '}
+                  {result.dc}
                 </p>
               )
             ) : (
@@ -166,10 +167,12 @@ export function ActionCheckRollModal({
             )}
             <p>关闭后会继续本轮结算。</p>
           </section>
-        )}
+        ) : null}
 
         <div className="actions">
-          {(phase === 'resolved' || phase === 'error') && <button onClick={onClose}>{phase === 'resolved' ? '继续' : '关闭'}</button>}
+          {phase === 'resolved' || phase === 'error' ? (
+            <button onClick={onClose}>{phase === 'resolved' ? '继续' : '关闭'}</button>
+          ) : null}
         </div>
       </div>
     </div>

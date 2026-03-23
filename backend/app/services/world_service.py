@@ -55,6 +55,7 @@ from app.models.schemas import (
     NpcChatResponse,
     NpcGreetRequest,
     NpcGreetResponse,
+    OriginStamp,
     InventoryItem,
     InventoryOwnerRef,
     InventoryEquipRequest,
@@ -100,6 +101,7 @@ from app.models.schemas import (
     SaveFile,
     SceneEvent,
     SceneInteractable,
+    TemplateLibraryDefinitionsRequest,
     SubZoneChatContext,
     SubZoneChatTurn,
     SubZoneChatTurnEvent,
@@ -109,6 +111,7 @@ from app.models.schemas import (
     Zone,
     ZoneSubZoneSeed,
 )
+from app.services.actor_capability_service import build_role_capability_snapshot, render_role_capability_brief
 from app.services.ai_adapter import build_completion_options, create_sync_client, has_ai_config
 from app.services.ai_protocol_contract_service import (
     AI_PROVIDER_CALL_FAILED,
@@ -136,6 +139,7 @@ from app.services.item_instance_service import (
     resolve_owner_instances,
 )
 from app.services.item_template_service import ensure_definition_for_inventory_item, get_template_library_status, infer_interactable_template_id, load_template_library
+from app.services.template_library_query_service import query_template_library_definitions
 from app.services.scene_interaction_service import execute_scene_interaction_in_save, list_scene_interactables
 
 
@@ -270,7 +274,12 @@ def _ensure_sub_zone_chat_context(sub_zone: AreaSubZone | None) -> SubZoneChatCo
 def _scene_event_to_turn_event(event: SceneEvent) -> SubZoneChatTurnEvent:
     actor_type: str = "system"
     event_kind = "system_notice"
-    if event.kind in {"public_targeted_npc_reply", "public_bystander_reaction"}:
+    if event.kind == "damage_resolution":
+        actor_type = str(event.metadata.get("target_actor_type") or event.metadata.get("actor_type") or "system")
+        if actor_type not in {"npc", "team", "encounter_temp_npc", "system"}:
+            actor_type = "system"
+        event_kind = "damage_resolution"
+    elif event.kind in {"public_targeted_npc_reply", "public_bystander_reaction"}:
         actor_type = "npc"
         event_kind = "npc_reply"
     elif event.kind == "team_public_reaction":
@@ -335,6 +344,21 @@ def _scene_event_to_turn_event(event: SceneEvent) -> SubZoneChatTurnEvent:
         event_kind = "encounter_progress"
     elif event.kind == "encounter_resolution":
         event_kind = "encounter_resolution"
+    elif event.kind == "player_entered_death_save":
+        event_kind = "player_entered_death_save"
+    elif event.kind == "player_death_save_result":
+        event_kind = "player_death_save_result"
+    elif event.kind == "player_died":
+        event_kind = "player_died"
+    elif event.kind == "team_npc_entered_death_save":
+        actor_type = "team"
+        event_kind = "team_npc_entered_death_save"
+    elif event.kind == "team_npc_death_save_result":
+        actor_type = "team"
+        event_kind = "team_npc_death_save_result"
+    elif event.kind == "team_npc_died":
+        actor_type = "team"
+        event_kind = "team_npc_died"
     return SubZoneChatTurnEvent(
         event_kind=event_kind,  # type: ignore[arg-type]
         actor_type=actor_type,  # type: ignore[arg-type]
@@ -468,9 +492,8 @@ def build_main_turn_context_payload(save: SaveFile, player_message: str, *, rece
                 "title": active_encounter.title,
                 "status": active_encounter.status,
                 "npc_role_id": active_encounter.npc_role_id,
+                "goal": active_encounter.goal,
                 "scene_summary": active_encounter.scene_summary,
-                "latest_outcome_summary": active_encounter.latest_outcome_summary,
-                "player_presence": active_encounter.player_presence,
             }
             if active_encounter is not None
             else None
@@ -608,6 +631,16 @@ def _sync_level_scaled_resources(sheet) -> None:
     current_martial = max(0, int(sheet.martial_points_current or 0))
     sheet.martial_points_maximum = martial_cap
     sheet.martial_points_current = martial_cap if martial_cap > 0 and not had_martial_resource else min(current_martial, martial_cap)
+    cooldowns = dict(getattr(sheet, "war_art_cooldowns", {}) or {})
+    known_war_arts = {str(item).strip() for item in list(sheet.war_arts or []) if str(item).strip()}
+    if cooldowns:
+        sheet.war_art_cooldowns = {
+            str(key): max(0, int(value or 0))
+            for key, value in cooldowns.items()
+            if str(key).strip() in known_war_arts or str(key).strip()
+        }
+    else:
+        sheet.war_art_cooldowns = {}
 
 
 def _sum_buff_delta(buffs: list[RoleBuff], key: str) -> int:
@@ -934,6 +967,37 @@ def _class_template(char_class: str) -> dict[str, object]:
     return templates.get(char_class, templates["战士"])
 
 
+def _template_origin_map(definition_names: list[str]) -> dict[str, OriginStamp]:
+    library = load_template_library()
+    name_to_id = {
+        str(definition.name or "").strip().lower(): definition.definition_id
+        for definition in [*library.spell_definitions, *library.war_art_definitions]
+    }
+    origins: dict[str, OriginStamp] = {}
+    for name in definition_names:
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            continue
+        definition_id = name_to_id.get(clean_name.lower(), "")
+        origins[clean_name] = OriginStamp(origin_kind="learned", origin_ref=definition_id or clean_name)
+    return origins
+
+
+def _npc_template_ability_names(char_class: str, level: int) -> tuple[list[str], list[str]]:
+    response = query_template_library_definitions(
+        TemplateLibraryDefinitionsRequest(
+            session_id="system",
+            kind="all",
+            recommended_class=char_class,
+            min_level=max(1, int(level or 1)),
+            limit=6,
+        )
+    )
+    spells = [definition.name for definition in response.spell_definitions[:6]]
+    war_arts = [definition.name for definition in response.war_art_definitions[:6]]
+    return spells, war_arts
+
+
 def _build_npc_profile(npc_id: str, npc_name: str) -> PlayerStaticData:
     strength = _ability_score_with_seed(npc_id, 1)
     dexterity = _ability_score_with_seed(npc_id, 2)
@@ -999,8 +1063,11 @@ def _build_npc_profile(npc_id: str, npc_name: str) -> PlayerStaticData:
         for idx, (name, item_type) in enumerate(template["extras"], start=1)  # type: ignore[index]
     ]
     all_items = [weapon_item, armor_item, *extra_items]
-    spell_list = list(template.get("spells") or [])
+    spell_list, war_art_list = _npc_template_ability_names(char_class, level)
+    if not spell_list:
+        spell_list = list(template.get("spells") or [])
     first_level_slots = _level_scaled_resource_cap(level) if spell_list else 0
+    martial_points = _level_scaled_resource_cap(level) if war_art_list else 0
     armor_class = 10 + int(armor_bonus) + _ability_mod(dexterity)
 
     profile = PlayerStaticData(
@@ -1043,6 +1110,9 @@ def _build_npc_profile(npc_id: str, npc_name: str) -> PlayerStaticData:
             },
             "features_traits": list(template.get("features") or []),
             "spells": spell_list,
+            "war_arts": war_art_list,
+            "spell_origins": {key: value.model_dump(mode="json") for key, value in _template_origin_map(spell_list).items()},
+            "war_art_origins": {key: value.model_dump(mode="json") for key, value in _template_origin_map(war_art_list).items()},
             "spell_slots_max": {
                 "level_1": first_level_slots,
                 "level_2": 0,
@@ -1065,6 +1135,9 @@ def _build_npc_profile(npc_id: str, npc_name: str) -> PlayerStaticData:
                 "level_8": 0,
                 "level_9": 0,
             },
+            "martial_points_current": martial_points,
+            "martial_points_maximum": martial_points,
+            "war_art_cooldowns": {},
             "notes": f"常驻NPC模板：{sheet_background}，职业倾向为{char_class}。",
         },
     )
@@ -1106,6 +1179,8 @@ def _ensure_npc_role_complete(save: SaveFile, role: NpcRoleCard) -> bool:
     if role.talkative_current < 0:
         role.talkative_current = 0
         changed = True
+    if getattr(role, "talkative_recovery_round_cursor", None) is None:
+        role.talkative_recovery_round_cursor = None
 
     profile = role.profile
     template = profile_template
@@ -1172,6 +1247,15 @@ def _ensure_npc_role_complete(save: SaveFile, role: NpcRoleCard) -> bool:
     if not sheet.spells and template_sheet.spells:
         sheet.spells = list(template_sheet.spells)
         changed = True
+    if not sheet.war_arts and template_sheet.war_arts:
+        sheet.war_arts = list(template_sheet.war_arts)
+        changed = True
+    if not sheet.spell_origins and template_sheet.spell_origins:
+        sheet.spell_origins = template_sheet.spell_origins.model_copy(deep=True) if hasattr(template_sheet.spell_origins, "model_copy") else dict(template_sheet.spell_origins)
+        changed = True
+    if not sheet.war_art_origins and template_sheet.war_art_origins:
+        sheet.war_art_origins = template_sheet.war_art_origins.model_copy(deep=True) if hasattr(template_sheet.war_art_origins, "model_copy") else dict(template_sheet.war_art_origins)
+        changed = True
     if (_spell_slots_total(sheet.spell_slots_max) <= 1 and not sheet.spells and template_sheet.spells) or _spell_slots_total(sheet.spell_slots_max) == 0:
         if _spell_slots_total(template_sheet.spell_slots_max) >= 0:
             sheet.spell_slots_max = template_sheet.spell_slots_max.model_copy(deep=True)
@@ -1180,6 +1264,19 @@ def _ensure_npc_role_complete(save: SaveFile, role: NpcRoleCard) -> bool:
     if not sheet.spells and _spell_slots_total(sheet.spell_slots_max) > 0:
         sheet.spell_slots_max = template_sheet.spell_slots_max.model_copy(deep=True)
         sheet.spell_slots_current = template_sheet.spell_slots_current.model_copy(deep=True)
+        changed = True
+    if not sheet.war_arts and int(sheet.martial_points_maximum or 0) > 0:
+        sheet.war_arts = list(template_sheet.war_arts)
+        changed = True
+    if int(sheet.martial_points_maximum or 0) <= 0 and template_sheet.war_arts:
+        sheet.martial_points_maximum = int(template_sheet.martial_points_maximum or 0)
+        sheet.martial_points_current = min(
+            max(0, int(sheet.martial_points_current or 0)),
+            max(0, int(template_sheet.martial_points_maximum or 0)),
+        ) or int(template_sheet.martial_points_current or 0)
+        changed = True
+    if getattr(sheet, "war_art_cooldowns", None) is None:
+        sheet.war_art_cooldowns = {}
         changed = True
 
     try:
@@ -2563,20 +2660,6 @@ def inventory_interact(payload: InventoryInteractRequest) -> InventoryInteractRe
         summary = _scene_events_to_summary(scene_events)
         if summary:
             reply = f"{reply}\n\n{summary}"
-    try:
-        from app.services.encounter_service import advance_active_encounter_in_save
-
-        advanced = advance_active_encounter_in_save(save, session_id=payload.session_id, minutes_elapsed=time_spent_min, config=payload.config)
-        if advanced is not None:
-            scene_events.append(
-                _new_scene_event(
-                    "encounter_background",
-                    advanced.latest_outcome_summary or advanced.scene_summary or advanced.description,
-                    metadata={"encounter_id": advanced.encounter_id},
-                )
-            )
-    except Exception:
-        pass
     _recompute_player_derived(profile)
     if role is not None:
         role.profile = profile
@@ -3352,16 +3435,6 @@ def _requires_encounter_escape_before_move(
     target_zone_id: str | None,
     target_sub_zone_id: str | None,
 ) -> str | None:
-    state = save.encounter_state
-    if state is None or not state.active_encounter_id:
-        return None
-    encounter = next((item for item in state.encounters if item.encounter_id == state.active_encounter_id), None)
-    if encounter is None or encounter.status != "active" or encounter.player_presence != "engaged":
-        return None
-    if encounter.zone_id and target_zone_id and encounter.zone_id != target_zone_id:
-        return encounter.encounter_id
-    if encounter.sub_zone_id and encounter.sub_zone_id != target_sub_zone_id:
-        return encounter.encounter_id
     return None
 
 
@@ -3372,29 +3445,8 @@ def _attempt_escape_for_move(
     target_sub_zone_id: str | None,
     config: ChatConfig | None = None,
 ) -> None:
-    save = get_current_save(default_session_id=session_id)
-    if save.session_id != session_id:
-        save.session_id = session_id
-    _ensure_area_snapshot(save)
-    encounter_id = _requires_encounter_escape_before_move(
-        save,
-        target_zone_id=target_zone_id,
-        target_sub_zone_id=target_sub_zone_id,
-    )
-    if not encounter_id:
-        return
-    from app.models.schemas import EncounterEscapeRequest
-    from app.services.encounter_service import escape_encounter
-
-    result = escape_encounter(
-        encounter_id,
-        EncounterEscapeRequest(
-            session_id=session_id,
-            config=config,
-        ),
-    )
-    if not result.escape_success:
-        raise ValueError("ENCOUNTER_ESCAPE_BLOCKED")
+    _ = (session_id, target_zone_id, target_sub_zone_id, config)
+    return
 
 
 def move_to_zone(req: MoveRequest) -> MoveResponse:
@@ -3484,12 +3536,6 @@ def move_to_zone(req: MoveRequest) -> MoveResponse:
             trigger_kind="zone_move",
             summary=movement_log.summary,
         )
-    except Exception:
-        pass
-    try:
-        from app.services.encounter_service import advance_active_encounter_in_save
-
-        advance_active_encounter_in_save(save, session_id=req.session_id, minutes_elapsed=duration_min)
     except Exception:
         pass
     save_current(save)
@@ -3915,6 +3961,8 @@ def _build_npc_prompt_context(role: NpcRoleCard, clock: WorldClock | None, recen
             lines.append(f"队伍状态=当前在玩家队伍中, affinity={affinity}, trust={trust}, join_reason={join_reason}")
         active_encounter = _active_encounter_for_current_sub_zone(save)
         if active_encounter is not None:
+            from app.services.encounter_service import encounter_secret_for_actor
+
             lines.append(
                 "当前地区活跃遭遇="
                 + json.dumps(
@@ -3922,8 +3970,9 @@ def _build_npc_prompt_context(role: NpcRoleCard, clock: WorldClock | None, recen
                         "encounter_id": active_encounter.encounter_id,
                         "title": active_encounter.title,
                         "status": active_encounter.status,
+                        "goal": active_encounter.goal,
                         "scene_summary": active_encounter.scene_summary,
-                        "latest_outcome_summary": active_encounter.latest_outcome_summary,
+                        "secret": encounter_secret_for_actor(save, role.role_id),
                     },
                     ensure_ascii=False,
                 )
@@ -3939,6 +3988,7 @@ def _build_npc_prompt_context(role: NpcRoleCard, clock: WorldClock | None, recen
 
 def _build_npc_roleplay_brief(role: NpcRoleCard) -> str:
     traits: list[str] = []
+    sheet = role.profile.dnd5e_sheet
     if role.personality:
         traits.append(f"性格={_trim_npc_text(role.personality, 80)}")
     if role.speaking_style:
@@ -3950,6 +4000,18 @@ def _build_npc_roleplay_brief(role: NpcRoleCard) -> str:
     if role.likes:
         traits.append(f"偏好={' / '.join(role.likes[:5])}")
     traits.append(f"健谈值={role.talkative_current}/{role.talkative_maximum}")
+    spell_text = "、".join(list(sheet.spells or [])[:6]) if sheet.spells else "无"
+    war_art_text = "、".join(list(sheet.war_arts or [])[:6]) if sheet.war_arts else "无"
+    slot_parts = [
+        f"1环:{int(sheet.spell_slots_current.level_1 or 0)}/{int(sheet.spell_slots_max.level_1 or 0)}"
+    ] if int(sheet.spell_slots_max.level_1 or 0) > 0 else []
+    traits.append(
+        f"职业={_trim_npc_text(sheet.char_class or '未知', 24)}；"
+        f"已会法术={spell_text}；"
+        f"已会武技={war_art_text}；"
+        f"法术位={('，'.join(slot_parts) if slot_parts else '无')}；"
+        f"武技点={int(sheet.martial_points_current or 0)}/{int(sheet.martial_points_maximum or 0)}"
+    )
     if role.state == "in_team":
         traits.append("当前是玩家队友，通常会更愿意给出实用反馈，但仍保留个人脾气。")
     if role.secret:
@@ -4167,37 +4229,74 @@ def _world_time_dict_to_datetime(world_time: dict[str, str | int] | None) -> dat
 
 
 def _count_public_turns_since_last_private_chat(save: SaveFile, role: NpcRoleCard) -> int:
-    if not role.last_private_chat_at:
+    last_private_raw = str(getattr(role, "last_private_chat_at", "") or "").strip()
+    if not last_private_raw:
         return 0
     try:
-        cutoff = datetime.fromisoformat(role.last_private_chat_at)
+        last_private_dt = datetime.fromisoformat(last_private_raw)
     except ValueError:
         return 0
-    seen_turn_ids: set[str] = set()
-    public_turns = 0
-    for sub_zone in save.area_snapshot.sub_zones:
-        context = getattr(sub_zone, "chat_context", None)
-        if context is None:
+    _, sub_zone_id = _effective_npc_area_ids(save, role)
+    if not sub_zone_id:
+        return 0
+    sub_zone = next((item for item in save.area_snapshot.sub_zones if item.sub_zone_id == sub_zone_id), None)
+    if sub_zone is None:
+        return 0
+    count = 0
+    for turn in sub_zone.chat_context.recent_turns:
+        if turn.source != "main_chat":
             continue
-        for turn in context.recent_turns:
-            if turn.turn_id in seen_turn_ids or turn.source != "main_chat":
-                continue
-            turn_time = _world_time_dict_to_datetime(turn.world_time)
-            if turn_time is None or turn_time <= cutoff:
-                continue
-            seen_turn_ids.add(turn.turn_id)
-            public_turns += 1
-    return public_turns
+        turn_dt = _world_time_dict_to_datetime(turn.world_time) or datetime.fromisoformat(turn.created_at)
+        if turn_dt <= last_private_dt:
+            continue
+        count += 1
+    return count
+
+
+def _eligible_roles_for_public_talkative_recovery(save: SaveFile) -> list[NpcRoleCard]:
+    current_zone_id = save.area_snapshot.current_zone_id
+    current_sub_zone_id = save.area_snapshot.current_sub_zone_id
+    team_ids = {item.role_id for item in getattr(save.team_state, "members", [])}
+    roles: list[NpcRoleCard] = []
+    for role in save.role_pool:
+        sheet = role.profile.dnd5e_sheet
+        if role.state == "dead" or sheet.role_action_status == "dead" or sheet.is_dead:
+            continue
+        if role.role_id in team_ids:
+            roles.append(role)
+            continue
+        if current_sub_zone_id and role.sub_zone_id == current_sub_zone_id:
+            roles.append(role)
+            continue
+        if current_zone_id and role.zone_id == current_zone_id and not role.sub_zone_id:
+            roles.append(role)
+    return roles
+
+
+def restore_npc_talkative_from_public_round(save: SaveFile, *, round_id: str) -> dict[str, int]:
+    recovered: dict[str, int] = {}
+    for role in _eligible_roles_for_public_talkative_recovery(save):
+        if role.talkative_recovery_round_cursor == round_id:
+            continue
+        before = int(role.talkative_current or 0)
+        role.talkative_current = min(int(role.talkative_maximum or 100), before + 4)
+        role.talkative_recovery_round_cursor = round_id
+        role.last_public_turn_at = _utc_now()
+        delta = max(0, int(role.talkative_current or 0) - before)
+        if delta > 0:
+            recovered[role.role_id] = delta
+    return recovered
 
 
 def _restore_npc_talkative(role: NpcRoleCard, clock: WorldClock | None, save: SaveFile | None = None) -> int:
-    if clock is None or save is None or not role.last_private_chat_at:
-        return 0
-    recovered = _count_public_turns_since_last_private_chat(save, role) * 4
-    if recovered <= 0:
-        return 0
+    del clock
     before = role.talkative_current
-    role.talkative_current = min(role.talkative_maximum, role.talkative_current + recovered)
+    if save is not None and not getattr(role, "talkative_recovery_round_cursor", None):
+        recovered_turns = _count_public_turns_since_last_private_chat(save, role)
+        if recovered_turns > 0:
+            role.talkative_current = min(role.talkative_maximum, role.talkative_current + recovered_turns * 4)
+            role.last_public_turn_at = _utc_now()
+    role.talkative_current = min(role.talkative_maximum, max(0, role.talkative_current))
     return max(0, role.talkative_current - before)
 
 
@@ -5211,20 +5310,6 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
         )
     except Exception:
         pass
-    try:
-        from app.services.encounter_service import advance_active_encounter_in_save
-
-        advanced = advance_active_encounter_in_save(save, session_id=req.session_id, minutes_elapsed=time_spent_min, config=req.config)
-        if advanced is not None:
-            scene_events.append(
-                _new_scene_event(
-                    "encounter_background",
-                    advanced.latest_outcome_summary or advanced.scene_summary or advanced.description,
-                    metadata={"encounter_id": advanced.encounter_id},
-                )
-            )
-    except Exception:
-        pass
     save_current(save)
     return NpcChatResponse(
         session_id=req.session_id,
@@ -5757,7 +5842,16 @@ def plan_public_turn_opposed_exchange(req: PublicTurnOpposedPlanRequest) -> Publ
         source_ability = "strength"
     if source_ability not in {"strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"}:
         source_ability = "strength"
-    target_ability, target_modifier = _choose_opposed_target_ability(target_profile, "max_strength_or_dexterity")
+    target_ability = "strength"
+    if has_ai_config(req.config):
+        try:
+            target_plan = _ai_action_plan("check", req.target_action_summary or req.target_speech_text or combined_prompt or req.source_action_summary, req.config)
+            target_ability = str(target_plan.get("ability_used") or "strength").strip().lower() or "strength"
+        except Exception:
+            target_ability = "strength"
+    if target_ability not in {"strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"}:
+        target_ability = "strength"
+    target_modifier = _ability_modifier(target_profile, target_ability)
     source_modifier = _ability_modifier(source_profile, source_ability)
     task_seed = _humanize_action_prompt(req.source_action_summary) or _humanize_action_prompt(combined_prompt) or "当前对抗"
     return PublicTurnOpposedPlanResponse(
@@ -5877,7 +5971,43 @@ def plan_action_check(req: ActionCheckPlanRequest) -> ActionCheckPlanResponse:
     target_actor_kind: Literal["player", "npc"] | None = None
     target_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
     target_ability_modifier: int | None = None
+    public_turn_interaction_kind: Literal["generic", "information_gathering", "social_influence", "intimidation"] | None = None
+    public_turn_notice_state: Literal["hidden", "noticed", "obvious"] | None = None
+    public_turn_resolution_mode: Literal["static_dc", "opposed_actor", "opposed_then_information_dc"] | None = None
+    followup_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
+    followup_dc: int | None = None
+    followup_check_task: str | None = None
     if req.source_context == "public_turn":
+        normalized_prompt = req.action_prompt.lower()
+        info_wisdom_tokens = ("观察", "觉察", "发现", "洞察", "偷听", "察看", "listen", "look", "notice", "watch")
+        info_intelligence_tokens = ("识别", "辨认", "分析", "推理", "读懂", "investigate", "analyze", "identify")
+        social_tokens = ("说服", "劝说", "安抚", "欺骗", "交涉", "persuade", "convince", "deceive", "comfort")
+        intimidation_tokens = ("威胁", "压迫", "威慑", "强逼", "恫吓", "intimidate", "threaten", "coerce")
+        hidden_tokens = ("暗中", "悄悄", "不被发现", "偷听", "潜行", "hidden", "quietly", "unnoticed")
+        obvious_tokens = ("直接", "公开", "当众", "点名", "高声", "强迫", "obvious", "loudly", "publicly")
+        if any(token in normalized_prompt for token in intimidation_tokens):
+            public_turn_interaction_kind = "intimidation"
+            strength_mod = int(profile.dnd5e_sheet.current_ability_modifiers.strength)
+            charisma_mod = int(profile.dnd5e_sheet.current_ability_modifiers.charisma)
+            chosen_ability = "strength" if strength_mod >= charisma_mod else "charisma"
+            plan["ability_used"] = chosen_ability
+        elif any(token in normalized_prompt for token in social_tokens):
+            public_turn_interaction_kind = "social_influence"
+            plan["ability_used"] = "charisma"
+        elif any(token in normalized_prompt for token in info_intelligence_tokens):
+            public_turn_interaction_kind = "information_gathering"
+            plan["ability_used"] = "intelligence"
+        elif any(token in normalized_prompt for token in info_wisdom_tokens):
+            public_turn_interaction_kind = "information_gathering"
+            plan["ability_used"] = "wisdom"
+        else:
+            public_turn_interaction_kind = "generic"
+        if any(token in normalized_prompt for token in hidden_tokens):
+            public_turn_notice_state = "hidden"
+        elif any(token in normalized_prompt for token in obvious_tokens):
+            public_turn_notice_state = "obvious"
+        else:
+            public_turn_notice_state = "noticed"
         opposed = _build_public_turn_opposed_plan(
             save,
             actor_role_id=actor_role_id,
@@ -5887,7 +6017,9 @@ def plan_action_check(req: ActionCheckPlanRequest) -> ActionCheckPlanResponse:
             planned_requires_check=bool(plan.get("requires_check")),
             config=req.config,
         )
-        if opposed is not None:
+        if public_turn_interaction_kind == "information_gathering" and public_turn_notice_state == "hidden":
+            public_turn_resolution_mode = "static_dc"
+        elif opposed is not None:
             plan = opposed
             resolution_rule = "opposed_actor"
             target_role_id = str(opposed.get("target_role_id") or "") or None
@@ -5900,6 +6032,15 @@ def plan_action_check(req: ActionCheckPlanRequest) -> ActionCheckPlanResponse:
                 target_ability_used = target_ability_value  # type: ignore[assignment]
             if opposed.get("target_ability_modifier") is not None:
                 target_ability_modifier = int(opposed["target_ability_modifier"])
+            if public_turn_interaction_kind == "information_gathering":
+                public_turn_resolution_mode = "opposed_then_information_dc"
+                followup_ability_used = str(plan.get("ability_used") or "wisdom")  # type: ignore[assignment]
+                followup_dc = int(req.threatened_consequence or 0) if str(req.threatened_consequence or "").isdigit() else int(plan["dc"])
+                followup_check_task = str(plan.get("check_task") or "获取当前线索")
+            else:
+                public_turn_resolution_mode = "opposed_actor"
+        else:
+            public_turn_resolution_mode = "static_dc"
     ability = str(plan["ability_used"])
     return ActionCheckPlanResponse(
         session_id=req.session_id,
@@ -5923,6 +6064,12 @@ def plan_action_check(req: ActionCheckPlanRequest) -> ActionCheckPlanResponse:
         target_actor_kind=target_actor_kind,
         target_ability_used=target_ability_used,
         target_ability_modifier=target_ability_modifier,
+        public_turn_interaction_kind=public_turn_interaction_kind,
+        public_turn_notice_state=public_turn_notice_state,
+        public_turn_resolution_mode=public_turn_resolution_mode,
+        followup_ability_used=followup_ability_used,
+        followup_dc=followup_dc,
+        followup_check_task=followup_check_task,
     )
 
 
@@ -6382,20 +6529,6 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
                 gm_summary=resolution_text,
                 config=req.config,
             )
-        try:
-            from app.services.encounter_service import advance_active_encounter_in_save
-
-            advanced = advance_active_encounter_in_save(save, session_id=req.session_id, minutes_elapsed=time_spent_min, config=req.config)
-            if advanced is not None:
-                scene_events.append(
-                    _new_scene_event(
-                        "encounter_background",
-                        advanced.latest_outcome_summary or advanced.scene_summary or advanced.description,
-                        metadata={"encounter_id": advanced.encounter_id},
-                    )
-                )
-        except Exception:
-            pass
     save_current(save)
 
     return ActionCheckResponse(
@@ -6533,12 +6666,6 @@ def move_to_sub_zone_in_save(req: AreaMoveSubZoneRequest) -> AreaMoveResult:
             trigger_kind="sub_zone_move",
             summary=movement_feedback,
         )
-    except Exception:
-        pass
-    try:
-        from app.services.encounter_service import advance_active_encounter_in_save
-
-        advance_active_encounter_in_save(save, session_id=req.session_id, minutes_elapsed=duration_min, config=None)
     except Exception:
         pass
     save_current(save)
