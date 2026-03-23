@@ -2703,6 +2703,58 @@ class PublicTurnRuntimeTests(unittest.TestCase):
         self.assertEqual(impact.hp_changes[0].target_name, save.player_static_data.name)
         self.assertEqual(settlement.hp_changes[0].hp_after, 0)
 
+    def test_resolve_ai_actor_turn_consumes_spell_slot_for_spell_action(self) -> None:
+        save = self._seed_public_turn_scene("sess_public_turn_npc_spell_slot")
+        start_round_in_save(save, entry_type=PublicTurnEntryType.NEXT_ROUND, config=None)
+        round_state = get_public_turn_state_in_save(save).current_round
+        assert round_state is not None
+        actor_role = next(item for item in save.role_pool if item.role_id == "npc_guard")
+        actor_role.profile.dnd5e_sheet.spells = ["Fire Bolt"]
+        actor_role.profile.dnd5e_sheet.spell_slots_max.level_1 = 1
+        actor_role.profile.dnd5e_sheet.spell_slots_current.level_1 = 1
+
+        actor = {
+            "actor_id": actor_role.role_id,
+            "name": actor_role.name,
+            "actor_type": "npc",
+            "role": actor_role,
+        }
+
+        with (
+            patch(
+                "app.services.public_scene_runtime_v2._ai_actor_action",
+                return_value={
+                    "response_mode": "respond",
+                    "action_type": "check",
+                    "world_impact_type": "world",
+                    "visible_intent": "guard uses fire bolt to hold the front line.",
+                    "external_action_narration": "瀹堝崼使用火焰箭，火光沿着前方炸开。",
+                    "speech_line": "",
+                    "specific_threat": "",
+                    "action_prompt": "actor=瀹堝崼; intent=use fire bolt",
+                    "target_label": "",
+                    "speech_target_label": "",
+                },
+            ),
+            patch("app.services.public_scene_runtime_v2.should_force_public_action_check", return_value=False),
+        ):
+            _, impact, settlement, pending_reaction, opposed_prompt = resolve_ai_actor_turn(
+                save,
+                actor=actor,
+                player_text="I wait.",
+                gm_summary="Hostile public turn.",
+                round_state=round_state,
+                scene_context={},
+                audience_context={},
+                reputation_score=50,
+                config=None,
+            )
+
+        self.assertIsNone(opposed_prompt)
+        self.assertIsNotNone(impact)
+        self.assertIsNotNone(settlement)
+        self.assertEqual(actor_role.profile.dnd5e_sheet.spell_slots_current.level_1, 0)
+
     def test_public_turn_player_turn_in_death_saving_returns_death_save_prompt(self) -> None:
         save = self._seed_public_turn_scene("sess_public_turn_player_death_save_prompt")
         start_round_in_save(save, entry_type=PublicTurnEntryType.NEXT_ROUND, config=None)

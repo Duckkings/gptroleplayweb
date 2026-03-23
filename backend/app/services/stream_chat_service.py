@@ -84,6 +84,7 @@ _PLANNER_TOOLS: dict[str, str] = {
     "get_template_library_status": "Return the current account template-library status and definition counts.",
     "get_template_library_definitions": "Return spell or war art definition rows from the current account template library.",
     "get_role_capability_snapshot": "Return one role capability snapshot, including known spells, war arts, and current resources.",
+    "actor_adjust_resource": "Consume or recover a spell slot or martial point for the player or one role using a spell or war art definition id.",
     "spawn_scene_npc": "Create one persistent NPC in the current sub-zone when a new role must immediately join the current scene. Requires args.name.",
     "inventory_grant_item": "Grant one item into player or role inventory when the scene should hand out an item. Requires args.owner_type, args.item_id, and args.name.",
     "inventory_consume_item": "Consume one item from player or role inventory when the scene spends or uses a consumable. Requires args.owner_type and args.item_id.",
@@ -771,7 +772,7 @@ def _planner_prompt(payload: ChatRequest, context_json: str) -> str:
         "You may select at most 3 tools.\n"
         "Only choose from these tools:\n"
         f"{tool_rows}\n"
-        "Most tools are read-only. Allowed state mutations are spawn_scene_npc, inventory_grant_item, inventory_consume_item, and execute_interaction. spawn_scene_npc may be used at most once when a new NPC must enter the current scene.\n"
+        "Most tools are read-only. Allowed state mutations are spawn_scene_npc, actor_adjust_resource, inventory_grant_item, inventory_consume_item, and execute_interaction. spawn_scene_npc may be used at most once when a new NPC must enter the current scene.\n"
         "Current structured context:\n"
         f"{context_json}\n"
         "Latest player message:\n"

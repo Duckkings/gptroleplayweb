@@ -52,3 +52,7 @@
 - Summary generation failures are surfaced to the player and do not create fallback memory.
 - Teammate memory summaries are stored in `NpcRoleCard.private_chat_memories`.
 - Public-turn teammate prompting consumes only the latest 12 summary memories, not raw private-chat logs.
+
+## Resource Tool Update
+- `get_role_capability_snapshot` now surfaces stable `definition_id` values for known spells and war arts.
+- `actor_adjust_resource` is available for explicit spell-slot / martial-point consume and recover flows on `player` or `role` actors.

@@ -42,3 +42,8 @@
 ## get_active_encounters / 前端公开数据
 - 公开返回只包含 active / queued 视角
 - 公开返回不包含 `secret`、`knows_secret`、`latest_outcome_summary`、`background_tick_count`
+
+## Resource Tools
+- `get_role_capability_snapshot` returns `available_abilities[].definition_id` so the AI can look up the exact spell / war-art row in the local CSV tables.
+- `actor_adjust_resource` can consume or recover a spell slot or martial point for either `player` or `role`.
+- For spells and war arts, prefer passing `resource_definition_id` instead of relying on display names.

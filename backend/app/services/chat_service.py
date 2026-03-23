@@ -45,6 +45,8 @@ from app.models.schemas import (
 )
 from app.services.actor_capability_service import build_role_capability_response
 from app.services.ai_adapter import build_completion_options, create_async_client
+from app.services.actor_resource_service import adjust_actor_resource_in_profile
+from app.services.actor_resource_service import resolve_actor_profile
 from app.services.template_library_query_service import query_template_library_definitions
 from app.services.world_service import (
     _active_encounter_for_current_sub_zone,
@@ -948,6 +950,28 @@ def _tools_schema() -> list[dict[str, Any]]:
                         "role_id": {"type": "string"},
                     },
                     "required": ["role_id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "actor_adjust_resource",
+                "description": "Consume or recover a spell slot or martial point for the player or one role using a spell or war art definition id from the local template library.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "actor_kind": {"type": "string", "enum": ["player", "role"]},
+                        "actor_role_id": {"type": "string"},
+                        "resource_kind": {"type": "string", "enum": ["spell", "war_art", "spell_slot", "martial_point"]},
+                        "resource_definition_id": {"type": "string"},
+                        "resource_name": {"type": "string"},
+                        "mode": {"type": "string", "enum": ["consume", "recover"], "default": "consume"},
+                        "level": {"type": "integer", "minimum": 1, "maximum": 9},
+                        "amount": {"type": "integer", "minimum": 1, "default": 1},
+                    },
+                    "required": ["actor_kind", "resource_kind"],
                     "additionalProperties": False,
                 },
             },
@@ -2233,6 +2257,86 @@ async def _handle_tool_call(payload: ChatRequest, tool_call: Any) -> tuple[dict[
                 "role": "tool",
                 "tool_call_id": tool_call_id,
                 "content": json.dumps({"ok": True, **response.model_dump(mode="json")}, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "actor_adjust_resource":
+        try:
+            args = json.loads(arg_text) if arg_text else {}
+        except Exception:
+            args = {}
+        actor_kind = str(args.get("actor_kind") or "").strip().lower()
+        resource_kind = str(args.get("resource_kind") or "").strip().lower()
+        mode = str(args.get("mode") or "consume").strip().lower()
+        actor_role_id = str(args.get("actor_role_id") or "").strip()
+        resource_definition_id = str(args.get("resource_definition_id") or "").strip()
+        resource_name = str(args.get("resource_name") or "").strip()
+        if actor_kind not in {"player", "role"}:
+            event = ToolEvent(tool_name="actor_adjust_resource", ok=False, summary="invalid actor_kind")
+            return (
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps({"ok": False, "error": "invalid_actor_kind"}, ensure_ascii=False),
+                },
+                event,
+            )
+        if resource_kind not in {"spell", "war_art", "spell_slot", "martial_point"}:
+            event = ToolEvent(tool_name="actor_adjust_resource", ok=False, summary="invalid resource_kind")
+            return (
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps({"ok": False, "error": "invalid_resource_kind"}, ensure_ascii=False),
+                },
+                event,
+            )
+        save = get_current_save(default_session_id=payload.session_id)
+        try:
+            profile, _ = resolve_actor_profile(save, owner_type=actor_kind, role_id=(actor_role_id or None))
+        except KeyError:
+            event = ToolEvent(tool_name="actor_adjust_resource", ok=False, summary="actor not found")
+            return (
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps({"ok": False, "error": "actor_not_found"}, ensure_ascii=False),
+                },
+                event,
+            )
+        level_value = args.get("level")
+        status = adjust_actor_resource_in_profile(
+            profile,
+            resource_kind=resource_kind,
+            mode=mode,
+            amount=max(1, int(args.get("amount") or 1)),
+            level=(int(level_value) if level_value is not None else None),
+            resource_definition_id=resource_definition_id,
+            resource_name=resource_name,
+        )
+        save.session_id = payload.session_id
+        save_current(save)
+        ok = status.check_status == "passed"
+        event = ToolEvent(
+            tool_name="actor_adjust_resource",
+            ok=ok,
+            summary=f"{actor_kind} {resource_kind} {mode} {'ok' if ok else 'failed'}",
+            payload={"resource_kind": resource_kind, "resolved_definition_id": status.resolved_definition_id},
+        )
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(
+                    {
+                        "ok": ok,
+                        "actor_kind": actor_kind,
+                        "actor_role_id": (actor_role_id or save.player_static_data.player_id),
+                        "resource_status": status.model_dump(mode="json"),
+                    },
+                    ensure_ascii=False,
+                ),
             },
             event,
         )

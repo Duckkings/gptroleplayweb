@@ -8,6 +8,7 @@ import type {
   PublicTurnOpposedPlanResponse,
   PublicTurnOpposedPrompt,
   PublicTurnPhase,
+  PublicTurnWorldImpactType,
   RoleActionStatus,
 } from '../types/app';
 
@@ -38,6 +39,8 @@ type AwaitingPlayerActionState = SummaryFields & {
   onActionChange: (value: string) => void;
   onSpeechChange: (value: string) => void;
   onSubmit: () => void;
+  onNoAction: () => void;
+  onObserve: () => void;
 };
 
 type InteractionResponseState = {
@@ -127,6 +130,18 @@ function attackAreaSummary(prompt: PublicTurnAttackPrompt): string | null {
     return `${prompt.attack_area_shape} / 长度 ${prompt.attack_area_length_m} 米`;
   }
   return prompt.attack_area_shape;
+}
+
+function worldImpactLabel(value: PublicTurnWorldImpactType | string | null | undefined): string {
+  if (value === 'world') return '世界影响';
+  if (value === 'non_world') return '无世界影响';
+  return '未标注';
+}
+
+function attackPromptWorldImpact(prompt: PublicTurnAttackPrompt): PublicTurnWorldImpactType | string {
+  const raw = prompt.metadata?.source_world_impact_type;
+  if (raw === 'world' || raw === 'non_world') return raw;
+  return 'world';
 }
 
 function canSubmitTextResponse(speechOnly: boolean, actionValue: string, speechValue: string): boolean {
@@ -245,13 +260,25 @@ export function PublicTurnInlinePromptPanel({ state }: Props) {
     const speechOnly = state.playerActionStatus === 'death_saving' || state.playerActionStatus === 'unable_to_act';
     const title = state.playerActionStatus === 'death_saving' ? '提交语言并进入死亡豁免' : '提交本阶段行动';
     const submitLabel = state.playerActionStatus === 'death_saving' ? '提交语言并掷死亡豁免' : '提交行动';
+    const actorName = state.currentActorName?.trim() || '玩家';
 
     return (
       <section className="public-turn-inline-panel">
         <header className="public-turn-inline-header">
-          <h4>当前回合输入</h4>
-          <p>直接在叙述区填写这轮动作和台词，提交后继续公开回合。</p>
+          <h4>玩家结算输入</h4>
+          <p>直接在结算区填写这轮动作和台词，提交后继续公开回合。</p>
         </header>
+        {!speechOnly ? (
+          <div className="actions public-turn-inline-actions public-turn-inline-quick-actions">
+            <button type="button" disabled={state.busy} onClick={state.onNoAction}>
+              观望
+            </button>
+            <button type="button" disabled={state.busy} onClick={state.onObserve}>
+              洞察
+            </button>
+          </div>
+        ) : null}
+        {!speechOnly ? <p className="hint">观望会提交“{actorName}无作为”，洞察会提交“{actorName}仔细地观察周围情况”。</p> : null}
         <ResponseComposer
           title={title}
           actionValue={state.actionValue}
@@ -287,6 +314,7 @@ export function PublicTurnInlinePromptPanel({ state }: Props) {
         <section className="public-turn-inline-context">
           <p>发起者: {state.prompt.source_actor_name}</p>
           <p>需要回应者: {state.prompt.target_actor_name}</p>
+          <p>动作判定: {worldImpactLabel(state.prompt.source_world_impact_type)}</p>
           {state.prompt.source_action_target_name ? <p>动作对象: {state.prompt.source_action_target_name}</p> : null}
           <p>对方行为: {state.prompt.source_action_summary}</p>
           {state.prompt.source_speech_text ? <p>对方语言: {state.prompt.source_speech_text}</p> : null}
@@ -326,6 +354,7 @@ export function PublicTurnInlinePromptPanel({ state }: Props) {
         <section className="public-turn-inline-context">
           <p>攻击者: {state.prompt.source_actor_name}</p>
           <p>当前目标: {state.prompt.current_target_name}</p>
+          <p>动作判定: {worldImpactLabel(attackPromptWorldImpact(state.prompt))}</p>
           <p>
             攻击分类: {attackKindLabel(state.prompt.attack_kind)} / {attackBasisLabel(state.prompt.attack_basis)}
           </p>

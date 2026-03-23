@@ -105,6 +105,62 @@ def should_force_public_action_check(
     return False
 
 
+_WORLD_IMPACT_HINT_TOKENS = (
+    "安抚",
+    "劝说",
+    "说服",
+    "鼓舞",
+    "震慑",
+    "威慑",
+    "驱散",
+    "压制",
+    "阻止",
+    "制止",
+    "拦住",
+    "推开",
+    "拉开",
+    "移动",
+    "带离",
+    "带走",
+    "演奏",
+    "弹奏",
+    "吹奏",
+    "唱",
+    "吟唱",
+    "施法",
+    "点燃",
+    "熄灭",
+    "抢夺",
+    "抓住",
+    "按住",
+    "压住",
+    "控制",
+    "拆除",
+    "封住",
+    "堵住",
+)
+
+
+def _normalize_world_impact_type(payload: dict[str, object]) -> PublicTurnWorldImpactType:
+    explicit = str(payload.get("world_impact_type") or "").strip().lower()
+    if explicit == PublicTurnWorldImpactType.WORLD.value:
+        return PublicTurnWorldImpactType.WORLD
+    combined = "\n".join(
+        part
+        for part in (
+            str(payload.get("external_action_narration") or "").strip(),
+            str(payload.get("visible_intent") or "").strip(),
+            str(payload.get("specific_threat") or "").strip(),
+            str(payload.get("action_prompt") or "").strip(),
+            str(payload.get("speech_line") or "").strip(),
+        )
+        if part
+    ).lower()
+    if any(token.lower() in combined for token in _WORLD_IMPACT_HINT_TOKENS):
+        return PublicTurnWorldImpactType.WORLD
+    return PublicTurnWorldImpactType.NON_WORLD
+
+
 _TEAM_AUDIENCE_HINTS = (
     "队友",
     "同伴",
@@ -476,6 +532,8 @@ def _ai_actor_action(
         "Allowed enum ids:\n"
         f"{render_enum_pool_text((EnumContractField(field_path='response_mode', allowed_ids=('respond', 'ignore', 'none')), EnumContractField(field_path='action_type', allowed_ids=('check', 'attack', 'item_use')), EnumContractField(field_path='world_impact_type', allowed_ids=(PublicTurnWorldImpactType.NON_WORLD.value, PublicTurnWorldImpactType.WORLD.value)), EnumContractField(field_path='consent_state', allowed_ids=('accepted', 'rejected', 'ambiguous', 'not_applicable')), EnumContractField(field_path='contest_state', allowed_ids=('opposed', 'non_opposed', 'not_applicable'))))}\n"
         "Use only the allowed stable ids for response_mode, action_type, world_impact_type, consent_state, and contest_state.\n"
+        "world_impact_type=world means the action visibly changes the scene, another character's state, the crowd's mood or behavior, positions, access, risk, resources, or other writable world facts.\n"
+        "world_impact_type=non_world is only for purely internal thoughts, flavor text, or speech that does not change the scene.\n"
         "Also return speech_target_label for the spoken addressee only.\n"
         "Do not use gaze targets, wink targets, gesture targets, or silent coordination partners as speech_target_label.\n"
         "If the narration mentions looking at actor A but the spoken line is addressed to actor B, speech_target_label must be actor B.\n"
@@ -532,6 +590,7 @@ def _ai_actor_action(
         raise
     except Exception as exc:
         raise ValueError(f"{AI_PROVIDER_CALL_FAILED}: {exc}") from exc
+    world_impact_type = _normalize_world_impact_type(parsed).value
     payload = {
         "response_mode": str(parsed.get("response_mode") or ("respond" if incoming_interaction else "none")).strip().lower(),
         "incoming_from_actor_id": str((incoming_interaction or {}).get("source_actor_id") or ""),
@@ -553,7 +612,7 @@ def _ai_actor_action(
         "specific_threat": str(parsed.get("specific_threat") or "")[:180],
         "target_label": str(parsed.get("target_label") or "")[:80],
         "speech_target_label": str(parsed.get("speech_target_label") or "")[:80],
-        "world_impact_type": str(parsed.get("world_impact_type") or "")[:20],
+        "world_impact_type": world_impact_type,
         "consent_state": str(parsed.get("consent_state") or "not_applicable")[:20],
         "contest_state": str(parsed.get("contest_state") or "not_applicable")[:20],
         "needs_check": bool(parsed.get("needs_check")),

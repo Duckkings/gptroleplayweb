@@ -48,6 +48,7 @@ from app.services import public_scene_runtime_v2 as public_scene_runtime
 from app.services import public_scene_service as public_scene_legacy
 from app.services import reaction_check_service
 from app.services import world_service as world
+from app.services.actor_resource_service import consume_action_resources_in_profile
 from app.services.actor_resource_service import consume_submission_resources_in_save
 from app.services.encounter_service import apply_active_encounter_situation_delta_in_save
 from app.services.public_turn_interaction_service import build_ai_interaction_response
@@ -1861,18 +1862,19 @@ def resolve_player_submission(
         environment_shift=0,
         scene_events=events,
     )
-    gm_resolution_summary = _generate_opposed_resolution_summary(
-        session_id=session_id,
-        actor_name=save.player_static_data.name,
-        target_name=str((action_result.target_name if action_result is not None else player_action_target_name) or "Unknown target"),
-        actor_action_summary=action_text.strip() or display_text,
-        actor_speech_text=speech_text.strip(),
-        target_action_summary="",
-        target_speech_text="",
-        stakes_summary=display_text,
-        action_result=action_result,
-        config=config,
-    )
+    if not gm_resolution_summary and action_result is not None and action_result.resolution_rule == "opposed_actor":
+        gm_resolution_summary = _generate_opposed_resolution_summary(
+            session_id=session_id,
+            actor_name=save.player_static_data.name,
+            target_name=str((action_result.target_name if action_result is not None else player_action_target_name) or "Unknown target"),
+            actor_action_summary=action_text.strip() or display_text,
+            actor_speech_text=speech_text.strip(),
+            target_action_summary="",
+            target_speech_text="",
+            stakes_summary=display_text,
+            action_result=action_result,
+            config=config,
+        )
     settlement = build_settlement_entry(
         round_state=round_state,
         actor_id=save.player_static_data.player_id,
@@ -2299,7 +2301,7 @@ def _build_attack_prompt(
         player_in_danger=(current_target.actor_type == PublicTurnActorType.PLAYER),
         attack_ability_used=(str(attack_assessment.get("attack_ability_used") or "") or None),  # type: ignore[arg-type]
         suggested_response_hint="Respond in the world if you want to disrupt or avoid this attack; otherwise the attack may resolve directly.",
-        metadata=metadata,
+        metadata={**metadata, "source_world_impact_type": PublicTurnWorldImpactType.WORLD.value},
     )
 
 
@@ -2571,6 +2573,22 @@ def resolve_ai_actor_turn(
             display_text=player_text,
             action_line=action_content,
             priority_reason=str(actor.get("priority_reason") or ""),
+        )
+    source_role = actor.get("role")
+    actor_profile = getattr(source_role, "profile", None) if source_role is not None else None
+    if actor_profile is not None:
+        consume_action_resources_in_profile(
+            actor_profile,
+            action_text=" ".join(
+                part
+                for part in (
+                    str(payload.get("external_action_narration") or ""),
+                    str(payload.get("visible_intent") or ""),
+                    str(payload.get("action_prompt") or ""),
+                )
+                if part.strip()
+            ),
+            speech_text=str(payload.get("speech_line") or ""),
         )
     opposed_prompt = _maybe_build_player_opposed_prompt(
         save,
@@ -3699,7 +3717,11 @@ def resolve_interaction_prompt_submission(
         return base_events, None, None, None, opposed_prompt
 
     action_result = None
-    if prompt.source_planned_requires_check and prompt.source_world_impact_type == PublicTurnWorldImpactType.WORLD:
+    # `no_action` is a passive response, but the source actor still needs to
+    # resolve its own check so we can emit the DC/result narration and
+    # downstream consequences. Keep explicit responses on the existing path.
+    should_run_source_check = prompt.source_planned_requires_check or target_response_kind == "no_action"
+    if should_run_source_check:
         combined_prompt = "\n".join(
             part
             for part in (
@@ -3710,7 +3732,7 @@ def resolve_interaction_prompt_submission(
                 target_speech_text.strip(),
             )
             if part
-        ).strip() or prompt.source_action_prompt.strip() or prompt.source_action_summary.strip()
+            ).strip() or prompt.source_action_prompt.strip() or prompt.source_action_summary.strip()
         action_result = world.action_check(
             ActionCheckRequest(
                 session_id=session_id,
