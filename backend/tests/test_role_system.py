@@ -45,6 +45,7 @@ from app.services.public_scene_service import get_public_scene_state
 from app.services.chat_service import route_main_turn_intent
 from app.services.team_service import ensure_team_state
 from app.services.world_service import (
+    _apply_action_prompt_hints,
     _parse_player_intent,
     NpcChatConfigError,
     NpcChatGenerationError,
@@ -680,6 +681,21 @@ class RoleSystemTests(unittest.TestCase):
         self.assertEqual(result.actor_kind, "player")
         self.assertTrue(result.check_task)
         self.assertIsInstance(result.ability_modifier, int)
+
+    def test_apply_action_prompt_hints_prefers_wisdom_for_observation(self) -> None:
+        plan = {
+            "action_type": "check",
+            "ability_used": "strength",
+            "dc": 12,
+            "time_spent_min": 5,
+            "requires_check": True,
+            "check_task": "观察周围情况",
+        }
+
+        updated = _apply_action_prompt_hints(plan, "仔细地观察周围情况")
+
+        self.assertIs(updated, plan)
+        self.assertEqual(updated["ability_used"], "wisdom")
 
     def test_action_check_player_requires_roll_when_check_needed(self) -> None:
         sid = "sess_action_check_player_roll_required"

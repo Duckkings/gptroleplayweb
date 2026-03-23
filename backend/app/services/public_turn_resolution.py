@@ -1722,7 +1722,7 @@ def resolve_player_submission(
     structured_situation_hint = 4 if action_check is not None and action_check.planned_requires_check else 0
     situation_delta = max(-20, min(20, structured_situation_hint + check_bonus(action_result)))
     relation_delta = relation_delta_from_result(action_result, situation_delta)
-    gm_resolution_summary = _last_nonempty_line(action_result.narrative) if action_result is not None else ""
+    gm_resolution_summary = _extract_resolution_summary_text(action_result.narrative, limit=280) if action_result is not None else ""
     current_primary_aggressor_name, current_primary_target_name, prior_settlement_excerpt = _recent_conflict_anchor(round_state)
     player_action_target_name = (
         str(action_result.target_name or "").strip()
@@ -2890,7 +2890,7 @@ def resolve_opposed_prompt_submission(
             )
         )
         _apply_followup_check_to_settlement(settlement, impact, followup_result)
-        followup_summary = _last_nonempty_line(followup_result.narrative) or settlement.gm_resolution_summary
+        followup_summary = _extract_resolution_summary_text(followup_result.narrative, limit=280) or settlement.gm_resolution_summary
         events.append(
             world._new_scene_event(
                 "public_turn_information_check",

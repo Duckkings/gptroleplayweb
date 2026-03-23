@@ -952,6 +952,7 @@ function App() {
   const [lastActionResult, setLastActionResult] = useState<ActionCheckResult | null>(null);
   const [actionCheckRollState, setActionCheckRollState] = useState<ActionCheckRollState>(DEFAULT_ACTION_CHECK_ROLL_STATE);
   const [publicTurnActionRollState, setPublicTurnActionRollState] = useState<ActionCheckRollState>(DEFAULT_ACTION_CHECK_ROLL_STATE);
+  const [publicTurnActionSubmitting, setPublicTurnActionSubmitting] = useState(false);
   const [reactionCheckRollState, setReactionCheckRollState] = useState<ActionCheckRollState>(DEFAULT_ACTION_CHECK_ROLL_STATE);
   const [pendingReactionState, setPendingReactionState] = useState<PendingReactionState | null>(null);
   const [pendingInteractionState, setPendingInteractionState] = useState<PendingInteractionState | null>(null);
@@ -6490,80 +6491,82 @@ function App() {
   };
 
   const submitPublicTurnAction = async (submissionActionDescription: string, submissionSpeechDescription: string) => {
+    setPublicTurnActionSubmitting(true);
     clearDamageHighlights();
     const speechOnlySubmission = playerSpeechOnlyInPublicTurn;
     if (!speechOnlySubmission && !submissionActionDescription && !submissionSpeechDescription) {
       setError('当前回合至少需要输入行为或语言。');
+      setPublicTurnActionSubmitting(false);
       return;
     }
-
-    let validatedActionDescription = submissionActionDescription;
-    let validatedSpeechDescription = submissionSpeechDescription;
-    if (!speechOnlySubmission) {
-      try {
-        const validated = await performPlayerInputValidation({
-          entryPoint: 'public_turn_action',
-          actorRoleId: playerStatic.player_id,
-          actionText: submissionActionDescription,
-          speechText: submissionSpeechDescription,
-        });
-        if (!validated) {
-          return;
-        }
-        validatedActionDescription = validated.actionText;
-        validatedSpeechDescription = validated.speechText;
-      } catch (e) {
-        setError(e instanceof Error ? e.message : '玩家输入校验失败');
-        return;
-      }
-    }
-    if (!validatedActionDescription && !validatedSpeechDescription) {
-      setError('校验建议后没有可提交内容，请直接修改输入。');
-      return;
-    }
-
-    setLastActionInput(validatedActionDescription);
-    setLastSpeechInput(validatedSpeechDescription);
-    setError('');
-    setMainLiveProgress([]);
-    setShowFoldedMainSceneEvents(false);
-    const sourcePhase = publicTurnRound?.awaiting_player_action_phase ?? publicTurnRound?.phase ?? publicTurnPhase;
-    const actionSubmission = {
-      actor_id: playerStatic.player_id,
-      action_text: speechOnlySubmission ? '' : validatedActionDescription,
-      speech_text: validatedSpeechDescription,
-      source_phase: sourcePhase,
-      forced_first: false,
-    };
-    const actionPrompt = speechOnlySubmission
-      ? validatedSpeechDescription.trim()
-      : [validatedActionDescription, validatedSpeechDescription].filter(Boolean).join('\n').trim();
-    const effectivePrompt = `${config.gm_prompt}\n${NARRATOR_STYLE_PROMPT}${godMode ? `\n${GOD_MODE_PROMPT}` : ''}`;
-    const effectiveConfig: AppConfig = { ...config, gm_prompt: effectivePrompt };
-    const applyPublicTurnStreamState = (
-      replyText: string,
-      sceneEvents: SceneEvent[],
-      status: MainOutputStatus = 'streaming',
-      publicTurnRuntimeState?: PublicTurnState | null,
-      publicTurnPresentation?: PublicTurnPresentation | null,
-    ) => {
-      applyPublicTurnMainOutput({
-        reply_text: replyText,
-        scene_events: sceneEvents,
-        public_turn_state: publicTurnRuntimeState ?? livePublicTurnState ?? publicTurnState,
-        public_turn_presentation: publicTurnPresentation ?? livePublicTurnPresentation ?? null,
-        archived_sub_zone_turn_id: null,
-        status,
-      });
-    };
-    const finalizePublicTurnAfterResponse = async (sceneEvents: SceneEvent[]) => {
-      await syncEncounterLaneAfterSceneEvents(sceneEvents);
-      await refreshAreaSnapshot();
-      await refreshGameLogs(sessionId);
-      await syncStateFromSave(sessionId);
-    };
 
     try {
+      let validatedActionDescription = submissionActionDescription;
+      let validatedSpeechDescription = submissionSpeechDescription;
+      if (!speechOnlySubmission) {
+        try {
+          const validated = await performPlayerInputValidation({
+            entryPoint: 'public_turn_action',
+            actorRoleId: playerStatic.player_id,
+            actionText: submissionActionDescription,
+            speechText: submissionSpeechDescription,
+          });
+          if (!validated) {
+            return;
+          }
+          validatedActionDescription = validated.actionText;
+          validatedSpeechDescription = validated.speechText;
+        } catch (e) {
+          setError(e instanceof Error ? e.message : '玩家输入校验失败');
+          return;
+        }
+      }
+      if (!validatedActionDescription && !validatedSpeechDescription) {
+        setError('校验建议后没有可提交内容，请直接修改输入。');
+        return;
+      }
+
+      setLastActionInput(validatedActionDescription);
+      setLastSpeechInput(validatedSpeechDescription);
+      setError('');
+      setMainLiveProgress([]);
+      setShowFoldedMainSceneEvents(false);
+      const sourcePhase = publicTurnRound?.awaiting_player_action_phase ?? publicTurnRound?.phase ?? publicTurnPhase;
+      const actionSubmission = {
+        actor_id: playerStatic.player_id,
+        action_text: speechOnlySubmission ? '' : validatedActionDescription,
+        speech_text: validatedSpeechDescription,
+        source_phase: sourcePhase,
+        forced_first: false,
+      };
+      const actionPrompt = speechOnlySubmission
+        ? validatedSpeechDescription.trim()
+        : [validatedActionDescription, validatedSpeechDescription].filter(Boolean).join('\n').trim();
+      const effectivePrompt = `${config.gm_prompt}\n${NARRATOR_STYLE_PROMPT}${godMode ? `\n${GOD_MODE_PROMPT}` : ''}`;
+      const effectiveConfig: AppConfig = { ...config, gm_prompt: effectivePrompt };
+      const applyPublicTurnStreamState = (
+        replyText: string,
+        sceneEvents: SceneEvent[],
+        status: MainOutputStatus = 'streaming',
+        publicTurnRuntimeState?: PublicTurnState | null,
+        publicTurnPresentation?: PublicTurnPresentation | null,
+      ) => {
+        applyPublicTurnMainOutput({
+          reply_text: replyText,
+          scene_events: sceneEvents,
+          public_turn_state: publicTurnRuntimeState ?? livePublicTurnState ?? publicTurnState,
+          public_turn_presentation: publicTurnPresentation ?? livePublicTurnPresentation ?? null,
+          archived_sub_zone_turn_id: null,
+          status,
+        });
+      };
+      const finalizePublicTurnAfterResponse = async (sceneEvents: SceneEvent[]) => {
+        await syncEncounterLaneAfterSceneEvents(sceneEvents);
+        await refreshAreaSnapshot();
+        await refreshGameLogs(sessionId);
+        await syncStateFromSave(sessionId);
+      };
+
       let playerActionCheck: PublicTurnPlayerActionCheck | null = null;
       if (!speechOnlySubmission) {
         setChatState('sending');
@@ -6871,6 +6874,8 @@ function App() {
       activeStreamRef.current = null;
       setError(e instanceof Error ? e.message : '公开回合提交失败');
       setChatState('error');
+    } finally {
+      setPublicTurnActionSubmitting(false);
     }
     };
 
@@ -9729,7 +9734,7 @@ function App() {
       return {
         kind: 'awaiting_player_action',
         ...publicTurnSummary,
-        busy: chatState === 'sending' || chatState === 'streaming' || publicTurnActionRollState.open,
+        busy: chatState === 'sending' || chatState === 'streaming' || publicTurnActionRollState.open || publicTurnActionSubmitting,
         playerActionStatus: playerPublicTurnActionStatus,
         actionValue: actionInput,
         speechValue: speechInput,

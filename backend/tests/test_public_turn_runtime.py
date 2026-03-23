@@ -51,6 +51,7 @@ from app.services import reaction_check_service
 from app.services.team_service import ensure_team_state
 from app.services.public_turn_resolution import (
     _apply_public_turn_hp_damage,
+    _extract_resolution_summary_text,
     build_initiative_declarations,
     resolve_player_attack_submission,
     resolve_player_submission,
@@ -2009,6 +2010,14 @@ class PublicTurnRuntimeTests(unittest.TestCase):
             )
 
         self.assertEqual(result.presentation.settlement_entries[0].gm_resolution_summary, "")
+
+    def test_extract_resolution_summary_text_keeps_multiline_content(self) -> None:
+        text = "第一句回应。\n第二句描写。"
+
+        summary = _extract_resolution_summary_text(text, limit=120)
+
+        self.assertIn("第一句回应。", summary)
+        self.assertIn("第二句描写。", summary)
 
     def test_build_settlement_fragment_includes_opposed_result_outcome(self) -> None:
         settlement = PublicTurnSettlementEntry(

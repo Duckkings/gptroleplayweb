@@ -5523,6 +5523,21 @@ def _fallback_action_plan(action_type: str, action_prompt: str) -> dict[str, int
     )
 
 
+def _apply_action_prompt_hints(plan: dict[str, int | bool | str], action_prompt: str) -> dict[str, int | bool | str]:
+    text = str(action_prompt or "").lower()
+    if any(token in text for token in ("attack", "strike", "hit", "砍", "攻击")):
+        plan["ability_used"] = "strength"
+    elif any(token in text for token in ("sneak", "dodge", "stealth", "潜行", "闪避")):
+        plan["ability_used"] = "dexterity"
+    elif any(token in text for token in ("investigate", "analyze", "arcana", "调查", "推理", "识别", "辨认", "分析", "推理")):
+        plan["ability_used"] = "intelligence"
+    elif any(token in text for token in ("persuade", "deceive", "intimidate", "说服", "威吓", "安抚", "劝说", "交涉")):
+        plan["ability_used"] = "charisma"
+    elif any(token in text for token in ("观察", "洞察", "觉察", "发现", "察看", "listen", "look", "notice", "watch")):
+        plan["ability_used"] = "wisdom"
+    return plan
+
+
 _PUBLIC_TURN_RESOLUTION_RULE_FIELDS = (
     EnumContractField(
         field_path="resolution_rule",
@@ -5927,7 +5942,7 @@ def _ai_action_plan(
                 system_prompt=prompt_table.get_text("action.plan.system", "你只输出JSON。"),
                 original_prompt=prompt,
             )
-        return _normalize_action_plan(action_type, action_prompt, parsed)
+        return _apply_action_prompt_hints(_normalize_action_plan(action_type, action_prompt, parsed), action_prompt)
     except ValueError:
         raise
     except Exception as exc:
