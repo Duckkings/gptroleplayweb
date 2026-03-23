@@ -54,6 +54,29 @@
       },
       "additionalProperties": false
     },
+    "build_media": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["follow_chat_provider", "explicit_provider"]
+        },
+        "explicit_provider": {
+          "type": ["string", "null"],
+          "enum": ["openai", "gemini", null]
+        },
+        "provider_configs": {
+          "type": "object",
+          "properties": {
+            "openai": { "$ref": "#/$defs/buildMediaProviderConfig" },
+            "deepseek": { "$ref": "#/$defs/buildMediaProviderConfig" },
+            "gemini": { "$ref": "#/$defs/buildMediaProviderConfig" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
     "gm_prompt": {
       "type": "string",
       "minLength": 1
@@ -106,6 +129,27 @@
             }
           },
           "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "buildMediaProviderConfig": {
+      "type": "object",
+      "properties": {
+        "api_key": {
+          "type": "string"
+        },
+        "base_url_override": {
+          "type": ["string", "null"]
+        },
+        "generation_model": {
+          "type": "string"
+        },
+        "background_removal_model": {
+          "type": "string"
+        },
+        "vision_model": {
+          "type": "string"
         }
       },
       "additionalProperties": false

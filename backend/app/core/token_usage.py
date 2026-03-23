@@ -5,7 +5,7 @@ from typing import Literal
 
 from app.models.schemas import TokenUsageBucket, TokenUsageResponse, TokenUsageSources
 
-TokenSource = Literal["chat", "map_generation", "movement_narration"]
+TokenSource = Literal["chat", "map_generation", "movement_narration", "encounter_location_generation"]
 
 
 class TokenUsageStore:

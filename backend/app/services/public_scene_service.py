@@ -26,6 +26,7 @@ from app.services.reputation_service import (
     apply_sub_zone_reputation_delta,
     get_current_sub_zone_reputation,
 )
+from app.services import zone_metric_service
 from app.services.world_service import (
     _active_encounter_for_current_sub_zone,
     _append_npc_dialogue,
@@ -63,8 +64,86 @@ def _team_role_map(save: SaveFile) -> dict[str, NpcRoleCard]:
     }
 
 
+def _normalize_actor_name_key(name: object) -> str:
+    return "".join(str(name or "").split()).strip().lower()
+
+
+def _alias_encounter_temp_npc_name(base_name: object, *, seen_keys: set[str]) -> str:
+    clean = str(base_name or "").strip()
+    if not clean:
+        return ""
+    base_key = _normalize_actor_name_key(clean)
+    if base_key and base_key not in seen_keys:
+        seen_keys.add(base_key)
+        return clean
+    index = 1
+    while True:
+        suffix = "遭遇NPC" if index == 1 else f"遭遇NPC{index}"
+        candidate = f"{clean}（{suffix}）"
+        candidate_key = _normalize_actor_name_key(candidate)
+        if candidate_key and candidate_key not in seen_keys:
+            seen_keys.add(candidate_key)
+            return candidate
+        index += 1
+
+
+def _encounter_temp_npcs_for_candidates(save: SaveFile, *, existing_names: set[str] | None = None) -> list[EncounterTemporaryNpc]:
+    seen_keys = {key for key in (existing_names or set()) if key}
+    filtered: list[EncounterTemporaryNpc] = []
+    for temp_npc in _encounter_temp_npcs(save):
+        unique_name = _alias_encounter_temp_npc_name(getattr(temp_npc, "name", ""), seen_keys=seen_keys)
+        if not unique_name:
+            continue
+        if unique_name == getattr(temp_npc, "name", ""):
+            filtered.append(temp_npc)
+            continue
+        filtered.append(temp_npc.model_copy(update={"name": unique_name}))
+    return filtered
+
+
 def _team_member_by_role_id(save: SaveFile, role_id: str):
     return next((item for item in getattr(save.team_state, "members", []) if item.role_id == role_id), None)
+
+
+def _candidate_limit(active_encounter, config: ChatConfig | None) -> int:
+    scene_config = getattr(config, "public_scene", None)
+    active_limit = int(getattr(scene_config, "active_actor_limit", 8) or 8)
+    idle_limit = int(getattr(scene_config, "idle_actor_limit", 2) or 2)
+    if active_encounter is not None and active_encounter.status == "active":
+        return max(1, min(active_limit, 16))
+    return max(1, min(idle_limit, 8))
+
+
+def _should_force_public_action_check(
+    save: SaveFile,
+    actor: dict[str, object] | None,
+    payload: dict[str, object],
+    *,
+    config: ChatConfig | None = None,
+) -> bool:
+    if bool(payload.get("needs_check")):
+        return True
+    scene_config = getattr(config, "public_scene", None)
+    if not bool(getattr(scene_config, "uncertain_actions_require_check", True)):
+        return False
+    outcome_certainty = str(payload.get("outcome_certainty") or "").strip().lower()
+    action_type = str(payload.get("action_type") or "check").strip().lower()
+    specific_threat = str(payload.get("specific_threat") or "").strip()
+    target_label = str(payload.get("target_label") or "").strip()
+    actor_type = str((actor or {}).get("actor_type") or "npc")
+    active_encounter = _active_encounter_for_current_sub_zone(save)
+    active_risk = active_encounter is not None and active_encounter.status == "active"
+    if outcome_certainty == "uncertain":
+        return True
+    if action_type == "attack":
+        return True
+    if specific_threat:
+        return True
+    if active_risk and action_type in {"check", "item_use"}:
+        return True
+    if active_risk and actor_type == "encounter_temp_npc" and target_label:
+        return True
+    return False
 
 
 def _encounter_temp_npcs(save: SaveFile) -> list[EncounterTemporaryNpc]:
@@ -77,7 +156,15 @@ def _encounter_temp_npcs(save: SaveFile) -> list[EncounterTemporaryNpc]:
 def _find_actor_name_match(name: str, text: str) -> bool:
     clean_name = (name or "").strip()
     clean_text = (text or "").strip()
-    return bool(clean_name and clean_text and clean_name in clean_text)
+    if not clean_name or not clean_text:
+        return False
+    candidate_names = [clean_name]
+    for separator in ("（", "("):
+        if separator in clean_name:
+            raw_name = clean_name.split(separator, 1)[0].strip()
+            if raw_name:
+                candidate_names.append(raw_name)
+    return any(candidate and candidate in clean_text for candidate in candidate_names)
 
 
 def _scene_focus_label(save: SaveFile, player_text: str, gm_summary: str) -> str:
@@ -175,6 +262,17 @@ def _actor_check(
     *,
     action_type: str,
     action_prompt: str,
+    resolution_rule: str = "static_dc",
+    target_role_id: str | None = None,
+    target_name: str | None = None,
+    target_actor_kind: str | None = None,
+    target_ability_used: str | None = None,
+    target_ability_modifier: int | None = None,
+    planned_ability_used: str | None = None,
+    planned_dc: int | None = None,
+    planned_time_spent_min: int | None = None,
+    planned_requires_check: bool | None = None,
+    planned_check_task: str | None = None,
     config: ChatConfig | None,
 ) -> ActionCheckResponse | None:
     try:
@@ -185,7 +283,19 @@ def _actor_check(
                 action_type=action_type,  # type: ignore[arg-type]
                 action_prompt=action_prompt,
                 allow_backend_roll=True,
+                source_context="public_turn",
+                resolution_rule=resolution_rule,  # type: ignore[arg-type]
+                target_role_id=target_role_id,
+                target_name=target_name,
+                target_actor_kind=target_actor_kind,  # type: ignore[arg-type]
+                target_ability_used=target_ability_used,  # type: ignore[arg-type]
+                target_ability_modifier=target_ability_modifier,
                 resolution_context="embedded",
+                planned_ability_used=planned_ability_used,  # type: ignore[arg-type]
+                planned_dc=planned_dc,
+                planned_time_spent_min=planned_time_spent_min,
+                planned_requires_check=planned_requires_check,
+                planned_check_task=planned_check_task,
                 config=config,
             )
         )
@@ -392,11 +502,15 @@ def _candidate_rows(
     *,
     player_text: str,
     addressed_role_name: str = "",
+    config: ChatConfig | None = None,
 ) -> list[dict[str, object]]:
     visible_npcs = _visible_public_roles(save)
     team_roles = list(_team_role_map(save).values())
     active_encounter = _active_encounter_for_current_sub_zone(save)
-    temp_npcs = _encounter_temp_npcs(save)
+    reserved_name_keys = {_normalize_actor_name_key(getattr(getattr(save, "player_static_data", None), "name", ""))}
+    reserved_name_keys.update(_normalize_actor_name_key(role.name) for role in visible_npcs)
+    reserved_name_keys.update(_normalize_actor_name_key(role.name) for role in team_roles)
+    temp_npcs = _encounter_temp_npcs_for_candidates(save, existing_names=reserved_name_keys)
     visible_rows: list[dict[str, object]] = [
         {"actor_id": role.role_id, "name": role.name, "actor_type": "npc", "priority_reason": "", "role": role}
         for role in visible_npcs
@@ -481,7 +595,7 @@ def _candidate_rows(
             continue
         seen_ids.add(actor_id)
         deduped.append(candidate)
-    limit = 4 if active_encounter is not None and active_encounter.status == "active" else 2
+    limit = _candidate_limit(active_encounter, config)
     return deduped[:limit]
 
 
@@ -494,17 +608,20 @@ def build_public_scene_state(
     intent = _parse_player_intent(player_text)
     addressed_role_name = str(intent.get("addressed_role_name") or "").strip()
     rep = get_current_sub_zone_reputation(save, create=True)
+    zone_metric = zone_metric_service.get_current_zone_metric(save, create=True)
     team_roles = _team_role_map(save)
     candidates = _candidate_rows(
         save,
         player_text=str(intent.get("display_text") or player_text).strip(),
         addressed_role_name=addressed_role_name,
+        config=None,
     )
     return PublicSceneState(
         session_id=session_id,
         current_zone_id=save.area_snapshot.current_zone_id,
         current_sub_zone_id=save.area_snapshot.current_sub_zone_id,
         current_reputation=rep,
+        current_zone_metric=zone_metric,
         visible_npcs=[
             StoryNpcSummary(
                 role_id=role.role_id,
@@ -614,7 +731,7 @@ def _fallback_round_resolution(records: list[dict[str, object]], *, predicted_si
         else:
             lines.append(f"{name}已经把动作落到了{target_label}上，意图是{stakes}，现场最危险的是{threat}。")
     if predicted_situation_value:
-        lines.append(f"GM随后把这一轮的结果汇总起来，局势值来到 {predicted_situation_value}/100，下一轮的压力和机会都已经摆在明处。")
+        lines.append("GM随后把这一轮的结果汇总起来，下一轮的压力和机会都已经摆在明处。")
     return "\n".join(lines)[:640]
 
 
@@ -728,12 +845,13 @@ def advance_public_scene_in_save(
         )
 
     active_encounter = _active_encounter_for_current_sub_zone(save)
-    reputation_entry = get_current_sub_zone_reputation(save, create=True)
-    reputation_score = reputation_entry.score if reputation_entry is not None else 50
+    zone_metric = zone_metric_service.get_current_zone_metric(save, create=True)
+    reputation_score = zone_metric.reputation_score if zone_metric is not None else 50
     candidates = _candidate_rows(
         save,
         player_text=display_text,
         addressed_role_name=addressed_role_name,
+        config=config,
     )
     if not candidates:
         return []
@@ -780,8 +898,10 @@ def advance_public_scene_in_save(
             action_line=action_line,
             priority_reason=priority_reason,
         )
+        requires_check = _should_force_public_action_check(save, actor, payload, config=config)
+        payload["needs_check"] = requires_check
         action_result = None
-        if bool(payload.get("needs_check")):
+        if requires_check:
             action_result = _actor_check(
                 save,
                 str(actor.get("actor_id") or ""),
@@ -853,7 +973,7 @@ def advance_public_scene_in_save(
         except Exception:
             pass
 
-    rep_entry, rep_event = apply_sub_zone_reputation_delta(
+    rep_entry, rep_event = zone_metric_service.apply_zone_reputation_delta(
         save,
         session_id=session_id,
         delta=_clamp(reputation_delta_total, -6, 6),
@@ -864,7 +984,7 @@ def advance_public_scene_in_save(
     )
     if rep_event is not None:
         scene_events.append(rep_event)
-        reputation_score = rep_entry.score if rep_entry is not None else reputation_score
+        reputation_score = rep_entry.reputation_score if rep_entry is not None else reputation_score
 
     scene_events.append(
         _new_scene_event(
@@ -875,7 +995,6 @@ def advance_public_scene_in_save(
                 "actor_type": "system",
                 "candidate_count": len(round_records),
                 "reputation_score": reputation_score,
-                "predicted_situation_value": predicted_situation_value,
             },
         )
     )
@@ -927,8 +1046,12 @@ def build_public_scene_state(
     player_text: str = "",
 ) -> PublicSceneState:
     from app.services.public_scene_runtime_v2 import build_public_scene_state as runtime_v2
+    from app.services.public_turn_state_store import get_public_turn_state_in_save, sync_pending_public_turn_in_save
 
-    return runtime_v2(save, session_id=session_id, player_text=player_text)
+    sync_pending_public_turn_in_save(save, session_id)
+    state = runtime_v2(save, session_id=session_id, player_text=player_text)
+    state.public_turn_state = get_public_turn_state_in_save(save).model_copy(deep=True)
+    return state
 
 
 def advance_public_scene_in_save(

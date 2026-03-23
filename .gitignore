@@ -1,5 +1,6 @@
 # Python
 backend/.venv/
+backend/.venv314/
 backend/__pycache__/
 **/__pycache__/
 *.py[cod]

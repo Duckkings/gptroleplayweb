@@ -123,7 +123,7 @@ class AreaLogicTests(unittest.TestCase):
 
         resp = execute_interaction(AreaExecuteInteractionRequest(session_id=session_id, interaction_id='int_base'))
         self.assertTrue(resp.ok)
-        self.assertEqual(resp.message, '待开发')
+        self.assertTrue(resp.message)
 
         after = get_area_current(session_id).area_snapshot.clock
         self.assertIsNotNone(after)

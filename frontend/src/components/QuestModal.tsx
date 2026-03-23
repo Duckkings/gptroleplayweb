@@ -5,15 +5,25 @@ type Props = {
   busy?: boolean;
   onAccept: (questId: string) => void;
   onReject: (questId: string) => void;
+  onMinimize?: () => void;
 };
 
-export function QuestModal({ quest, busy = false, onAccept, onReject }: Props) {
+export function QuestModal({ quest, busy = false, onAccept, onReject, onMinimize }: Props) {
   if (!quest) return null;
 
   return (
     <div className="modal-mask">
       <div className="modal-card modal-wide">
-        <h3>{quest.source === 'fate' ? '命运任务' : '新任务'}</h3>
+        <div className="modal-header-actions">
+          <div>
+            <h3>{quest.source === 'fate' ? '命运任务' : '新任务'}</h3>
+          </div>
+          {onMinimize ? (
+            <button type="button" onClick={onMinimize} disabled={busy}>
+              暂时关闭
+            </button>
+          ) : null}
+        </div>
         <strong>{quest.title}</strong>
         <p>{quest.description}</p>
         <div className="quest-objective-list">

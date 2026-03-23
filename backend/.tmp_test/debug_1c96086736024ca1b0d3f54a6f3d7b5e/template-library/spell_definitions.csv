@@ -1,0 +1,3 @@
+﻿definition_id,name,attack_mode,casting_ability,spell_cost,damage_dice,damage_bonus,damage_type,area_shape,area_radius_m,area_length_m,self_target_policy,description,resolution_notes
+fire_bolt,Fire Bolt,targeted_attack,intelligence,,1d10,0,fire,none,0,0,never,A ranged fire cantrip that strikes a single visible target.,Single target spell attack in public turn.
+fireball,Fireball,aoe_attack,intelligence,,8d6,0,fire,sphere,5,0,can_include_self,A classic explosive fire spell that fills a wide area.,"If cast at point-blank range, the caster can be inside the blast radius."

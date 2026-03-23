@@ -8,6 +8,7 @@ export type AppRuntimeConfig = {
   temperature?: number;
   max_tokens?: number;
   max_completion_tokens?: number;
+  structured_output_mode?: 'auto' | 'legacy_tags';
 };
 
 export type SubZoneDebugConfig = {
@@ -20,6 +21,13 @@ export type SubZoneDebugConfig = {
   discover_interaction_limit: number;
 };
 
+export type PublicSceneConfig = {
+  active_actor_limit: number;
+  idle_actor_limit: number;
+  max_world_pushes: number;
+  uncertain_actions_require_check: boolean;
+};
+
 export type ProviderScopedConfig = {
   api_key: string;
   base_url_override?: string | null;
@@ -28,6 +36,20 @@ export type ProviderScopedConfig = {
 };
 
 export type ProviderConfigMap = Record<AIProvider, ProviderScopedConfig>;
+
+export type ProviderBuildMediaConfig = {
+  api_key: string;
+  base_url_override?: string | null;
+  generation_model: string;
+  background_removal_model: string;
+  vision_model: string;
+};
+
+export type BuildMediaConfig = {
+  mode: 'follow_chat_provider' | 'explicit_provider';
+  explicit_provider?: 'openai' | 'gemini' | null;
+  provider_configs: Record<AIProvider, ProviderBuildMediaConfig>;
+};
 
 export type AppConfig = {
   version: string;
@@ -41,6 +63,8 @@ export type AppConfig = {
   gm_prompt: string;
   speech_time_per_50_tokens_min: number;
   sub_zone_debug: SubZoneDebugConfig;
+  public_scene: PublicSceneConfig;
+  build_media: BuildMediaConfig;
   ui?: UIConfig;
 };
 
@@ -111,6 +135,786 @@ export type ChatResponse = {
   scene_events?: SceneEvent[];
   time_spent_min: number;
   archived_sub_zone_turn_id?: string | null;
+  main_turn_summary?: MainTurnSummary | null;
+  current_zone_metric?: ZoneMetricEntry | null;
+};
+
+export type PlayerReactionCheck = {
+  reaction_id: string;
+  source_kind: 'npc_action' | 'environment' | 'world_push' | 'encounter_effect' | 'npc_chat' | 'map_arrival' | 'public_turn';
+  source_actor_id?: string | null;
+  source_actor_name?: string | null;
+  source_label: string;
+  trigger_summary: string;
+  threatened_consequence: string;
+  ability_used: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
+  dc: number;
+  check_task: string;
+  resolution_context: 'main_chat' | 'encounter' | 'npc_chat' | 'map_move' | 'public_turn';
+  success_hint: string;
+  failure_hint: string;
+  critical_success_hint: string;
+  critical_failure_hint: string;
+};
+
+export type PendingTurnContinueResponse = {
+  session_id: string;
+  pending_turn_id?: string | null;
+  flow_kind: 'main_chat' | 'encounter' | 'npc_chat' | 'map_move' | 'public_turn';
+  status:
+    | 'awaiting_reaction'
+    | 'awaiting_opposed'
+    | 'awaiting_player_information_check'
+    | 'awaiting_player_attack_response'
+    | 'awaiting_player_attack_defense'
+    | 'awaiting_player_death_save'
+    | 'awaiting_protocol_repair'
+    | 'completed'
+    | 'cancelled';
+  reply_text: string;
+  scene_events: SceneEvent[];
+  tool_events: ToolEvent[];
+  main_turn_summary?: MainTurnSummary | null;
+  current_zone_metric?: ZoneMetricEntry | null;
+  pending_reaction?: PlayerReactionCheck | null;
+  public_interaction_prompt?: PublicTurnInteractionPrompt | null;
+  public_attack_prompt?: PublicTurnAttackPrompt | null;
+  public_attack_defense_prompt?: PublicTurnAttackDefensePrompt | null;
+  public_opposed_prompt?: PublicTurnOpposedPrompt | null;
+  public_information_check_prompt?: PublicTurnInformationCheckPrompt | null;
+  death_save_prompt?: DeathSavePrompt | null;
+  reaction_result?: ActionCheckResult | null;
+  player_action_check_result?: ActionCheckResult | null;
+  public_turn_state?: PublicTurnState | null;
+  public_turn_presentation?: PublicTurnPresentation | null;
+  archived_sub_zone_turn_id?: string | null;
+  npc_role_id?: string | null;
+  public_turn_protocol_repair_notice?: PublicTurnProtocolRepairNotice | null;
+  public_turn_protocol_repair_request?: PublicTurnProtocolRepairRequest | null;
+};
+
+export type PublicTurnProtocolEnumViolation = {
+  field_path: string;
+  invalid_value?: string | null;
+  allowed_ids: string[];
+  reason: string;
+};
+
+export type PublicTurnProtocolRepairNotice = {
+  code: string;
+  message: string;
+  violations: PublicTurnProtocolEnumViolation[];
+};
+
+export type PublicTurnProtocolRepairRequest = {
+  session_id: string;
+  pending_turn_id: string;
+  continue_kind: 'entry' | 'continue' | 'reaction' | 'opposed' | 'information_check' | 'attack_defense' | 'death_save';
+  config?: AppConfig;
+};
+
+export type PublicTurnPhase =
+  | 'idle'
+  | 'initiative_declaration'
+  | 'initiative_execution'
+  | 'normal_advancement'
+  | 'gm_push'
+  | 'situation_advancement'
+  | 'awaiting_player_interaction'
+  | 'awaiting_player_reaction'
+  | 'awaiting_player_opposed'
+  | 'awaiting_player_information_check'
+  | 'awaiting_player_attack_response'
+  | 'awaiting_player_attack_defense'
+  | 'awaiting_player_death_save';
+
+export type EnvironmentRiskLevel = 'stable' | 'risky' | 'collapse';
+
+export type PublicTurnEntryType = 'next_round' | 'initiative' | 'god_override';
+
+export type PublicTurnActorType = 'player' | 'npc' | 'team' | 'encounter_temp_npc' | 'hidden_npc' | 'environment';
+export type PublicTurnWorldImpactType = 'non_world' | 'world';
+
+export type PublicTurnActionSubmission = {
+  actor_id: string;
+  action_text: string;
+  speech_text: string;
+  source_phase: PublicTurnPhase;
+  forced_first?: boolean;
+};
+
+export type PublicTurnInteractionResponseSubmission = {
+  prompt_id: string;
+  action_text: string;
+  speech_text: string;
+  response_kind: 'explicit_response' | 'no_action';
+};
+
+export type PublicTurnPlayerActionCheck = {
+  action_type: 'attack' | 'check' | 'item_use';
+  source_context: 'generic' | 'public_turn';
+  resolution_rule: 'static_dc' | 'opposed_actor';
+  planned_requires_check: boolean;
+  planned_ability_used?: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma' | null;
+  planned_dc?: number | null;
+  planned_time_spent_min?: number | null;
+  planned_check_task?: string | null;
+  forced_dice_roll?: number | null;
+  target_role_id?: string | null;
+  target_name?: string | null;
+  target_actor_kind?: 'player' | 'npc' | null;
+  target_ability_used?: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma' | null;
+  target_ability_modifier?: number | null;
+  public_turn_interaction_kind?: 'generic' | 'information_gathering' | 'social_influence' | 'intimidation' | null;
+  public_turn_notice_state?: 'hidden' | 'noticed' | 'obvious' | null;
+  public_turn_resolution_mode?: 'static_dc' | 'opposed_actor' | 'opposed_then_information_dc' | null;
+  followup_ability_used?: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma' | null;
+  followup_dc?: number | null;
+  followup_check_task?: string | null;
+};
+
+export type InitiativeDeclaration = {
+  actor_id: string;
+  actor_name: string;
+  actor_type: PublicTurnActorType;
+  declared_action: string;
+  dex_modifier: number;
+  roll_d20?: number | null;
+  total_initiative?: number | null;
+  forced_first?: boolean;
+  is_hidden?: boolean;
+  revealed_by_declaration?: boolean;
+};
+
+export type PublicTurnRelationDelta = {
+  role_id: string;
+  name: string;
+  before_tag: string;
+  after_tag: string;
+  relation_delta: number;
+  reaction_tone: 'supportive' | 'approving' | 'neutral' | 'concerned' | 'warning' | 'hostile';
+  reaction_focus_actor_id?: string | null;
+  reaction_focus_actor_name?: string | null;
+  reaction_speech_target_id?: string | null;
+  reaction_speech_target_name?: string | null;
+  reaction_action: string;
+  reaction_speech: string;
+  reaction_text: string;
+};
+
+export type PublicTurnTeamAffinityDelta = {
+  member_role_id: string;
+  name: string;
+  affinity_before: number;
+  affinity_after: number;
+  affinity_delta: number;
+  trust_before: number;
+  trust_after: number;
+  trust_delta: number;
+  reaction_tone: 'supportive' | 'approving' | 'neutral' | 'concerned' | 'warning' | 'hostile';
+  reaction_focus_actor_id?: string | null;
+  reaction_focus_actor_name?: string | null;
+  reaction_speech_target_id?: string | null;
+  reaction_speech_target_name?: string | null;
+  reaction_action: string;
+  reaction_speech: string;
+  reaction_text: string;
+};
+
+export type PublicTurnHpChange = {
+  target_id: string;
+  target_name: string;
+  hp_before: number;
+  hp_after: number;
+  hp_delta: number;
+};
+
+export type PublicTurnImpact = {
+  actor_id: string;
+  actor_name: string;
+  action_summary: string;
+  check_outcome: string;
+  situation_delta: number;
+  zone_reputation_delta: number;
+  relation_deltas: PublicTurnRelationDelta[];
+  team_affinity_deltas: PublicTurnTeamAffinityDelta[];
+  hp_changes: PublicTurnHpChange[];
+  environment_shift: number;
+  scene_event_ids: string[];
+};
+
+export type PublicTurnInitiativeEntry = {
+  actor_id: string;
+  actor_name: string;
+  actor_type: PublicTurnActorType;
+  dex_modifier: number;
+  roll_d20: number;
+  total_initiative: number;
+  revealed: boolean;
+  order_index: number;
+};
+
+export type PublicTurnSettlementCheck = {
+  resolution_rule: 'static_dc' | 'opposed_actor';
+  ability_used: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
+  ability_modifier: number;
+  dice_roll?: number | null;
+  total_score?: number | null;
+  dc?: number | null;
+  target_name?: string | null;
+  target_ability_used?: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma' | null;
+  target_ability_modifier?: number | null;
+  target_dice_roll?: number | null;
+  target_total_score?: number | null;
+  success: boolean;
+  critical: 'none' | 'critical_success' | 'critical_failure';
+  comparison_text: string;
+  outcome_text: string;
+};
+
+export type PublicTurnGmPushResult = {
+  roll_d6: number;
+  outcome_kind: 'none' | 'environment_change' | 'extra_npc_intervention';
+  outcome_label: string;
+  gm_environment_text: string;
+  environment_change_text: string;
+  spawned_npc_role_id?: string | null;
+  spawned_npc_name?: string | null;
+};
+
+export type PublicTurnSettlementEntry = {
+  entry_id: string;
+  round_id: string;
+  entry_kind: 'actor' | 'gm_push';
+  phase: PublicTurnPhase;
+  order_index: number;
+  actor_id: string;
+  actor_name: string;
+  actor_type: PublicTurnActorType;
+  action_summary: string;
+  speech_text: string;
+  narrative_entry_id?: string | null;
+  action_target_actor_id?: string | null;
+  action_target_name?: string | null;
+  action_target_kind?: PublicTurnActorType | null;
+  speech_target_actor_id?: string | null;
+  speech_target_name?: string | null;
+  speech_target_kind?: PublicTurnActorType | null;
+  source_world_impact_type: PublicTurnWorldImpactType;
+  target_response_world_impact_type: PublicTurnWorldImpactType;
+  interaction_exchange_kind: 'non_world_exchange' | 'world_exchange' | 'alternated_exchange';
+  alternation_depth: number;
+  target_response_kind: 'explicit_response' | 'no_action';
+  interaction_target_name?: string | null;
+  interaction_resolution: 'non_interactive' | 'accepted' | 'ambiguous_non_opposed' | 'rejected_opposed' | 'attack_flow';
+  attack_kind?: 'ordinary_action' | 'targeted_attack' | 'aoe_attack' | null;
+  attack_basis?: 'weapon' | 'spell' | 'other' | null;
+  attack_definition_id?: string | null;
+  attack_definition_name?: string | null;
+  attack_area_shape?: 'none' | 'sphere' | 'cone' | 'line' | 'burst' | 'emanation' | null;
+  threatened_target_names: string[];
+  hit_target_names: string[];
+  avoided_target_names: string[];
+  revealed_target_names: string[];
+  opposed_target_name?: string | null;
+  opposed_target_action?: string | null;
+  opposed_target_speech?: string | null;
+  opposed_target_speech_target_name?: string | null;
+  check?: PublicTurnSettlementCheck | null;
+  followup_check?: PublicTurnSettlementCheck | null;
+  gm_resolution_summary: string;
+  gm_push_result?: PublicTurnGmPushResult | null;
+  situation_delta: number;
+  zone_reputation_delta: number;
+  relation_deltas: PublicTurnRelationDelta[];
+  team_affinity_deltas: PublicTurnTeamAffinityDelta[];
+  hp_changes: PublicTurnHpChange[];
+  environment_shift: number;
+};
+
+export type PublicTurnRoundNarrationStatus = 'pending' | 'ready' | 'empty' | 'streaming' | 'paused' | 'complete';
+
+export type PublicTurnNarrativeEntry = {
+  narrative_entry_id: string;
+  round_id: string;
+  settlement_entry_id?: string | null;
+  phase: PublicTurnPhase;
+  order_index: number;
+  actor_id: string;
+  actor_name: string;
+  actor_type: PublicTurnActorType;
+  text: string;
+  status: 'streaming' | 'ready';
+};
+
+export type PublicTurnOpposedPrompt = {
+  check_id: string;
+  round_id: string;
+  phase: PublicTurnPhase;
+  source_actor_id: string;
+  source_actor_name: string;
+  source_action_summary: string;
+  source_speech_text: string;
+  source_interaction_kind: string;
+  source_action_target_name?: string | null;
+  source_speech_target_name?: string | null;
+  source_situation_delta_hint: number;
+  source_reputation_delta_hint: number;
+  target_actor_id: string;
+  target_actor_name: string;
+  stakes_summary: string;
+  followup_notice_state?: 'hidden' | 'noticed' | 'obvious' | null;
+  followup_ability_used?: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma' | null;
+  followup_dc?: number | null;
+  followup_check_task?: string | null;
+};
+
+export type PublicTurnInformationCheckPrompt = {
+  prompt_id: string;
+  round_id: string;
+  phase: PublicTurnPhase;
+  actor_id: string;
+  actor_name: string;
+  source_actor_id?: string | null;
+  source_actor_name?: string | null;
+  source_interaction_kind: 'generic' | 'information_gathering' | 'social_influence' | 'intimidation';
+  notice_state: 'hidden' | 'noticed' | 'obvious';
+  ability_used: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
+  ability_modifier: number;
+  dc: number;
+  check_task: string;
+  stakes_summary: string;
+  metadata: Record<string, JsonValue>;
+};
+
+export type PublicTurnAttackPrompt = {
+  prompt_id: string;
+  round_id: string;
+  phase: PublicTurnPhase;
+  source_actor_id: string;
+  source_actor_name: string;
+  source_action_summary: string;
+  source_speech_text: string;
+  attack_kind: 'targeted_attack' | 'aoe_attack';
+  attack_basis: 'weapon' | 'spell' | 'other';
+  attack_definition_id?: string | null;
+  attack_definition_name?: string | null;
+  attack_area_shape: 'none' | 'sphere' | 'cone' | 'line' | 'burst' | 'emanation';
+  attack_area_radius_m: number;
+  attack_area_length_m: number;
+  can_include_self: boolean;
+  current_target_actor_id: string;
+  current_target_name: string;
+  current_target_kind: PublicTurnActorType;
+  threatened_target_names: string[];
+  revealed_target_names: string[];
+  player_in_danger: boolean;
+  attack_ability_used?: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma' | null;
+  suggested_response_hint: string;
+  metadata: Record<string, unknown>;
+};
+
+export type PublicTurnAttackDefensePrompt = {
+  check_id: string;
+  round_id: string;
+  phase: PublicTurnPhase;
+  attack_kind: 'targeted_attack' | 'aoe_attack';
+  source_actor_id: string;
+  source_actor_name: string;
+  source_action_summary: string;
+  source_speech_text: string;
+  source_attack_ability_used: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
+  source_attack_ability_modifier: number;
+  target_actor_id: string;
+  target_actor_name: string;
+  target_action_summary: string;
+  target_speech_text: string;
+  target_defense_ability_used: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
+  target_defense_ability_modifier: number;
+  threatened_target_names: string[];
+  hit_target_names: string[];
+  aoe_remaining_target_count: number;
+  stakes_summary: string;
+  metadata: Record<string, unknown>;
+};
+
+export type PublicTurnInteractionPrompt = {
+  prompt_id: string;
+  round_id: string;
+  phase: PublicTurnPhase;
+  source_actor_id: string;
+  source_actor_name: string;
+  source_action_type: 'attack' | 'check' | 'item_use';
+  source_action_summary: string;
+  source_speech_text: string;
+  source_action_target_name?: string | null;
+  source_speech_target_name?: string | null;
+  source_action_prompt: string;
+  source_world_impact_type: PublicTurnWorldImpactType;
+  source_situation_delta_hint: number;
+  source_reputation_delta_hint: number;
+  source_planned_requires_check: boolean;
+  source_planned_ability_used?: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma' | null;
+  source_planned_dc?: number | null;
+  source_planned_check_task?: string | null;
+  source_interaction_kind: string;
+  target_actor_id: string;
+  target_actor_name: string;
+  target_actor_kind: PublicTurnActorType;
+  alternation_depth: number;
+  interaction_mode: 'initial' | 'alternated';
+  suggested_target_label: string;
+};
+
+export type PublicTurnAttackResponseSubmission = {
+  prompt_id: string;
+  target_actor_id: string;
+  action_text: string;
+  speech_text: string;
+  response_kind: 'explicit_response' | 'no_action';
+};
+
+export type PublicTurnOpposedPlanResponse = {
+  ok: boolean;
+  session_id: string;
+  round_id: string;
+  check_id: string;
+  resolution_rule: 'opposed_actor';
+  source_actor_id: string;
+  source_actor_name: string;
+  source_action_summary: string;
+  source_speech_text: string;
+  source_ability_used: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
+  source_ability_modifier: number;
+  target_actor_id: string;
+  target_actor_name: string;
+  target_action_summary: string;
+  target_speech_text: string;
+  target_ability_used: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
+  target_ability_modifier: number;
+  check_task: string;
+  stakes_summary: string;
+};
+
+export type DeathSavePrompt = {
+  prompt_id: string;
+  round_id: string;
+  phase: PublicTurnPhase;
+  actor_id: string;
+  actor_name: string;
+  successes: number;
+  failures: number;
+  dc: number;
+  severe_wound_threshold: number;
+  speech_only: boolean;
+  metadata: Record<string, JsonValue>;
+};
+
+export type PublicTurnRound = {
+  round_id: string;
+  round_number: number;
+  phase: PublicTurnPhase;
+  initiative_declarations: InitiativeDeclaration[];
+  initiative_order: PublicTurnInitiativeEntry[];
+  executed_actor_ids: string[];
+  impacts: PublicTurnImpact[];
+  settlement_entries: PublicTurnSettlementEntry[];
+  situation_triggered: boolean;
+  situation_event?: string | null;
+  environment_risk_level: EnvironmentRiskLevel;
+  situation_dc: number;
+  pending_reaction_check_id?: string | null;
+  pending_interaction_prompt?: PublicTurnInteractionPrompt | null;
+  pending_attack_prompt?: PublicTurnAttackPrompt | null;
+  pending_attack_defense_prompt?: PublicTurnAttackDefensePrompt | null;
+  pending_information_check_prompt?: PublicTurnInformationCheckPrompt | null;
+  pending_death_save_prompt?: DeathSavePrompt | null;
+  current_actor_id?: string | null;
+  awaiting_player_action: boolean;
+  awaiting_player_action_phase?: PublicTurnPhase | null;
+  gm_push_summary: string;
+  gm_push_scene_event_id?: string | null;
+  gm_push_result?: PublicTurnGmPushResult | null;
+  accumulated_narration: string;
+  narrative_entries: PublicTurnNarrativeEntry[];
+  narrative_status: PublicTurnRoundNarrationStatus;
+  round_narration: string;
+  round_narration_status: PublicTurnRoundNarrationStatus;
+  created_at: string;
+  completed_at?: string | null;
+};
+
+export type PublicTurnState = {
+  version: string;
+  current_round?: PublicTurnRound | null;
+  round_history: PublicTurnRound[];
+  max_history: number;
+  environment_risk_level: EnvironmentRiskLevel;
+  situation_dc: number;
+  awaiting_player_entry: boolean;
+  updated_at: string;
+};
+
+export type PublicTurnStateResponse = {
+  ok: boolean;
+  session_id: string;
+  public_turn_state: PublicTurnState;
+};
+
+export type PublicTurnPresentation = {
+  round_id: string;
+  round_number: number;
+  phase: PublicTurnPhase;
+  initiative_order: PublicTurnInitiativeEntry[];
+  settlement_entries: PublicTurnSettlementEntry[];
+  gm_push_result?: PublicTurnGmPushResult | null;
+  narrative_entries: PublicTurnNarrativeEntry[];
+  accumulated_narration: string;
+  narrative_status: PublicTurnRoundNarrationStatus;
+  round_narration: string;
+  round_narration_status: PublicTurnRoundNarrationStatus;
+};
+
+export type PublicTurnResponse = {
+  ok: boolean;
+  session_id: string;
+  phase: PublicTurnPhase;
+  narration: string;
+  scene_events: SceneEvent[];
+  reaction_check?: PlayerReactionCheck | null;
+  public_interaction_prompt?: PublicTurnInteractionPrompt | null;
+  public_attack_prompt?: PublicTurnAttackPrompt | null;
+  public_attack_defense_prompt?: PublicTurnAttackDefensePrompt | null;
+  public_opposed_prompt?: PublicTurnOpposedPrompt | null;
+  public_information_check_prompt?: PublicTurnInformationCheckPrompt | null;
+  death_save_prompt?: DeathSavePrompt | null;
+  round_completed: boolean;
+  awaiting_entry: boolean;
+  public_turn_state: PublicTurnState;
+  archived_sub_zone_turn_id?: string | null;
+  impacts: PublicTurnImpact[];
+  pending_turn_id?: string | null;
+  player_action_check_result?: ActionCheckResult | null;
+  presentation: PublicTurnPresentation;
+};
+
+export type BattleDamageProfile = {
+  dice: string;
+  damage_type: string;
+  flat_bonus: number;
+};
+
+export type BattleFieldState = {
+  zone_id?: string | null;
+  zone_name: string;
+  sub_zone_id?: string | null;
+  sub_zone_name: string;
+  description: string;
+  feature_tags: string[];
+  danger_score?: number | null;
+  reputation_score?: number | null;
+};
+
+export type BattleStepEntry = {
+  step_id: string;
+  round: number;
+  kind:
+    | 'setup'
+    | 'initiative'
+    | 'turn_start'
+    | 'attack'
+    | 'damage'
+    | 'move'
+    | 'defend'
+    | 'disengage'
+    | 'escape'
+    | 'observe'
+    | 'item_use'
+    | 'reaction_prompt'
+    | 'reaction_result'
+    | 'defeat'
+    | 'end'
+    | 'system';
+  actor_combatant_id?: string | null;
+  actor_name: string;
+  content: string;
+  metadata: Record<string, string | number | boolean>;
+  created_at: string;
+};
+
+export type CombatantState = {
+  combatant_id: string;
+  source_kind: 'player' | 'team' | 'npc' | 'test_monster';
+  role_id?: string | null;
+  display_name: string;
+  side: 'player_side' | 'enemy_side';
+  template_id?: string | null;
+  role_kind: 'brute' | 'skirmisher' | 'ranged' | 'support' | 'beast' | 'adventurer';
+  ai_style: string;
+  level_hint: number;
+  max_hp: number;
+  current_hp: number;
+  temp_hp: number;
+  base_armor_class: number;
+  armor_class: number;
+  speed: number;
+  initiative: number;
+  initiative_bonus: number;
+  attack_bonus: number;
+  damage_profile: BattleDamageProfile;
+  ability_modifiers: Dnd5eAbilityModifiers;
+  saving_throw_bonuses: Dnd5eAbilityModifiers;
+  position_band: 'engaged' | 'near' | 'far' | 'remote';
+  position_feature_tags: string[];
+  action_available: boolean;
+  bonus_action_available: boolean;
+  reaction_available: boolean;
+  movement_remaining: number;
+  conditions: string[];
+  alive: boolean;
+  downed: boolean;
+  escaped: boolean;
+  temporary_ac_bonus: number;
+  next_attack_bonus_against?: string | null;
+  next_attack_bonus_amount: number;
+  inventory_item_instance_ids?: string[];
+  equipped_weapon_instance_id?: string | null;
+  equipped_armor_instance_id?: string | null;
+  equipped_shield_instance_id?: string | null;
+  inventory_items: InventoryItem[];
+};
+
+export type CombatState = {
+  round: number;
+  phase: 'initiative' | 'turn' | 'resolution' | 'ended';
+  active_combatant_id?: string | null;
+  initiative_order: string[];
+  momentum_value: number;
+  combatants: CombatantState[];
+  recent_steps: BattleStepEntry[];
+  winner_side?: 'player_side' | 'enemy_side' | 'escaped' | 'cancelled' | null;
+};
+
+export type BattleRollPrompt = {
+  prompt_id: string;
+  roll_kind: 'initiative' | 'attack' | 'observe' | 'escape' | 'reaction' | 'item_use' | 'death_save' | 'stabilize';
+  actor_combatant_id: string;
+  actor_name: string;
+  ability_used: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
+  ability_modifier: number;
+  dc: number;
+  check_task: string;
+  source_label?: string | null;
+  threatened_consequence?: string | null;
+  success_hint?: string | null;
+  failure_hint?: string | null;
+  target_combatant_id?: string | null;
+  action_name: string;
+  metadata: Record<string, string | number | boolean>;
+};
+
+export type BattleRollResolution = {
+  prompt_id: string;
+  actor_combatant_id: string;
+  actor_name: string;
+  roll_kind: 'initiative' | 'attack' | 'observe' | 'escape' | 'reaction' | 'item_use' | 'death_save' | 'stabilize';
+  ability_used: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
+  ability_modifier: number;
+  dc: number;
+  dice_roll: number;
+  total_score: number;
+  success: boolean;
+  critical: 'none' | 'critical_success' | 'critical_failure';
+  summary: string;
+};
+
+export type BattleUiFlags = {
+  ai_pacing: 'step' | 'auto';
+  can_continue_ai: boolean;
+};
+
+export type BattleSandboxState = {
+  battle_id: string;
+  session_id: string;
+  status: 'setup' | 'active' | 'awaiting_player_action' | 'awaiting_player_roll' | 'awaiting_ai_continue' | 'ended' | 'cancelled';
+  source_kind: 'debug_template' | 'debug_ai_generated';
+  created_at: string;
+  updated_at: string;
+  battlefield: BattleFieldState;
+  player_snapshot: CombatantState;
+  ally_snapshots: CombatantState[];
+  enemy_snapshots: CombatantState[];
+  combat_state: CombatState;
+  pending_roll?: BattleRollPrompt | null;
+  last_roll_result?: BattleRollResolution | null;
+  battle_logs: BattleStepEntry[];
+  ui_flags: BattleUiFlags;
+};
+
+export type BattleStartRequest = {
+  session_id: string;
+  mode: 'template' | 'ai_generated';
+  template_group?: string | null;
+  ai_scale: 'single' | 'squad';
+  ai_strength: 'weak' | 'standard' | 'strong';
+  ai_pacing: 'step' | 'auto';
+  config?: AppConfig | null;
+};
+
+export type BattleStartResponse = {
+  ok: boolean;
+  session_id: string;
+  battle: BattleSandboxState;
+};
+
+export type BattleActionRequest = {
+  session_id: string;
+  action_kind: 'attack' | 'defend' | 'move' | 'disengage' | 'escape' | 'use_item' | 'observe' | 'end_turn';
+  target_combatant_id?: string | null;
+  destination_band?: 'engaged' | 'near' | 'far' | 'remote' | null;
+  item_id?: string | null;
+};
+
+export type BattleActionResponse = {
+  ok: boolean;
+  session_id: string;
+  battle: BattleSandboxState;
+};
+
+export type BattleContinueAiRequest = {
+  session_id: string;
+  ai_pacing?: 'step' | 'auto' | null;
+};
+
+export type BattleContinueAiResponse = {
+  ok: boolean;
+  session_id: string;
+  battle: BattleSandboxState;
+};
+
+export type BattleResolveRollRequest = {
+  session_id: string;
+  forced_dice_roll: number;
+};
+
+export type BattleResolveRollResponse = {
+  ok: boolean;
+  session_id: string;
+  battle: BattleSandboxState;
+  roll_result?: BattleRollResolution | null;
+};
+
+export type BattleCurrentResponse = {
+  ok: boolean;
+  session_id: string;
+  battle?: BattleSandboxState | null;
+};
+
+export type BattleEndResponse = {
+  ok: boolean;
+  session_id: string;
+  battle_id?: string | null;
+  ended: boolean;
 };
 
 export type ToolEvent = {
@@ -120,8 +924,60 @@ export type ToolEvent = {
   payload: Record<string, string | number | boolean>;
 };
 
+export type StreamPhaseCode =
+  | 'prepare'
+  | 'intent_route'
+  | 'tool_plan'
+  | 'tool_run'
+  | 'model_reply'
+  | 'bundle_parse'
+  | 'apply'
+  | 'commit'
+  | 'rollback'
+  | 'public_turn';
+
+export type StreamPhaseEvent = {
+  code: StreamPhaseCode;
+  label: string;
+  status: 'running' | 'done' | 'failed';
+  detail: string;
+};
+
+export type LiveToolEvent = {
+  tool_name: string;
+  status: 'running' | 'done' | 'failed';
+  summary: string;
+  payload: Record<string, string | number | boolean>;
+};
+
+export type TurnRollbackPayload = {
+  reason: string;
+  message: string;
+  discarded: true;
+};
+
+export type LiveProgressEntry = {
+  id: string;
+  kind: 'phase' | 'tool';
+  label: string;
+  status: 'running' | 'done' | 'failed';
+  detail: string;
+};
+
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+
+export type PublicActorCheckResult = {
+  requires_check: boolean;
+  ability_used?: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
+  ability_modifier?: number;
+  dice_roll?: number | null;
+  total_score?: number | null;
+  dc?: number;
+  success?: boolean;
+  critical?: 'none' | 'critical_success' | 'critical_failure';
+  outcome_label?: '无需检定' | '成功' | '失败' | '大成功' | '大失败';
+};
 
 export type PublicActorActionMetadata = {
   response_mode?: 'respond' | 'ignore' | 'none';
@@ -141,12 +997,38 @@ export type PublicActorActionMetadata = {
   risk_source?: string;
   risk_object?: string;
   risk_location?: string;
+  affiliation_kind?: 'team' | 'public_npc' | 'encounter_temp_npc';
+  affiliation_label?: '队友' | '在场NPC' | '遭遇NPC';
   specific_threat?: string;
   target_label?: string;
   needs_check?: boolean;
   action_type?: 'check' | 'attack' | 'item_use';
   situation_delta_hint?: number;
+  situation_delta?: number;
   actor_type?: 'npc' | 'team' | 'encounter_temp_npc' | 'system';
+  checked_action_label?: string;
+  checked_action_prompt?: string;
+  gm_result_summary?: string;
+  team_affinity_before?: number;
+  team_affinity_after?: number;
+  team_affinity_delta?: number;
+  team_trust_before?: number;
+  team_trust_after?: number;
+  team_trust_delta?: number;
+  check_result?: PublicActorCheckResult;
+};
+
+export type PublicActorResolutionMetadata = {
+  actor_type?: 'npc' | 'team' | 'encounter_temp_npc' | 'system';
+  success?: boolean;
+  critical?: 'none' | 'critical_success' | 'critical_failure';
+  situation_delta?: number;
+  relation_delta?: number;
+  reputation_delta?: number;
+  affected_object?: string;
+  concrete_effect?: string;
+  opened_opportunity?: string;
+  new_pressure?: string;
 };
 
 export type PublicRoundResolutionRow = {
@@ -157,15 +1039,30 @@ export type PublicRoundResolutionRow = {
   concrete_effect: string;
   opened_opportunity: string;
   new_pressure: string;
+  situation_delta?: number;
+  relation_delta?: number;
+  reputation_delta?: number;
 };
 
 export type PublicRoundResolutionMetadata = {
+  actor_type?: 'system';
+  candidate_count?: number;
+  reputation_score?: number;
   situation_value_before?: number;
   situation_value_after?: number;
   direction?: 'stabilize' | 'hold' | 'worsen';
   trend?: 'improving' | 'stable' | 'worsening';
   result_rows?: PublicRoundResolutionRow[];
-  actor_type?: 'system';
+  team_relation_rows?: Array<{
+    role_id: string;
+    name: string;
+    affinity_before: number;
+    affinity_after: number;
+    affinity_delta: number;
+    trust_before: number;
+    trust_after: number;
+    trust_delta: number;
+  }>;
 };
 
 export type EncounterSituationMetadata = {
@@ -173,21 +1070,54 @@ export type EncounterSituationMetadata = {
   encounter_title?: string;
   situation_value?: number;
   situation_delta?: number;
+  situation_value_before?: number;
+  player_situation_delta?: number;
+  public_actor_situation_delta_total?: number;
+  world_push_situation_delta_total?: number;
+  turn_total_delta?: number;
+  situation_value_after?: number;
   direction?: 'stabilize' | 'hold' | 'worsen';
   trend?: 'improving' | 'stable' | 'worsening';
   summary_basis?: 'numeric' | 'fallback';
   actor_type?: 'npc' | 'team' | 'encounter_temp_npc' | 'system';
 };
 
+export type EncounterWorldPushMetadata = {
+  encounter_id?: string;
+  encounter_title?: string;
+  push_kind?: 'new_clue' | 'environment_shift' | 'hazard_escalation' | 'pressure_release' | 'faction_move' | 'npc_arrival';
+  opened_window?: string;
+  pressure_note?: string;
+  situation_delta_hint?: number;
+  spawned_role_id?: string;
+  spawned_npc_name?: string;
+  target_zone_id?: string;
+  target_sub_zone_id?: string;
+  target_location_label?: string;
+  generated_zone?: boolean;
+  generated_sub_zone?: boolean;
+};
+
 export type SceneEvent = {
   event_id: string;
   kind:
+    | 'damage_resolution'
     | 'public_targeted_npc_reply'
     | 'public_bystander_reaction'
     | 'team_public_reaction'
     | 'public_actor_action'
     | 'public_actor_resolution'
     | 'public_round_resolution'
+    | 'public_turn_phase'
+    | 'public_turn_initiative'
+    | 'public_turn_actor_action'
+    | 'public_turn_actor_resolution'
+    | 'public_turn_situation'
+    | 'public_turn_gm_push'
+    | 'public_turn_round_end'
+    | 'public_turn_relation_update'
+    | 'public_turn_team_update'
+    | 'public_turn_environment_update'
     | 'role_desire_surface'
     | 'companion_story_surface'
     | 'reputation_update'
@@ -195,7 +1125,21 @@ export type SceneEvent = {
     | 'encounter_progress'
     | 'encounter_resolution'
     | 'encounter_background'
-    | 'encounter_situation_update';
+    | 'encounter_situation_update'
+    | 'encounter_world_push'
+    | 'player_reaction_triggered'
+    | 'player_reaction_result'
+    | 'player_dying'
+    | 'player_death_save'
+    | 'player_entered_death_save'
+    | 'player_death_save_result'
+    | 'player_stabilized'
+    | 'player_died'
+    | 'player_revived'
+    | 'team_npc_entered_death_save'
+    | 'team_npc_death_save_result'
+    | 'team_npc_died'
+    | 'sub_zone_dead_npc_recorded';
   actor_role_id: string | null;
   actor_name: string;
   content: string;
@@ -250,12 +1194,51 @@ export type MapSnapshot = {
   zones: Zone[];
 };
 
+export type PortraitAssetRef = {
+  asset_id: string;
+  relative_path: string;
+  mime_type: string;
+  width: number;
+  height: number;
+  variant_kind: 'uploaded_raw' | 'generated_raw' | 'bg_removed' | 'final_portrait';
+  derived_from_asset_id?: string | null;
+  provider?: AIProvider | null;
+  model?: string | null;
+  created_at: string;
+};
+
+export type CharacterBuildState = {
+  player_status: 'uncreated' | 'completed';
+  initial_companion_offer_seen: boolean;
+  updated_at: string;
+};
+
 export type PlayerStaticData = {
   player_id: string;
   name: string;
+  age: number;
+  height_cm: number;
+  body_type: string;
+  appearance: string;
+  portrait: PortraitAssetRef | null;
+  build_archive_id?: string | null;
   move_speed_mph: number;
   role_type: 'player' | 'npc' | 'monster';
   dnd5e_sheet: Dnd5eCharacterSheet;
+};
+
+export type DeadNpcRecord = {
+  role_id: string;
+  name: string;
+  death_at: string;
+  death_cause: string;
+  was_team_member: boolean;
+};
+
+export type SubZoneState = {
+  time_segment: string;
+  flags: string[];
+  dead_npc_records: DeadNpcRecord[];
 };
 
 export type PlayerRuntimeData = {
@@ -277,10 +1260,193 @@ export type SaveFile = {
   role_pool: NpcRoleCard[];
   team_state: TeamState;
   reputation_state: ReputationState;
+  zone_metric_state: ZoneMetricState;
+  travel_companion_state: TravelCompanionState;
   quest_state: QuestState;
   encounter_state: EncounterState;
   fate_state: FateState;
+  character_build_state: CharacterBuildState;
   updated_at: string;
+};
+
+export type CharacterBuildChoiceOption = {
+  option_id: string;
+  label: string;
+  description: string;
+  source_kind: 'spell' | 'equipment' | 'skill' | 'item' | 'armor';
+  definition_id?: string | null;
+  metadata: Record<string, string | number | boolean>;
+};
+
+export type CharacterBuildMediaCapabilities = {
+  active_provider?: AIProvider | null;
+  supports_generation: boolean;
+  supports_background_removal: boolean;
+  supports_vision: boolean;
+  requires_explicit_provider: boolean;
+  detail: string;
+};
+
+export type CharacterBuildStateResponse = {
+  session_id: string;
+  state: CharacterBuildState;
+  forced_entry: boolean;
+  can_build_companion: boolean;
+  companion_offer_pending: boolean;
+  media_capabilities: CharacterBuildMediaCapabilities;
+};
+
+export type CharacterBuildBasicInfo = {
+  name: string;
+  age: number;
+  race: string;
+  height_cm: number;
+  body_type: string;
+};
+
+export type CharacterBuildOptionsResponse = {
+  kind: 'player' | 'companion';
+  specialization: 'warrior' | 'mage';
+  point_buy_total: number;
+  point_buy_costs: Record<string, number>;
+  recommended_races: string[];
+  body_type_suggestions: string[];
+  spell_pick_count: number;
+  equipment_pick_count: number;
+  skill_pick_count: number;
+  spell_options: CharacterBuildChoiceOption[];
+  equipment_options: CharacterBuildChoiceOption[];
+  skill_options: CharacterBuildChoiceOption[];
+  granted_armor?: CharacterBuildChoiceOption | null;
+  granted_items: CharacterBuildChoiceOption[];
+};
+
+export type CharacterBuildBasicInfoSuggestResponse = {
+  basic_info: CharacterBuildBasicInfo;
+};
+
+export type CharacterBuildAbilitySuggestResponse = {
+  ability_scores: Dnd5eAbilityScores;
+  points_spent: number;
+};
+
+export type CharacterBuildPortraitPromptSuggestResponse = {
+  portrait_prompt: string;
+};
+
+export type CharacterBuildCompanionFlavor = {
+  personality: string;
+  speaking_style: string;
+  cognition: string;
+  secret: string;
+  likes: string[];
+};
+
+export type CharacterBuildLoadoutSelection = {
+  spell_option_ids: string[];
+  equipment_option_ids: string[];
+  skill_option_ids: string[];
+};
+
+export type CharacterBuildLoadoutSuggestResponse = CharacterBuildLoadoutSelection;
+
+export type CharacterBuildCompanionFlavorSuggestResponse = {
+  flavor: CharacterBuildCompanionFlavor;
+};
+
+export type CharacterBuildMediaUploadResponse = {
+  asset: PortraitAssetRef;
+};
+
+export type CharacterBuildMediaGenerateResponse = {
+  assets: PortraitAssetRef[];
+  provider: AIProvider;
+  model: string;
+  prompt_used: string;
+};
+
+export type CharacterBuildMediaRemoveBackgroundResponse = {
+  raw_asset: PortraitAssetRef;
+  bg_removed_asset: PortraitAssetRef;
+};
+
+export type CharacterBuildMediaFinalizeResponse = {
+  asset: PortraitAssetRef;
+};
+
+export type CharacterBuildMediaDescribeResponse = {
+  description: string;
+  asset_id: string;
+  provider: AIProvider;
+  model: string;
+};
+
+export type CharacterBuildPlayerCompleteResponse = {
+  session_id: string;
+  player: PlayerStaticData;
+  state: CharacterBuildState;
+  archive_id: string;
+};
+
+export type CharacterBuildCompanionCompleteResponse = {
+  session_id: string;
+  role: NpcRoleCard;
+  member: TeamMember;
+  retained_id: string;
+};
+
+export type PlayerBuildSeedSummary = {
+  archive_id: string;
+  name: string;
+  created_at: string;
+  portrait?: PortraitAssetRef | null;
+};
+
+export type PlayerBuildSeed = {
+  archive_id: string;
+  name: string;
+  created_at: string;
+  basic_info: CharacterBuildBasicInfo;
+  specialization: 'warrior' | 'mage';
+  player_static_data: PlayerStaticData;
+};
+
+export type PlayerBuildSeedListResponse = {
+  items: PlayerBuildSeedSummary[];
+};
+
+export type PlayerBuildSeedResponse = {
+  seed: PlayerBuildSeed;
+};
+
+export type CompanionBuildSeedSummary = {
+  retained_id: string;
+  name: string;
+  retained_at: string;
+  portrait?: PortraitAssetRef | null;
+};
+
+export type CompanionBuildSeedListResponse = {
+  items: CompanionBuildSeedSummary[];
+};
+
+export type CompanionBuildSeedResponse = {
+  retained_id: string;
+  retained_at: string;
+  role: NpcRoleCard;
+};
+
+export type DebugSaveResetResponse = {
+  ok: boolean;
+  session_id: string;
+  save: SaveFile;
+  cleared_active_encounter_ids: string[];
+  cleared_pending_encounter_ids: string[];
+  cleared_public_round_ids: string[];
+  cleared_recent_turn_count: number;
+  cleared_team_member_role_ids: string[];
+  cleared_pending_turn: boolean;
+  summary: string;
 };
 
 export type SubZoneReputationEntry = {
@@ -383,15 +1549,15 @@ export type EncounterEntry = {
   source_map_revision: number;
   entity_refs: EntityRef[];
   invalidated_reason: string | null;
-  status: 'queued' | 'active' | 'resolved' | 'escaped' | 'expired' | 'invalidated';
+  status: 'queued' | 'active' | 'resolved' | 'expired' | 'invalidated';
   trigger_kind: 'random_move' | 'random_dialog' | 'scripted' | 'quest_rule' | 'fate_rule' | 'debug_forced';
   encounter_mode: 'standard' | 'npc_initiated_chat';
   title: string;
   description: string;
+  goal: string;
   zone_id: string | null;
   sub_zone_id: string | null;
   npc_role_id: string | null;
-  player_presence: 'engaged' | 'away';
   related_quest_ids: string[];
   related_fate_phase_ids: string[];
   participant_role_ids: string[];
@@ -401,12 +1567,10 @@ export type EncounterEntry = {
   termination_conditions: EncounterTerminationCondition[];
   steps: EncounterStepEntry[];
   scene_summary: string;
-  latest_outcome_summary: string;
   situation_start_value: number;
   situation_value: number;
   situation_trend: 'improving' | 'stable' | 'worsening';
   last_outcome_package: EncounterOutcomePackage | null;
-  background_tick_count: number;
   created_at: string;
   presented_at: string | null;
   resolved_at: string | null;
@@ -423,11 +1587,12 @@ export type EncounterTerminationCondition = {
 
 export type EncounterStepEntry = {
   step_id: string;
-  kind: 'announcement' | 'player_action' | 'gm_update' | 'npc_reaction' | 'team_reaction' | 'temp_npc_action' | 'escape_attempt' | 'background_tick' | 'resolution';
+  kind: 'announcement' | 'player_action' | 'gm_update' | 'npc_reaction' | 'team_reaction' | 'temp_npc_action' | 'escape_attempt' | 'background_tick' | 'world_push' | 'resolution';
   actor_type: 'player' | 'npc' | 'team' | 'encounter_temp_npc' | 'system';
   actor_id: string;
   actor_name: string;
   content: string;
+  metadata?: Record<string, JsonValue>;
   created_at: string;
 };
 
@@ -439,7 +1604,53 @@ export type EncounterTemporaryNpc = {
   speaking_style: string;
   agenda: string;
   state: string;
+  zone_id?: string | null;
+  sub_zone_id?: string | null;
   introduced_at: string;
+};
+
+export type MainTurnSummary = {
+  player_situation_delta: number;
+  public_actor_situation_delta_total: number;
+  world_push_situation_delta_total: number;
+  turn_total_delta: number;
+  situation_value_before?: number | null;
+  situation_value_after?: number | null;
+};
+
+export type ZoneMetricEntry = {
+  zone_id: string;
+  zone_name: string;
+  reputation_score: number;
+  reputation_band: 'hostile' | 'cold' | 'neutral' | 'trusted' | 'favored';
+  danger_score: number;
+  danger_band: 'low' | 'medium' | 'high';
+  reputation_reasons: string[];
+  danger_reasons: string[];
+  seed_source: 'ai_generated' | 'migration_backfill' | 'system_default';
+  updated_at: string;
+};
+
+export type ZoneMetricState = {
+  version: string;
+  entries: ZoneMetricEntry[];
+  updated_at: string;
+};
+
+export type TravelCompanionEntry = {
+  role_id: string;
+  role_name: string;
+  source_kind: 'npc' | 'team';
+  destination_zone_id: string;
+  destination_sub_zone_id?: string | null;
+  follow_until_arrival: boolean;
+  declared_at: string;
+};
+
+export type TravelCompanionState = {
+  version: string;
+  companions: TravelCompanionEntry[];
+  updated_at: string;
 };
 
 export type EncounterResolution = {
@@ -464,6 +1675,8 @@ export type EncounterOutcomeChange = {
 export type EncounterOutcomePackage = {
   result: 'success' | 'failure';
   reputation_delta: number;
+  zone_reputation_delta: number;
+  zone_danger_delta: number;
   npc_relation_deltas: EncounterOutcomeChange[];
   team_deltas: EncounterOutcomeChange[];
   item_rewards: InventoryItem[];
@@ -502,7 +1715,7 @@ export type EncounterActResponse = {
   ok: boolean;
   session_id: string;
   encounter_id: string;
-  status: 'queued' | 'active' | 'resolved' | 'escaped' | 'expired' | 'invalidated';
+  status: 'queued' | 'active' | 'resolved' | 'expired' | 'invalidated';
   reply: string;
   time_spent_min: number;
   encounter: EncounterEntry;
@@ -514,7 +1727,7 @@ export type EncounterEscapeResponse = {
   ok: boolean;
   session_id: string;
   encounter_id: string;
-  status: 'queued' | 'active' | 'resolved' | 'escaped' | 'expired' | 'invalidated';
+  status: 'queued' | 'active' | 'resolved' | 'expired' | 'invalidated';
   reply: string;
   time_spent_min: number;
   escape_success: boolean;
@@ -527,7 +1740,7 @@ export type EncounterRejoinResponse = {
   ok: boolean;
   session_id: string;
   encounter_id: string;
-  status: 'queued' | 'active' | 'resolved' | 'escaped' | 'expired' | 'invalidated';
+  status: 'queued' | 'active' | 'resolved' | 'expired' | 'invalidated';
   reply: string;
   encounter: EncounterEntry;
   encounter_state: EncounterState;
@@ -651,11 +1864,24 @@ export type SubZoneChatTurnEvent = {
     | 'public_actor_action'
     | 'public_actor_resolution'
     | 'public_round_resolution'
+    | 'public_turn_phase'
+    | 'public_turn_initiative'
+    | 'public_turn_actor_action'
+    | 'public_turn_actor_resolution'
+    | 'public_turn_situation'
+    | 'public_turn_gm_push'
+    | 'public_turn_round_end'
+    | 'public_turn_relation_update'
+    | 'public_turn_team_update'
+    | 'public_turn_environment_update'
     | 'role_desire_surface'
     | 'companion_story_surface'
     | 'reputation_update'
-    | 'encounter_situation_update';
-  actor_type: 'npc' | 'team' | 'encounter_temp_npc' | 'system';
+    | 'encounter_situation_update'
+    | 'encounter_world_push'
+    | 'player_reaction_triggered'
+    | 'player_reaction_result';
+  actor_type: 'npc' | 'team' | 'encounter_temp_npc' | 'hidden_npc' | 'environment' | 'system';
   actor_id: string;
   actor_name: string;
   content: string;
@@ -675,6 +1901,10 @@ export type SubZoneChatTurn = {
   active_encounter_id: string | null;
   active_encounter_title: string;
   active_encounter_status: string;
+  public_round_id?: string | null;
+  public_round_number?: number | null;
+  public_phase?: PublicTurnPhase | null;
+  public_turn_presentation?: PublicTurnPresentation | null;
   events: SubZoneChatTurnEvent[];
   created_at: string;
 };
@@ -682,6 +1912,7 @@ export type SubZoneChatTurn = {
 export type SubZoneChatContext = {
   version: string;
   recent_turns: SubZoneChatTurn[];
+  public_turn_state: PublicTurnState;
   updated_at: string;
 };
 
@@ -695,6 +1926,7 @@ export type AreaSubZone = {
   generated_mode: 'pre' | 'instant';
   key_interactions: AreaInteraction[];
   npcs: AreaNpc[];
+  state: SubZoneState;
   chat_context: SubZoneChatContext;
 };
 
@@ -737,11 +1969,43 @@ export type AreaMoveResult = {
   movement_feedback: string;
 };
 
+export type MapNarrativePayload = {
+  text: string;
+  source: 'ai' | 'deterministic' | 'none';
+};
+
 export type RenderNode = {
   zone_id: string;
   name: string;
   x: number;
   y: number;
+};
+
+export type MapRenderPayload = {
+  viewport: {
+    min_x: number;
+    max_x: number;
+    min_y: number;
+    max_y: number;
+  };
+  nodes: RenderNode[];
+  sub_nodes: Array<{
+    sub_zone_id: string;
+    zone_id: string;
+    name: string;
+    x: number;
+    y: number;
+  }>;
+  circles: Array<{
+    zone_id: string;
+    center_x: number;
+    center_y: number;
+    radius_m: number;
+    danger_score?: number | null;
+    danger_band?: 'low' | 'medium' | 'high' | null;
+    fill_color?: string | null;
+  }>;
+  player_marker: { x: number; y: number };
 };
 
 export type RenderResult = {
@@ -765,8 +2029,90 @@ export type RenderResult = {
     center_x: number;
     center_y: number;
     radius_m: number;
+    danger_score?: number | null;
+    danger_band?: 'low' | 'medium' | 'high' | null;
+    fill_color?: string | null;
   }>;
   player_marker: { x: number; y: number };
+};
+
+export type MapPostChecksBundle = {
+  trigger_kind: 'random_move' | 'random_dialog' | 'scripted' | 'quest_rule' | 'fate_rule' | 'debug_forced' | null;
+  quests_evaluated: boolean;
+  fate_evaluated: boolean;
+  encounter_checked: boolean;
+  encounter_generated: boolean;
+  generated_encounter_id: string | null;
+  blocked_by_higher_priority_modal: boolean;
+};
+
+export type MapStateSyncBundle = {
+  map_snapshot: MapSnapshot;
+  area_snapshot: AreaSnapshot;
+  render: MapRenderPayload;
+  world_state: WorldState;
+  player_static_data: PlayerStaticData;
+  player_runtime_data: PlayerRuntimeData;
+  role_pool: NpcRoleCard[];
+  current_reputation: SubZoneReputationEntry | null;
+  current_zone_metric: ZoneMetricEntry | null;
+  zone_metric_state: ZoneMetricState;
+  quest_state: QuestState;
+  pending_offers: QuestEntry[];
+  tracked_quest: QuestEntry | null;
+  encounter_state: EncounterState;
+  pending_encounters: EncounterEntry[];
+  active_encounter: EncounterEntry | null;
+  fate_state: FateState;
+  team_state: TeamState;
+  team_members: TeamMember[];
+  game_logs: GameLogEntry[];
+};
+
+export type MapBootstrapResponse = {
+  ok: boolean;
+  operation: 'bootstrap';
+  generated: boolean;
+  narration: MapNarrativePayload;
+  state_sync: MapStateSyncBundle;
+};
+
+export type MoveResolvedResponse = {
+  session_id: string;
+  new_position: { x: number; y: number; z: number; zone_id: string };
+  duration_min: number;
+  movement_log: MovementLog;
+  narration: MapNarrativePayload;
+  post_checks: MapPostChecksBundle;
+  state_sync: MapStateSyncBundle;
+  scene_events?: SceneEvent[];
+  main_turn_summary?: MainTurnSummary | null;
+  current_zone_metric?: ZoneMetricEntry | null;
+};
+
+export type AreaMoveResolvedResponse = AreaMoveResult & {
+  narration: MapNarrativePayload;
+  post_checks: MapPostChecksBundle;
+  state_sync: MapStateSyncBundle;
+};
+
+export type AreaDiscoverInteractionsResolvedResponse = {
+  ok: boolean;
+  generated_mode: 'instant';
+  new_interactions: NonNullable<AreaSnapshot['sub_zones']>[number]['key_interactions'];
+  narration: MapNarrativePayload;
+  state_sync: MapStateSyncBundle;
+};
+
+export type AreaExecuteInteractionResolvedResponse = {
+  ok: boolean;
+  status: 'placeholder' | 'ok' | 'fallback';
+  message: string;
+  reply: string;
+  scene_events: SceneEvent[];
+  inventory_changes: Record<string, JsonValue>[];
+  interactable_updates: Record<string, JsonValue>[];
+  state_sync: MapStateSyncBundle;
 };
 
 export type MovementLog = {
@@ -851,6 +2197,11 @@ export type RoleBuff = {
   effect: RoleBuffEffect;
 };
 
+export type OriginStamp = {
+  origin_kind: 'starting_build' | 'level_up' | 'loot' | 'quest_reward' | 'purchase' | 'learned' | 'crafted' | 'gifted' | 'debug';
+  origin_ref: string;
+};
+
 export type InventoryItem = {
   item_id: string;
   name: string;
@@ -868,16 +2219,22 @@ export type InventoryItem = {
   slot_type: 'weapon' | 'armor' | 'misc';
   attack_bonus: number;
   armor_bonus: number;
+  origin?: OriginStamp | null;
 };
 
 export type InventoryData = {
   gold: number;
+  item_instance_ids?: string[];
   items: InventoryItem[];
 };
 
 export type EquipmentSlots = {
   weapon_item_id: string | null;
   armor_item_id: string | null;
+  shield_item_id?: string | null;
+  weapon_item_instance_id?: string | null;
+  armor_item_instance_id?: string | null;
+  shield_item_instance_id?: string | null;
 };
 
 export type Dnd5eCharacterSheet = {
@@ -896,6 +2253,7 @@ export type Dnd5eCharacterSheet = {
   stamina_current: number;
   stamina_maximum: number;
   is_dead: boolean;
+  role_action_status: RoleActionStatus;
   status_flags: string[];
   hit_dice: string;
   hit_points: Dnd5eHitPoints;
@@ -913,9 +2271,37 @@ export type Dnd5eCharacterSheet = {
   buffs: RoleBuff[];
   features_traits: string[];
   spells: string[];
+  war_arts: string[];
+  spell_origins?: Record<string, OriginStamp>;
+  skill_origins?: Record<string, OriginStamp>;
+  war_art_origins?: Record<string, OriginStamp>;
   spell_slots_max: Dnd5eSpellSlots;
   spell_slots_current: Dnd5eSpellSlots;
+  martial_points_current: number;
+  martial_points_maximum: number;
+  war_art_cooldowns?: Record<string, number>;
   notes: string;
+  death_state: PlayerDeathState;
+};
+
+export type RoleActionStatus = 'free_action' | 'death_saving' | 'dead' | 'unable_to_act';
+
+export type PlayerDeathState = {
+  version: string;
+  life_status: 'healthy' | 'dying' | 'stable' | 'dead';
+  death_save_successes: number;
+  death_save_failures: number;
+  death_count: number;
+  death_streak_count: number;
+  death_streak_reset_at?: string | null;
+  last_death_at?: string | null;
+  last_death_zone_id?: string | null;
+  last_death_sub_zone_id?: string | null;
+  last_death_cause: string;
+  revived_at?: string | null;
+  revival_method?: 'shrine' | 'teammate' | 'item' | null;
+  revival_weakness_until?: string | null;
+  updated_at: string;
 };
 
 export type RoleRelation = {
@@ -943,6 +2329,15 @@ export type NpcConversationState = {
   last_player_intent: string;
   last_referenced_entity: string;
   last_scene_mode: string;
+};
+
+export type NpcPrivateChatMemoryEntry = {
+  memory_id: string;
+  world_time_text: string;
+  world_time: Record<string, string | number>;
+  created_at: string;
+  summary: string;
+  source_dialogue_ids: string[];
 };
 
 export type RoleDesire = {
@@ -995,11 +2390,15 @@ export type NpcRoleCard = {
   talkative_maximum: number;
   last_private_chat_at: string | null;
   last_public_turn_at: string | null;
+  talkative_recovery_round_cursor?: string | null;
+  portrait?: PortraitAssetRef | null;
+  retained_id?: string | null;
   profile: PlayerStaticData;
   relations: RoleRelation[];
   cognition_changes: string[];
   attitude_changes: string[];
   dialogue_logs: NpcDialogueEntry[];
+  private_chat_memories: NpcPrivateChatMemoryEntry[];
   conversation_state?: NpcConversationState;
   generated_at: string;
 };
@@ -1025,6 +2424,70 @@ export type NpcChatResponse = {
   scene_events?: SceneEvent[];
 };
 
+export type PlayerInputValidationEntryPoint =
+  | 'main_chat'
+  | 'npc_chat'
+  | 'teammate_chat'
+  | 'public_turn_action'
+  | 'public_turn_interaction_response'
+  | 'public_turn_attack_response'
+  | 'debug_panel';
+
+export type PlayerInputValidationIssue = {
+  code:
+    | 'multiple_world_actions'
+    | 'claimed_outcome'
+    | 'controls_other_actor'
+    | 'spell_not_known'
+    | 'spell_slot_insufficient'
+    | 'war_art_not_known'
+    | 'war_art_points_insufficient'
+    | 'war_art_requires_weapon'
+    | 'item_not_owned'
+    | 'speech_only_required'
+    | 'actor_dead';
+  message: string;
+  field: 'action_text' | 'speech_text' | 'both';
+};
+
+export type PlayerInputResourceStatus = {
+  check_status: 'not_applicable' | 'passed' | 'failed';
+  resource_kind: 'none' | 'spell' | 'war_art' | 'item';
+  mentioned_name: string;
+  resolved_name: string;
+  resolved_definition_id?: string | null;
+  required_amount?: number | null;
+  current_amount?: number | null;
+  requirement_summary: string;
+  current_summary: string;
+};
+
+export type PlayerInputValidationRequest = {
+  session_id: string;
+  entry_point: PlayerInputValidationEntryPoint;
+  action_text?: string;
+  speech_text?: string;
+  actor_role_id?: string | null;
+  config?: AppConfig | null;
+};
+
+export type PlayerInputValidationResponse = {
+  ok: boolean;
+  session_id: string;
+  entry_point: PlayerInputValidationEntryPoint;
+  actor_role_id: string;
+  actor_name: string;
+  actor_kind: 'player' | 'npc';
+  status: 'accepted' | 'needs_player_confirmation';
+  normalized_action_text: string;
+  normalized_speech_text: string;
+  fallback_action_text: string;
+  display_text: string;
+  summary: string;
+  issues: PlayerInputValidationIssue[];
+  resource_status: PlayerInputResourceStatus;
+};
+
 export type ActionCheckResult = {
   ok: boolean;
   session_id: string;
@@ -1032,20 +2495,35 @@ export type ActionCheckResult = {
   actor_name: string;
   actor_kind: 'player' | 'npc';
   action_type: 'attack' | 'check' | 'item_use';
+  check_mode?: 'action' | 'reaction_save';
+  source_context?: 'generic' | 'public_turn';
+  resolution_rule?: 'static_dc' | 'opposed_actor';
   requires_check: boolean;
   ability_used: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
   ability_modifier: number;
   dc: number;
   check_task: string;
+  target_role_id?: string | null;
+  target_name?: string | null;
+  target_actor_kind?: 'player' | 'npc' | null;
+  target_ability_used?: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma' | null;
+  target_ability_modifier?: number | null;
   dice_roll: number | null;
   total_score: number | null;
+  target_dice_roll?: number | null;
+  target_total_score?: number | null;
+  contested_success?: boolean | null;
   success: boolean;
   critical: 'none' | 'critical_success' | 'critical_failure';
   time_spent_min: number;
   narrative: string;
   applied_effects: string[];
   relation_tag_suggestion: string | null;
+  source_label?: string | null;
+  threatened_consequence?: string | null;
   scene_events?: SceneEvent[];
+  state_sync?: MapStateSyncBundle | null;
+  post_checks?: MapPostChecksBundle | null;
 };
 
 export type ActionCheckPlan = {
@@ -1055,12 +2533,28 @@ export type ActionCheckPlan = {
   actor_name: string;
   actor_kind: 'player' | 'npc';
   action_type: 'attack' | 'check' | 'item_use';
+  check_mode?: 'action' | 'reaction_save';
+  source_context?: 'generic' | 'public_turn';
+  resolution_rule?: 'static_dc' | 'opposed_actor';
   requires_check: boolean;
   ability_used: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
   ability_modifier: number;
   dc: number;
   time_spent_min: number;
   check_task: string;
+  source_label?: string | null;
+  threatened_consequence?: string | null;
+  target_role_id?: string | null;
+  target_name?: string | null;
+  target_actor_kind?: 'player' | 'npc' | null;
+  target_ability_used?: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma' | null;
+  target_ability_modifier?: number | null;
+  public_turn_interaction_kind?: 'generic' | 'information_gathering' | 'social_influence' | 'intimidation' | null;
+  public_turn_notice_state?: 'hidden' | 'noticed' | 'obvious' | null;
+  public_turn_resolution_mode?: 'static_dc' | 'opposed_actor' | 'opposed_then_information_dc' | null;
+  followup_ability_used?: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma' | null;
+  followup_dc?: number | null;
+  followup_check_task?: string | null;
 };
 
 export type WorldState = {
@@ -1157,11 +2651,13 @@ export type PublicSceneState = {
   current_zone_id: string | null;
   current_sub_zone_id: string | null;
   current_reputation: SubZoneReputationEntry | null;
+  current_zone_metric?: ZoneMetricEntry | null;
   visible_npcs: StoryNpcSummary[];
   team_members: StoryNpcSummary[];
   candidate_actors: PublicSceneActorCandidate[];
   surfaced_drives: RoleDriveSummary[];
   active_encounter: EncounterEntry | null;
+  public_turn_state: PublicTurnState;
 };
 
 export type NpcKnowledgeSnapshot = {
@@ -1202,7 +2698,7 @@ export type TeamReaction = {
   reaction_id: string;
   member_role_id: string;
   member_name: string;
-  trigger_kind: 'main_chat' | 'npc_chat' | 'zone_move' | 'sub_zone_move' | 'action_check' | 'team_chat' | 'public_chat' | 'encounter' | 'system';
+  trigger_kind: 'main_chat' | 'npc_chat' | 'zone_move' | 'sub_zone_move' | 'action_check' | 'team_chat' | 'public_chat' | 'public_turn' | 'encounter' | 'system';
   content: string;
   affinity_delta: number;
   trust_delta: number;
@@ -1278,6 +2774,22 @@ export type TeamMutationResponse = {
   chat_feedback: string;
 };
 
+export type TeamPrivateChatMemoryGenerateRequest = {
+  session_id: string;
+  npc_role_id: string;
+  source_dialogue_ids: string[];
+  config?: AppConfig | null;
+};
+
+export type TeamPrivateChatMemoryGenerateResponse = {
+  ok: boolean;
+  session_id: string;
+  npc_role_id: string;
+  memory: NpcPrivateChatMemoryEntry;
+  role: NpcRoleCard;
+  deduped_existing: boolean;
+};
+
 export type InventoryOwnerRef = {
   owner_type: 'player' | 'role';
   role_id: string | null;
@@ -1301,8 +2813,122 @@ export type InventoryMutationResponse = {
   session_id: string;
   owner: InventoryOwnerRef;
   message: string;
+  item_id?: string | null;
+  amount_changed?: number;
+  quantity_after?: number;
+  uses_left_after?: number | null;
   player: PlayerStaticData | null;
   role: NpcRoleCard | null;
+};
+
+export type TemplateLibraryStatusResponse = {
+  ok: boolean;
+  session_id: string;
+  template_dir: string;
+  item_definition_count: number;
+  equipment_definition_count: number;
+  spell_definition_count: number;
+  war_art_definition_count: number;
+  interactable_template_count: number;
+  last_filled_at?: string | null;
+};
+
+export type SpellDefinition = {
+  definition_id: string;
+  name: string;
+  attack_mode: 'targeted_attack' | 'aoe_attack';
+  casting_ability: 'intelligence' | 'wisdom' | 'charisma' | 'other';
+  spell_cost: number;
+  damage_dice: string;
+  damage_bonus: number;
+  damage_type: string;
+  area_shape: 'none' | 'sphere' | 'cone' | 'line' | 'burst' | 'emanation';
+  area_radius_m: number;
+  area_length_m: number;
+  self_target_policy: 'never' | 'can_include_self' | 'always_include_self';
+  description: string;
+  resolution_notes: string;
+  recommended_classes?: string[];
+  min_level?: number;
+  npc_priority?: number;
+};
+
+export type WarArtDefinition = {
+  definition_id: string;
+  name: string;
+  attack_mode: 'targeted_attack' | 'aoe_attack';
+  scaling_ability: 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma' | 'other';
+  martial_cost: number;
+  cooldown_rounds: number;
+  damage_dice: string;
+  damage_bonus: number;
+  damage_type: string;
+  area_shape: 'none' | 'sphere' | 'cone' | 'line' | 'burst' | 'emanation';
+  area_radius_m: number;
+  area_length_m: number;
+  self_target_policy: 'never' | 'can_include_self' | 'always_include_self';
+  description: string;
+  resolution_notes: string;
+  recommended_classes?: string[];
+  min_level?: number;
+  npc_priority?: number;
+};
+
+export type TemplateLibraryDefinitionsResponse = {
+  ok: boolean;
+  session_id: string;
+  kind: 'spell' | 'war_art' | 'all';
+  spell_definitions: SpellDefinition[];
+  war_art_definitions: WarArtDefinition[];
+};
+
+export type TemplateLibraryFillResponse = TemplateLibraryStatusResponse & {
+  appended_item_definition_ids: string[];
+  appended_equipment_definition_ids: string[];
+  appended_spell_definition_ids: string[];
+  appended_war_art_definition_ids: string[];
+  appended_interactable_template_ids: string[];
+  updated_item_definition_ids: string[];
+  updated_equipment_definition_ids: string[];
+  updated_spell_definition_ids: string[];
+  updated_war_art_definition_ids: string[];
+  updated_interactable_template_ids: string[];
+};
+
+export type RoleCapabilityAbilityEntry = {
+  definition_id: string;
+  name: string;
+  kind: 'spell' | 'war_art';
+  resource_cost: number;
+  cooldown_rounds: number;
+  cooldown_remaining: number;
+  available_now: boolean;
+  summary: string;
+};
+
+export type RoleCapabilitySnapshot = {
+  role_id: string;
+  role_name: string;
+  actor_kind: 'player' | 'npc';
+  char_class: string;
+  level: number;
+  spells_known: string[];
+  war_arts_known: string[];
+  spell_slots_current: Record<string, number>;
+  spell_slots_max: Record<string, number>;
+  martial_points_current: number;
+  martial_points_maximum: number;
+  war_art_cooldowns: Record<string, number>;
+  equipped_weapon_name?: string | null;
+  equipped_armor_name?: string | null;
+  available_abilities: RoleCapabilityAbilityEntry[];
+};
+
+export type RoleCapabilityResponse = {
+  ok: boolean;
+  session_id: string;
+  role_id: string;
+  snapshot: RoleCapabilitySnapshot;
 };
 
 export type InventoryInteractRequest = {
@@ -1351,6 +2977,12 @@ export type TeamChatResponse = {
 export const defaultPlayerStaticData: PlayerStaticData = {
   player_id: 'player_001',
   name: '玩家',
+  age: 18,
+  height_cm: 170,
+  body_type: '',
+  appearance: '',
+  portrait: null,
+  build_archive_id: null,
   move_speed_mph: 4500,
   role_type: 'player',
   dnd5e_sheet: {
@@ -1369,6 +3001,7 @@ export const defaultPlayerStaticData: PlayerStaticData = {
     stamina_current: 10,
     stamina_maximum: 10,
     is_dead: false,
+    role_action_status: 'free_action',
     status_flags: [],
     hit_dice: '1d8',
     hit_points: {
@@ -1424,8 +3057,12 @@ export const defaultPlayerStaticData: PlayerStaticData = {
     buffs: [],
     features_traits: [],
     spells: [],
+    war_arts: [],
+    spell_origins: {},
+    skill_origins: {},
+    war_art_origins: {},
     spell_slots_max: {
-      level_1: 2,
+      level_1: 1,
       level_2: 0,
       level_3: 0,
       level_4: 0,
@@ -1436,7 +3073,7 @@ export const defaultPlayerStaticData: PlayerStaticData = {
       level_9: 0,
     },
     spell_slots_current: {
-      level_1: 2,
+      level_1: 1,
       level_2: 0,
       level_3: 0,
       level_4: 0,
@@ -1446,8 +3083,34 @@ export const defaultPlayerStaticData: PlayerStaticData = {
       level_8: 0,
       level_9: 0,
     },
+    martial_points_current: 0,
+    martial_points_maximum: 0,
+    war_art_cooldowns: {},
     notes: '',
+    death_state: {
+      version: '0.1.0',
+      life_status: 'healthy',
+      death_save_successes: 0,
+      death_save_failures: 0,
+      death_count: 0,
+      death_streak_count: 0,
+      death_streak_reset_at: null,
+      last_death_at: null,
+      last_death_zone_id: null,
+      last_death_sub_zone_id: null,
+      last_death_cause: '',
+      revived_at: null,
+      revival_method: null,
+      revival_weakness_until: null,
+      updated_at: new Date(0).toISOString(),
+    },
   },
+};
+
+export const defaultCharacterBuildState: CharacterBuildState = {
+  player_status: 'uncreated',
+  initial_companion_offer_seen: false,
+  updated_at: new Date(0).toISOString(),
 };
 
 export const defaultQuestState: QuestState = {
@@ -1489,6 +3152,17 @@ export const defaultTeamState: TeamState = {
   updated_at: new Date(0).toISOString(),
 };
 
+export const defaultPublicTurnState: PublicTurnState = {
+  version: '0.2.0',
+  current_round: null,
+  round_history: [],
+  max_history: 20,
+  environment_risk_level: 'stable',
+  situation_dc: 10,
+  awaiting_player_entry: true,
+  updated_at: new Date(0).toISOString(),
+};
+
 export const defaultReputationState: ReputationState = {
   version: '0.1.0',
   entries: [],
@@ -1505,6 +3179,7 @@ export const defaultConfig: AppConfig = {
   runtime: {
     temperature: 0.8,
     max_completion_tokens: 1200,
+    structured_output_mode: 'auto',
   },
   gm_prompt: '?????????????????????????????????????',
   speech_time_per_50_tokens_min: 1,
@@ -1517,6 +3192,39 @@ export const defaultConfig: AppConfig = {
     large_max_count: 15,
     discover_interaction_limit: 3,
   },
+  public_scene: {
+    active_actor_limit: 8,
+    idle_actor_limit: 2,
+    max_world_pushes: 2,
+    uncertain_actions_require_check: true,
+  },
+  build_media: {
+    mode: 'follow_chat_provider',
+    explicit_provider: null,
+    provider_configs: {
+      openai: {
+        api_key: '',
+        base_url_override: '',
+        generation_model: 'gpt-image-1',
+        background_removal_model: 'gpt-image-1',
+        vision_model: 'gpt-4.1-mini',
+      },
+      deepseek: {
+        api_key: '',
+        base_url_override: '',
+        generation_model: '',
+        background_removal_model: '',
+        vision_model: '',
+      },
+      gemini: {
+        api_key: '',
+        base_url_override: '',
+        generation_model: 'imagen-3.0-generate-002',
+        background_removal_model: 'gemini-2.5-flash',
+        vision_model: 'gemini-2.5-flash',
+      },
+    },
+  },
   provider_configs: {
     openai: {
       api_key: 'sk-xxxx',
@@ -1525,6 +3233,7 @@ export const defaultConfig: AppConfig = {
       runtime: {
         temperature: 0.8,
         max_completion_tokens: 1200,
+        structured_output_mode: 'auto',
       },
     },
     deepseek: {
@@ -1534,13 +3243,14 @@ export const defaultConfig: AppConfig = {
       runtime: {
         temperature: 0.8,
         max_tokens: 1200,
+        structured_output_mode: 'auto',
       },
     },
     gemini: {
       api_key: '',
       base_url_override: '',
       model: 'gemini-2.5-flash',
-      runtime: {},
+      runtime: { structured_output_mode: 'auto' },
     },
   },
   ui: {

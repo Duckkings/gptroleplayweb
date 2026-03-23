@@ -1,6 +1,6 @@
 # 技术文档总览
 
-更新日期：`2026-03-09`
+更新日期：`2026-03-15`
 
 ## 1. 文档来源
 - `docs/design/gamedesign/gamedesign.md`
@@ -20,6 +20,7 @@
 - `docs/technical/fate-technical.md`
 - `docs/technical/quest-technical.md`
 - `docs/technical/area-technical.md`
+- `docs/technical/multiplayer-room-technical-2026-03-15.md`
 
 ## 3. 本轮增补文档
 - `docs/technical/gameplay-core-technical-2026-03-09-addendum.md`
@@ -27,6 +28,7 @@
 - `docs/technical/encounter-technical-2026-03-09-situation-addendum.md`
 - `docs/technical/ai-tool-protocol-2026-03-09-addendum.md`
 - `docs/technical/current-feature-summary-2026-03-09.md`
+- `docs/technical/multiplayer-room-technical-2026-03-15.md`
 
 ## 4. 当前系统能力概览
 

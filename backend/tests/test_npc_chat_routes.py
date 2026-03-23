@@ -33,19 +33,19 @@ class NpcChatRouteTests(unittest.TestCase):
         }
 
     def test_npc_chat_route_maps_config_error_to_400(self) -> None:
-        with patch("app.api.routes.npc_chat", side_effect=NpcChatConfigError("missing config")):
+        with patch("app.api.routes.run_npc_chat_once", side_effect=NpcChatConfigError("missing config")):
             response = self.client.post("/api/v1/npc/chat", json=self._payload())
         self.assertEqual(response.status_code, 400)
         self.assertIn("missing config", response.text)
 
     def test_npc_chat_route_maps_generation_error_to_502(self) -> None:
-        with patch("app.api.routes.npc_chat", side_effect=NpcChatGenerationError("bad output")):
+        with patch("app.api.routes.run_npc_chat_once", side_effect=NpcChatGenerationError("bad output")):
             response = self.client.post("/api/v1/npc/chat", json=self._payload())
         self.assertEqual(response.status_code, 502)
         self.assertIn("bad output", response.text)
 
     def test_npc_chat_route_maps_role_not_found_to_404(self) -> None:
-        with patch("app.api.routes.npc_chat", side_effect=KeyError("ROLE_NOT_FOUND")):
+        with patch("app.api.routes.run_npc_chat_once", side_effect=KeyError("ROLE_NOT_FOUND")):
             response = self.client.post("/api/v1/npc/chat", json=self._payload())
         self.assertEqual(response.status_code, 404)
 

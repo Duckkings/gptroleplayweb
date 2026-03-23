@@ -1,0 +1,8 @@
+﻿template_id,name,interactable_kind,description,allowed_actions,initial_state_tags,loot_mode,allowed_item_tags,allowed_definition_ids,can_pick_up,can_drop_into,can_lock,can_break,can_trigger
+generic_scene_object,普通场景物,scene,默认的场景可交互物模板。,inspect,normal,none,,,False,False,False,False,False
+item_proxy,地面物品,item_proxy,代表掉落在场景中的单个物品。,inspect|pickup,visible,none,,,True,False,False,False,False
+basic_container,基础容器,container,可以开启、搜索并持久化掉落内容的容器。,inspect|open|search|take_all|put_in,closed,ai_first_open,,,False,True,True,True,False
+door,门,door,门、栅栏或通路阻挡物。,inspect|open|close|lock|unlock|enter|force_open,closed,none,,,False,False,True,True,False
+mechanism,机关,mechanism,可触发、重置或解除的机关。,inspect|trigger|reset|disable,idle,none,,,False,False,False,True,True
+hazard,危险物,hazard,可观察、解除、利用或引燃的危险场景物。,inspect|trigger|disarm|exploit|ignite|push_into,active,none,,,False,False,False,True,True
+clue,线索,clue,可被收集、标记或展示给 NPC 的线索对象。,inspect|collect_evidence|mark|show_to_npc,visible,none,,,False,False,False,False,False

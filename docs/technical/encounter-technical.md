@@ -1,146 +1,84 @@
-# 遭遇系统技术文档
+# 遭遇技术文档
 
-更新日期：`2026-03-09`
+更新时间：`2026-03-23`
 
-## 1. 范围
-当前遭遇系统已经从单步描述演进为带持续局势值的轻量持续场景系统。本文描述现状，而不是未来设计草案。
+## 当前模型
 
-## 2. 当前状态模型
+### 内部模型
+- `EncounterEntry.goal: str`
+- `EncounterEntry.secret: str`
+- `EncounterEntry.scene_summary: str`
+- `EncounterTemporaryNpc.knows_secret: bool = False`
 
-### 2.1 `EncounterEntry`
-当前关键字段：
-- `encounter_id`
-- `type`
-- `status`
-- `trigger_kind`
-- `title`
-- `description`
-- `zone_id`
-- `sub_zone_id`
-- `related_quest_ids`
-- `related_fate_phase_ids`
-- `termination_conditions`
-- `steps`
-- `scene_summary`
+兼容保留但停止新写入的字段：
 - `latest_outcome_summary`
-- `npc_role_id`
-- `player_presence`
-- `participant_role_ids`
-- `situation_start_value`
+- `background_tick_count`
+- `status = escaped`
+- `player_presence = away`
+- `EncounterStepEntry.kind = background_tick | escape_attempt`
+
+### 玩家公开 DTO
+- `PublicEncounterEntry`
+- `PublicEncounterState`
+
+公开 DTO 只暴露：
+- `goal`
+- `scene_summary`
 - `situation_value`
 - `situation_trend`
-- `last_outcome_package`
+- 基础身份信息
+- 终止条件
+
+公开 DTO 不暴露：
+- `secret`
+- `knows_secret`
+- `latest_outcome_summary`
 - `background_tick_count`
-- `last_advanced_at`
+- `player_presence`
 
-### 2.2 `EncounterResolution`
-当前结算记录字段：
-- `encounter_id`
-- `player_prompt`
-- `reply`
-- `time_spent_min`
-- `quest_updates`
-- `created_at`
-- `situation_delta`
-- `situation_value_after`
-- `reputation_delta`
-- `applied_outcome_summaries`
+## 运行时规则
+- active encounter 的公开展示统一使用 `PublicEncounterEntry`。
+- 旧档中 `escaped` 在公开视图里统一映射成 `active`。
+- 旧档中 `away` 在运行时归一化为 `engaged`。
 
-### 2.3 `EncounterState`
-- `pending_ids`
-- `active_encounter_id`
-- `encounters`
-- `history`
-- `debug_force_trigger`
-- `updated_at`
+## scene_summary
+- `scene_summary` 是唯一公开局势摘要。
+- 每次公开回合结束后，后端通过 `encounter.public_turn.summary.user.v1` 生成新的 `scene_summary`。
+- `encounter_situation_update.content` 直接等于这条摘要。
+- 不再使用模板化 concretize 逻辑重写摘要。
 
-## 3. 局势值
+## secret 可见范围
+- 后端服务可见
+- 主遭遇 NPC 恒定可见
+- 临时 NPC 仅在 `knows_secret = true` 时可见
+- 玩家、队友、前端公开 DTO 默认不可见
 
-### 3.1 初始值
-局势值基线为 `50`，再按当前规则修正并夹到 `20..80`：
-- 子区块声望 `>= 70`：`+10`
-- 子区块声望 `<= 30`：`-10`
-- 当前追踪 quest 或 fate phase 直接关联：`+5`
-- 玩家 HP 或体力低于 30%：`-5`
-- 至少一名队友在场：`+5`
+## 队友目标注入
+- 队友公开反应 prompt 使用 `team.public.reaction.user.v3`
+- prompt 会收到 `encounter_goal`
+- 不会收到 `secret`
 
-### 3.2 行动增量
-玩家、NPC、队友行动都可以修改 `situation_value`。
+## 后台推进退役
+- `advance_active_encounter_in_save()` 已退役为 no-op。
+- 主聊天、流式聊天、队友聊天、物品互动、移动、NPC 聊天、行动检定都不再调用后台推进。
+- 不再生成新的 `encounter_background` 或 `encounter_background_tick` 事件。
 
-当前公式：
-- `delta = clamp(situation_delta_hint + check_bonus, -20, +20)`
-- `check_bonus = +8 / +4 / -4 / -8`
+## 逃离/重返退役
+- `/encounters/{id}/escape` 与 `/encounters/{id}/rejoin` 返回 `410 Gone`。
+- 主聊天与流式聊天中的逃离/重返关键词拦截已移除。
+- 旧字段与旧状态只为兼容读取保留。
 
-### 3.3 趋势
-`situation_trend` 当前使用：
-- `improving`
-- `stable`
-- `worsening`
+## 前端展示
+- 主聊天主列显示 `遭遇目标: {goal}`
+- 侧栏与弹窗只显示 `goal + scene_summary`
+- “最近进展”与“最近步骤”不再驱动玩家 UI
 
-每次变化都会写一条 `encounter_situation_update` scene event。
+## 提示词
+- `encounter.generate.user.v3`
+- `encounter.step.user.v4`
+- `encounter.public_turn.summary.user.v1`
 
-## 4. 结束条件
-当前满足以下任一条件即结束：
-- 终止条件命中
-- `situation_value <= 0`
-- `situation_value >= 100`
-
-结果判定：
-- `>= 100` 强制成功
-- `<= 0` 强制失败
-- 其他结束时 `>= 50` 视为成功，否则失败
-
-## 5. 结果包
-
-### 5.1 当前结构
-`EncounterOutcomePackage` 当前包含：
-- `result`
-- `reputation_delta`
-- `npc_relation_deltas`
-- `team_deltas`
-- `item_rewards`
-- `buff_rewards`
-- `resource_deltas`
-- `narrative_summary`
-
-### 5.2 当前落地规则
-- 结果包会先清洗再写入存档
-- 奖励物品目前只允许安全的 `misc`
-- 声望变化会回写 `reputation_state`
-- 关系和资源会真实写回角色/玩家状态
-
-## 6. 当前接口
-- `GET /api/v1/encounters/pending`
-- `GET /api/v1/encounters/history`
-- `POST /api/v1/encounters/check`
-- `POST /api/v1/encounters/{encounter_id}/present`
-- `POST /api/v1/encounters/{encounter_id}/act`
-- `POST /api/v1/encounters/{encounter_id}/escape`
-- `POST /api/v1/encounters/{encounter_id}/rejoin`
-- `GET /api/v1/encounters/debug/overview`
-
-## 7. 与公开场景的关系
-- 活跃遭遇存在时，公开场景导演器会把当前遭遇锚点角色纳入优先序列
-- NPC/队友公开动作也可推动局势值
-- 主聊天 route 命中遭遇动作时，会先做真实的遭遇状态推进
-
-## 8. 前端联动
-- `frontend/src/components/EncounterLane.tsx`
-- `frontend/src/components/EncounterModal.tsx`
-- `frontend/src/App.tsx`
-
-当前前端已展示：
-- 局势值
-- 初始局势值
-- 趋势
-- 最新结果摘要
-
-## 9. 当前限制
-- 这不是完整战斗系统
-- 暂无先攻、回合条、技能资源分配面板
-- 结果包仍是轻量奖励/惩罚，不是完整掉落表系统
-
-## 10. 回归测试
-- `backend/tests/test_encounter_service.py`
-- `backend/tests/test_chat_route_scene_rendering.py`
-- `backend/tests/test_role_system.py`
+## 回归关注点
+- 新遭遇能生成 `goal`、`secret`、`scene_summary`
+- 队友只能看到 `goal`
+- scene event 正文直接显示 AI 生成的 `scene_summary`

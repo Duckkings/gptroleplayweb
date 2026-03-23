@@ -1,0 +1,993 @@
+{
+  "items": [
+    {
+      "role_id": "npc_1",
+      "name": "川洛",
+      "zone_id": "zone_a",
+      "sub_zone_id": "sub_zone_a",
+      "source_world_revision": 1,
+      "source_map_revision": 1,
+      "knowledge_scope": "local",
+      "state": "idle",
+      "personality": "谨慎",
+      "speaking_style": "习惯先试探再表态",
+      "appearance": "背着工具包",
+      "background": "常驻于【zone_a/酒馆】。当前子区块",
+      "cognition": "重视利益交换",
+      "alignment": "lawful_good",
+      "secret": "欠着某位旧识一笔没有还清的人情",
+      "likes": [
+        "准时赴约",
+        "有趣的冒险故事",
+        "手工点心"
+      ],
+      "desires": [
+        {
+          "desire_id": "npc_1_desire_1",
+          "kind": "info",
+          "title": "想查清 酒馆 的旧传闻",
+          "summary": "川洛 一直惦记着 酒馆 里没人愿意明说的旧事，希望有人能替他把线索拼起来。",
+          "intensity": 74,
+          "status": "active",
+          "visibility": "hinted",
+          "preferred_surface": "public_scene",
+          "target_refs": [
+            {
+              "entity_type": "sub_zone",
+              "entity_id": "sub_zone_a",
+              "label": "酒馆",
+              "required": true,
+              "source": "system"
+            }
+          ],
+          "linked_quest_id": null,
+          "cooldown_until": null,
+          "last_surfaced_at": null
+        },
+        {
+          "desire_id": "npc_1_desire_2",
+          "kind": "help",
+          "title": "需要有人帮忙处理 zone_a 的小麻烦",
+          "summary": "川洛 对 zone_a 的局面放不下，但又不想把真实压力直接说出口。",
+          "intensity": 84,
+          "status": "active",
+          "visibility": "hinted",
+          "preferred_surface": "public_scene",
+          "target_refs": [
+            {
+              "entity_type": "zone",
+              "entity_id": "zone_a",
+              "label": "zone_a",
+              "required": true,
+              "source": "system"
+            }
+          ],
+          "linked_quest_id": null,
+          "cooldown_until": null,
+          "last_surfaced_at": null
+        }
+      ],
+      "story_beats": [],
+      "talkative_current": 64,
+      "talkative_maximum": 64,
+      "last_private_chat_at": null,
+      "last_public_turn_at": null,
+      "portrait": null,
+      "retained_id": null,
+      "profile": {
+        "player_id": "npc_1",
+        "name": "川洛",
+        "age": 18,
+        "height_cm": 170,
+        "body_type": "",
+        "appearance": "",
+        "portrait": null,
+        "build_archive_id": null,
+        "move_speed_mph": 4500,
+        "role_type": "npc",
+        "dnd5e_sheet": {
+          "level": 1,
+          "experience_current": 0,
+          "experience_to_next_level": 300,
+          "race": "半精灵",
+          "char_class": "武僧",
+          "background": "城镇守望",
+          "alignment": "chaotic_neutral",
+          "proficiency_bonus": 2,
+          "armor_class": 10,
+          "difficulty_class": 11,
+          "speed_ft": 30,
+          "initiative_bonus": 0,
+          "stamina_current": 10,
+          "stamina_maximum": 10,
+          "is_dead": false,
+          "role_action_status": "free_action",
+          "status_flags": [],
+          "hit_dice": "1d8",
+          "hit_points": {
+            "current": 10,
+            "maximum": 10,
+            "temporary": 0
+          },
+          "ability_scores": {
+            "strength": 10,
+            "dexterity": 10,
+            "constitution": 10,
+            "intelligence": 10,
+            "wisdom": 10,
+            "charisma": 10
+          },
+          "current_ability_scores": {
+            "strength": 10,
+            "dexterity": 10,
+            "constitution": 10,
+            "intelligence": 10,
+            "wisdom": 10,
+            "charisma": 10
+          },
+          "ability_modifiers": {
+            "strength": 0,
+            "dexterity": 0,
+            "constitution": 0,
+            "intelligence": 0,
+            "wisdom": 0,
+            "charisma": 0
+          },
+          "current_ability_modifiers": {
+            "strength": 0,
+            "dexterity": 0,
+            "constitution": 0,
+            "intelligence": 0,
+            "wisdom": 0,
+            "charisma": 0
+          },
+          "saving_throws_proficient": [
+            "strength",
+            "dexterity"
+          ],
+          "skills_proficient": [
+            "acrobatics",
+            "insight"
+          ],
+          "languages": [
+            "通用语",
+            "精灵语"
+          ],
+          "tool_proficiencies": [
+            "草药工具"
+          ],
+          "equipment": [
+            "木珠手串",
+            "短棍",
+            "练功服",
+            "绷带卷"
+          ],
+          "equipment_slots": {
+            "weapon_item_id": "npc_1_weapon",
+            "armor_item_id": "npc_1_armor",
+            "shield_item_id": null,
+            "weapon_item_instance_id": "role_npc_1_npc_1_weapon",
+            "armor_item_instance_id": "role_npc_1_npc_1_armor",
+            "shield_item_instance_id": null
+          },
+          "backpack": {
+            "gold": 12,
+            "item_instance_ids": [
+              "role_npc_1_npc_1_weapon",
+              "role_npc_1_npc_1_armor",
+              "role_npc_1_npc_1_extra_1",
+              "role_npc_1_npc_1_extra_2"
+            ],
+            "items": [
+              {
+                "item_id": "npc_1_weapon",
+                "name": "短棍",
+                "item_type": "weapon",
+                "description": "便于训练的武器",
+                "weight": 0.0,
+                "rarity": "common",
+                "value": 25,
+                "effect": "",
+                "uses_max": null,
+                "uses_left": null,
+                "cooldown_min": 0,
+                "bound": false,
+                "quantity": 1,
+                "slot_type": "weapon",
+                "attack_bonus": 1,
+                "armor_bonus": 0,
+                "origin": null
+              },
+              {
+                "item_id": "npc_1_armor",
+                "name": "练功服",
+                "item_type": "armor",
+                "description": "并非真正护甲",
+                "weight": 0.0,
+                "rarity": "common",
+                "value": 27,
+                "effect": "",
+                "uses_max": null,
+                "uses_left": null,
+                "cooldown_min": 0,
+                "bound": false,
+                "quantity": 1,
+                "slot_type": "armor",
+                "attack_bonus": 0,
+                "armor_bonus": 0,
+                "origin": null
+              },
+              {
+                "item_id": "npc_1_extra_1",
+                "name": "绷带卷",
+                "item_type": "misc",
+                "description": "川洛 随身携带的物品。",
+                "weight": 0.0,
+                "rarity": "common",
+                "value": 5,
+                "effect": "",
+                "uses_max": null,
+                "uses_left": null,
+                "cooldown_min": 0,
+                "bound": false,
+                "quantity": 1,
+                "slot_type": "misc",
+                "attack_bonus": 0,
+                "armor_bonus": 0,
+                "origin": null
+              },
+              {
+                "item_id": "npc_1_extra_2",
+                "name": "木珠手串",
+                "item_type": "misc",
+                "description": "川洛 随身携带的物品。",
+                "weight": 0.0,
+                "rarity": "common",
+                "value": 7,
+                "effect": "",
+                "uses_max": null,
+                "uses_left": null,
+                "cooldown_min": 0,
+                "bound": false,
+                "quantity": 1,
+                "slot_type": "misc",
+                "attack_bonus": 0,
+                "armor_bonus": 0,
+                "origin": null
+              }
+            ]
+          },
+          "buffs": [],
+          "features_traits": [
+            "疾风连击",
+            "气"
+          ],
+          "spells": [],
+          "war_arts": [],
+          "spell_origins": {},
+          "skill_origins": {},
+          "war_art_origins": {},
+          "spell_slots_max": {
+            "level_1": 0,
+            "level_2": 0,
+            "level_3": 0,
+            "level_4": 0,
+            "level_5": 0,
+            "level_6": 0,
+            "level_7": 0,
+            "level_8": 0,
+            "level_9": 0
+          },
+          "spell_slots_current": {
+            "level_1": 0,
+            "level_2": 0,
+            "level_3": 0,
+            "level_4": 0,
+            "level_5": 0,
+            "level_6": 0,
+            "level_7": 0,
+            "level_8": 0,
+            "level_9": 0
+          },
+          "martial_points_current": 0,
+          "martial_points_maximum": 0,
+          "notes": "常驻NPC模板：城镇守望，职业倾向为武僧。",
+          "death_state": {
+            "version": "0.1.0",
+            "life_status": "healthy",
+            "death_save_successes": 0,
+            "death_save_failures": 0,
+            "death_count": 0,
+            "death_streak_count": 0,
+            "death_streak_reset_at": null,
+            "last_death_at": null,
+            "last_death_zone_id": null,
+            "last_death_sub_zone_id": null,
+            "last_death_cause": "",
+            "revived_at": null,
+            "revival_method": null,
+            "revival_weakness_until": null,
+            "updated_at": "2026-03-22T07:35:11.512881+00:00"
+          }
+        }
+      },
+      "relations": [
+        {
+          "target_role_id": "team_1",
+          "relation_tag": "acquaintance",
+          "note": "初始关联"
+        },
+        {
+          "target_role_id": "npc_sub_zone_a_6833",
+          "relation_tag": "ally",
+          "note": "初始关联"
+        }
+      ],
+      "cognition_changes": [],
+      "attitude_changes": [],
+      "conversation_state": {
+        "current_topic": "",
+        "last_open_question": "",
+        "last_npc_claim": "",
+        "last_player_intent": "",
+        "last_referenced_entity": "",
+        "last_scene_mode": "unknown",
+        "updated_at": "2026-03-22T07:35:11.512895+00:00"
+      },
+      "dialogue_logs": [],
+      "generated_at": "2026-03-22T07:35:11.512897+00:00"
+    },
+    {
+      "role_id": "team_1",
+      "name": "缇儿",
+      "zone_id": "zone_a",
+      "sub_zone_id": "sub_zone_a",
+      "source_world_revision": 1,
+      "source_map_revision": 1,
+      "knowledge_scope": "local",
+      "state": "in_team",
+      "personality": "冷静",
+      "speaking_style": "习惯先试探再表态",
+      "appearance": "手上有旧伤疤",
+      "background": "常驻于【zone_a/酒馆】。当前子区块",
+      "cognition": "重视同伴承诺",
+      "alignment": "lawful_good",
+      "secret": "欠着某位旧识一笔没有还清的人情",
+      "likes": [
+        "热茶",
+        "准时赴约",
+        "手工点心"
+      ],
+      "desires": [
+        {
+          "desire_id": "team_1_desire_1",
+          "kind": "info",
+          "title": "想查清 酒馆 的旧传闻",
+          "summary": "缇儿 一直惦记着 酒馆 里没人愿意明说的旧事，希望有人能替他把线索拼起来。",
+          "intensity": 78,
+          "status": "active",
+          "visibility": "hinted",
+          "preferred_surface": "public_scene",
+          "target_refs": [
+            {
+              "entity_type": "sub_zone",
+              "entity_id": "sub_zone_a",
+              "label": "酒馆",
+              "required": true,
+              "source": "system"
+            }
+          ],
+          "linked_quest_id": null,
+          "cooldown_until": null,
+          "last_surfaced_at": null
+        }
+      ],
+      "story_beats": [
+        {
+          "beat_id": "team_1_story_1",
+          "title": "第一次提起过去的同伴",
+          "summary": "缇儿 会在一个相对安静的时刻，第一次认真提起自己曾经失去的同伴。",
+          "affinity_required": 60,
+          "min_days_in_team": 2,
+          "status": "locked",
+          "preferred_surface": "team_chat",
+          "last_surfaced_at": null,
+          "completed_at": null
+        },
+        {
+          "beat_id": "team_1_story_2",
+          "title": "解释为什么总盯着 酒馆",
+          "summary": "缇儿 会解释自己为什么每到 酒馆 都会短暂沉默，像是在确认某件旧事还在不在。",
+          "affinity_required": 70,
+          "min_days_in_team": 2,
+          "status": "locked",
+          "preferred_surface": "area_arrival",
+          "last_surfaced_at": null,
+          "completed_at": null
+        }
+      ],
+      "talkative_current": 78,
+      "talkative_maximum": 78,
+      "last_private_chat_at": null,
+      "last_public_turn_at": null,
+      "portrait": null,
+      "retained_id": null,
+      "profile": {
+        "player_id": "team_1",
+        "name": "缇儿",
+        "age": 18,
+        "height_cm": 170,
+        "body_type": "",
+        "appearance": "",
+        "portrait": null,
+        "build_archive_id": null,
+        "move_speed_mph": 4500,
+        "role_type": "npc",
+        "dnd5e_sheet": {
+          "level": 1,
+          "experience_current": 0,
+          "experience_to_next_level": 300,
+          "race": "半身人",
+          "char_class": "法师",
+          "background": "行会学徒",
+          "alignment": "true_neutral",
+          "proficiency_bonus": 2,
+          "armor_class": 10,
+          "difficulty_class": 11,
+          "speed_ft": 30,
+          "initiative_bonus": 0,
+          "stamina_current": 10,
+          "stamina_maximum": 10,
+          "is_dead": false,
+          "role_action_status": "free_action",
+          "status_flags": [],
+          "hit_dice": "1d8",
+          "hit_points": {
+            "current": 10,
+            "maximum": 10,
+            "temporary": 0
+          },
+          "ability_scores": {
+            "strength": 10,
+            "dexterity": 10,
+            "constitution": 10,
+            "intelligence": 10,
+            "wisdom": 10,
+            "charisma": 10
+          },
+          "current_ability_scores": {
+            "strength": 10,
+            "dexterity": 10,
+            "constitution": 10,
+            "intelligence": 10,
+            "wisdom": 10,
+            "charisma": 10
+          },
+          "ability_modifiers": {
+            "strength": 0,
+            "dexterity": 0,
+            "constitution": 0,
+            "intelligence": 0,
+            "wisdom": 0,
+            "charisma": 0
+          },
+          "current_ability_modifiers": {
+            "strength": 0,
+            "dexterity": 0,
+            "constitution": 0,
+            "intelligence": 0,
+            "wisdom": 0,
+            "charisma": 0
+          },
+          "saving_throws_proficient": [
+            "intelligence",
+            "wisdom"
+          ],
+          "skills_proficient": [
+            "arcana",
+            "history"
+          ],
+          "languages": [
+            "通用语",
+            "精灵语"
+          ],
+          "tool_proficiencies": [
+            "抄写工具"
+          ],
+          "equipment": [
+            "墨水套装",
+            "法术书",
+            "法杖",
+            "法袍"
+          ],
+          "equipment_slots": {
+            "weapon_item_id": "team_1_weapon",
+            "armor_item_id": "team_1_armor",
+            "shield_item_id": null,
+            "weapon_item_instance_id": "role_team_1_team_1_weapon",
+            "armor_item_instance_id": "role_team_1_team_1_armor",
+            "shield_item_instance_id": null
+          },
+          "backpack": {
+            "gold": 14,
+            "item_instance_ids": [
+              "role_team_1_team_1_weapon",
+              "role_team_1_team_1_armor",
+              "role_team_1_team_1_extra_1",
+              "role_team_1_team_1_extra_2"
+            ],
+            "items": [
+              {
+                "item_id": "team_1_weapon",
+                "name": "法杖",
+                "item_type": "weapon",
+                "description": "施法与自卫兼用",
+                "weight": 0.0,
+                "rarity": "common",
+                "value": 19,
+                "effect": "",
+                "uses_max": null,
+                "uses_left": null,
+                "cooldown_min": 0,
+                "bound": false,
+                "quantity": 1,
+                "slot_type": "weapon",
+                "attack_bonus": 1,
+                "armor_bonus": 0,
+                "origin": null
+              },
+              {
+                "item_id": "team_1_armor",
+                "name": "法袍",
+                "item_type": "armor",
+                "description": "轻便衣袍",
+                "weight": 0.0,
+                "rarity": "common",
+                "value": 21,
+                "effect": "",
+                "uses_max": null,
+                "uses_left": null,
+                "cooldown_min": 0,
+                "bound": false,
+                "quantity": 1,
+                "slot_type": "armor",
+                "attack_bonus": 0,
+                "armor_bonus": 0,
+                "origin": null
+              },
+              {
+                "item_id": "team_1_extra_1",
+                "name": "法术书",
+                "item_type": "misc",
+                "description": "缇儿 随身携带的物品。",
+                "weight": 0.0,
+                "rarity": "common",
+                "value": 5,
+                "effect": "",
+                "uses_max": null,
+                "uses_left": null,
+                "cooldown_min": 0,
+                "bound": false,
+                "quantity": 1,
+                "slot_type": "misc",
+                "attack_bonus": 0,
+                "armor_bonus": 0,
+                "origin": null
+              },
+              {
+                "item_id": "team_1_extra_2",
+                "name": "墨水套装",
+                "item_type": "misc",
+                "description": "缇儿 随身携带的物品。",
+                "weight": 0.0,
+                "rarity": "common",
+                "value": 7,
+                "effect": "",
+                "uses_max": null,
+                "uses_left": null,
+                "cooldown_min": 0,
+                "bound": false,
+                "quantity": 1,
+                "slot_type": "misc",
+                "attack_bonus": 0,
+                "armor_bonus": 0,
+                "origin": null
+              }
+            ]
+          },
+          "buffs": [],
+          "features_traits": [
+            "奥术恢复",
+            "法术书"
+          ],
+          "spells": [
+            "侦测魔法",
+            "护盾术",
+            "魔法飞弹"
+          ],
+          "war_arts": [],
+          "spell_origins": {},
+          "skill_origins": {},
+          "war_art_origins": {},
+          "spell_slots_max": {
+            "level_1": 1,
+            "level_2": 0,
+            "level_3": 0,
+            "level_4": 0,
+            "level_5": 0,
+            "level_6": 0,
+            "level_7": 0,
+            "level_8": 0,
+            "level_9": 0
+          },
+          "spell_slots_current": {
+            "level_1": 1,
+            "level_2": 0,
+            "level_3": 0,
+            "level_4": 0,
+            "level_5": 0,
+            "level_6": 0,
+            "level_7": 0,
+            "level_8": 0,
+            "level_9": 0
+          },
+          "martial_points_current": 0,
+          "martial_points_maximum": 0,
+          "notes": "常驻NPC模板：行会学徒，职业倾向为法师。",
+          "death_state": {
+            "version": "0.1.0",
+            "life_status": "healthy",
+            "death_save_successes": 0,
+            "death_save_failures": 0,
+            "death_count": 0,
+            "death_streak_count": 0,
+            "death_streak_reset_at": null,
+            "last_death_at": null,
+            "last_death_zone_id": null,
+            "last_death_sub_zone_id": null,
+            "last_death_cause": "",
+            "revived_at": null,
+            "revival_method": null,
+            "revival_weakness_until": null,
+            "updated_at": "2026-03-22T07:35:11.512915+00:00"
+          }
+        }
+      },
+      "relations": [
+        {
+          "target_role_id": "npc_sub_zone_a_6833",
+          "relation_tag": "acquaintance",
+          "note": "初始关联"
+        }
+      ],
+      "cognition_changes": [],
+      "attitude_changes": [],
+      "conversation_state": {
+        "current_topic": "",
+        "last_open_question": "",
+        "last_npc_claim": "",
+        "last_player_intent": "",
+        "last_referenced_entity": "",
+        "last_scene_mode": "unknown",
+        "updated_at": "2026-03-22T07:35:11.512919+00:00"
+      },
+      "dialogue_logs": [],
+      "generated_at": "2026-03-22T07:35:11.512921+00:00"
+    },
+    {
+      "role_id": "npc_sub_zone_a_6833",
+      "name": "zone_a向导岚岑",
+      "zone_id": "zone_a",
+      "sub_zone_id": "sub_zone_a",
+      "source_world_revision": 1,
+      "source_map_revision": 1,
+      "knowledge_scope": "local",
+      "state": "idle",
+      "personality": "寡言",
+      "speaking_style": "偶尔会先观察再开口",
+      "appearance": "腰间挂着旧钥匙串",
+      "background": "常驻于【zone_a/酒馆】。当前子区块",
+      "cognition": "重视秩序",
+      "alignment": "chaotic_neutral",
+      "secret": "欠着某位旧识一笔没有还清的人情",
+      "likes": [
+        "手工点心",
+        "旧地图",
+        "罕见草药"
+      ],
+      "desires": [
+        {
+          "desire_id": "npc_sub_zone_a_6833_desire_1",
+          "kind": "info",
+          "title": "想查清 酒馆 的旧传闻",
+          "summary": "zone_a向导岚岑 一直惦记着 酒馆 里没人愿意明说的旧事，希望有人能替他把线索拼起来。",
+          "intensity": 54,
+          "status": "latent",
+          "visibility": "hidden",
+          "preferred_surface": "public_scene",
+          "target_refs": [
+            {
+              "entity_type": "sub_zone",
+              "entity_id": "sub_zone_a",
+              "label": "酒馆",
+              "required": true,
+              "source": "system"
+            }
+          ],
+          "linked_quest_id": null,
+          "cooldown_until": null,
+          "last_surfaced_at": null
+        }
+      ],
+      "story_beats": [],
+      "talkative_current": 53,
+      "talkative_maximum": 53,
+      "last_private_chat_at": null,
+      "last_public_turn_at": null,
+      "portrait": null,
+      "retained_id": null,
+      "profile": {
+        "player_id": "npc_sub_zone_a_6833",
+        "name": "zone_a向导岚岑",
+        "age": 18,
+        "height_cm": 170,
+        "body_type": "",
+        "appearance": "",
+        "portrait": null,
+        "build_archive_id": null,
+        "move_speed_mph": 4200,
+        "role_type": "npc",
+        "dnd5e_sheet": {
+          "level": 1,
+          "experience_current": 0,
+          "experience_to_next_level": 300,
+          "race": "侏儒",
+          "char_class": "战士",
+          "background": "旅商随员",
+          "alignment": "chaotic_neutral",
+          "proficiency_bonus": 2,
+          "armor_class": 14,
+          "difficulty_class": 12,
+          "speed_ft": 30,
+          "initiative_bonus": 0,
+          "stamina_current": 10,
+          "stamina_maximum": 10,
+          "is_dead": false,
+          "role_action_status": "free_action",
+          "status_flags": [],
+          "hit_dice": "1d10",
+          "hit_points": {
+            "current": 13,
+            "maximum": 13,
+            "temporary": 0
+          },
+          "ability_scores": {
+            "strength": 10,
+            "dexterity": 11,
+            "constitution": 17,
+            "intelligence": 13,
+            "wisdom": 15,
+            "charisma": 9
+          },
+          "current_ability_scores": {
+            "strength": 10,
+            "dexterity": 11,
+            "constitution": 17,
+            "intelligence": 13,
+            "wisdom": 15,
+            "charisma": 9
+          },
+          "ability_modifiers": {
+            "strength": 0,
+            "dexterity": 0,
+            "constitution": 3,
+            "intelligence": 1,
+            "wisdom": 2,
+            "charisma": -1
+          },
+          "current_ability_modifiers": {
+            "strength": 0,
+            "dexterity": 0,
+            "constitution": 3,
+            "intelligence": 1,
+            "wisdom": 2,
+            "charisma": -1
+          },
+          "saving_throws_proficient": [
+            "strength",
+            "constitution"
+          ],
+          "skills_proficient": [
+            "athletics",
+            "intimidation"
+          ],
+          "languages": [
+            "通用语",
+            "矮人语"
+          ],
+          "tool_proficiencies": [
+            "护甲保养工具"
+          ],
+          "equipment": [
+            "水袋",
+            "磨刀石",
+            "锁子甲",
+            "长剑"
+          ],
+          "equipment_slots": {
+            "weapon_item_id": "npc_sub_zone_a_6833_weapon",
+            "armor_item_id": "npc_sub_zone_a_6833_armor",
+            "shield_item_id": null,
+            "weapon_item_instance_id": "role_npc_sub_zone_a_6833_npc_sub_zone_a_6833_weapon",
+            "armor_item_instance_id": "role_npc_sub_zone_a_6833_npc_sub_zone_a_6833_armor",
+            "shield_item_instance_id": null
+          },
+          "backpack": {
+            "gold": 11,
+            "item_instance_ids": [
+              "role_npc_sub_zone_a_6833_npc_sub_zone_a_6833_weapon",
+              "role_npc_sub_zone_a_6833_npc_sub_zone_a_6833_armor",
+              "role_npc_sub_zone_a_6833_npc_sub_zone_a_6833_extra_1",
+              "role_npc_sub_zone_a_6833_npc_sub_zone_a_6833_extra_2"
+            ],
+            "items": [
+              {
+                "item_id": "npc_sub_zone_a_6833_weapon",
+                "name": "长剑",
+                "item_type": "weapon",
+                "description": "近战常用制式武器",
+                "weight": 0.0,
+                "rarity": "common",
+                "value": 13,
+                "effect": "",
+                "uses_max": null,
+                "uses_left": null,
+                "cooldown_min": 0,
+                "bound": false,
+                "quantity": 1,
+                "slot_type": "weapon",
+                "attack_bonus": 2,
+                "armor_bonus": 0,
+                "origin": null
+              },
+              {
+                "item_id": "npc_sub_zone_a_6833_armor",
+                "name": "锁子甲",
+                "item_type": "armor",
+                "description": "常备护甲",
+                "weight": 0.0,
+                "rarity": "common",
+                "value": 15,
+                "effect": "",
+                "uses_max": null,
+                "uses_left": null,
+                "cooldown_min": 0,
+                "bound": false,
+                "quantity": 1,
+                "slot_type": "armor",
+                "attack_bonus": 0,
+                "armor_bonus": 4,
+                "origin": null
+              },
+              {
+                "item_id": "npc_sub_zone_a_6833_extra_1",
+                "name": "磨刀石",
+                "item_type": "misc",
+                "description": "zone_a向导岚岑 随身携带的物品。",
+                "weight": 0.0,
+                "rarity": "common",
+                "value": 5,
+                "effect": "",
+                "uses_max": null,
+                "uses_left": null,
+                "cooldown_min": 0,
+                "bound": false,
+                "quantity": 1,
+                "slot_type": "misc",
+                "attack_bonus": 0,
+                "armor_bonus": 0,
+                "origin": null
+              },
+              {
+                "item_id": "npc_sub_zone_a_6833_extra_2",
+                "name": "水袋",
+                "item_type": "misc",
+                "description": "zone_a向导岚岑 随身携带的物品。",
+                "weight": 0.0,
+                "rarity": "common",
+                "value": 7,
+                "effect": "",
+                "uses_max": null,
+                "uses_left": null,
+                "cooldown_min": 0,
+                "bound": false,
+                "quantity": 1,
+                "slot_type": "misc",
+                "attack_bonus": 0,
+                "armor_bonus": 0,
+                "origin": null
+              }
+            ]
+          },
+          "buffs": [],
+          "features_traits": [
+            "第二风息",
+            "战斗风格"
+          ],
+          "spells": [],
+          "war_arts": [],
+          "spell_origins": {},
+          "skill_origins": {},
+          "war_art_origins": {},
+          "spell_slots_max": {
+            "level_1": 0,
+            "level_2": 0,
+            "level_3": 0,
+            "level_4": 0,
+            "level_5": 0,
+            "level_6": 0,
+            "level_7": 0,
+            "level_8": 0,
+            "level_9": 0
+          },
+          "spell_slots_current": {
+            "level_1": 0,
+            "level_2": 0,
+            "level_3": 0,
+            "level_4": 0,
+            "level_5": 0,
+            "level_6": 0,
+            "level_7": 0,
+            "level_8": 0,
+            "level_9": 0
+          },
+          "martial_points_current": 0,
+          "martial_points_maximum": 0,
+          "notes": "常驻NPC模板：旅商随员，职业倾向为战士。",
+          "death_state": {
+            "version": "0.1.0",
+            "life_status": "healthy",
+            "death_save_successes": 0,
+            "death_save_failures": 0,
+            "death_count": 0,
+            "death_streak_count": 0,
+            "death_streak_reset_at": null,
+            "last_death_at": null,
+            "last_death_zone_id": null,
+            "last_death_sub_zone_id": null,
+            "last_death_cause": "",
+            "revived_at": null,
+            "revival_method": null,
+            "revival_weakness_until": null,
+            "updated_at": "2026-03-22T07:35:11.653103+00:00"
+          }
+        }
+      },
+      "relations": [
+        {
+          "target_role_id": "npc_1",
+          "relation_tag": "acquaintance",
+          "note": "初始关联"
+        },
+        {
+          "target_role_id": "team_1",
+          "relation_tag": "ally",
+          "note": "初始关联"
+        }
+      ],
+      "cognition_changes": [],
+      "attitude_changes": [],
+      "conversation_state": {
+        "current_topic": "",
+        "last_open_question": "",
+        "last_npc_claim": "",
+        "last_player_intent": "",
+        "last_referenced_entity": "",
+        "last_scene_mode": "unknown",
+        "updated_at": "2026-03-22T07:35:11.656040+00:00"
+      },
+      "dialogue_logs": [],
+      "generated_at": "2026-03-22T07:35:11.656045+00:00"
+    }
+  ]
+}

@@ -389,6 +389,10 @@ def evaluate_fate_state(req: FateEvaluateRequest) -> FateEvaluateResponse:
     return FateEvaluateResponse(session_id=req.session_id, fate_state=state, advanced=advanced, generated_quest_id=generated_quest_id)
 
 
+def evaluate_fate_in_save(req: FateEvaluateRequest) -> FateEvaluateResponse:
+    return evaluate_fate_state(req)
+
+
 def generate_fate(req: FateGenerateRequest) -> FateGenerateResponse:
     save = get_current_save(default_session_id=req.session_id)
     save.session_id = req.session_id

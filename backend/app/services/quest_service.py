@@ -23,6 +23,14 @@ from app.models.schemas import (
     QuestStateResponse,
 )
 from app.services.ai_adapter import build_completion_options, create_sync_client
+from app.services.ai_protocol_contract_service import (
+    AI_PROVIDER_CALL_FAILED,
+    EnumContractField,
+    allow_protocol_repair,
+    render_enum_pool_text,
+    require_ai_config,
+    validate_or_repair_json_payload,
+)
 from app.services.consistency_service import (
     build_entity_index,
     build_global_story_snapshot,
@@ -373,12 +381,7 @@ def _ai_generate_quest_draft(save, source: str, config: ChatConfig | None) -> Qu
 
 
 def _ai_generate_quest_draft_guarded(save, source: str, config: ChatConfig | None) -> QuestDraft | None:
-    if config is None:
-        return None
-    api_key = (config.openai_api_key or "").strip()
-    model = (config.model or "").strip()
-    if not api_key or not model:
-        return None
+    config = require_ai_config(config)
 
     zone_id, sub_zone_id = _current_area_refs(save)
     zone_name = next((z.name for z in save.area_snapshot.zones if z.zone_id == zone_id), "current_area")
@@ -433,10 +436,14 @@ def _ai_generate_quest_draft_guarded(save, source: str, config: ChatConfig | Non
         active_quests=_prompt_list([f"{quest.quest_id}:{quest.title}" for quest in snapshot.active_quests]),
         pending_quest_ids=_prompt_list(snapshot.pending_quest_ids),
     )
+    prompt = (
+        f"{prompt}\nAllowed enum ids:\n"
+        f"{render_enum_pool_text((EnumContractField(field_path='objectives[].kind', allowed_ids=('reach_zone', 'talk_to_npc', 'obtain_item', 'resolve_encounter', 'complete_quest', 'manual_text')), EnumContractField(field_path='rewards[].kind', allowed_ids=('gold', 'item', 'relation', 'flag', 'none'))))}"
+    )
     try:
         client = create_sync_client(config, client_cls=OpenAI)
         resp = client.chat.completions.create(
-            model=model,
+            model=config.model,
             **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
@@ -444,7 +451,23 @@ def _ai_generate_quest_draft_guarded(save, source: str, config: ChatConfig | Non
                 {"role": "user", "content": prompt},
             ],
         )
-        parsed = _extract_json_content((resp.choices[0].message.content or "").strip())
+        raw_json = (resp.choices[0].message.content or "").strip() or "{}"
+        parsed = _extract_json_content(raw_json)
+        with allow_protocol_repair():
+            parsed = validate_or_repair_json_payload(
+                parsed=parsed,
+                raw_json=raw_json,
+                fields=(
+                    EnumContractField(
+                        field_path="objectives[].kind",
+                        allowed_ids=("reach_zone", "talk_to_npc", "obtain_item", "resolve_encounter", "complete_quest", "manual_text"),
+                    ),
+                    EnumContractField(field_path="rewards[].kind", allowed_ids=("gold", "item", "relation", "flag", "none")),
+                ),
+                config=config,
+                system_prompt=prompt_table.get_text("quest.generate.system", "Return JSON only."),
+                original_prompt=prompt,
+            )
         title = str(parsed.get("title") or "").strip()
         description = str(parsed.get("description") or "").strip()
         raw_objectives = parsed.get("objectives") if isinstance(parsed.get("objectives"), list) else []
@@ -454,9 +477,7 @@ def _ai_generate_quest_draft_guarded(save, source: str, config: ChatConfig | Non
         for item in raw_objectives[:3]:
             if not isinstance(item, dict):
                 continue
-            kind = str(item.get("kind") or "manual_text").strip().lower()
-            if kind not in {"reach_zone", "talk_to_npc", "obtain_item", "resolve_encounter", "complete_quest", "manual_text"}:
-                kind = "manual_text"
+            kind = str(item.get("kind") or "").strip().lower()
             obj_title = str(item.get("title") or "").strip() or "quest objective"
             obj_desc = str(item.get("description") or "").strip() or obj_title
             target_ref = item.get("target_ref") if isinstance(item.get("target_ref"), dict) else {}
@@ -489,9 +510,7 @@ def _ai_generate_quest_draft_guarded(save, source: str, config: ChatConfig | Non
         for item in raw_rewards[:2]:
             if not isinstance(item, dict):
                 continue
-            kind = str(item.get("kind") or "none").strip().lower()
-            if kind not in {"gold", "item", "relation", "flag", "none"}:
-                kind = "none"
+            kind = str(item.get("kind") or "").strip().lower()
             label = str(item.get("label") or "").strip() or "quest reward"
             payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
             clean_payload = {str(k): v for k, v in payload.items() if isinstance(v, (str, int, float, bool))}
@@ -512,15 +531,17 @@ def _ai_generate_quest_draft_guarded(save, source: str, config: ChatConfig | Non
         )
         draft.entity_refs = extract_entity_refs_from_quest_like(draft)
         return draft
-    except Exception:
-        return None
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"{AI_PROVIDER_CALL_FAILED}: {exc}") from exc
 
 
 def _resolve_publish_draft(save, req: QuestPublishRequest) -> QuestDraft:
     if req.quest is not None:
         draft = req.quest
     else:
-        draft = _ai_generate_quest_draft_guarded(save, req.source, req.config) or _fallback_quest_draft(save, req.source)
+        draft = _ai_generate_quest_draft_guarded(save, req.source, req.config)
     if draft.source == "fate":
         draft.offer_mode = "accept_only"
     return draft
@@ -861,6 +882,10 @@ def evaluate_all_quests(req: QuestEvaluateAllRequest) -> QuestStateResponse:
         except Exception:
             continue
     return get_quest_state(req.session_id)
+
+
+def evaluate_all_quests_in_save(req: QuestEvaluateAllRequest) -> QuestStateResponse:
+    return evaluate_all_quests(req)
 
 
 def debug_generate_quest(session_id: str, config: ChatConfig | None = None) -> QuestMutationResponse:

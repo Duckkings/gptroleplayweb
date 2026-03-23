@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import json
 from math import ceil
 import random
-from typing import Any
+from typing import Any, Iterable
 
 from openai import OpenAI
 
@@ -31,6 +31,10 @@ from app.models.schemas import (
     EncounterPendingResponse,
     EncounterPresentRequest,
     EncounterPresentResponse,
+    PublicEncounterEntry,
+    PublicEncounterState,
+    PublicEncounterTemporaryNpc,
+    PublicEncounterTerminationCondition,
     EncounterRejoinRequest,
     EncounterRejoinResponse,
     EncounterResolution,
@@ -50,8 +54,26 @@ from app.services.consistency_service import (
     validate_entity_refs,
 )
 from app.services.ai_adapter import build_completion_options, create_sync_client
-from app.services.world_service import _advance_clock, _default_world_clock, _new_scene_event, _parse_player_intent, get_current_save, save_current
-from app.services.reputation_service import apply_sub_zone_reputation_delta, get_current_sub_zone_reputation
+from app.services.ai_protocol_contract_service import (
+    AI_PROTOCOL_REPAIR_FAILED,
+    AI_PROVIDER_CALL_FAILED,
+    EnumContractField,
+    allow_protocol_repair,
+    render_enum_pool_text,
+    require_ai_config,
+    validate_or_repair_json_payload,
+)
+from app.services.generation_debug_log_service import current_generation_debug_log
+from app.services.world_service import (
+    _advance_clock,
+    _default_world_clock,
+    _new_scene_event,
+    _parse_player_intent,
+    get_current_save,
+    save_current,
+    spawn_persistent_scene_npc_in_save,
+)
+from app.services import zone_metric_service
 
 
 def _utc_now() -> str:
@@ -81,7 +103,126 @@ def _touch_state(state: EncounterState) -> None:
 def _state(save) -> EncounterState:
     if save.encounter_state is None:
         save.encounter_state = EncounterState()
+    _normalize_legacy_encounter_state(save)
     return save.encounter_state
+
+
+def _normalize_legacy_encounter_state(save) -> None:
+    state = save.encounter_state
+    if state is None:
+        return
+    relocated_zone_id = getattr(save.area_snapshot, "current_zone_id", None)
+    relocated_sub_zone_id = getattr(save.area_snapshot, "current_sub_zone_id", None)
+    for encounter in state.encounters:
+        changed = False
+        if encounter.status == "escaped":
+            encounter.status = "active"
+            changed = True
+        if encounter.player_presence == "away":
+            encounter.player_presence = "engaged"
+            changed = True
+        if changed:
+            if relocated_zone_id:
+                encounter.zone_id = relocated_zone_id
+            if relocated_sub_zone_id:
+                encounter.sub_zone_id = relocated_sub_zone_id
+            for temp_npc in encounter.temporary_npcs or []:
+                if relocated_zone_id:
+                    temp_npc.zone_id = relocated_zone_id
+                if relocated_sub_zone_id:
+                    temp_npc.sub_zone_id = relocated_sub_zone_id
+            if encounter.status == "active":
+                state.active_encounter_id = encounter.encounter_id
+
+
+def encounter_secret_for_actor(save, actor_role_id: str | None) -> str:
+    actor_id = str(actor_role_id or "").strip()
+    if not actor_id:
+        return ""
+    encounter = _current_active_encounter(_state(save))
+    if encounter is None or not encounter.secret.strip():
+        return ""
+    if encounter.npc_role_id and encounter.npc_role_id == actor_id:
+        return encounter.secret
+    temp_npc = next((item for item in encounter.temporary_npcs if item.encounter_npc_id == actor_id), None)
+    if temp_npc is not None and bool(temp_npc.knows_secret):
+        return encounter.secret
+    return ""
+
+
+def serialize_public_encounter(encounter: EncounterEntry) -> PublicEncounterEntry:
+    status = "active" if encounter.status == "escaped" else encounter.status
+    if status not in {"queued", "active", "resolved", "expired", "invalidated"}:
+        status = "active"
+    return PublicEncounterEntry(
+        encounter_id=encounter.encounter_id,
+        type=encounter.type,
+        source_world_revision=encounter.source_world_revision,
+        source_map_revision=encounter.source_map_revision,
+        entity_refs=[item.model_copy(deep=True) for item in encounter.entity_refs],
+        invalidated_reason=encounter.invalidated_reason,
+        status=status,  # type: ignore[arg-type]
+        trigger_kind=encounter.trigger_kind,
+        encounter_mode=encounter.encounter_mode,
+        title=encounter.title,
+        description=encounter.description,
+        goal=encounter.goal,
+        zone_id=encounter.zone_id,
+        sub_zone_id=encounter.sub_zone_id,
+        npc_role_id=encounter.npc_role_id,
+        related_quest_ids=list(encounter.related_quest_ids),
+        related_fate_phase_ids=list(encounter.related_fate_phase_ids),
+        participant_role_ids=list(encounter.participant_role_ids),
+        temporary_npcs=[
+            PublicEncounterTemporaryNpc(
+                encounter_npc_id=item.encounter_npc_id,
+                name=item.name,
+                title=item.title,
+                description=item.description,
+                speaking_style=item.speaking_style,
+                agenda=item.agenda,
+                state=item.state,
+                zone_id=item.zone_id,
+                sub_zone_id=item.sub_zone_id,
+                introduced_at=item.introduced_at,
+            )
+            for item in encounter.temporary_npcs
+        ],
+        generated_prompt_tags=list(encounter.generated_prompt_tags),
+        allow_player_prompt=encounter.allow_player_prompt,
+        termination_conditions=[
+            PublicEncounterTerminationCondition(
+                condition_id=item.condition_id,
+                kind=item.kind,
+                description=item.description,
+                satisfied=item.satisfied,
+                satisfied_at=item.satisfied_at,
+            )
+            for item in encounter.termination_conditions
+        ],
+        steps=[item.model_copy(deep=True) for item in encounter.steps],
+        scene_summary=encounter.scene_summary,
+        situation_start_value=encounter.situation_start_value,
+        situation_value=encounter.situation_value,
+        situation_trend=encounter.situation_trend,
+        last_outcome_package=(encounter.last_outcome_package.model_copy(deep=True) if encounter.last_outcome_package is not None else None),
+        created_at=encounter.created_at,
+        presented_at=encounter.presented_at,
+        resolved_at=encounter.resolved_at,
+        last_advanced_at=encounter.last_advanced_at,
+    )
+
+
+def serialize_public_encounter_state(state: EncounterState) -> PublicEncounterState:
+    return PublicEncounterState(
+        version=state.version,
+        pending_ids=list(state.pending_ids),
+        active_encounter_id=state.active_encounter_id,
+        encounters=[serialize_public_encounter(item) for item in state.encounters],
+        history=[item.model_copy(deep=True) for item in state.history],
+        debug_force_trigger=state.debug_force_trigger,
+        updated_at=state.updated_at,
+    )
 
 
 def _pending_entries(state: EncounterState) -> list[EncounterEntry]:
@@ -255,6 +396,79 @@ def _visible_participant_text(save, encounter: EncounterEntry) -> tuple[str, str
     return (" / ".join(team_members) or "none", " / ".join(npc_names) or "none")
 
 
+def _normalize_actor_name_key(name: object) -> str:
+    return "".join(str(name or "").split()).strip().lower()
+
+
+def _encounter_actor_name_suffix(actor_kind: str) -> str:
+    return "新NPC" if actor_kind == "new_npc" else "遭遇NPC"
+
+
+def _coerce_reserved_name_keys(
+    forbidden_names: Iterable[object] | None = None,
+    reserved_name_keys: set[str] | None = None,
+) -> set[str]:
+    keys = reserved_name_keys if reserved_name_keys is not None else set()
+    for item in forbidden_names or []:
+        key = _normalize_actor_name_key(item)
+        if key:
+            keys.add(key)
+    return keys
+
+
+def _make_unique_encounter_actor_name(
+    base_name: object,
+    *,
+    actor_kind: str,
+    forbidden_names: Iterable[object] | None = None,
+    reserved_name_keys: set[str] | None = None,
+    force_annotation: bool = False,
+) -> str:
+    clean = str(base_name or "").strip()
+    if not clean:
+        return ""
+    reserved_keys = _coerce_reserved_name_keys(forbidden_names, reserved_name_keys)
+    base_key = _normalize_actor_name_key(clean)
+    if not force_annotation and base_key and base_key not in reserved_keys:
+        reserved_keys.add(base_key)
+        return clean
+    suffix = _encounter_actor_name_suffix(actor_kind)
+    index = 1
+    while True:
+        label = suffix if index == 1 else f"{suffix}{index}"
+        candidate = f"{clean}（{label}）"
+        candidate_key = _normalize_actor_name_key(candidate)
+        if candidate_key and candidate_key not in reserved_keys:
+            reserved_keys.add(candidate_key)
+            return candidate
+        index += 1
+
+
+def _encounter_forbidden_actor_names(save) -> list[str]:
+    current_sub_zone_id = str(getattr(getattr(save, "area_snapshot", None), "current_sub_zone_id", "") or "")
+    current_sub = next(
+        (item for item in getattr(getattr(save, "area_snapshot", None), "sub_zones", []) if item.sub_zone_id == current_sub_zone_id),
+        None,
+    )
+    names: list[str] = []
+    seen_keys: set[str] = set()
+
+    def add(name: object) -> None:
+        clean = str(name or "").strip()
+        key = _normalize_actor_name_key(clean)
+        if not clean or not key or key in seen_keys:
+            return
+        seen_keys.add(key)
+        names.append(clean)
+
+    add(getattr(getattr(save, "player_static_data", None), "name", ""))
+    for member in getattr(getattr(save, "team_state", None), "members", []) or []:
+        add(getattr(member, "name", ""))
+    for area_npc in getattr(current_sub, "npcs", []) or []:
+        add(getattr(area_npc, "name", ""))
+    return names
+
+
 def _build_encounter_temp_npc(raw: dict[str, object], index: int) -> EncounterTemporaryNpc | None:
     name = _force_chinese_text(raw.get("name"), "", limit=24)
     if not name:
@@ -270,26 +484,82 @@ def _build_encounter_temp_npc(raw: dict[str, object], index: int) -> EncounterTe
         description=description,
         speaking_style=speaking_style,
         agenda=agenda,
+        knows_secret=bool(raw.get("knows_secret")),
         state="active",
     )
 
 
-def _sanitize_temporary_npcs(raw_list: object) -> list[EncounterTemporaryNpc]:
+def _sanitize_temporary_npcs(
+    raw_list: object,
+    *,
+    forbidden_names: Iterable[object] | None = None,
+    reserved_name_keys: set[str] | None = None,
+) -> list[EncounterTemporaryNpc]:
     if not isinstance(raw_list, list):
         return []
+    shared_reserved_keys = _coerce_reserved_name_keys(forbidden_names, reserved_name_keys)
     items: list[EncounterTemporaryNpc] = []
-    seen_names: set[str] = set()
+    name_counts: dict[str, int] = {}
+    for raw in raw_list:
+        if not isinstance(raw, dict):
+            continue
+        key = _normalize_actor_name_key(raw.get("name"))
+        if key:
+            name_counts[key] = name_counts.get(key, 0) + 1
     for index, raw in enumerate(raw_list):
         if len(items) >= 2:
             break
         if not isinstance(raw, dict):
             continue
         built = _build_encounter_temp_npc(raw, index)
-        if built is None or built.name in seen_names:
+        built_key = _normalize_actor_name_key(getattr(built, "name", "")) if built is not None else ""
+        if built is None or not built_key:
             continue
-        seen_names.add(built.name)
-        items.append(built)
+        unique_name = _make_unique_encounter_actor_name(
+            built.name,
+            actor_kind="temporary_npc",
+            forbidden_names=forbidden_names,
+            reserved_name_keys=shared_reserved_keys,
+            force_annotation=name_counts.get(built_key, 0) > 1,
+        )
+        if not unique_name:
+            continue
+        items.append(built.model_copy(update={"name": unique_name}))
     return items
+
+
+def _sanitize_new_npc_seed(
+    raw: object,
+    *,
+    forbidden_names: Iterable[object] | None = None,
+    reserved_name_keys: set[str] | None = None,
+) -> dict[str, object] | None:
+    if not isinstance(raw, dict):
+        return None
+    name = _force_chinese_text(raw.get("name"), "", limit=24)
+    if not name:
+        return None
+    unique_name = _make_unique_encounter_actor_name(
+        name,
+        actor_kind="new_npc",
+        forbidden_names=forbidden_names,
+        reserved_name_keys=reserved_name_keys,
+    )
+    if not unique_name:
+        return None
+    likes_raw = raw.get("likes") if isinstance(raw.get("likes"), list) else []
+    likes = [_force_chinese_text(item, "", limit=32) for item in likes_raw[:6]]
+    likes = [item for item in likes if item]
+    return {
+        "name": unique_name,
+        "title": _force_chinese_text(raw.get("title"), "", limit=40),
+        "description": _force_chinese_text(raw.get("description"), f"{unique_name}正被卷进眼前的遭遇。", limit=160),
+        "speaking_style": _force_chinese_text(raw.get("speaking_style"), "", limit=80),
+        "agenda": _force_chinese_text(raw.get("agenda"), f"{unique_name}想先处理现场最紧要的部分。", limit=120),
+        "appearance": _force_chinese_text(raw.get("appearance"), "", limit=80),
+        "alignment": _force_chinese_text(raw.get("alignment"), "", limit=40),
+        "likes": likes,
+    }
 
 
 def _check_bonus_from_result(action_result: ActionCheckResponse | None) -> int:
@@ -324,12 +594,17 @@ def _player_low_resources(save) -> bool:
 
 def _calculate_initial_situation_value(save, encounter: EncounterEntry) -> int:
     value = 50
-    reputation = get_current_sub_zone_reputation(save, create=True)
-    score = reputation.score if reputation is not None else 50
-    if score >= 70:
+    zone_metric = zone_metric_service.get_current_zone_metric(save, create=True)
+    reputation_score = zone_metric.reputation_score if zone_metric is not None else 50
+    danger_score = zone_metric.danger_score if zone_metric is not None else 50
+    if reputation_score >= 70:
         value += 10
-    elif score <= 30:
+    elif reputation_score <= 30:
         value -= 10
+    if danger_score >= 67:
+        value -= 8
+    elif danger_score <= 33:
+        value += 4
     tracked = next((item for item in save.quest_state.quests if item.status == "active" and item.is_tracked), None)
     if tracked is not None and (
         tracked.quest_id in encounter.related_quest_ids
@@ -347,7 +622,10 @@ def _calculate_initial_situation_value(save, encounter: EncounterEntry) -> int:
 
 
 def _refresh_participants(save, encounter: EncounterEntry) -> None:
-    participant_ids = [member.role_id for member in getattr(save.team_state, "members", [])]
+    participant_ids = [item for item in list(getattr(encounter, "participant_role_ids", []) or []) if str(item).strip()]
+    for member in getattr(save.team_state, "members", []):
+        if member.role_id not in participant_ids:
+            participant_ids.append(member.role_id)
     if encounter.npc_role_id and encounter.npc_role_id not in participant_ids:
         participant_ids.append(encounter.npc_role_id)
     for temp_npc in getattr(encounter, "temporary_npcs", []) or []:
@@ -363,6 +641,26 @@ def _initialize_encounter_state(save, encounter: EncounterEntry) -> None:
     encounter.situation_value = encounter.situation_start_value
     encounter.situation_trend = "stable"
     _refresh_participants(save, encounter)
+
+
+def _spawn_persistent_encounter_npc(save, encounter: EncounterEntry, seed: dict[str, object]) -> str:
+    role = spawn_persistent_scene_npc_in_save(
+        save,
+        name=str(seed.get("name") or ""),
+        title=str(seed.get("title") or ""),
+        description=str(seed.get("description") or ""),
+        speaking_style=str(seed.get("speaking_style") or ""),
+        agenda=str(seed.get("agenda") or ""),
+        appearance=str(seed.get("appearance") or ""),
+        alignment=str(seed.get("alignment") or ""),
+        likes=[str(item) for item in list(seed.get("likes") or [])],
+    )
+    if role.role_id not in encounter.participant_role_ids:
+        encounter.participant_role_ids.append(role.role_id)
+    if not encounter.npc_role_id:
+        encounter.npc_role_id = role.role_id
+    _refresh_participants(save, encounter)
+    return role.role_id
 
 
 def _situation_result(encounter: EncounterEntry) -> str:
@@ -407,6 +705,8 @@ def _sanitize_outcome_package(encounter: EncounterEntry, package: EncounterOutco
     return EncounterOutcomePackage(
         result=result,  # type: ignore[arg-type]
         reputation_delta=rep_delta,
+        zone_reputation_delta=rep_delta,
+        zone_danger_delta=(_clamp(int(package.zone_danger_delta or 0), -12, 12) if int(package.zone_danger_delta or 0) != 0 else (-4 if result == "success" else 6)),
         npc_relation_deltas=[
             EncounterOutcomeChange(
                 target_id=item.target_id,
@@ -453,6 +753,8 @@ def _fallback_outcome_package(save, encounter: EncounterEntry) -> EncounterOutco
     return EncounterOutcomePackage(
         result=result,  # type: ignore[arg-type]
         reputation_delta=(rep_abs if result == "success" else -rep_abs),
+        zone_reputation_delta=(rep_abs if result == "success" else -rep_abs),
+        zone_danger_delta=(-4 if result == "success" else 6),
         npc_relation_deltas=(
             [EncounterOutcomeChange(target_id=encounter.npc_role_id, delta=relation_delta, summary="遭遇结果影响了关键 NPC 对玩家的判断。")]
             if encounter.npc_role_id
@@ -475,17 +777,28 @@ def _fallback_outcome_package(save, encounter: EncounterEntry) -> EncounterOutco
 
 def _apply_outcome_package(save, session_id: str, encounter: EncounterEntry, package: EncounterOutcomePackage) -> list[str]:
     applied_summaries: list[str] = []
-    if package.reputation_delta:
-        entry, _ = apply_sub_zone_reputation_delta(
+    zone_rep_delta = int(package.zone_reputation_delta or package.reputation_delta or 0)
+    if zone_rep_delta:
+        entry, _ = zone_metric_service.apply_zone_reputation_delta(
             save,
             session_id=session_id,
-            delta=_clamp(package.reputation_delta, -12, 12),
+            delta=_clamp(zone_rep_delta, -12, 12),
             reason=f"遭遇《{encounter.title}》结算",
             append_scene_event=False,
             append_log=True,
         )
         if entry is not None:
-            applied_summaries.append(f"区域声望 {package.reputation_delta:+d} -> {entry.score}/100")
+            applied_summaries.append(f"大区块名声 {zone_rep_delta:+d} -> {entry.reputation_score}/100")
+    zone_danger_delta = int(package.zone_danger_delta or 0)
+    if zone_danger_delta:
+        entry = zone_metric_service.apply_zone_danger_delta(
+            save,
+            session_id=session_id,
+            delta=_clamp(zone_danger_delta, -12, 12),
+            reason=f"遭遇《{encounter.title}》结算",
+        )
+        if entry is not None:
+            applied_summaries.append(f"大区块危险 {zone_danger_delta:+d} -> {entry.danger_score}/100")
     for change in package.npc_relation_deltas:
         role = next((item for item in save.role_pool if item.role_id == change.target_id), None)
         if role is None:
@@ -561,6 +874,7 @@ def _append_step(
     actor_type: str = "system",
     actor_id: str = "",
     actor_name: str = "",
+    metadata: dict[str, Any] | None = None,
 ) -> EncounterStepEntry:
     step = EncounterStepEntry(
         step_id=_new_id("estep"),
@@ -569,6 +883,7 @@ def _append_step(
         actor_id=actor_id,
         actor_name=actor_name,
         content=content,
+        metadata=metadata or {},
     )
     encounter.steps.append(step)
     encounter.steps = encounter.steps[-40:]
@@ -608,6 +923,7 @@ def _default_termination_conditions(encounter_type: str) -> list[EncounterTermin
                 description="遭遇核心目标被处理、确认或排除。",
             ),
         )
+    conditions = [item for item in conditions if item.kind != "player_escapes"]
     return conditions
 
 
@@ -738,10 +1054,6 @@ def _fallback_encounter(save, trigger_kind: str) -> EncounterEntry:
     zone_name, sub_name, zone_id, sub_zone_id = _current_area_data(save)
     active_quests = _active_quests(save)
     phase = _current_fate_phase(save)
-    global_pref = prompt_table.get_text(
-        "encounter.global.preference",
-        "默认遭遇：抢劫、可疑NPC、异常痕迹、遗落宝箱。偏好偏向奇幻冒险和轻度悬疑。",
-    )
 
     if active_quests:
         quest = active_quests[0]
@@ -752,7 +1064,7 @@ def _fallback_encounter(save, trigger_kind: str) -> EncounterEntry:
                 trigger_kind=("fate_rule" if quest.source == "fate" else "quest_rule"),
                 encounter_mode="standard",
                 title=f"与【{quest.title}】相关的异动",
-                description=f"你在【{zone_name}/{sub_name}】察觉到一场与任务【{quest.title}】有关的异动。{global_pref[:36]}",
+                description=f"你在【{zone_name}/{sub_name}】察觉到一场与任务【{quest.title}】有关的异动。",
                 zone_id=zone_id,
                 sub_zone_id=sub_zone_id,
                 related_quest_ids=[quest.quest_id],
@@ -769,7 +1081,7 @@ def _fallback_encounter(save, trigger_kind: str) -> EncounterEntry:
             trigger_kind="fate_rule",
             encounter_mode="standard",
             title=f"命运相位：{phase.title}",
-            description=f"【{zone_name}/{sub_name}】出现与你的命运阶段【{phase.title}】有关的异常迹象。{global_pref[:36]}",
+            description=f"【{zone_name}/{sub_name}】出现与你的命运阶段【{phase.title}】有关的异常迹象。",
             zone_id=zone_id,
             sub_zone_id=sub_zone_id,
             related_fate_phase_ids=[phase.phase_id],
@@ -785,15 +1097,37 @@ def _fallback_encounter(save, trigger_kind: str) -> EncounterEntry:
     ]
     idx = 0 if trigger_kind == "random_move" else 1
     typ, title, description = base_templates[idx if idx < len(base_templates) else 0]
+    npc_role_id = None
+    if typ == "npc":
+        existing_role = next(
+            (
+                role
+                for role in save.role_pool
+                if role.sub_zone_id == sub_zone_id and role.state != "in_team"
+            ),
+            None,
+        )
+        if existing_role is None:
+            existing_role = spawn_persistent_scene_npc_in_save(
+                save,
+                name=f"{sub_name}来客",
+                title="突然现身的陌生人",
+                description=f"这名陌生人看起来并不属于【{sub_name}】，却在此刻突然闯进了现场。",
+                agenda="先确认眼前局势里最危险的变化。",
+            )
+        npc_role_id = existing_role.role_id
+        if existing_role.name not in title:
+            title = f"{existing_role.name}: {title}"
     return EncounterEntry(
         encounter_id=_new_id("enc"),
         type=typ,  # type: ignore[arg-type]
         trigger_kind=trigger_kind if trigger_kind in {"random_move", "random_dialog", "scripted", "quest_rule", "fate_rule", "debug_forced"} else "random_move",  # type: ignore[arg-type]
         encounter_mode=("npc_initiated_chat" if typ == "npc" and trigger_kind == "random_dialog" else "standard"),
         title=title,
-        description=f"{description}{global_pref[:28]}",
+        description=description,
         zone_id=zone_id,
         sub_zone_id=sub_zone_id,
+        npc_role_id=npc_role_id,
         generated_prompt_tags=[zone_name, sub_name, typ],
         scene_summary=f"{zone_name}/{sub_name} 里突发了一件需要立刻回应的事。",
         termination_conditions=_default_termination_conditions(typ),
@@ -808,20 +1142,27 @@ def _ai_generate_encounter(save, trigger_kind: str, config: ChatConfig | None) -
     if not api_key or not model:
         return None
     zone_name, sub_name, zone_id, sub_zone_id = _current_area_data(save)
+    zone_metric = zone_metric_service.get_zone_metric_entry(save, zone_id=zone_id, zone_name=zone_name, create=True)
+    zone_metric_text = (
+        f"大区块名声={zone_metric.reputation_score}/100({zone_metric.reputation_band})；"
+        f"危险={zone_metric.danger_score}/100({zone_metric.danger_band})"
+        if zone_metric is not None
+        else "大区块名声=50/100(neutral)；危险=50/100(medium)"
+    )
     quest_titles = " / ".join(item.title for item in _active_quests(save)) or "无活动任务"
     phase = _current_fate_phase(save)
     phase_title = phase.title if phase is not None else "无命运阶段"
     default_prompt = (
         "你是跑团遭遇设计器，只输出 JSON。"
         "结构：{\"type\":\"npc|event|anomaly\",\"title\":\"\",\"description\":\"\",\"tags\":[\"\"]}。"
-        "全局遭遇偏好=$global_pref。区域=$zone_name/$sub_name。触发原因=$trigger_kind。活动任务=$quest_titles。当前命运阶段=$phase_title。"
+        "区域=$zone_name/$sub_name。$zone_metric_text。触发原因=$trigger_kind。活动任务=$quest_titles。当前命运阶段=$phase_title。"
     )
     prompt = prompt_table.render(
         PromptKeys.ENCOUNTER_GENERATE_USER,
         default_prompt,
-        global_pref=prompt_table.get_text("encounter.global.preference", "奇幻冒险、随机异象、可疑NPC、宝箱与伏击。"),
         zone_name=zone_name,
         sub_name=sub_name,
+        zone_metric_text=zone_metric_text,
         trigger_kind=trigger_kind,
         quest_titles=quest_titles,
         phase_title=phase_title,
@@ -829,7 +1170,7 @@ def _ai_generate_encounter(save, trigger_kind: str, config: ChatConfig | None) -
     try:
         client = create_sync_client(config, client_cls=OpenAI)
         resp = client.chat.completions.create(
-            model=model,
+            model=config.model,
             **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
@@ -837,10 +1178,24 @@ def _ai_generate_encounter(save, trigger_kind: str, config: ChatConfig | None) -
                 {"role": "user", "content": prompt},
             ],
         )
-        parsed = _extract_json_content((resp.choices[0].message.content or "").strip())
-        typ = str(parsed.get("type") or "event").strip().lower()
-        if typ not in {"npc", "event", "anomaly"}:
-            typ = "event"
+        raw_json = (resp.choices[0].message.content or "").strip() or "{}"
+        parsed = _extract_json_content(raw_json)
+        parsed = validate_or_repair_json_payload(
+            parsed=parsed,
+            raw_json=raw_json,
+            fields=(
+                EnumContractField(field_path="type", allowed_ids=("npc", "event", "anomaly")),
+                EnumContractField(
+                    field_path="termination_conditions[].kind",
+                    allowed_ids=("npc_leaves", "player_escapes", "target_resolved", "time_elapsed", "manual_custom"),
+                    required=False,
+                ),
+            ),
+            config=config,
+            system_prompt=prompt_table.get_text("encounter.generate.system", "Return JSON only."),
+            original_prompt=prompt,
+        )
+        typ = str(parsed.get("type") or "").strip().lower()
         title = str(parsed.get("title") or "").strip()
         description = str(parsed.get("description") or "").strip()
         tags = parsed.get("tags") if isinstance(parsed.get("tags"), list) else []
@@ -865,16 +1220,19 @@ def _ai_generate_encounter(save, trigger_kind: str, config: ChatConfig | None) -
 
 
 def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig | None) -> EncounterEntry | None:
-    if config is None:
-        return None
-    api_key = (config.openai_api_key or "").strip()
-    model = (config.model or "").strip()
-    if not api_key or not model:
-        return None
+    config = require_ai_config(config)
 
     zone_name, sub_name, zone_id, sub_zone_id = _current_area_data(save)
+    zone_metric = zone_metric_service.get_zone_metric_entry(save, zone_id=zone_id, zone_name=zone_name, create=True)
+    zone_metric_text = (
+        f"当前大区块名声={zone_metric.reputation_score}/100({zone_metric.reputation_band})；"
+        f"危险={zone_metric.danger_score}/100({zone_metric.danger_band})"
+        if zone_metric is not None
+        else "当前大区块名声=50/100(neutral)；危险=50/100(medium)"
+    )
     snapshot = build_global_story_snapshot(save)
     entity_index = build_entity_index(save, scope="current_zone")
+    forbidden_actor_names = _encounter_forbidden_actor_names(save)
     allowed_npc_ids = set(snapshot.available_npc_ids)
     allowed_zone_ids = set(entity_index.zone_ids)
     allowed_sub_zone_ids = set(entity_index.sub_zone_ids)
@@ -886,18 +1244,21 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
     default_prompt = (
         "你要设计一个持续型跑团遭遇，且只能返回 JSON。\n"
         "所有可见文本字段都必须使用简体中文，不允许输出英文标题、英文描述或英文叙事。\n"
-        "Schema: {\"type\":\"npc|event|anomaly\",\"title\":\"\",\"description\":\"\",\"npc_role_id\":\"optional\",\"temporary_npcs\":[{\"name\":\"\",\"title\":\"\",\"description\":\"\",\"speaking_style\":\"\",\"agenda\":\"\"}],\"scene_summary\":\"\",\"termination_conditions\":[{\"kind\":\"npc_leaves|player_escapes|target_resolved|time_elapsed|manual_custom\",\"description\":\"\"}],\"tags\":[\"\"]}。\n"
-        "若 type=npc，则 npc_role_id 必填，且只能从允许列表中选择。\n"
+        "Schema: {\"type\":\"npc|event|anomaly\",\"title\":\"\",\"description\":\"\",\"npc_role_id\":\"optional\",\"new_npc\":{\"name\":\"\",\"title\":\"\",\"description\":\"\",\"speaking_style\":\"\",\"agenda\":\"\",\"appearance\":\"\",\"alignment\":\"\",\"likes\":[\"\"]},\"temporary_npcs\":[{\"name\":\"\",\"title\":\"\",\"description\":\"\",\"speaking_style\":\"\",\"agenda\":\"\"}],\"scene_summary\":\"\",\"termination_conditions\":[{\"kind\":\"npc_leaves|player_escapes|target_resolved|time_elapsed|manual_custom\",\"description\":\"\"}],\"tags\":[\"\"]}。\n"
+        "若 type=npc，优先使用 npc_role_id；若当前现场没有合适已有 NPC，则提供 new_npc；仍不适合常驻时才提供 temporary_npcs。\n"
+        "new_npc 会创建为当前子区块的常驻 NPC，可继续参与后续公开场景与遭遇。\n"
         "temporary_npcs 用于遭遇现场临时出现的 NPC，只在这次遭遇中存在，最多 2 名。\n"
         "禁止编造 npc id、zone id、sub-zone id、quest id 或 fate phase id。\n"
-        "遭遇需要有立刻发生的现场感，title、description、scene_summary 和 termination_conditions.description 都必须是简体中文。"
+        "遭遇需要有立刻发生的现场感，title、description、scene_summary 和 termination_conditions.description 都必须是简体中文。\n"
+        "大区块名声越差，区域 NPC 默认态度越冷淡或敌对；名声越好，默认态度越友好。\n"
+        "大区块危险越低，越适合日常、友好、轻松遭遇；危险越高，越适合冲突、威胁、危险遭遇。"
     )
     prompt = prompt_table.render(
         PromptKeys.ENCOUNTER_GENERATE_USER,
         default_prompt,
-        global_pref=prompt_table.get_text("encounter.global.preference", "奇幻遭遇"),
         zone_name=zone_name,
         sub_name=sub_name,
+        zone_metric_text=zone_metric_text,
         trigger_kind=trigger_kind,
         current_fate_id=snapshot.current_fate_id or "none",
         current_fate_phase_id=snapshot.current_fate_phase_id or "none",
@@ -908,11 +1269,30 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
         allowed_fate_phase_ids=_prompt_list(sorted(allowed_fate_phase_ids)),
         visible_npcs=_prompt_list([f"{npc.role_id}:{npc.name}" for npc in snapshot.available_npcs]),
         active_quests=_prompt_list([f"{quest.quest_id}:{quest.title}" for quest in snapshot.active_quests]),
+        team_member_names=_prompt_list([member.name for member in getattr(save.team_state, "members", []) if str(getattr(member, "name", "") or "").strip()]),
+        forbidden_actor_names=_prompt_list(forbidden_actor_names),
     )
+    prompt = (
+        f"{prompt}\nAllowed enum ids:\n"
+        f"{render_enum_pool_text((EnumContractField(field_path='type', allowed_ids=('npc', 'event', 'anomaly')), EnumContractField(field_path='termination_conditions[].kind', allowed_ids=('npc_leaves', 'player_escapes', 'target_resolved', 'time_elapsed', 'manual_custom'), required=False)))}\n"
+        "Use only the allowed stable ids for type and termination_conditions[].kind.\n"
+        "Name rules:\n"
+        "- Do not create new_npc or temporary_npcs with the same display name as the player, any active team member, or any currently visible NPC.\n"
+        "- If an existing visible NPC already fits the encounter, use npc_role_id instead of creating a same-name NPC.\n"
+        f"- Active team member names: {_prompt_list([member.name for member in getattr(save.team_state, 'members', []) if str(getattr(member, 'name', '') or '').strip()])}\n"
+        f"- Forbidden display names for new_npc/temporary_npcs: {_prompt_list(forbidden_actor_names)}"
+    )
+    debug_log = current_generation_debug_log()
+    if debug_log is not None:
+        debug_log.record(
+            "encounter_generation_started",
+            "starting guarded encounter generation",
+            {"trigger_kind": trigger_kind, "zone_name": zone_name, "sub_name": sub_name},
+        )
     try:
         client = create_sync_client(config, client_cls=OpenAI)
         resp = client.chat.completions.create(
-            model=model,
+            model=config.model,
             **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
@@ -920,12 +1300,29 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
                 {"role": "user", "content": prompt},
             ],
         )
-        parsed = _extract_json_content((resp.choices[0].message.content or "").strip())
-        typ = str(parsed.get("type") or "event").strip().lower()
-        if typ not in {"npc", "event", "anomaly"}:
-            typ = "event"
+        raw_json = (resp.choices[0].message.content or "").strip() or "{}"
+        parsed = _extract_json_content(raw_json)
+        with allow_protocol_repair():
+            parsed = validate_or_repair_json_payload(
+                parsed=parsed,
+                raw_json=raw_json,
+                fields=(
+                    EnumContractField(field_path="type", allowed_ids=("npc", "event", "anomaly")),
+                    EnumContractField(
+                        field_path="termination_conditions[].kind",
+                        allowed_ids=("npc_leaves", "player_escapes", "target_resolved", "time_elapsed", "manual_custom"),
+                        required=False,
+                    ),
+                ),
+                config=config,
+                system_prompt=prompt_table.get_text("encounter.generate.system", "Return JSON only."),
+                original_prompt=prompt,
+            )
+        typ = str(parsed.get("type") or "").strip().lower()
         title = _force_chinese_text(parsed.get("title"), fallback_encounter.title, limit=80)
         description = _force_chinese_text(parsed.get("description"), fallback_encounter.description, limit=240)
+        goal = _force_chinese_text(parsed.get("goal"), fallback_encounter.goal or "完成眼前遭遇的核心目标。", limit=160)
+        secret = _force_chinese_text(parsed.get("secret"), fallback_encounter.secret or description, limit=240)
         scene_summary = _force_chinese_text(
             parsed.get("scene_summary"),
             fallback_encounter.scene_summary or fallback_encounter.description,
@@ -934,11 +1331,32 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
         tags = parsed.get("tags") if isinstance(parsed.get("tags"), list) else []
         clean_tags = [str(item).strip()[:40] for item in tags[:6] if str(item).strip()]
         if not title or not description:
-            return None
+            raise ValueError(AI_PROTOCOL_REPAIR_FAILED)
 
         entity_refs: list[EntityRef] = []
         npc_role_id = _sanitize_allowed_id(parsed.get("npc_role_id"), allowed_npc_ids)
-        temporary_npcs = _sanitize_temporary_npcs(parsed.get("temporary_npcs"))
+        reserved_name_keys = _coerce_reserved_name_keys(forbidden_actor_names)
+        new_npc = _sanitize_new_npc_seed(
+            parsed.get("new_npc"),
+            forbidden_names=forbidden_actor_names,
+            reserved_name_keys=reserved_name_keys,
+        )
+        temporary_npcs = _sanitize_temporary_npcs(
+            parsed.get("temporary_npcs"),
+            forbidden_names=forbidden_actor_names,
+            reserved_name_keys=reserved_name_keys,
+        )
+        if debug_log is not None:
+            debug_log.record(
+                "encounter_generation_model_parsed",
+                "encounter model output parsed",
+                {
+                    "type": typ,
+                    "npc_role_id": npc_role_id,
+                    "temporary_npcs_count": len(temporary_npcs),
+                    "has_new_npc": new_npc is not None,
+                },
+            )
         termination_conditions_raw = parsed.get("termination_conditions") if isinstance(parsed.get("termination_conditions"), list) else []
         termination_conditions: list[EncounterTerminationCondition] = []
         for raw in termination_conditions_raw[:5]:
@@ -946,8 +1364,6 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
                 continue
             kind = str(raw.get("kind") or "").strip()
             description_text = _force_chinese_text(raw.get("description"), "", limit=160)
-            if kind not in {"npc_leaves", "player_escapes", "target_resolved", "time_elapsed", "manual_custom"}:
-                continue
             if not description_text:
                 continue
             termination_conditions.append(
@@ -957,13 +1373,43 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
                     description=description_text,
                 )
             )
+        spawned_new_npc = False
+        used_temporary_npc = False
         if typ == "npc":
-            if not npc_role_id:
-                return None
+            if not npc_role_id and new_npc is not None:
+                npc_role_id = _spawn_persistent_encounter_npc(save, fallback_encounter, new_npc)
+                spawned_new_npc = True
+            if not npc_role_id and temporary_npcs:
+                used_temporary_npc = True
+            if not npc_role_id and not temporary_npcs:
+                if debug_log is not None:
+                    debug_log.record(
+                        "encounter_generation_fallback",
+                        "npc encounter missing npc carrier",
+                        {"reason": "npc_type_missing_npc_role_id_new_npc_and_temporary_npcs"},
+                    )
+                raise ValueError(AI_PROTOCOL_REPAIR_FAILED)
             npc_name = next((item.name for item in save.role_pool if item.role_id == npc_role_id), npc_role_id)
-            if npc_name not in title:
+            if npc_role_id and npc_name and npc_name not in title:
                 title = f"{npc_name}: {title}"
+            if npc_role_id:
+                entity_refs.append(EntityRef(entity_type="npc", entity_id=npc_role_id, label=npc_name))
+        elif new_npc is not None:
+            npc_role_id = _spawn_persistent_encounter_npc(save, fallback_encounter, new_npc)
+            spawned_new_npc = True
+            npc_name = next((item.name for item in save.role_pool if item.role_id == npc_role_id), npc_role_id)
             entity_refs.append(EntityRef(entity_type="npc", entity_id=npc_role_id, label=npc_name))
+        if debug_log is not None:
+            debug_log.record(
+                "encounter_generation_salvage_applied",
+                "applied encounter npc salvage",
+                {
+                    "used_existing_npc": bool(npc_role_id and not spawned_new_npc),
+                    "spawned_new_persistent_npc": spawned_new_npc,
+                    "used_temporary_npc": used_temporary_npc,
+                    "npc_role_id": npc_role_id,
+                },
+            )
 
         encounter = EncounterEntry(
             encounter_id=_new_id("enc"),
@@ -972,6 +1418,8 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
             encounter_mode=("npc_initiated_chat" if typ == "npc" and trigger_kind == "random_dialog" else "standard"),
             title=title,
             description=description,
+            goal=goal,
+            secret=secret,
             zone_id=zone_id,
             sub_zone_id=sub_zone_id,
             npc_role_id=npc_role_id or None,
@@ -982,10 +1430,17 @@ def _ai_generate_encounter_guarded(save, trigger_kind: str, config: ChatConfig |
             scene_summary=scene_summary,
             termination_conditions=termination_conditions or _default_termination_conditions(typ),
         )
+        if spawned_new_npc and npc_role_id:
+            if npc_role_id not in encounter.participant_role_ids:
+                encounter.participant_role_ids.append(npc_role_id)
         encounter.entity_refs = extract_entity_refs_from_encounter(encounter) + entity_refs
         return encounter
-    except Exception:
-        return None
+    except ValueError:
+        raise
+    except Exception as exc:
+        if debug_log is not None:
+            debug_log.record("encounter_generation_error", str(exc))
+        raise ValueError(f"{AI_PROVIDER_CALL_FAILED}: {exc}") from exc
 
 
 def get_pending_encounters(session_id: str) -> EncounterPendingResponse:
@@ -996,7 +1451,12 @@ def get_pending_encounters(session_id: str) -> EncounterPendingResponse:
     state = _state(save)
     pending = _pending_entries(state)
     active = _current_active_encounter(state)
-    return EncounterPendingResponse(session_id=session_id, encounter_state=state, pending=pending, active_encounter=active)
+    return EncounterPendingResponse(
+        session_id=session_id,
+        encounter_state=serialize_public_encounter_state(state),
+        pending=[serialize_public_encounter(item) for item in pending],
+        active_encounter=(serialize_public_encounter(active) if active is not None else None),
+    )
 
 
 def get_encounter_history(session_id: str) -> EncounterHistoryResponse:
@@ -1024,6 +1484,7 @@ def check_for_encounter(req: EncounterCheckRequest) -> EncounterCheckResponse:
     save.session_id = req.session_id
     state = _state(save)
     world_state = ensure_world_state(save)
+    debug_log = current_generation_debug_log()
     if _current_active_encounter(state) is not None:
         return EncounterCheckResponse(ok=True, generated=False, blocked_by_higher_priority_modal=_has_pending_quest(save))
 
@@ -1040,7 +1501,7 @@ def check_for_encounter(req: EncounterCheckRequest) -> EncounterCheckResponse:
     if not should_trigger:
         return EncounterCheckResponse(ok=True, generated=False, blocked_by_higher_priority_modal=_has_pending_quest(save))
 
-    encounter = _ai_generate_encounter_guarded(save, req.trigger_kind, req.config) or _fallback_encounter(save, req.trigger_kind)
+    encounter = _ai_generate_encounter_guarded(save, req.trigger_kind, req.config)
     encounter.source_world_revision = world_state.world_revision
     encounter.source_map_revision = world_state.map_revision
     encounter.situation_start_value = _calculate_initial_situation_value(save, encounter)
@@ -1074,14 +1535,30 @@ def check_for_encounter(req: EncounterCheckRequest) -> EncounterCheckResponse:
             "description": encounter.description,
         },
     )
+    if debug_log is not None:
+        debug_log.record(
+            "encounter_generated",
+            "encounter queued",
+            {
+                "encounter_id": encounter.encounter_id,
+                "type": encounter.type,
+                "npc_role_id": encounter.npc_role_id,
+                "temporary_npcs_count": len(encounter.temporary_npcs),
+                "participant_role_ids": list(encounter.participant_role_ids),
+            },
+        )
     save_current(save)
     return EncounterCheckResponse(
         ok=True,
         generated=True,
         encounter_id=encounter.encounter_id,
         blocked_by_higher_priority_modal=_has_pending_quest(save),
-        encounter=encounter,
+        encounter=serialize_public_encounter(encounter),
     )
+
+
+def check_for_encounter_in_save(req: EncounterCheckRequest) -> EncounterCheckResponse:
+    return check_for_encounter(req)
 
 
 def present_encounter(encounter_id: str, req: EncounterPresentRequest) -> EncounterPresentResponse:
@@ -1091,7 +1568,7 @@ def present_encounter(encounter_id: str, req: EncounterPresentRequest) -> Encoun
     encounter = _find_encounter(state, encounter_id)
     if encounter.invalidated_reason or encounter.status == "invalidated":
         raise ValueError("ENCOUNTER_INVALIDATED")
-    if encounter.status not in {"queued", "active", "escaped"}:
+    if encounter.status not in {"queued", "active"}:
         raise ValueError("ENCOUNTER_INVALID_STATUS")
     if encounter.status == "queued":
         encounter.status = "active"
@@ -1103,7 +1580,7 @@ def present_encounter(encounter_id: str, req: EncounterPresentRequest) -> Encoun
             encounter.termination_conditions = _default_termination_conditions(encounter.type)
         encounter.scene_summary = encounter.scene_summary or encounter.description
         encounter.latest_outcome_summary = f"就在这时，{encounter.description}"
-        _append_step(encounter, kind="announcement", content=encounter.latest_outcome_summary)
+        _append_step(encounter, kind="announcement", content=encounter.scene_summary)
         _append_game_log(
             save,
             req.session_id,
@@ -1123,7 +1600,7 @@ def present_encounter(encounter_id: str, req: EncounterPresentRequest) -> Encoun
         session_id=req.session_id,
         encounter_id=encounter.encounter_id,
         status=encounter.status,
-        encounter=encounter,
+        encounter=serialize_public_encounter(encounter),
     )
 
 
@@ -1272,12 +1749,7 @@ def _legacy_unused_resolve_fallback_reply_v1(encounter: EncounterEntry, player_p
 
 def _legacy_unused_ai_resolve_encounter_v1(encounter: EncounterEntry, req: EncounterActRequest) -> dict[str, object] | None:
     config = req.config
-    if config is None:
-        return None
-    api_key = (config.openai_api_key or "").strip()
-    model = (config.model or "").strip()
-    if not api_key or not model:
-        return None
+    config = require_ai_config(config)
     fallback_reply, fallback_minutes = _resolve_fallback_reply(encounter, req.player_prompt)
     save = get_current_save(default_session_id=req.session_id)
     team_members, visible_npcs = _visible_participant_text(save, encounter)
@@ -1312,7 +1784,7 @@ def _legacy_unused_ai_resolve_encounter_v1(encounter: EncounterEntry, req: Encou
     try:
         client = create_sync_client(config, client_cls=OpenAI)
         resp = client.chat.completions.create(
-            model=model,
+            model=config.model,
             **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
@@ -1381,17 +1853,13 @@ def act_on_encounter(encounter_id: str, req: EncounterActRequest) -> EncounterAc
     encounter = _find_encounter(state, encounter_id)
     if encounter.invalidated_reason or encounter.status == "invalidated":
         raise ValueError("ENCOUNTER_INVALIDATED")
-    if encounter.status not in {"queued", "active", "escaped"}:
+    if encounter.status not in {"queued", "active"}:
         raise ValueError("ENCOUNTER_INVALID_STATUS")
     if encounter.status == "queued":
         encounter.status = "active"
         encounter.presented_at = _utc_now()
         encounter.player_presence = "engaged"
         _initialize_encounter_state(save, encounter)
-    if encounter.status == "escaped":
-        encounter.status = "active"
-        encounter.player_presence = "engaged"
-        state.active_encounter_id = encounter.encounter_id
     if encounter.presented_at is None:
         _initialize_encounter_state(save, encounter)
 
@@ -1404,22 +1872,16 @@ def act_on_encounter(encounter_id: str, req: EncounterActRequest) -> EncounterAc
         content=req.player_prompt.strip(),
     )
     resolved = _ai_resolve_encounter(encounter, req)
-    if resolved is None:
-        reply, time_spent_min = _resolve_fallback_reply(encounter, req.player_prompt)
-        next_scene_summary, termination_updates, step_kind = _fallback_step_updates(encounter, req.player_prompt)
-        situation_delta_hint = _fallback_situation_delta(encounter, req.player_prompt)
-    else:
-        reply = str(resolved.get("reply") or "").strip()
-        time_spent_min = max(1, min(30, int(resolved.get("time_spent_min") or 1)))
-        next_scene_summary = str(resolved.get("scene_summary") or "").strip() or encounter.scene_summary or encounter.description
-        termination_updates = resolved.get("termination_updates") if isinstance(resolved.get("termination_updates"), list) else []
-        step_kind = str(resolved.get("step_kind") or "gm_update")
-        situation_delta_hint = _clamp(int(resolved.get("situation_delta_hint") or 0), -8, 8)
+    reply = str(resolved.get("reply") or "").strip()
+    time_spent_min = max(1, min(30, int(resolved.get("time_spent_min") or 1)))
+    next_scene_summary = str(resolved.get("scene_summary") or "").strip() or encounter.scene_summary or encounter.description
+    termination_updates = resolved.get("termination_updates") if isinstance(resolved.get("termination_updates"), list) else []
+    step_kind = str(resolved.get("step_kind") or "gm_update")
+    situation_delta_hint = _clamp(int(resolved.get("situation_delta_hint") or 0), -8, 8)
     if save.area_snapshot.clock is None:
         save.area_snapshot.clock = _default_world_clock()
     save.area_snapshot.clock = _advance_clock(save.area_snapshot.clock, time_spent_min)
     encounter.scene_summary = next_scene_summary
-    encounter.latest_outcome_summary = reply
     encounter.last_advanced_at = _utc_now()
     _append_step(encounter, kind=step_kind, content=reply)
     _apply_termination_updates(encounter, termination_updates)
@@ -1499,9 +1961,9 @@ def act_on_encounter(encounter_id: str, req: EncounterActRequest) -> EncounterAc
         status=encounter.status,
         reply=reply,
         time_spent_min=time_spent_min,
-        encounter=encounter,
+        encounter=serialize_public_encounter(encounter),
         resolution=resolution,
-        encounter_state=state,
+        encounter_state=serialize_public_encounter_state(state),
     )
 
 
@@ -1792,11 +2254,77 @@ def _legacy_unused_apply_active_encounter_situation_delta_in_save_v1(
     return events
 
 
+def _escape_encounter_in_save(save, encounter: EncounterEntry, *, session_id: str, config: ChatConfig | None = None) -> EncounterEscapeResponse:
+    if encounter.status != "active" or encounter.player_presence != "engaged":
+        raise ValueError("ENCOUNTER_INVALID_STATUS")
+
+    from app.models.schemas import ActionCheckRequest
+    from app.services.world_service import action_check
+
+    action_result: ActionCheckResponse = action_check(
+        ActionCheckRequest(
+            session_id=session_id,
+            action_type="check",
+            action_prompt=f"encounter_escape; encounter_id={encounter.encounter_id}; title={encounter.title}",
+            actor_role_id=save.player_static_data.player_id,
+            allow_backend_roll=True,
+            config=config,
+        )
+    )
+    state = _state(save)
+    escape_success = bool(action_result.success)
+    if escape_success:
+        encounter.status = "escaped"
+        encounter.player_presence = "away"
+        state.active_encounter_id = encounter.encounter_id
+        reply = f"你暂时从《{encounter.title}》里抽身离开，但事件仍在你身后继续发展。"
+        for index, condition in enumerate(encounter.termination_conditions):
+            if condition.kind == "player_escapes":
+                _apply_termination_updates(encounter, [{"condition_index": index, "satisfied": True}])
+                break
+    else:
+        reply = f"你试图从《{encounter.title}》里脱身，但局势没有给你留下完整的脱离空档。"
+    encounter.latest_outcome_summary = reply
+    encounter.last_advanced_at = _utc_now()
+    _append_step(
+        encounter,
+        kind="escape_attempt",
+        content=reply,
+        metadata={
+            "impact_summary": ("成功脱离当前遭遇" if escape_success else "未能脱离当前遭遇"),
+            "affects_encounter": True,
+            "source_kind": "escape_attempt",
+        },
+    )
+    _append_game_log(
+        save,
+        session_id,
+        "encounter_escape",
+        reply,
+        {"encounter_id": encounter.encounter_id, "escape_success": escape_success},
+    )
+    _touch_state(state)
+    return EncounterEscapeResponse(
+        session_id=session_id,
+        encounter_id=encounter.encounter_id,
+        status=encounter.status,
+        reply=reply,
+        time_spent_min=action_result.time_spent_min,
+        escape_success=escape_success,
+        encounter=encounter,
+        encounter_state=state,
+        action_check=action_result,
+    )
+
+
 def escape_encounter(encounter_id: str, req: EncounterEscapeRequest) -> EncounterEscapeResponse:
     save = get_current_save(default_session_id=req.session_id)
     save.session_id = req.session_id
     state = _state(save)
     encounter = _find_encounter(state, encounter_id)
+    response = _escape_encounter_in_save(save, encounter, session_id=req.session_id, config=req.config)
+    save_current(save)
+    return response
     if encounter.status != "active" or encounter.player_presence != "engaged":
         raise ValueError("ENCOUNTER_INVALID_STATUS")
 

@@ -261,9 +261,8 @@ class ConsistencyServiceTests(unittest.TestCase):
         )
 
         with patch("app.services.encounter_service.OpenAI", return_value=client):
-            encounter = _ai_generate_encounter_guarded(save, "random_dialog", self._test_config())
-
-        self.assertIsNone(encounter)
+            with self.assertRaisesRegex(ValueError, "AI_PROTOCOL_REPAIR_FAILED"):
+                _ai_generate_encounter_guarded(save, "random_dialog", self._test_config())
 
 
 if __name__ == "__main__":

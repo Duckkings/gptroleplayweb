@@ -1,0 +1,258 @@
+{
+  "version": "0.1.0",
+  "items": [
+    {
+      "item_instance_id": "role_npc_1_npc_1_weapon",
+      "definition_id": "legacy_weapon_短棍",
+      "quantity": 1,
+      "uses_left": null,
+      "uses_max": null,
+      "durability": null,
+      "owner_kind": "role",
+      "owner_id": "npc_1",
+      "zone_id": null,
+      "sub_zone_id": null,
+      "display_name": "短棍",
+      "description_override": "便于训练的武器",
+      "tags": [],
+      "metadata": {
+        "legacy_item_id": "npc_1_weapon",
+        "compat_item_id": "npc_1_weapon"
+      },
+      "created_at": "2026-03-22T07:35:11.681360+00:00",
+      "updated_at": "2026-03-22T07:35:11.681365+00:00"
+    },
+    {
+      "item_instance_id": "role_npc_1_npc_1_armor",
+      "definition_id": "legacy_armor_练功服",
+      "quantity": 1,
+      "uses_left": null,
+      "uses_max": null,
+      "durability": null,
+      "owner_kind": "role",
+      "owner_id": "npc_1",
+      "zone_id": null,
+      "sub_zone_id": null,
+      "display_name": "练功服",
+      "description_override": "并非真正护甲",
+      "tags": [],
+      "metadata": {
+        "legacy_item_id": "npc_1_armor",
+        "compat_item_id": "npc_1_armor"
+      },
+      "created_at": "2026-03-22T07:35:11.681899+00:00",
+      "updated_at": "2026-03-22T07:35:11.681903+00:00"
+    },
+    {
+      "item_instance_id": "role_npc_1_npc_1_extra_1",
+      "definition_id": "legacy_misc_绷带卷",
+      "quantity": 1,
+      "uses_left": null,
+      "uses_max": null,
+      "durability": null,
+      "owner_kind": "role",
+      "owner_id": "npc_1",
+      "zone_id": null,
+      "sub_zone_id": null,
+      "display_name": "绷带卷",
+      "description_override": "川洛 随身携带的物品。",
+      "tags": [],
+      "metadata": {
+        "legacy_item_id": "npc_1_extra_1",
+        "compat_item_id": "npc_1_extra_1"
+      },
+      "created_at": "2026-03-22T07:35:11.682398+00:00",
+      "updated_at": "2026-03-22T07:35:11.682401+00:00"
+    },
+    {
+      "item_instance_id": "role_npc_1_npc_1_extra_2",
+      "definition_id": "legacy_misc_木珠手串",
+      "quantity": 1,
+      "uses_left": null,
+      "uses_max": null,
+      "durability": null,
+      "owner_kind": "role",
+      "owner_id": "npc_1",
+      "zone_id": null,
+      "sub_zone_id": null,
+      "display_name": "木珠手串",
+      "description_override": "川洛 随身携带的物品。",
+      "tags": [],
+      "metadata": {
+        "legacy_item_id": "npc_1_extra_2",
+        "compat_item_id": "npc_1_extra_2"
+      },
+      "created_at": "2026-03-22T07:35:11.682910+00:00",
+      "updated_at": "2026-03-22T07:35:11.682913+00:00"
+    },
+    {
+      "item_instance_id": "role_team_1_team_1_weapon",
+      "definition_id": "legacy_weapon_法杖",
+      "quantity": 1,
+      "uses_left": null,
+      "uses_max": null,
+      "durability": null,
+      "owner_kind": "role",
+      "owner_id": "team_1",
+      "zone_id": null,
+      "sub_zone_id": null,
+      "display_name": "法杖",
+      "description_override": "施法与自卫兼用",
+      "tags": [],
+      "metadata": {
+        "legacy_item_id": "team_1_weapon",
+        "compat_item_id": "team_1_weapon"
+      },
+      "created_at": "2026-03-22T07:35:11.683495+00:00",
+      "updated_at": "2026-03-22T07:35:11.683498+00:00"
+    },
+    {
+      "item_instance_id": "role_team_1_team_1_armor",
+      "definition_id": "legacy_armor_法袍",
+      "quantity": 1,
+      "uses_left": null,
+      "uses_max": null,
+      "durability": null,
+      "owner_kind": "role",
+      "owner_id": "team_1",
+      "zone_id": null,
+      "sub_zone_id": null,
+      "display_name": "法袍",
+      "description_override": "轻便衣袍",
+      "tags": [],
+      "metadata": {
+        "legacy_item_id": "team_1_armor",
+        "compat_item_id": "team_1_armor"
+      },
+      "created_at": "2026-03-22T07:35:11.683987+00:00",
+      "updated_at": "2026-03-22T07:35:11.683990+00:00"
+    },
+    {
+      "item_instance_id": "role_team_1_team_1_extra_1",
+      "definition_id": "legacy_misc_法术书",
+      "quantity": 1,
+      "uses_left": null,
+      "uses_max": null,
+      "durability": null,
+      "owner_kind": "role",
+      "owner_id": "team_1",
+      "zone_id": null,
+      "sub_zone_id": null,
+      "display_name": "法术书",
+      "description_override": "缇儿 随身携带的物品。",
+      "tags": [],
+      "metadata": {
+        "legacy_item_id": "team_1_extra_1",
+        "compat_item_id": "team_1_extra_1"
+      },
+      "created_at": "2026-03-22T07:35:11.684459+00:00",
+      "updated_at": "2026-03-22T07:35:11.684462+00:00"
+    },
+    {
+      "item_instance_id": "role_team_1_team_1_extra_2",
+      "definition_id": "legacy_misc_墨水套装",
+      "quantity": 1,
+      "uses_left": null,
+      "uses_max": null,
+      "durability": null,
+      "owner_kind": "role",
+      "owner_id": "team_1",
+      "zone_id": null,
+      "sub_zone_id": null,
+      "display_name": "墨水套装",
+      "description_override": "缇儿 随身携带的物品。",
+      "tags": [],
+      "metadata": {
+        "legacy_item_id": "team_1_extra_2",
+        "compat_item_id": "team_1_extra_2"
+      },
+      "created_at": "2026-03-22T07:35:11.684942+00:00",
+      "updated_at": "2026-03-22T07:35:11.684945+00:00"
+    },
+    {
+      "item_instance_id": "role_npc_sub_zone_a_6833_npc_sub_zone_a_6833_weapon",
+      "definition_id": "legacy_weapon_长剑",
+      "quantity": 1,
+      "uses_left": null,
+      "uses_max": null,
+      "durability": null,
+      "owner_kind": "role",
+      "owner_id": "npc_sub_zone_a_6833",
+      "zone_id": null,
+      "sub_zone_id": null,
+      "display_name": "长剑",
+      "description_override": "近战常用制式武器",
+      "tags": [],
+      "metadata": {
+        "legacy_item_id": "npc_sub_zone_a_6833_weapon",
+        "compat_item_id": "npc_sub_zone_a_6833_weapon"
+      },
+      "created_at": "2026-03-22T07:35:11.685444+00:00",
+      "updated_at": "2026-03-22T07:35:11.685447+00:00"
+    },
+    {
+      "item_instance_id": "role_npc_sub_zone_a_6833_npc_sub_zone_a_6833_armor",
+      "definition_id": "legacy_armor_锁子甲",
+      "quantity": 1,
+      "uses_left": null,
+      "uses_max": null,
+      "durability": null,
+      "owner_kind": "role",
+      "owner_id": "npc_sub_zone_a_6833",
+      "zone_id": null,
+      "sub_zone_id": null,
+      "display_name": "锁子甲",
+      "description_override": "常备护甲",
+      "tags": [],
+      "metadata": {
+        "legacy_item_id": "npc_sub_zone_a_6833_armor",
+        "compat_item_id": "npc_sub_zone_a_6833_armor"
+      },
+      "created_at": "2026-03-22T07:35:11.685934+00:00",
+      "updated_at": "2026-03-22T07:35:11.685937+00:00"
+    },
+    {
+      "item_instance_id": "role_npc_sub_zone_a_6833_npc_sub_zone_a_6833_extra_1",
+      "definition_id": "legacy_misc_磨刀石",
+      "quantity": 1,
+      "uses_left": null,
+      "uses_max": null,
+      "durability": null,
+      "owner_kind": "role",
+      "owner_id": "npc_sub_zone_a_6833",
+      "zone_id": null,
+      "sub_zone_id": null,
+      "display_name": "磨刀石",
+      "description_override": "zone_a向导岚岑 随身携带的物品。",
+      "tags": [],
+      "metadata": {
+        "legacy_item_id": "npc_sub_zone_a_6833_extra_1",
+        "compat_item_id": "npc_sub_zone_a_6833_extra_1"
+      },
+      "created_at": "2026-03-22T07:35:11.686405+00:00",
+      "updated_at": "2026-03-22T07:35:11.686408+00:00"
+    },
+    {
+      "item_instance_id": "role_npc_sub_zone_a_6833_npc_sub_zone_a_6833_extra_2",
+      "definition_id": "legacy_misc_水袋",
+      "quantity": 1,
+      "uses_left": null,
+      "uses_max": null,
+      "durability": null,
+      "owner_kind": "role",
+      "owner_id": "npc_sub_zone_a_6833",
+      "zone_id": null,
+      "sub_zone_id": null,
+      "display_name": "水袋",
+      "description_override": "zone_a向导岚岑 随身携带的物品。",
+      "tags": [],
+      "metadata": {
+        "legacy_item_id": "npc_sub_zone_a_6833_extra_2",
+        "compat_item_id": "npc_sub_zone_a_6833_extra_2"
+      },
+      "created_at": "2026-03-22T07:35:11.686871+00:00",
+      "updated_at": "2026-03-22T07:35:11.686874+00:00"
+    }
+  ],
+  "updated_at": "2026-03-22T07:35:11.686882+00:00"
+}

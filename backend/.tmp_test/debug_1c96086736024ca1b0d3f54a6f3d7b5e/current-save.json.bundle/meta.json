@@ -1,0 +1,8 @@
+{
+  "version": "1.4.0",
+  "session_id": "sess_public_actor_fallback",
+  "updated_at": "2026-03-22T07:35:11.688258+00:00",
+  "game_log_settings": {
+    "ai_fetch_limit": 10
+  }
+}

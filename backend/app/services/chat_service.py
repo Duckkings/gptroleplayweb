@@ -14,9 +14,9 @@ from app.models.schemas import (
     AreaMoveSubZoneRequest,
     ChatRequest,
     EncounterActRequest,
-    EncounterEscapeRequest,
-    EncounterRejoinRequest,
     InventoryEquipRequest,
+    InventoryConsumeRequest,
+    InventoryGrantRequest,
     InventoryInteractRequest,
     InventoryUnequipRequest,
     Message,
@@ -36,13 +36,18 @@ from app.models.schemas import (
     PlayerUnequipRequest,
     RoleBuff,
     RoleRelationSetRequest,
+    TemplateLibraryDefinitionsRequest,
     TeamDebugGenerateRequest,
     TeamInviteRequest,
     TeamLeaveRequest,
     ToolEvent,
     Usage,
 )
+from app.services.actor_capability_service import build_role_capability_response
 from app.services.ai_adapter import build_completion_options, create_async_client
+from app.services.actor_resource_service import adjust_actor_resource_in_profile
+from app.services.actor_resource_service import resolve_actor_profile
+from app.services.template_library_query_service import query_template_library_definitions
 from app.services.world_service import (
     _active_encounter_for_current_sub_zone,
     _build_scene_context_payload,
@@ -66,6 +71,8 @@ from app.services.world_service import (
     get_area_current,
     get_current_save,
     get_game_logs,
+    get_scene_interactables,
+    get_template_library_status_payload,
     recover_spell_slots,
     recover_stamina,
     remove_player_buff,
@@ -74,14 +81,17 @@ from app.services.world_service import (
     remove_player_spell,
     set_role_relation,
     inventory_equip,
+    inventory_consume,
+    inventory_grant,
     inventory_interact,
     inventory_unequip,
+    spawn_persistent_scene_npc_in_save,
     unequip_player_item,
     move_to_sub_zone,
     move_to_zone,
     save_current,
 )
-from app.services.encounter_service import act_on_encounter, advance_active_encounter_from_main_chat_in_save, advance_active_encounter_in_save, escape_encounter, get_encounter_debug_overview, rejoin_encounter
+from app.services.encounter_service import act_on_encounter, advance_active_encounter_from_main_chat_in_save, get_encounter_debug_overview
 from app.services.consistency_service import (
     build_entity_index,
     build_global_story_snapshot,
@@ -90,6 +100,7 @@ from app.services.consistency_service import (
     reconcile_consistency,
 )
 from app.services.team_service import generate_debug_teammate, get_team_state, invite_npc_to_team, leave_npc_from_team, team_chat
+from app.services.death_service import death_service
 
 logger = logging.getLogger("roleplay.tools")
 
@@ -353,28 +364,6 @@ def route_main_turn_intent(session_id: str, parsed_intent: dict[str, object], co
             }
 
     if active_encounter is not None:
-        if active_encounter.player_presence == "away" and _contains_any_token(merged, ["回去", "返回遭遇", "重新加入", "rejoin"]):
-            result = rejoin_encounter(active_encounter.encounter_id, EncounterRejoinRequest(session_id=session_id, config=config))
-            tool_events.append(ToolEvent(tool_name="encounter_rejoin", ok=True, summary=f"rejoined {result.encounter_id}"))
-            return {
-                "handled": True,
-                "reply": Message(role="assistant", content=result.reply),
-                "tool_events": tool_events,
-                "scene_events": _encounter_scene_events(result.encounter, reply=result.reply),
-                "time_spent_min": 1,
-                "skip_encounter_main_chat_advance": True,
-            }
-        if active_encounter.player_presence == "engaged" and _contains_any_token(merged, ["离开", "逃离", "脱身", "撤退", "escape"]):
-            result = escape_encounter(active_encounter.encounter_id, EncounterEscapeRequest(session_id=session_id, config=config))
-            tool_events.append(ToolEvent(tool_name="encounter_escape", ok=True, summary=f"escape {'ok' if result.escape_success else 'failed'}"))
-            return {
-                "handled": True,
-                "reply": Message(role="assistant", content=result.reply),
-                "tool_events": tool_events,
-                "scene_events": _encounter_scene_events(result.encounter, reply=result.reply),
-                "time_spent_min": result.time_spent_min,
-                "skip_encounter_main_chat_advance": True,
-            }
         if active_encounter.player_presence == "engaged" and merged:
             result = act_on_encounter(
                 active_encounter.encounter_id,
@@ -753,6 +742,59 @@ def _tools_schema() -> list[dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "inventory_grant_item",
+                "description": "Grant one item into player or one role inventory. Use this when AI should hand an item to the player or an NPC.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "owner_type": {"type": "string", "enum": ["player", "role"]},
+                        "role_id": {"type": "string"},
+                        "item_id": {"type": "string"},
+                        "name": {"type": "string"},
+                        "item_type": {"type": "string"},
+                        "description": {"type": "string"},
+                        "weight": {"type": "number", "minimum": 0},
+                        "rarity": {"type": "string"},
+                        "value": {"type": "integer", "minimum": 0},
+                        "effect": {"type": "string"},
+                        "uses_max": {"type": "integer", "minimum": 0},
+                        "uses_left": {"type": "integer", "minimum": 0},
+                        "cooldown_min": {"type": "integer", "minimum": 0},
+                        "bound": {"type": "boolean"},
+                        "quantity": {"type": "integer", "minimum": 1},
+                        "slot_type": {"type": "string", "enum": ["weapon", "armor", "misc"]},
+                        "attack_bonus": {"type": "integer"},
+                        "armor_bonus": {"type": "integer"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["owner_type", "item_id", "name"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "inventory_consume_item",
+                "description": "Consume one player or role inventory item. Use this when an item is spent, used up, or intentionally consumed.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "owner_type": {"type": "string", "enum": ["player", "role"]},
+                        "role_id": {"type": "string"},
+                        "item_id": {"type": "string"},
+                        "amount": {"type": "integer", "minimum": 1},
+                        "consume_mode": {"type": "string", "enum": ["auto", "quantity", "uses"]},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["owner_type", "item_id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "team_chat",
                 "description": "Send one player message into current party chat and return each current teammate response.",
                 "parameters": {
@@ -792,36 +834,6 @@ def _tools_schema() -> list[dict[str, Any]]:
                         "player_prompt": {"type": "string"},
                     },
                     "required": ["encounter_id", "player_prompt"],
-                    "additionalProperties": False,
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "encounter_escape",
-                "description": "Attempt to escape from the current active encounter.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "encounter_id": {"type": "string"},
-                    },
-                    "required": ["encounter_id"],
-                    "additionalProperties": False,
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "encounter_rejoin",
-                "description": "Rejoin an escaped encounter after returning to its original location.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "encounter_id": {"type": "string"},
-                    },
-                    "required": ["encounter_id"],
                     "additionalProperties": False,
                 },
             },
@@ -889,6 +901,106 @@ def _tools_schema() -> list[dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "get_scene_interactables",
+                "description": "Return current or target sub-zone scene interactables from the formal persistent interactable state.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "sub_zone_id": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_template_library_status",
+                "description": "Return current account template-library counts for item/equipment/interactable definitions.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_template_library_definitions",
+                "description": "Return spell or war art definition rows from the current template library.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["spell", "war_art", "all"]},
+                        "definition_ids": {"type": "array", "items": {"type": "string"}},
+                        "recommended_class": {"type": "string"},
+                        "min_level": {"type": "integer", "minimum": 1, "maximum": 20},
+                        "for_role_id": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_role_capability_snapshot",
+                "description": "Return one role capability snapshot, including known spells, war arts, and current resources.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "role_id": {"type": "string"},
+                    },
+                    "required": ["role_id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "actor_adjust_resource",
+                "description": "Consume or recover a spell slot or martial point for the player or one role using a spell or war art definition id from the local template library.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "actor_kind": {"type": "string", "enum": ["player", "role"]},
+                        "actor_role_id": {"type": "string"},
+                        "resource_kind": {"type": "string", "enum": ["spell", "war_art", "spell_slot", "martial_point"]},
+                        "resource_definition_id": {"type": "string"},
+                        "resource_name": {"type": "string"},
+                        "mode": {"type": "string", "enum": ["consume", "recover"], "default": "consume"},
+                        "level": {"type": "integer", "minimum": 1, "maximum": 9},
+                        "amount": {"type": "integer", "minimum": 1, "default": 1},
+                    },
+                    "required": ["actor_kind", "resource_kind"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "spawn_scene_npc",
+                "description": "Create one persistent NPC in the current sub-zone so the role can immediately join the scene.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "title": {"type": "string"},
+                        "description": {"type": "string"},
+                        "speaking_style": {"type": "string"},
+                        "agenda": {"type": "string"},
+                        "appearance": {"type": "string"},
+                        "alignment": {"type": "string"},
+                        "likes": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["name"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "move_to_sub_zone",
                 "description": "Move player to target sub-zone inside area model and advance world clock.",
                 "parameters": {
@@ -921,11 +1033,16 @@ def _tools_schema() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "execute_interaction",
-                "description": "Execute placeholder interaction. Returns fixed placeholder message for now.",
+                "description": "Execute one formal scene interaction against the persistent scene interactable state.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "interaction_id": {"type": "string"},
+                        "action_kind": {"type": "string"},
+                        "actor_kind": {"type": "string", "enum": ["player", "role"]},
+                        "actor_role_id": {"type": "string"},
+                        "item_instance_id": {"type": "string"},
+                        "prompt": {"type": "string"},
                     },
                     "required": ["interaction_id"],
                     "additionalProperties": False,
@@ -1000,11 +1117,11 @@ def _tools_schema() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "player_adjust_resource",
-                "description": "Consume/recover spell slots or stamina.",
+                "description": "Consume/recover spell slots, martial points, or stamina.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "kind": {"type": "string", "enum": ["spell_slot", "stamina"]},
+                        "kind": {"type": "string", "enum": ["spell_slot", "martial_point", "stamina"]},
                         "mode": {"type": "string", "enum": ["consume", "recover"], "default": "consume"},
                         "level": {"type": "integer", "minimum": 1, "maximum": 9},
                         "amount": {"type": "integer", "minimum": 1, "default": 1},
@@ -1045,6 +1162,108 @@ def _tools_schema() -> list[dict[str, Any]]:
                         "value": {"type": "string"},
                     },
                     "required": ["kind", "value"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_player_death_state",
+                "description": "Get player death/dying state including death save progress, death count, and revival weakness status.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "stabilize_player",
+                "description": "Attempt to stabilize a dying player using medicine check or healing item. Can be used by teammates.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "medic_role_id": {"type": "string", "description": "Role ID of the character attempting to stabilize. If omitted, assumes player is using an item."},
+                        "method": {"type": "string", "enum": ["medicine_check", "healing_kit", "spell"], "default": "medicine_check"},
+                        "item_instance_id": {"type": "string", "description": "Item to use if method is healing_kit"},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "player_revive",
+                "description": "Revive a dead player at shrine, by item, or by teammate. Applies death penalties and revival weakness buff.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "method": {"type": "string", "enum": ["shrine", "item", "teammate"], "default": "shrine"},
+                        "shrine_zone_id": {"type": "string", "description": "Zone ID of shrine for shrine revival"},
+                        "item_instance_id": {"type": "string", "description": "Revival item ID for item revival"},
+                        "teammate_role_id": {"type": "string", "description": "Teammate role ID for teammate revival"},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "spawn_encounter_npc",
+                "description": "Spawn a temporary NPC into an active encounter mid-way. Use when narrative introduces a new character that should be tracked as an encounter participant. This will add the NPC to encounter.temporary_npcs and participant_role_ids.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "encounter_id": {
+                            "type": "string",
+                            "description": "ID of the active encounter",
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "NPC name",
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "NPC title or role (e.g., 'Mysterious Stranger')",
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Brief description of the NPC",
+                        },
+                        "speaking_style": {
+                            "type": "string",
+                            "description": "How the NPC speaks (e.g., 'gruff', 'eloquent')",
+                        },
+                        "agenda": {
+                            "type": "string",
+                            "description": "NPC's current goal or motivation in this scene",
+                        },
+                        "role_type": {
+                            "type": "string",
+                            "enum": ["neutral", "hostile", "friendly"],
+                            "description": "NPC's attitude toward the player",
+                        },
+                    },
+                    "required": ["encounter_id", "name"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_encounter_participants",
+                "description": "Get current encounter participant list including temporary NPCs. Use to check which NPCs are already instantiated in the encounter.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "encounter_id": {
+                            "type": "string",
+                            "description": "ID of the encounter",
+                        },
+                    },
+                    "required": ["encounter_id"],
                     "additionalProperties": False,
                 },
             },
@@ -1659,6 +1878,76 @@ async def _handle_tool_call(payload: ChatRequest, tool_call: Any) -> tuple[dict[
             event,
         )
 
+    if tool_name == "inventory_grant_item":
+        try:
+            args = json.loads(arg_text)
+            owner = InventoryOwnerRef(
+                owner_type=str(args.get("owner_type") or "player").strip().lower(),
+                role_id=(str(args.get("role_id") or "").strip() or None),
+            )
+            item = InventoryItem(
+                item_id=str(args.get("item_id") or "").strip(),
+                name=str(args.get("name") or "").strip(),
+                item_type=str(args.get("item_type") or "misc").strip() or "misc",
+                description=str(args.get("description") or "").strip(),
+                weight=max(0.0, float(args.get("weight") or 0.0)),
+                rarity=str(args.get("rarity") or "common").strip() or "common",
+                value=max(0, int(args.get("value") or 0)),
+                effect=str(args.get("effect") or "").strip(),
+                uses_max=(int(args["uses_max"]) if args.get("uses_max") is not None else None),
+                uses_left=(int(args["uses_left"]) if args.get("uses_left") is not None else None),
+                cooldown_min=max(0, int(args.get("cooldown_min") or 0)),
+                bound=bool(args.get("bound", False)),
+                quantity=max(1, int(args.get("quantity") or 1)),
+                slot_type=str(args.get("slot_type") or "misc"),  # type: ignore[arg-type]
+                attack_bonus=int(args.get("attack_bonus") or 0),
+                armor_bonus=int(args.get("armor_bonus") or 0),
+            )
+            response = inventory_grant(
+                InventoryGrantRequest(
+                    session_id=payload.session_id,
+                    owner=owner,
+                    item=item,
+                    reason=str(args.get("reason") or "").strip(),
+                )
+            )
+            result = {"ok": True, **response.model_dump(mode="json")}
+            event = ToolEvent(tool_name="inventory_grant_item", ok=True, summary=response.message or "inventory grant ok")
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="inventory_grant_item", ok=False, summary=f"inventory grant failed: {exc}")
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "inventory_consume_item":
+        try:
+            args = json.loads(arg_text)
+            owner = InventoryOwnerRef(
+                owner_type=str(args.get("owner_type") or "player").strip().lower(),
+                role_id=(str(args.get("role_id") or "").strip() or None),
+            )
+            response = inventory_consume(
+                InventoryConsumeRequest(
+                    session_id=payload.session_id,
+                    owner=owner,
+                    item_id=str(args.get("item_id") or "").strip(),
+                    amount=max(1, int(args.get("amount") or 1)),
+                    consume_mode=str(args.get("consume_mode") or "auto").strip().lower(),  # type: ignore[arg-type]
+                    reason=str(args.get("reason") or "").strip(),
+                )
+            )
+            result = {"ok": True, **response.model_dump(mode="json")}
+            event = ToolEvent(tool_name="inventory_consume_item", ok=True, summary=response.message or "inventory consume ok")
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="inventory_consume_item", ok=False, summary=f"inventory consume failed: {exc}")
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
     if tool_name == "team_chat":
         try:
             args = json.loads(arg_text)
@@ -1729,64 +2018,6 @@ async def _handle_tool_call(payload: ChatRequest, tool_call: Any) -> tuple[dict[
         except Exception as exc:
             result = {"ok": False, "error": str(exc)}
             event = ToolEvent(tool_name="encounter_act", ok=False, summary=f"encounter act failed: {exc}")
-        return (
-            {
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": json.dumps(result, ensure_ascii=False),
-            },
-            event,
-        )
-
-    if tool_name == "encounter_escape":
-        try:
-            args = json.loads(arg_text)
-            encounter_id = str(args.get("encounter_id") or "").strip()
-            response = escape_encounter(
-                encounter_id,
-                EncounterEscapeRequest(
-                    session_id=payload.session_id,
-                ),
-            )
-            result = {"ok": True, **response.model_dump(mode="json")}
-            event = ToolEvent(
-                tool_name="encounter_escape",
-                ok=True,
-                summary=f"escape {'ok' if response.escape_success else 'failed'}",
-                payload={"encounter_id": response.encounter_id, "escape_success": response.escape_success},
-            )
-        except Exception as exc:
-            result = {"ok": False, "error": str(exc)}
-            event = ToolEvent(tool_name="encounter_escape", ok=False, summary=f"encounter escape failed: {exc}")
-        return (
-            {
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": json.dumps(result, ensure_ascii=False),
-            },
-            event,
-        )
-
-    if tool_name == "encounter_rejoin":
-        try:
-            args = json.loads(arg_text)
-            encounter_id = str(args.get("encounter_id") or "").strip()
-            response = rejoin_encounter(
-                encounter_id,
-                EncounterRejoinRequest(
-                    session_id=payload.session_id,
-                ),
-            )
-            result = {"ok": True, **response.model_dump(mode="json")}
-            event = ToolEvent(
-                tool_name="encounter_rejoin",
-                ok=True,
-                summary=f"rejoin {response.status}",
-                payload={"encounter_id": response.encounter_id},
-            )
-        except Exception as exc:
-            result = {"ok": False, "error": str(exc)}
-            event = ToolEvent(tool_name="encounter_rejoin", ok=False, summary=f"encounter rejoin failed: {exc}")
         return (
             {
                 "role": "tool",
@@ -1926,6 +2157,243 @@ async def _handle_tool_call(payload: ChatRequest, tool_call: Any) -> tuple[dict[
             event,
         )
 
+    if tool_name == "get_scene_interactables":
+        try:
+            args = json.loads(arg_text) if arg_text else {}
+        except Exception:
+            args = {}
+        sub_zone_id = str(args.get("sub_zone_id") or "").strip() or None
+        items = get_scene_interactables(payload.session_id, sub_zone_id=sub_zone_id)
+        result = {
+            "ok": True,
+            "count": len(items),
+            "items": [item.model_dump(mode="json") for item in items],
+        }
+        event = ToolEvent(tool_name="get_scene_interactables", ok=True, summary=f"scene interactables returned: {len(items)}")
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(result, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "get_template_library_status":
+        status = get_template_library_status_payload(payload.session_id)
+        event = ToolEvent(tool_name="get_template_library_status", ok=True, summary="template library status returned")
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps({"ok": True, **status}, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "get_template_library_definitions":
+        try:
+            args = json.loads(arg_text) if arg_text else {}
+        except Exception:
+            args = {}
+        save = get_current_save(default_session_id=payload.session_id)
+        req = TemplateLibraryDefinitionsRequest(
+            session_id=payload.session_id,
+            kind=str(args.get("kind") or "all"),  # type: ignore[arg-type]
+            definition_ids=[str(item).strip() for item in list(args.get("definition_ids") or []) if str(item).strip()],
+            recommended_class=(str(args.get("recommended_class") or "").strip() or None),
+            min_level=(int(args.get("min_level")) if args.get("min_level") is not None else None),
+            for_role_id=(str(args.get("for_role_id") or "").strip() or None),
+            limit=max(1, min(int(args.get("limit") or 20), 200)),
+        )
+        response = query_template_library_definitions(req, save=save)
+        event = ToolEvent(
+            tool_name="get_template_library_definitions",
+            ok=True,
+            summary="template library definitions returned",
+            payload={"spell_count": len(response.spell_definitions), "war_art_count": len(response.war_art_definitions)},
+        )
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps({"ok": True, **response.model_dump(mode="json")}, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "get_role_capability_snapshot":
+        try:
+            args = json.loads(arg_text) if arg_text else {}
+        except Exception:
+            args = {}
+        role_id = str(args.get("role_id") or "").strip()
+        if not role_id:
+            event = ToolEvent(tool_name="get_role_capability_snapshot", ok=False, summary="role_id is required")
+            return (
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps({"ok": False, "error": "role_id_required"}, ensure_ascii=False),
+                },
+                event,
+            )
+        save = get_current_save(default_session_id=payload.session_id)
+        try:
+            response = build_role_capability_response(save, session_id=payload.session_id, role_id=role_id)
+        except KeyError:
+            event = ToolEvent(tool_name="get_role_capability_snapshot", ok=False, summary="role not found")
+            return (
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps({"ok": False, "error": "role_not_found"}, ensure_ascii=False),
+                },
+                event,
+            )
+        event = ToolEvent(tool_name="get_role_capability_snapshot", ok=True, summary="role capability returned")
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps({"ok": True, **response.model_dump(mode="json")}, ensure_ascii=False),
+            },
+            event,
+        )
+
+    if tool_name == "actor_adjust_resource":
+        try:
+            args = json.loads(arg_text) if arg_text else {}
+        except Exception:
+            args = {}
+        actor_kind = str(args.get("actor_kind") or "").strip().lower()
+        resource_kind = str(args.get("resource_kind") or "").strip().lower()
+        mode = str(args.get("mode") or "consume").strip().lower()
+        actor_role_id = str(args.get("actor_role_id") or "").strip()
+        resource_definition_id = str(args.get("resource_definition_id") or "").strip()
+        resource_name = str(args.get("resource_name") or "").strip()
+        if actor_kind not in {"player", "role"}:
+            event = ToolEvent(tool_name="actor_adjust_resource", ok=False, summary="invalid actor_kind")
+            return (
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps({"ok": False, "error": "invalid_actor_kind"}, ensure_ascii=False),
+                },
+                event,
+            )
+        if resource_kind not in {"spell", "war_art", "spell_slot", "martial_point"}:
+            event = ToolEvent(tool_name="actor_adjust_resource", ok=False, summary="invalid resource_kind")
+            return (
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps({"ok": False, "error": "invalid_resource_kind"}, ensure_ascii=False),
+                },
+                event,
+            )
+        save = get_current_save(default_session_id=payload.session_id)
+        try:
+            profile, _ = resolve_actor_profile(save, owner_type=actor_kind, role_id=(actor_role_id or None))
+        except KeyError:
+            event = ToolEvent(tool_name="actor_adjust_resource", ok=False, summary="actor not found")
+            return (
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps({"ok": False, "error": "actor_not_found"}, ensure_ascii=False),
+                },
+                event,
+            )
+        level_value = args.get("level")
+        status = adjust_actor_resource_in_profile(
+            profile,
+            resource_kind=resource_kind,
+            mode=mode,
+            amount=max(1, int(args.get("amount") or 1)),
+            level=(int(level_value) if level_value is not None else None),
+            resource_definition_id=resource_definition_id,
+            resource_name=resource_name,
+        )
+        save.session_id = payload.session_id
+        save_current(save)
+        ok = status.check_status == "passed"
+        event = ToolEvent(
+            tool_name="actor_adjust_resource",
+            ok=ok,
+            summary=f"{actor_kind} {resource_kind} {mode} {'ok' if ok else 'failed'}",
+            payload={"resource_kind": resource_kind, "resolved_definition_id": status.resolved_definition_id},
+        )
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(
+                    {
+                        "ok": ok,
+                        "actor_kind": actor_kind,
+                        "actor_role_id": (actor_role_id or save.player_static_data.player_id),
+                        "resource_status": status.model_dump(mode="json"),
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+            event,
+        )
+
+    if tool_name == "spawn_scene_npc":
+        try:
+            args = json.loads(arg_text)
+        except Exception:
+            args = {}
+        npc_name = str(args.get("name") or "").strip()
+        if not npc_name:
+            event = ToolEvent(tool_name="spawn_scene_npc", ok=False, summary="name is required")
+            return (
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps({"ok": False, "error": "name_required"}, ensure_ascii=False),
+                },
+                event,
+            )
+        try:
+            role = spawn_persistent_scene_npc_in_save(
+                get_current_save(default_session_id=payload.session_id),
+                name=npc_name,
+                title=str(args.get("title") or "").strip(),
+                description=str(args.get("description") or "").strip(),
+                speaking_style=str(args.get("speaking_style") or "").strip(),
+                agenda=str(args.get("agenda") or "").strip(),
+                appearance=str(args.get("appearance") or "").strip(),
+                alignment=str(args.get("alignment") or "").strip(),
+                likes=[str(item) for item in list(args.get("likes") or []) if str(item).strip()],
+            )
+            result = {
+                "ok": True,
+                "role_id": role.role_id,
+                "name": role.name,
+                "zone_id": role.zone_id,
+                "sub_zone_id": role.sub_zone_id,
+            }
+            event = ToolEvent(
+                tool_name="spawn_scene_npc",
+                ok=True,
+                summary=f"spawned scene npc {role.name}",
+                payload={"role_id": role.role_id},
+            )
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+            event = ToolEvent(tool_name="spawn_scene_npc", ok=False, summary=f"spawn failed: {exc}")
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": json.dumps(result, ensure_ascii=False),
+            },
+            event,
+        )
+
     if tool_name == "move_to_sub_zone":
         try:
             args = json.loads(arg_text)
@@ -2008,8 +2476,18 @@ async def _handle_tool_call(payload: ChatRequest, tool_call: Any) -> tuple[dict[
         try:
             args = json.loads(arg_text)
             interaction_id = str(args.get("interaction_id") or "").strip()
+            action_kind = str(args.get("action_kind") or "inspect").strip() or "inspect"
+            actor_kind = str(args.get("actor_kind") or "player").strip() or "player"
+            actor_role_id = str(args.get("actor_role_id") or "").strip() or None
+            item_instance_id = str(args.get("item_instance_id") or "").strip() or None
+            prompt = str(args.get("prompt") or "").strip()
         except Exception:
             interaction_id = ""
+            action_kind = "inspect"
+            actor_kind = "player"
+            actor_role_id = None
+            item_instance_id = None
+            prompt = ""
         if not interaction_id:
             event = ToolEvent(tool_name="execute_interaction", ok=False, summary="interaction_id is required")
             return (
@@ -2022,10 +2500,19 @@ async def _handle_tool_call(payload: ChatRequest, tool_call: Any) -> tuple[dict[
             )
         try:
             executed = execute_interaction(
-                AreaExecuteInteractionRequest(session_id=payload.session_id, interaction_id=interaction_id)
+                AreaExecuteInteractionRequest(
+                    session_id=payload.session_id,
+                    interaction_id=interaction_id,
+                    action_kind=action_kind,
+                    actor_kind=actor_kind,  # type: ignore[arg-type]
+                    actor_role_id=actor_role_id,
+                    item_instance_id=item_instance_id,
+                    prompt=prompt,
+                    config=payload.config,
+                )
             )
             result = executed.model_dump(mode="json")
-            event = ToolEvent(tool_name="execute_interaction", ok=True, summary="placeholder interaction executed")
+            event = ToolEvent(tool_name="execute_interaction", ok=True, summary=executed.reply or executed.message or "scene interaction executed")
         except Exception as exc:
             result = {"ok": False, "error": str(exc)}
             event = ToolEvent(tool_name="execute_interaction", ok=False, summary=f"execute failed: {exc}")
@@ -2127,6 +2614,12 @@ async def _handle_tool_call(payload: ChatRequest, tool_call: Any) -> tuple[dict[
             if kind == "spell_slot":
                 req = PlayerSpellSlotAdjustRequest(level=max(1, int(args.get("level") or 1)), amount=amount)
                 updated = recover_spell_slots(payload.session_id, req) if mode == "recover" else consume_spell_slots(payload.session_id, req)
+            elif kind == "martial_point":
+                from app.models.schemas import PlayerMartialPointAdjustRequest
+                from app.services.world_service import consume_martial_points, recover_martial_points
+
+                req = PlayerMartialPointAdjustRequest(amount=amount)
+                updated = recover_martial_points(payload.session_id, req) if mode == "recover" else consume_martial_points(payload.session_id, req)
             else:
                 req = PlayerStaminaAdjustRequest(amount=amount)
                 updated = recover_stamina(payload.session_id, req) if mode == "recover" else consume_stamina(payload.session_id, req)
@@ -2177,6 +2670,472 @@ async def _handle_tool_call(payload: ChatRequest, tool_call: Any) -> tuple[dict[
         except Exception as exc:
             result = {"ok": False, "error": str(exc)}
             event = ToolEvent(tool_name="player_set_trait", ok=False, summary=f"trait failed: {exc}")
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "get_player_death_state":
+        save = get_current_save(default_session_id=payload.session_id)
+        player = save.player_static_data
+        death_state = player.dnd5e_sheet.death_state
+        
+        # 检查虚弱是否过期
+        death_service.check_weakness_expired(player.dnd5e_sheet)
+        
+        result = {
+            "ok": True,
+            "life_status": death_state.life_status,
+            "death_save_progress": {
+                "successes": death_state.death_save_successes,
+                "failures": death_state.death_save_failures,
+            },
+            "death_count": death_state.death_count,
+            "death_streak_count": death_state.death_streak_count,
+            "can_be_stabilized": death_state.life_status == "dying",
+            "revival_weakness_active": any(
+                b.name == "复活虚弱" for b in player.dnd5e_sheet.buffs
+            ),
+            "last_death_cause": death_state.last_death_cause,
+        }
+        event = ToolEvent(
+            tool_name="get_player_death_state",
+            ok=True,
+            summary=f"death state: {death_state.life_status}",
+            payload={"life_status": death_state.life_status},
+        )
+        logger.info("tool_call get_player_death_state ok: status=%s", death_state.life_status)
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "stabilize_player":
+        try:
+            args = json.loads(arg_text)
+        except Exception:
+            event = ToolEvent(tool_name="stabilize_player", ok=False, summary="invalid json args")
+            logger.info("tool_call stabilize_player failed: invalid_json_args")
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "invalid_json_args"}, ensure_ascii=False)},
+                event,
+            )
+        
+        save = get_current_save(default_session_id=payload.session_id)
+        player = save.player_static_data
+        
+        if player.dnd5e_sheet.death_state.life_status != "dying":
+            result = {"ok": False, "error": "player_not_dying"}
+            event = ToolEvent(tool_name="stabilize_player", ok=False, summary="player not in dying state")
+        else:
+            from app.models.schemas import CombatantState
+            player_combatant = CombatantState(
+                combatant_id="player_001",
+                source_kind="player",
+                display_name=player.name,
+                side="player_side",
+                max_hp=player.dnd5e_sheet.hit_points.maximum,
+                current_hp=player.dnd5e_sheet.hit_points.current,
+                death_state=player.dnd5e_sheet.death_state,
+                conditions=["dying", "unconscious", "prone"],
+            )
+            
+            result_stabilize = death_service.stabilize(
+                save,
+                player_combatant,
+                stabilizer=None,
+                method="medicine" if args.get("method") == "medicine_check" else "item",
+            )
+            
+            # 同步状态回玩家数据
+            player.dnd5e_sheet.death_state = player_combatant.death_state
+            if result_stabilize.get("stabilized"):
+                player.dnd5e_sheet.status_flags = ["stable", "unconscious"]
+            save_current(save)
+            
+            result = {
+                "ok": True,
+                "stabilized": result_stabilize.get("stabilized", False),
+                "narrative": result_stabilize.get("narrative", ""),
+            }
+            event = ToolEvent(
+                tool_name="stabilize_player",
+                ok=True,
+                summary="stabilize " + ("ok" if result["stabilized"] else "failed"),
+                payload={"stabilized": result["stabilized"]},
+            )
+            logger.info("tool_call stabilize_player ok: stabilized=%s", result["stabilized"])
+        
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "player_revive":
+        try:
+            args = json.loads(arg_text)
+        except Exception:
+            event = ToolEvent(tool_name="player_revive", ok=False, summary="invalid json args")
+            logger.info("tool_call player_revive failed: invalid_json_args")
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "invalid_json_args"}, ensure_ascii=False)},
+                event,
+            )
+        
+        save = get_current_save(default_session_id=payload.session_id)
+        player = save.player_static_data
+        
+        if player.dnd5e_sheet.death_state.life_status != "dead":
+            result = {"ok": False, "error": "player_not_dead"}
+            event = ToolEvent(tool_name="player_revive", ok=False, summary="player not dead")
+        else:
+            method = args.get("method", "shrine")
+            
+            if method == "shrine":
+                revive_result = death_service.revive_at_shrine(save, shrine_zone_id=args.get("shrine_zone_id"))
+            elif method == "item":
+                # 查找复活道具
+                item_id = args.get("item_instance_id")
+                item = next((i for i in player.dnd5e_sheet.backpack.items if i.item_id == item_id), None)
+                if item:
+                    revive_result = death_service.revive_by_item(save, item)
+                else:
+                    revive_result = {"success": False, "error": "item_not_found"}
+            else:
+                # 队友复活（简化处理，使用神庙复活的逻辑但减少惩罚）
+                revive_result = death_service.revive_at_shrine(save)
+                revive_result["method"] = "teammate"
+                revive_result["narrative"] = "队友的急救让你重新苏醒。"
+            
+            if revive_result.get("success"):
+                save_current(save)
+                result = {
+                    "ok": True,
+                    "method": revive_result.get("method", method),
+                    "narrative": revive_result.get("narrative", ""),
+                    "penalties": {
+                        "gold_lost": revive_result["penalties_applied"].gold_lost,
+                        "exp_lost": revive_result["penalties_applied"].exp_lost,
+                        "weakness_duration_min": revive_result["penalties_applied"].weakness_duration_min,
+                    },
+                }
+                event = ToolEvent(
+                    tool_name="player_revive",
+                    ok=True,
+                    summary=f"revived by {method}",
+                    payload={"method": method},
+                )
+                logger.info("tool_call player_revive ok: method=%s", method)
+            else:
+                result = {"ok": False, "error": revive_result.get("error", "revive_failed")}
+                event = ToolEvent(tool_name="player_revive", ok=False, summary=result["error"])
+        
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "deal_damage":
+        try:
+            args = json.loads(arg_text)
+        except Exception:
+            event = ToolEvent(tool_name="deal_damage", ok=False, summary="invalid json args")
+            logger.info("tool_call deal_damage failed: invalid_json_args")
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "invalid_json_args"}, ensure_ascii=False)},
+                event,
+            )
+
+        target_type = str(args.get("target_type") or "").strip().lower()
+        damage = max(1, int(args.get("damage") or 1))
+        damage_type = str(args.get("damage_type") or "").strip()
+        attacker_role_id = str(args.get("attacker_role_id") or "").strip() or None
+        reason = str(args.get("reason") or "").strip()
+        skip_death_save = bool(args.get("skip_death_save", False))
+
+        if target_type not in {"player", "role"}:
+            event = ToolEvent(tool_name="deal_damage", ok=False, summary="target_type must be player or role")
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "invalid_target_type"}, ensure_ascii=False)},
+                event,
+            )
+
+        save = get_current_save(default_session_id=payload.session_id)
+        result: dict[str, Any] = {"ok": True, "damage_applied": 0, "hp_remaining": 0, "life_status": "healthy"}
+
+        if target_type == "player":
+            player_sheet = save.player_static_data.dnd5e_sheet
+            hp_before = player_sheet.hit_points.current
+            temp_hp = player_sheet.hit_points.temporary
+
+            # 先扣临时HP
+            remaining_damage = damage
+            if temp_hp > 0:
+                absorbed = min(temp_hp, remaining_damage)
+                player_sheet.hit_points.temporary -= absorbed
+                remaining_damage -= absorbed
+
+            # 扣除当前HP
+            if remaining_damage > 0:
+                player_sheet.hit_points.current = max(0, player_sheet.hit_points.current - remaining_damage)
+
+            hp_after = player_sheet.hit_points.current
+            result["damage_applied"] = damage
+            result["hp_remaining"] = hp_after
+            result["hp_before"] = hp_before
+            result["temp_hp_absorbed"] = min(temp_hp, damage) if temp_hp > 0 else 0
+
+            death_state = player_sheet.death_state
+
+            # 检查死亡流程
+            if hp_after <= 0:
+                # 检查即死条件：单次伤害从正值降到负的最大生命值
+                is_instant_death = skip_death_save
+                if hp_before > 0 and damage >= hp_before + player_sheet.hit_points.maximum:
+                    is_instant_death = True
+
+                if is_instant_death:
+                    # 直接死亡
+                    death_state.life_status = "dead"
+                    death_state.death_count += 1
+                    death_state.death_streak_count += 1
+                    death_state.last_death_at = datetime.now(timezone.utc).isoformat()
+                    death_state.last_death_cause = reason or f"伤害 ({damage_type or '未知'})"
+                    death_state.updated_at = datetime.now(timezone.utc).isoformat()
+                    player_sheet.is_dead = True
+                    player_sheet.status_flags = ["dead"]
+                    result["life_status"] = "dead"
+                    result["declared_death"] = True
+                    result["is_instant_death"] = True
+                    summary = f"deal_damage: player died instantly, damage={damage}"
+                else:
+                    # 进入濒死状态
+                    death_state.life_status = "dying"
+                    death_state.death_save_successes = 0
+                    death_state.death_save_failures = 0
+                    death_state.updated_at = datetime.now(timezone.utc).isoformat()
+                    player_sheet.status_flags = ["dying", "unconscious", "prone"]
+                    result["life_status"] = "dying"
+                    result["entered_dying"] = True
+                    result["death_save"] = {"successes": 0, "failures": 0}
+                    summary = f"deal_damage: player entering dying state, damage={damage}"
+            else:
+                result["life_status"] = death_state.life_status
+                summary = f"deal_damage: player damaged, hp={hp_after}/{player_sheet.hit_points.maximum}"
+
+            save_current(save)
+            event = ToolEvent(tool_name="deal_damage", ok=True, summary=summary, payload={"damage": damage, "hp_remaining": hp_after, "life_status": result["life_status"]})
+            logger.info("tool_call deal_damage ok: target=player damage=%s hp_remaining=%s life_status=%s", damage, hp_after, result["life_status"])
+        else:
+            # target_type == "role"
+            target_role_id = str(args.get("target_role_id") or "").strip()
+            if not target_role_id:
+                event = ToolEvent(tool_name="deal_damage", ok=False, summary="target_role_id is required when target_type is 'role'")
+                return (
+                    {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "target_role_id_required"}, ensure_ascii=False)},
+                    event,
+                )
+
+            role = next((r for r in save.role_pool if r.role_id == target_role_id), None)
+            if role is None:
+                event = ToolEvent(tool_name="deal_damage", ok=False, summary="role not found")
+                return (
+                    {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "role_not_found"}, ensure_ascii=False)},
+                    event,
+                )
+
+            role_sheet = role.profile.dnd5e_sheet
+            hp_before = role_sheet.hit_points.current
+            temp_hp = role_sheet.hit_points.temporary
+
+            # 先扣临时HP
+            remaining_damage = damage
+            if temp_hp > 0:
+                absorbed = min(temp_hp, remaining_damage)
+                role_sheet.hit_points.temporary -= absorbed
+                remaining_damage -= absorbed
+
+            # 扣除当前HP
+            if remaining_damage > 0:
+                role_sheet.hit_points.current = max(0, role_sheet.hit_points.current - remaining_damage)
+
+            hp_after = role_sheet.hit_points.current
+            result["damage_applied"] = damage
+            result["hp_remaining"] = hp_after
+            result["hp_before"] = hp_before
+            result["temp_hp_absorbed"] = min(temp_hp, damage) if temp_hp > 0 else 0
+
+            if hp_after <= 0:
+                role_sheet.is_dead = True
+                role_sheet.status_flags = ["dead", "downed"]
+                result["life_status"] = "dead"
+                summary = f"deal_damage: role died, damage={damage}"
+            else:
+                result["life_status"] = "healthy"
+                summary = f"deal_damage: role damaged, hp={hp_after}/{role_sheet.hit_points.maximum}"
+
+            save_current(save)
+            event = ToolEvent(tool_name="deal_damage", ok=True, summary=summary, payload={"damage": damage, "hp_remaining": hp_after, "life_status": result["life_status"]})
+            logger.info("tool_call deal_damage ok: target_role=%s damage=%s hp_remaining=%s", target_role_id, damage, hp_after)
+
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "spawn_encounter_npc":
+        try:
+            args = json.loads(arg_text)
+        except Exception:
+            event = ToolEvent(tool_name="spawn_encounter_npc", ok=False, summary="invalid json args")
+            logger.info("tool_call spawn_encounter_npc failed: invalid_json_args")
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "invalid_json_args"}, ensure_ascii=False)},
+                event,
+            )
+
+        encounter_id = str(args.get("encounter_id") or "").strip()
+        name = str(args.get("name") or "").strip()
+        title = str(args.get("title") or "").strip()
+        description = str(args.get("description") or "").strip()
+        speaking_style = str(args.get("speaking_style") or "").strip()
+        agenda = str(args.get("agenda") or "").strip()
+        role_type = str(args.get("role_type") or "neutral").strip()
+
+        if not encounter_id or not name:
+            event = ToolEvent(tool_name="spawn_encounter_npc", ok=False, summary="encounter_id and name are required")
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "missing_required_fields"}, ensure_ascii=False)},
+                event,
+            )
+
+        save = get_current_save(default_session_id=payload.session_id)
+        from app.services.encounter_service import _state, _find_encounter, _refresh_participants, _append_step, _touch_state, _utc_now
+
+        state = _state(save)
+        encounter = _find_encounter(state, encounter_id)
+
+        if encounter is None:
+            event = ToolEvent(tool_name="spawn_encounter_npc", ok=False, summary="encounter not found")
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "encounter_not_found"}, ensure_ascii=False)},
+                event,
+            )
+
+        # 创建临时NPC
+        from datetime import datetime, timezone
+        from app.models.schemas import EncounterTemporaryNpc
+
+        temp_npc = EncounterTemporaryNpc(
+            encounter_npc_id=f"encnpc_mid_{datetime.now(timezone.utc).timestamp()}",
+            name=name,
+            title=title,
+            description=description or f"{name}卷入了当前的遭遇。",
+            speaking_style=speaking_style,
+            agenda=agenda or f"{name}正试图处理眼前的情况。",
+            state="active",
+            zone_id=encounter.zone_id,
+            sub_zone_id=encounter.sub_zone_id,
+            introduced_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+        # 添加到遭遇
+        encounter.temporary_npcs.append(temp_npc)
+        if temp_npc.encounter_npc_id not in encounter.participant_role_ids:
+            encounter.participant_role_ids.append(temp_npc.encounter_npc_id)
+        _refresh_participants(save, encounter)
+
+        # 记录日志
+        _append_step(
+            encounter,
+            kind="npc_entrance",
+            actor_type="temporary_npc",
+            actor_id=temp_npc.encounter_npc_id,
+            actor_name=name,
+            content=f"新角色入场：{name}" + (f"（{title}）" if title else "") + "。",
+            metadata={"npc_name": name, "role_type": role_type},
+        )
+        _touch_state(state)
+        save_current(save)
+
+        result = {
+            "ok": True,
+            "encounter_npc_id": temp_npc.encounter_npc_id,
+            "name": name,
+            "title": title,
+            "role_type": role_type,
+        }
+        event = ToolEvent(
+            tool_name="spawn_encounter_npc",
+            ok=True,
+            summary=f"spawned encounter npc: {name}",
+            payload={"npc_id": temp_npc.encounter_npc_id, "name": name},
+        )
+        logger.info("tool_call spawn_encounter_npc ok: encounter=%s npc=%s", encounter_id, name)
+
+        return (
+            {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
+            event,
+        )
+
+    if tool_name == "get_encounter_participants":
+        try:
+            args = json.loads(arg_text)
+        except Exception:
+            event = ToolEvent(tool_name="get_encounter_participants", ok=False, summary="invalid json args")
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "invalid_json_args"}, ensure_ascii=False)},
+                event,
+            )
+
+        encounter_id = str(args.get("encounter_id") or "").strip()
+        if not encounter_id:
+            event = ToolEvent(tool_name="get_encounter_participants", ok=False, summary="encounter_id is required")
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "encounter_id_required"}, ensure_ascii=False)},
+                event,
+            )
+
+        save = get_current_save(default_session_id=payload.session_id)
+        from app.services.encounter_service import _state, _find_encounter, _visible_participant_text
+
+        state = _state(save)
+        encounter = _find_encounter(state, encounter_id)
+
+        if encounter is None:
+            event = ToolEvent(tool_name="get_encounter_participants", ok=False, summary="encounter not found")
+            return (
+                {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"ok": False, "error": "encounter_not_found"}, ensure_ascii=False)},
+                event,
+            )
+
+        team_members, visible_npcs = _visible_participant_text(save, encounter)
+
+        result = {
+            "ok": True,
+            "encounter_id": encounter_id,
+            "main_npc_role_id": encounter.npc_role_id,
+            "participant_role_ids": encounter.participant_role_ids,
+            "team_members": team_members,
+            "visible_npcs": visible_npcs,
+            "temporary_npcs": [
+                {
+                    "encounter_npc_id": npc.encounter_npc_id,
+                    "name": npc.name,
+                    "title": npc.title,
+                    "state": npc.state,
+                }
+                for npc in encounter.temporary_npcs
+            ],
+        }
+        event = ToolEvent(
+            tool_name="get_encounter_participants",
+            ok=True,
+            summary=f"participants: {len(encounter.temporary_npcs)} temp npcs",
+            payload={"temp_npc_count": len(encounter.temporary_npcs)},
+        )
+        logger.info("tool_call get_encounter_participants ok: encounter=%s", encounter_id)
+
         return (
             {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result, ensure_ascii=False)},
             event,
@@ -2290,20 +3249,6 @@ async def resolve_main_chat_turn(payload: ChatRequest) -> tuple[Message, Usage, 
             config=payload.config,
         )
         scene_events.extend(public_events)
-        background_advanced = advance_active_encounter_in_save(
-            save,
-            session_id=payload.session_id,
-            minutes_elapsed=time_spent_min,
-            config=payload.config,
-        )
-        if background_advanced is not None:
-            scene_events.append(
-                _new_scene_event(
-                    "encounter_background",
-                    background_advanced.latest_outcome_summary or background_advanced.scene_summary or background_advanced.description,
-                    metadata={"encounter_id": background_advanced.encounter_id, "encounter_title": background_advanced.title},
-                )
-            )
         archived_sub_zone_turn_id = _record_sub_zone_chat_turn(
             save,
             source="main_chat",

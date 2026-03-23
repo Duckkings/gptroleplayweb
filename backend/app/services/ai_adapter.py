@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib
 from typing import Any
 
 from openai import AsyncOpenAI, OpenAI
@@ -96,6 +97,19 @@ def resolve_model_profile(provider: str, model: str) -> ResolvedModelProfile:
     )
 
 
+def resolve_structured_capability_profile(provider: str, model: str) -> str:
+    model_id = (model or "").strip().lower()
+    if provider == "gemini":
+        return "gemini_native_schema_stream"
+    if provider == "openai":
+        return "openai_schema_stream"
+    if provider == "deepseek":
+        if "reasoner" in model_id or "deepseek" in model_id:
+            return "deepseek_json_two_phase"
+        return "deepseek_json_two_phase"
+    return "legacy_tag_fallback"
+
+
 def has_ai_config(config: ChatConfig | None) -> bool:
     if config is None:
         return False
@@ -116,6 +130,12 @@ def create_async_client(config: ChatConfig, client_cls: type[AsyncOpenAI] = Asyn
     if base_url:
         kwargs["base_url"] = base_url
     return client_cls(**kwargs)
+
+
+def create_gemini_native_client(config: ChatConfig) -> Any:
+    module = importlib.import_module("google.genai")
+    client_cls = getattr(module, "Client")
+    return client_cls(api_key=config.api_key)
 
 
 def build_completion_options(config: ChatConfig) -> dict[str, Any]:

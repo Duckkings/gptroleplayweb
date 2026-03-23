@@ -29,6 +29,15 @@ from app.models.schemas import (
     TeamStateResponse,
 )
 from app.services.ai_adapter import build_completion_options, create_sync_client
+from app.services.ai_protocol_contract_service import (
+    AI_PROVIDER_CALL_FAILED,
+    EnumContractField,
+    allow_protocol_repair,
+    render_enum_pool_text,
+    require_ai_config,
+    validate_or_repair_json_payload,
+)
+from app.services.actor_resource_service import consume_submission_resources_in_save
 from app.services.consistency_service import build_npc_knowledge_snapshot
 from app.services.world_service import (
     _ability_mod,
@@ -47,6 +56,7 @@ from app.services.world_service import (
     _ensure_npc_role_complete,
     _extract_json_content,
     _make_npc_item,
+    _npc_template_ability_names,
     _pick_many,
     _recompute_player_derived,
     _stable_int,
@@ -123,6 +133,8 @@ def _remove_area_presence(save, role_id: str) -> None:
 
 
 def _restore_area_presence(save, role: NpcRoleCard, member: TeamMember) -> None:
+    if role.state == "dead" or role.profile.dnd5e_sheet.role_action_status == "dead":
+        return
     role.zone_id = member.origin_zone_id
     role.sub_zone_id = member.origin_sub_zone_id
     role.state = "idle"
@@ -173,20 +185,30 @@ def _build_invite_decision(save, role: NpcRoleCard, req: TeamInviteRequest) -> t
             try:
                 client = create_sync_client(config, client_cls=OpenAI)
                 zone_name, sub_name = _current_player_area_names(save)
-                prompt_text = (
+                prompt_text = prompt_table.render(
+                    "team.invite_decider.user",
                     "You decide whether one NPC should join the player's party. Return JSON only.\n"
                     "Schema: {\"accept\":true,\"reason\":\"\",\"affinity\":50,\"trust\":40}.\n"
                     "Consider personality, relation tag, trust, and whether interests align.\n"
-                    f"NPC={role.name}, personality={role.personality}, background={role.background}, cognition={role.cognition}, alignment={role.alignment}.\n"
-                    f"CurrentArea={zone_name}/{sub_name}. RelationTag={relation_tag}. PlayerRequest={prompt or 'none'}.\n"
-                    "affinity/trust must be integers between 0 and 100."
+                    "NPC=$npc_name, personality=$personality, background=$background, cognition=$cognition, alignment=$alignment.\n"
+                    "CurrentArea=$zone_name/$sub_name. RelationTag=$relation_tag. PlayerRequest=$player_request.\n"
+                    "affinity/trust must be integers between 0 and 100.",
+                    npc_name=role.name,
+                    personality=role.personality,
+                    background=role.background,
+                    cognition=role.cognition,
+                    alignment=role.alignment,
+                    zone_name=zone_name,
+                    sub_name=sub_name,
+                    relation_tag=relation_tag,
+                    player_request=(prompt or "none"),
                 )
                 resp = client.chat.completions.create(
                     model=model,
                     **build_completion_options(config),
                     response_format={"type": "json_object"},
                     messages=[
-                        {"role": "system", "content": "Return JSON only."},
+                        {"role": "system", "content": prompt_table.get_text("team.json_only.system", "Return JSON only.")},
                         {"role": "user", "content": prompt_text},
                     ],
                 )
@@ -558,7 +580,7 @@ def _compose_fallback_team_background(
     if likes:
         parts.append(f"平时会对{'、'.join(likes[:2])}这类线索格外上心，也因此更容易被相关话题打动。")
     elif prompt_text:
-        parts.append(f"从你的描述来看，他/她身上最鲜明的特征与“{_limit_text(prompt_text, 24)}”有关。")
+        parts.append(f'从你的描述来看，他/她身上最鲜明的特征与“{_limit_text(prompt_text, 24)}”有关。')
     return _limit_text("".join(parts), 280)
 
 
@@ -693,6 +715,7 @@ def _sanitize_team_role_spec(raw: dict[str, Any], fallback: dict[str, Any]) -> d
         "skills_proficient": _merge_unique(_normalize_text_list(raw.get("skills_proficient"), limit=5), _normalize_text_list(fallback.get("skills_proficient"), limit=5), 5),
         "features_traits": _merge_unique(_normalize_text_list(raw.get("features_traits"), limit=6), _normalize_text_list(fallback.get("features_traits"), limit=6), 6),
         "spells": _merge_unique(_normalize_text_list(raw.get("spells"), limit=5), _normalize_text_list(fallback.get("spells"), limit=5), 5),
+        "war_arts": _merge_unique(_normalize_text_list(raw.get("war_arts"), limit=5), _normalize_text_list(fallback.get("war_arts"), limit=5), 5),
         "preferred_weapon": preferred_weapon,
         "preferred_armor": preferred_armor,
         "inventory_items": inventory_items,
@@ -709,20 +732,26 @@ def _ai_team_role_spec(save, prompt: str, config, source: str) -> dict[str, Any]
     if not api_key or not model:
         return None
     zone_name, sub_name = _current_player_area_names(save)
-    prompt_text = (
+    prompt_text = prompt_table.render(
+        "team.teammate_concept.user",
         "You generate one teammate concept for a fantasy RPG. Return JSON only.\n"
         "Use this exact schema keys only: "
         "{\"display_name\":\"\",\"race\":\"\",\"char_class\":\"\",\"sheet_background\":\"\",\"alignment\":\"\","
         "\"personality\":\"\",\"speaking_style\":\"\",\"appearance\":\"\",\"background\":\"\",\"cognition\":\"\","
         "\"secret\":\"\",\"likes\":[],\"languages\":[],\"tool_proficiencies\":[],\"skills_proficient\":[],"
-        "\"features_traits\":[],\"spells\":[],\"preferred_weapon\":\"\",\"preferred_armor\":\"\","
+        "\"features_traits\":[],\"spells\":[],\"war_arts\":[],\"preferred_weapon\":\"\",\"preferred_armor\":\"\","
         "\"inventory_items\":[],\"notes\":\"\",\"ability_bias\":\"\"}.\n"
-        f"Allowed race={_ALLOWED_TEAM_RACES}. Allowed char_class={_ALLOWED_TEAM_CLASSES}. "
-        f"Allowed alignment={_ALLOWED_TEAM_ALIGNMENTS}. Allowed ability_bias="
-        "[strength,dexterity,constitution,intelligence,wisdom,charisma].\n"
+        "Allowed race=$allowed_race. Allowed char_class=$allowed_class. Allowed alignment=$allowed_alignment. Allowed ability_bias=[strength,dexterity,constitution,intelligence,wisdom,charisma].\n"
         "Keep array items short. Use Chinese strings. Do not output markdown.\n"
         "background should be 2-3 full Chinese sentences, not a fragment. cognition/secret/appearance should also be complete phrases.\n"
-        f"Current area={zone_name}/{sub_name}. Source={source}. Player prompt={prompt}."
+        "Current area=$zone_name/$sub_name. Source=$source. Player prompt=$player_prompt.",
+        allowed_race=_ALLOWED_TEAM_RACES,
+        allowed_class=_ALLOWED_TEAM_CLASSES,
+        allowed_alignment=_ALLOWED_TEAM_ALIGNMENTS,
+        zone_name=zone_name,
+        sub_name=sub_name,
+        source=source,
+        player_prompt=prompt,
     )
     try:
         client = create_sync_client(config, client_cls=OpenAI)
@@ -731,7 +760,7 @@ def _ai_team_role_spec(save, prompt: str, config, source: str) -> dict[str, Any]
             **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
-                {"role": "system", "content": "Return JSON only."},
+                {"role": "system", "content": prompt_table.get_text("team.json_only.system", "Return JSON only.")},
                 {"role": "user", "content": prompt_text},
             ],
         )
@@ -838,8 +867,13 @@ def _build_team_profile_from_spec(role_id: str, name: str, spec: dict[str, Any])
     skills = _merge_unique(list(template.get("skills") or []), list(spec["skills_proficient"]), 6)
     tools = _merge_unique(list(template.get("tools") or []), list(spec["tool_proficiencies"]), 5)
     features = _merge_unique(list(template.get("features") or []), list(spec["features_traits"]), 6)
-    spells = _merge_unique(list(template.get("spells") or []), list(spec["spells"]), 6)
-    first_level_slots = max(int(template.get("spell_slots_level_1") or 0), 1 if spells else 0)
+    template_spells, template_war_arts = _npc_template_ability_names(char_class, level)
+    if not template_spells:
+        template_spells = list(template.get("spells") or [])
+    spells = _merge_unique(template_spells, list(spec["spells"]), 6)
+    war_arts = _merge_unique(template_war_arts, list(spec.get("war_arts") or []), 6)
+    first_level_slots = max(1, min(int(level or 1), 9)) if spells else 0
+    martial_points = max(1, min(int(level or 1), 9)) if war_arts else 0
     profile = PlayerStaticData(
         player_id=role_id,
         name=name,
@@ -873,6 +907,7 @@ def _build_team_profile_from_spec(role_id: str, name: str, spec: dict[str, Any])
             },
             "features_traits": features,
             "spells": spells,
+            "war_arts": war_arts,
             "spell_slots_max": {
                 "level_1": first_level_slots,
                 "level_2": 0,
@@ -895,6 +930,9 @@ def _build_team_profile_from_spec(role_id: str, name: str, spec: dict[str, Any])
                 "level_8": 0,
                 "level_9": 0,
             },
+            "martial_points_current": martial_points,
+            "martial_points_maximum": martial_points,
+            "war_art_cooldowns": {},
             "notes": _limit_text(spec["notes"] or f"由prompt生成的队友：{spec['sheet_background']}", 160),
         },
     )
@@ -1015,6 +1053,77 @@ def _team_chat_deltas(player_text: str) -> tuple[int, int]:
     return (0, 0)
 
 
+def _private_chat_deltas(player_text: str, relation_tag: str) -> tuple[int, int]:
+    affinity_delta, trust_delta = _team_chat_deltas(player_text)
+    relation_affinity, relation_trust = {
+        "ally": (1, 2),
+        "friendly": (1, 1),
+        "met": (0, 0),
+        "neutral": (0, 0),
+        "wary": (-1, -1),
+        "hostile": (-2, -2),
+    }.get((relation_tag or "").strip().lower(), (0, 0))
+    return (
+        max(-3, min(3, affinity_delta + relation_affinity)),
+        max(-3, min(3, trust_delta + relation_trust)),
+    )
+
+
+def apply_private_chat_feedback_in_save(
+    save,
+    *,
+    session_id: str,
+    role_id: str,
+    player_text: str,
+    reply: str,
+    relation_tag: str,
+) -> TeamReaction | None:
+    state = ensure_team_state(save)
+    member = _find_member(state, role_id)
+    if member is None:
+        return None
+    role = next((item for item in save.role_pool if item.role_id == role_id), None)
+    if role is None:
+        return None
+    affinity_delta, trust_delta = _private_chat_deltas(player_text, relation_tag)
+    preview = (reply or f"{role.name} 对你的单聊做出了回应。").strip()[:120]
+    member.affinity = _clamp_score(member.affinity + affinity_delta)
+    member.trust = _clamp_score(member.trust + trust_delta)
+    member.last_reaction_at = _utc_now()
+    member.last_reaction_preview = preview
+    role.attitude_changes.append(f"{member.last_reaction_at} team:private_chat:{affinity_delta}/{trust_delta}")
+    role.attitude_changes = role.attitude_changes[-50:]
+    role.cognition_changes.append(f"{member.last_reaction_at} 单聊记忆: {player_text[:48]}")
+    role.cognition_changes = role.cognition_changes[-50:]
+    reaction = TeamReaction(
+        reaction_id=_new_id("treact"),
+        member_role_id=member.role_id,
+        member_name=member.name,
+        trigger_kind="npc_chat",
+        content=preview or role.name,
+        affinity_delta=affinity_delta,
+        trust_delta=trust_delta,
+    )
+    state.reactions.append(reaction)
+    state.reactions = state.reactions[-100:]
+    _append_game_log(
+        save,
+        session_id,
+        "team_private_chat",
+        f"{member.name}: {preview}",
+        {
+            "role_id": member.role_id,
+            "affinity_delta": affinity_delta,
+            "trust_delta": trust_delta,
+            "relation_tag": relation_tag,
+        },
+    )
+    if member.affinity <= 0:
+        _remove_member_from_team_in_save(save, member, "affinity_depleted")
+    _touch_state(state)
+    return reaction
+
+
 def _fallback_team_chat_reply(role: NpcRoleCard, player_text: str) -> tuple[str, str]:
     silent = any(token in f"{role.personality} {role.speaking_style} {role.background}" for token in ["沉默", "寡言", "冷淡"])
     if _contains_any([player_text], ["威胁", "attack", "抢", "rob", "杀", "threat"]):
@@ -1031,18 +1140,14 @@ def _fallback_team_chat_reply(role: NpcRoleCard, player_text: str) -> tuple[str,
 
 
 def _ai_team_chat_reply(save, role: NpcRoleCard, player_text: str, config) -> tuple[str, str] | None:
-    if config is None:
-        return None
-    api_key = (config.openai_api_key or "").strip()
-    model = (config.model or "").strip()
-    if not api_key or not model:
-        return None
+    config = require_ai_config(config)
     try:
         client = create_sync_client(config, client_cls=OpenAI)
         knowledge = build_npc_knowledge_snapshot(save, role.role_id)
         world_time_text, _ = _world_time_payload(save.area_snapshot.clock)
         context = _build_npc_context(role, recent_count=10)
         zone_name, sub_name = _current_player_area_names(save)
+        active_encounter = next((item for item in save.encounter_state.encounters if item.encounter_id == save.encounter_state.active_encounter_id), None)
         default_prompt = (
             "你要扮演跑团中的队友 NPC，在队伍聊天里回应玩家。"
             "只返回 JSON，不要输出额外解释。"
@@ -1077,8 +1182,9 @@ def _ai_team_chat_reply(save, role: NpcRoleCard, player_text: str, config) -> tu
             context=context,
             player_text=player_text,
         )
+        prompt = f"{prompt}\nAllowed enum ids:\n{render_enum_pool_text((EnumContractField(field_path='response_mode', allowed_ids=('speech', 'action')),))}"
         resp = client.chat.completions.create(
-            model=model,
+            model=config.model,
             **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
@@ -1093,16 +1199,26 @@ def _ai_team_chat_reply(save, role: NpcRoleCard, player_text: str, config) -> tu
             getattr(usage, "prompt_tokens", 0) or 0,
             getattr(usage, "completion_tokens", 0) or 0,
         )
-        parsed = json.loads((resp.choices[0].message.content or "{}").strip())
+        raw_json = (resp.choices[0].message.content or "{}").strip() or "{}"
+        parsed = json.loads(raw_json)
+        with allow_protocol_repair():
+            parsed = validate_or_repair_json_payload(
+                parsed=parsed if isinstance(parsed, dict) else {},
+                raw_json=raw_json,
+                fields=(EnumContractField(field_path="response_mode", allowed_ids=("speech", "action")),),
+                config=config,
+                system_prompt=config.gm_prompt,
+                original_prompt=prompt,
+            )
         content = str(parsed.get("content") or "").strip()
         if not content:
-            return None
-        response_mode = str(parsed.get("response_mode") or "speech").strip().lower()
-        if response_mode not in {"speech", "action"}:
-            response_mode = "speech"
+            raise ValueError("AI_PROTOCOL_REPAIR_FAILED")
+        response_mode = str(parsed.get("response_mode") or "").strip().lower()
         return content[:120], response_mode
-    except Exception:
-        return None
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"{AI_PROVIDER_CALL_FAILED}: {exc}") from exc
 
 
 def team_chat(req: TeamChatRequest) -> TeamChatResponse:
@@ -1139,11 +1255,7 @@ def team_chat(req: TeamChatRequest) -> TeamChatResponse:
             clock=save.area_snapshot.clock,
             context_kind="team_chat",
         )
-        generated = _ai_team_chat_reply(save, role, player_text, req.config)
-        if generated is None:
-            content, response_mode = _fallback_team_chat_reply(role, player_text)
-        else:
-            content, response_mode = generated
+        content, response_mode = _ai_team_chat_reply(save, role, player_text, req.config)
         affinity_delta, trust_delta = _team_chat_deltas(player_text)
         _append_npc_dialogue(
             role=role,
@@ -1205,12 +1317,6 @@ def team_chat(req: TeamChatRequest) -> TeamChatResponse:
         _remove_member_from_team_in_save(save, member, "affinity_depleted")
     if replies or leave_ids:
         _touch_state(state)
-    try:
-        from app.services.encounter_service import advance_active_encounter_in_save
-
-        advance_active_encounter_in_save(save, session_id=req.session_id, minutes_elapsed=time_spent_min, config=req.config)
-    except Exception:
-        pass
     save_current(save)
     return TeamChatResponse(
         session_id=req.session_id,
@@ -1247,7 +1353,14 @@ def _build_reaction(role: NpcRoleCard, trigger_kind: str, player_text: str, summ
         return (f"{role.name} 点了点头，似乎更愿意继续跟着你。", 1, 1)
     return (f"{role.name} 记下了这件事，但暂时没有多说什么。", 0, 0)
 
-def _ai_team_public_reply(save, role: NpcRoleCard, player_text: str, scene_summary: str, scene_context, config) -> tuple[str, str, int, int] | None:
+def _ai_team_public_reply(
+    save,
+    role: NpcRoleCard,
+    player_text: str,
+    scene_summary: str,
+    scene_context,
+    config,
+) -> tuple[str, str, str, str, int, int] | None:
     if config is None:
         return None
     api_key = (config.openai_api_key or "").strip()
@@ -1263,6 +1376,7 @@ def _ai_team_public_reply(save, role: NpcRoleCard, player_text: str, scene_summa
             roleplay_brief=_build_npc_roleplay_brief(role),
             scene_summary=scene_summary or "公开区域中的即时互动",
             player_text=player_text,
+            encounter_goal=(active_encounter.goal if active_encounter is not None else ""),
             gm_summary=scene_summary,
             area_text=f"{zone_name} / {sub_name}",
             context=_build_npc_prompt_context(role, save.area_snapshot.clock, recent_count=8, save=save),
@@ -1293,7 +1407,7 @@ def _ai_team_public_reply(save, role: NpcRoleCard, player_text: str, scene_summa
         response_mode = "speech" if speech_reply else "action"
         affinity_delta = max(-3, min(3, int(parsed.get("affinity_delta") or 0)))
         trust_delta = max(-3, min(3, int(parsed.get("trust_delta") or 0)))
-        return content[:120], response_mode, affinity_delta, trust_delta
+        return action_reaction, speech_reply, content[:120], response_mode, affinity_delta, trust_delta
     except Exception:
         return None
 
@@ -1330,7 +1444,15 @@ def generate_team_public_replies_in_save(
             affinity_delta = 0
             trust_delta = 0
         else:
-            content, response_mode, affinity_delta, trust_delta = generated
+            action_reaction, speech_reply, content, response_mode, affinity_delta, trust_delta = generated
+            consume_submission_resources_in_save(
+                save,
+                actor_role_id=role.role_id,
+                action_text=action_reaction,
+                speech_text=speech_reply,
+                entry_point="teammate_chat",
+                config=config,
+            )
         member.affinity = _clamp_score(member.affinity + affinity_delta)
         member.trust = _clamp_score(member.trust + trust_delta)
         member.last_reaction_at = _utc_now()

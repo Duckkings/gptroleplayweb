@@ -1,11 +1,15 @@
 ﻿from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from math import ceil, sqrt
 import random
 import re
+from typing import Iterator, Literal
 
 from openai import OpenAI
 
@@ -32,6 +36,7 @@ from app.models.schemas import (
     AreaSubZone,
     AreaZone,
     BehaviorDescribeResponse,
+    CharacterBuildState,
     ChatConfig,
     Coord3D,
     GameLogAddRequest,
@@ -50,11 +55,15 @@ from app.models.schemas import (
     NpcChatResponse,
     NpcGreetRequest,
     NpcGreetResponse,
+    OriginStamp,
     InventoryItem,
     InventoryOwnerRef,
     InventoryEquipRequest,
     InventoryUnequipRequest,
     InventoryMutationResponse,
+    InventoryGrantRequest,
+    InventoryConsumeRequest,
+    MapRenderPayload,
     InventoryInteractRequest,
     InventoryInteractResponse,
     PlayerRuntimeData,
@@ -64,6 +73,7 @@ from app.models.schemas import (
     PlayerItemAddRequest,
     PlayerItemRemoveRequest,
     PlayerSkillSetRequest,
+    PlayerMartialPointAdjustRequest,
     PlayerSpellSetRequest,
     PlayerSpellSlotAdjustRequest,
     PlayerStaminaAdjustRequest,
@@ -78,13 +88,20 @@ from app.models.schemas import (
     RoleBuff,
     Dnd5eAbilityScores,
     Dnd5eAbilityModifiers,
+    EntityRef,
     RenderMapRequest,
     RenderCircle,
     RenderMapResponse,
     RenderNode,
     RenderSubNode,
+    PublicTurnState,
+    PublicTurnPresentation,
+    PublicTurnOpposedPlanRequest,
+    PublicTurnOpposedPlanResponse,
     SaveFile,
     SceneEvent,
+    SceneInteractable,
+    TemplateLibraryDefinitionsRequest,
     SubZoneChatContext,
     SubZoneChatTurn,
     SubZoneChatTurnEvent,
@@ -94,7 +111,16 @@ from app.models.schemas import (
     Zone,
     ZoneSubZoneSeed,
 )
-from app.services.ai_adapter import build_completion_options, create_sync_client
+from app.services.actor_capability_service import build_role_capability_snapshot, render_role_capability_brief
+from app.services.ai_adapter import build_completion_options, create_sync_client, has_ai_config
+from app.services.ai_protocol_contract_service import (
+    AI_PROVIDER_CALL_FAILED,
+    EnumContractField,
+    allow_protocol_repair,
+    render_enum_pool_text,
+    require_ai_config,
+    validate_or_repair_json_payload,
+)
 from app.services.consistency_service import (
     build_npc_knowledge_snapshot,
     bump_world_revision,
@@ -103,6 +129,36 @@ from app.services.consistency_service import (
     player_mentions_unknown_npc,
     reconcile_consistency,
 )
+from app.services.item_instance_service import (
+    create_item_instance,
+    ensure_item_system,
+    get_owner_instance,
+    get_owner_instance_by_ref,
+    refresh_item_system_projection,
+    remove_item_instance,
+    resolve_owner_instances,
+)
+from app.services.item_template_service import ensure_definition_for_inventory_item, get_template_library_status, infer_interactable_template_id, load_template_library
+from app.services.template_library_query_service import query_template_library_definitions
+from app.services.scene_interaction_service import execute_scene_interaction_in_save, list_scene_interactables
+
+
+@dataclass
+class SaveTransaction:
+    save: SaveFile
+    committed: bool = False
+
+    def commit(self) -> SaveFile:
+        if not self.committed:
+            _persist_save(self.save)
+            self.committed = True
+        return self.save
+
+    def rollback(self) -> None:
+        self.committed = False
+
+
+_SAVE_TRANSACTION: ContextVar[SaveTransaction | None] = ContextVar("save_transaction", default=None)
 
 
 class AIRegionGenerationError(RuntimeError):
@@ -156,6 +212,31 @@ def _empty_save(session_id: str) -> SaveFile:
     )
 
 
+def ensure_character_build_state(save: SaveFile) -> None:
+    state = getattr(save, "character_build_state", None)
+    if state is None:
+        save.character_build_state = CharacterBuildState()
+        state = save.character_build_state
+
+    player = getattr(save, "player_static_data", None)
+    sheet = getattr(player, "dnd5e_sheet", None)
+    heuristics = [
+        bool(player and player.name and player.name != "玩家"),
+        bool(sheet and sheet.race),
+        bool(sheet and sheet.char_class),
+        bool(sheet and sheet.skills_proficient),
+        bool(sheet and sheet.spells),
+        bool(sheet and getattr(getattr(sheet, "backpack", None), "items", [])),
+        bool(getattr(player, "portrait", None)),
+    ]
+    desired = "completed" if any(heuristics) else "uncreated"
+    if state.player_status not in {"uncreated", "completed"}:
+        state.player_status = desired
+    elif state.player_status == "uncreated" and desired == "completed":
+        state.player_status = "completed"
+    state.updated_at = _utc_now()
+
+
 def _new_game_log(session_id: str, kind: str, message: str, payload: dict[str, str | int | float | bool] | None = None) -> GameLogEntry:
     return GameLogEntry(
         id=f"glog_{int(datetime.now(timezone.utc).timestamp() * 1000)}",
@@ -184,13 +265,21 @@ def _ensure_sub_zone_chat_context(sub_zone: AreaSubZone | None) -> SubZoneChatCo
     context = getattr(sub_zone, "chat_context", None)
     if context is None:
         sub_zone.chat_context = SubZoneChatContext()
+    elif getattr(context, "public_turn_state", None) is None:
+        context.public_turn_state = PublicTurnState()
+        context.version = "0.2.0"
     return sub_zone.chat_context
 
 
 def _scene_event_to_turn_event(event: SceneEvent) -> SubZoneChatTurnEvent:
     actor_type: str = "system"
     event_kind = "system_notice"
-    if event.kind in {"public_targeted_npc_reply", "public_bystander_reaction"}:
+    if event.kind == "damage_resolution":
+        actor_type = str(event.metadata.get("target_actor_type") or event.metadata.get("actor_type") or "system")
+        if actor_type not in {"npc", "team", "encounter_temp_npc", "system"}:
+            actor_type = "system"
+        event_kind = "damage_resolution"
+    elif event.kind in {"public_targeted_npc_reply", "public_bystander_reaction"}:
         actor_type = "npc"
         event_kind = "npc_reply"
     elif event.kind == "team_public_reaction":
@@ -209,6 +298,34 @@ def _scene_event_to_turn_event(event: SceneEvent) -> SubZoneChatTurnEvent:
     elif event.kind == "public_round_resolution":
         actor_type = "system"
         event_kind = "public_round_resolution"
+    elif event.kind == "public_turn_phase":
+        event_kind = "public_turn_phase"
+    elif event.kind == "public_turn_initiative":
+        event_kind = "public_turn_initiative"
+    elif event.kind == "public_turn_actor_action":
+        actor_type = str(event.metadata.get("actor_type") or "system")
+        if actor_type not in {"npc", "team", "encounter_temp_npc", "system"}:
+            actor_type = "system"
+        event_kind = "public_turn_actor_action"
+    elif event.kind == "public_turn_actor_resolution":
+        actor_type = str(event.metadata.get("actor_type") or "system")
+        if actor_type not in {"npc", "team", "encounter_temp_npc", "system"}:
+            actor_type = "system"
+        event_kind = "public_turn_actor_resolution"
+    elif event.kind == "public_turn_situation":
+        event_kind = "public_turn_situation"
+    elif event.kind == "public_turn_round_end":
+        event_kind = "public_turn_round_end"
+    elif event.kind == "public_turn_gm_push":
+        event_kind = "public_turn_gm_push"
+    elif event.kind == "public_turn_relation_update":
+        actor_type = "npc"
+        event_kind = "public_turn_relation_update"
+    elif event.kind == "public_turn_team_update":
+        actor_type = "team"
+        event_kind = "public_turn_team_update"
+    elif event.kind == "public_turn_environment_update":
+        event_kind = "public_turn_environment_update"
     elif event.kind == "role_desire_surface":
         actor_type = str(event.metadata.get("actor_type") or "npc")
         if actor_type not in {"npc", "team", "encounter_temp_npc", "system"}:
@@ -221,10 +338,27 @@ def _scene_event_to_turn_event(event: SceneEvent) -> SubZoneChatTurnEvent:
         event_kind = "reputation_update"
     elif event.kind == "encounter_situation_update":
         event_kind = "encounter_situation_update"
+    elif event.kind == "encounter_world_push":
+        event_kind = "encounter_world_push"
     elif event.kind == "encounter_progress":
         event_kind = "encounter_progress"
     elif event.kind == "encounter_resolution":
         event_kind = "encounter_resolution"
+    elif event.kind == "player_entered_death_save":
+        event_kind = "player_entered_death_save"
+    elif event.kind == "player_death_save_result":
+        event_kind = "player_death_save_result"
+    elif event.kind == "player_died":
+        event_kind = "player_died"
+    elif event.kind == "team_npc_entered_death_save":
+        actor_type = "team"
+        event_kind = "team_npc_entered_death_save"
+    elif event.kind == "team_npc_death_save_result":
+        actor_type = "team"
+        event_kind = "team_npc_death_save_result"
+    elif event.kind == "team_npc_died":
+        actor_type = "team"
+        event_kind = "team_npc_died"
     return SubZoneChatTurnEvent(
         event_kind=event_kind,  # type: ignore[arg-type]
         actor_type=actor_type,  # type: ignore[arg-type]
@@ -259,6 +393,14 @@ def _serialize_recent_sub_zone_turns(sub_zone: AreaSubZone | None, *, limit: int
         items.append(
             {
                 "player_mode": turn.player_mode,
+                "public_round_id": turn.public_round_id,
+                "public_round_number": turn.public_round_number,
+                "public_phase": (turn.public_phase.value if turn.public_phase is not None else None),
+                "public_turn_presentation": (
+                    turn.public_turn_presentation.model_dump(mode="json")
+                    if turn.public_turn_presentation is not None
+                    else None
+                ),
                 "world_time_text": turn.world_time_text,
                 "player_action": turn.player_action,
                 "player_speech": turn.player_speech,
@@ -291,9 +433,12 @@ def _visible_team_roles(save: SaveFile) -> list[dict[str, str]]:
 
 
 def build_main_turn_context_payload(save: SaveFile, player_message: str, *, recent_turn_count: int = 8) -> dict[str, object]:
+    from app.services import zone_metric_service
+
     _ensure_area_snapshot(save)
     sub_zone = _current_sub_zone(save)
     zone = next((item for item in save.area_snapshot.zones if item.zone_id == save.area_snapshot.current_zone_id), None)
+    zone_metric = zone_metric_service.get_current_zone_metric(save, create=True)
     active_encounter = _active_encounter_for_current_sub_zone(save)
     active_quest = next((item for item in save.quest_state.quests if item.status == "active" and item.is_tracked), None)
     if active_quest is None:
@@ -309,6 +454,10 @@ def build_main_turn_context_payload(save: SaveFile, player_message: str, *, rece
             "sub_zone_id": save.area_snapshot.current_sub_zone_id,
             "sub_zone_name": sub_zone.name if sub_zone is not None else "",
             "sub_zone_description": sub_zone.description if sub_zone is not None else "",
+            "zone_reputation_score": (zone_metric.reputation_score if zone_metric is not None else 50),
+            "zone_reputation_band": (zone_metric.reputation_band if zone_metric is not None else "neutral"),
+            "zone_danger_score": (zone_metric.danger_score if zone_metric is not None else 50),
+            "zone_danger_band": (zone_metric.danger_band if zone_metric is not None else "medium"),
         },
         "world_time": {"world_time_text": world_time_text, **world_time},
         "player_input": {
@@ -343,9 +492,8 @@ def build_main_turn_context_payload(save: SaveFile, player_message: str, *, rece
                 "title": active_encounter.title,
                 "status": active_encounter.status,
                 "npc_role_id": active_encounter.npc_role_id,
+                "goal": active_encounter.goal,
                 "scene_summary": active_encounter.scene_summary,
-                "latest_outcome_summary": active_encounter.latest_outcome_summary,
-                "player_presence": active_encounter.player_presence,
             }
             if active_encounter is not None
             else None
@@ -357,7 +505,11 @@ def build_main_turn_context_payload(save: SaveFile, player_message: str, *, rece
 
 
 def build_main_turn_context_json(save: SaveFile, player_message: str, *, recent_turn_count: int = 8) -> str:
-    return json.dumps(build_main_turn_context_payload(save, player_message, recent_turn_count=recent_turn_count), ensure_ascii=False, indent=2)
+    return json.dumps(
+        build_main_turn_context_payload(save, player_message, recent_turn_count=recent_turn_count),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def _build_scene_context_payload(
@@ -382,6 +534,10 @@ def _record_sub_zone_chat_turn(
     player_action_check: dict[str, object] | None,
     gm_narration: str,
     events: list[SceneEvent],
+    public_round_id: str | None = None,
+    public_round_number: int | None = None,
+    public_phase=None,
+    public_turn_presentation: PublicTurnPresentation | None = None,
 ) -> str | None:
     sub_zone = _current_sub_zone(save)
     context = _ensure_sub_zone_chat_context(sub_zone)
@@ -393,6 +549,9 @@ def _record_sub_zone_chat_turn(
         turn_id=f"sturn_{int(datetime.now(timezone.utc).timestamp() * 1000)}_{random.randint(100, 999)}",
         source=source,  # type: ignore[arg-type]
         player_mode=player_mode,  # type: ignore[arg-type]
+        public_round_id=public_round_id,
+        public_round_number=public_round_number,
+        public_phase=public_phase,
         world_time_text=world_time_text,
         world_time=world_time,
         player_action=player_action,
@@ -402,6 +561,7 @@ def _record_sub_zone_chat_turn(
         active_encounter_id=(active_encounter.encounter_id if active_encounter is not None else None),
         active_encounter_title=(active_encounter.title if active_encounter is not None else ""),
         active_encounter_status=(active_encounter.status if active_encounter is not None else ""),
+        public_turn_presentation=public_turn_presentation.model_copy(deep=True) if public_turn_presentation is not None else None,
         events=[_scene_event_to_turn_event(event) for event in events[:_SUB_ZONE_CHAT_EVENT_LIMIT]],
     )
     context.recent_turns.append(turn)
@@ -428,6 +588,61 @@ def _spell_slot_field(level: int) -> str:
     return f"level_{max(1, min(int(level), 9))}"
 
 
+def _level_scaled_resource_cap(level: int) -> int:
+    return max(1, min(int(level or 1), 9))
+
+
+def _spell_slots_total_from_sheet(sheet) -> int:
+    return sum(int(getattr(sheet, _spell_slot_field(level))) for level in range(1, 10))
+
+
+def _martial_resource_name(value: str) -> str | None:
+    query = str(value or "").strip().lower()
+    if not query:
+        return None
+    try:
+        library = load_template_library()
+    except Exception:
+        return None
+    for definition in library.war_art_definitions:
+        if definition.name.strip().lower() == query or definition.definition_id.strip().lower() == query:
+            return definition.name
+    return None
+
+
+def _sync_level_scaled_resources(sheet) -> None:
+    if not sheet.war_arts and sheet.skills_proficient:
+        inferred_war_arts = [name for name in (_martial_resource_name(skill) for skill in sheet.skills_proficient) if name]
+        if inferred_war_arts:
+            sheet.war_arts = inferred_war_arts
+
+    spell_cap = _level_scaled_resource_cap(sheet.level) if sheet.spells else 0
+    had_spell_resource = _spell_slots_total_from_sheet(sheet.spell_slots_max) > 0 or _spell_slots_total_from_sheet(sheet.spell_slots_current) > 0
+    current_level_1 = max(0, int(sheet.spell_slots_current.level_1))
+    sheet.spell_slots_max.level_1 = spell_cap
+    sheet.spell_slots_current.level_1 = (spell_cap if spell_cap > 0 and not had_spell_resource else min(current_level_1, spell_cap))
+    for level in range(2, 10):
+        key = _spell_slot_field(level)
+        setattr(sheet.spell_slots_max, key, 0)
+        setattr(sheet.spell_slots_current, key, 0)
+
+    martial_cap = _level_scaled_resource_cap(sheet.level) if sheet.war_arts else 0
+    had_martial_resource = int(sheet.martial_points_maximum or 0) > 0 or int(sheet.martial_points_current or 0) > 0
+    current_martial = max(0, int(sheet.martial_points_current or 0))
+    sheet.martial_points_maximum = martial_cap
+    sheet.martial_points_current = martial_cap if martial_cap > 0 and not had_martial_resource else min(current_martial, martial_cap)
+    cooldowns = dict(getattr(sheet, "war_art_cooldowns", {}) or {})
+    known_war_arts = {str(item).strip() for item in list(sheet.war_arts or []) if str(item).strip()}
+    if cooldowns:
+        sheet.war_art_cooldowns = {
+            str(key): max(0, int(value or 0))
+            for key, value in cooldowns.items()
+            if str(key).strip() in known_war_arts or str(key).strip()
+        }
+    else:
+        sheet.war_art_cooldowns = {}
+
+
 def _sum_buff_delta(buffs: list[RoleBuff], key: str) -> int:
     return sum(int(getattr(item.effect, key, 0) or 0) for item in buffs)
 
@@ -436,6 +651,7 @@ def _sanitize_sheet_lists(profile: PlayerStaticData) -> None:
     sheet = profile.dnd5e_sheet
     sheet.skills_proficient = sorted({s.strip() for s in sheet.skills_proficient if s.strip()})
     sheet.spells = sorted({s.strip() for s in sheet.spells if s.strip()})
+    sheet.war_arts = sorted({s.strip() for s in sheet.war_arts if s.strip()})
     sheet.status_flags = sorted({s.strip() for s in sheet.status_flags if s.strip()})
     sheet.equipment = sorted({s.strip() for s in sheet.equipment if s.strip()})
 
@@ -453,6 +669,7 @@ def _recompute_player_derived(profile: PlayerStaticData) -> None:
     sheet = profile.dnd5e_sheet
     _sanitize_sheet_lists(profile)
     _ensure_equipped_item_exists(profile)
+    _sync_level_scaled_resources(sheet)
 
     buffs = sheet.buffs
     base = sheet.ability_scores
@@ -502,13 +719,25 @@ def _recompute_player_derived(profile: PlayerStaticData) -> None:
     hp.current = max(0, min(hp.current, hp.maximum))
 
     sheet.stamina_current = max(0, min(sheet.stamina_current, sheet.stamina_maximum))
-    sheet.is_dead = hp.current <= 0
+    if sheet.death_state.life_status == "dead":
+        sheet.is_dead = True
+        sheet.role_action_status = "dead"
+    else:
+        sheet.is_dead = False
+        if sheet.death_state.life_status == "dying":
+            sheet.role_action_status = "death_saving"
+        elif sheet.death_state.life_status == "stable":
+            if sheet.role_action_status == "dead":
+                sheet.role_action_status = "unable_to_act"
+        elif sheet.role_action_status in {"death_saving", "dead"} and hp.current > 0:
+            sheet.role_action_status = "free_action"
 
     for level in range(1, 10):
         key = _spell_slot_field(level)
         max_val = max(0, int(getattr(sheet.spell_slots_max, key)))
         cur_val = max(0, int(getattr(sheet.spell_slots_current, key)))
         setattr(sheet.spell_slots_current, key, min(cur_val, max_val))
+    sheet.martial_points_current = max(0, min(int(sheet.martial_points_current or 0), int(sheet.martial_points_maximum or 0)))
 
 
 def _pick(seed: str, options: list[str]) -> str:
@@ -671,7 +900,7 @@ def _class_template(char_class: str) -> dict[str, object]:
             "armor": ("鳞甲", "神职护甲", 3),
             "extras": [("圣徽", "misc"), ("香料包", "misc")],
             "spells": ["疗伤术", "祝福术", "神导术"],
-            "spell_slots_level_1": 2,
+            "spell_slots_level_1": 1,
             "hit_dice": "1d8",
         },
         "法师": {
@@ -683,7 +912,7 @@ def _class_template(char_class: str) -> dict[str, object]:
             "armor": ("法袍", "轻便衣袍", 0),
             "extras": [("法术书", "misc"), ("墨水套装", "misc")],
             "spells": ["魔法飞弹", "护盾术", "侦测魔法"],
-            "spell_slots_level_1": 3,
+            "spell_slots_level_1": 1,
             "hit_dice": "1d6",
         },
         "游侠": {
@@ -695,7 +924,7 @@ def _class_template(char_class: str) -> dict[str, object]:
             "armor": ("皮甲", "轻便护甲", 2),
             "extras": [("箭袋", "misc"), ("干粮包", "misc")],
             "spells": ["猎人印记", "疗伤术"],
-            "spell_slots_level_1": 2,
+            "spell_slots_level_1": 1,
             "hit_dice": "1d10",
         },
         "吟游诗人": {
@@ -707,7 +936,7 @@ def _class_template(char_class: str) -> dict[str, object]:
             "armor": ("皮甲", "做工精致的轻甲", 1),
             "extras": [("鲁特琴", "misc"), ("记事册", "misc")],
             "spells": ["魅惑人类", "治疗真言", "塔莎狂笑术"],
-            "spell_slots_level_1": 2,
+            "spell_slots_level_1": 1,
             "hit_dice": "1d8",
         },
         "武僧": {
@@ -731,11 +960,42 @@ def _class_template(char_class: str) -> dict[str, object]:
             "armor": ("皮甲", "缝着叶片的轻甲", 1),
             "extras": [("草药袋", "misc"), ("种子囊", "misc")],
             "spells": ["纠缠术", "疗伤术", "造水术"],
-            "spell_slots_level_1": 2,
+            "spell_slots_level_1": 1,
             "hit_dice": "1d8",
         },
     }
     return templates.get(char_class, templates["战士"])
+
+
+def _template_origin_map(definition_names: list[str]) -> dict[str, OriginStamp]:
+    library = load_template_library()
+    name_to_id = {
+        str(definition.name or "").strip().lower(): definition.definition_id
+        for definition in [*library.spell_definitions, *library.war_art_definitions]
+    }
+    origins: dict[str, OriginStamp] = {}
+    for name in definition_names:
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            continue
+        definition_id = name_to_id.get(clean_name.lower(), "")
+        origins[clean_name] = OriginStamp(origin_kind="learned", origin_ref=definition_id or clean_name)
+    return origins
+
+
+def _npc_template_ability_names(char_class: str, level: int) -> tuple[list[str], list[str]]:
+    response = query_template_library_definitions(
+        TemplateLibraryDefinitionsRequest(
+            session_id="system",
+            kind="all",
+            recommended_class=char_class,
+            min_level=max(1, int(level or 1)),
+            limit=6,
+        )
+    )
+    spells = [definition.name for definition in response.spell_definitions[:6]]
+    war_arts = [definition.name for definition in response.war_art_definitions[:6]]
+    return spells, war_arts
 
 
 def _build_npc_profile(npc_id: str, npc_name: str) -> PlayerStaticData:
@@ -803,8 +1063,11 @@ def _build_npc_profile(npc_id: str, npc_name: str) -> PlayerStaticData:
         for idx, (name, item_type) in enumerate(template["extras"], start=1)  # type: ignore[index]
     ]
     all_items = [weapon_item, armor_item, *extra_items]
-    spell_list = list(template.get("spells") or [])
-    first_level_slots = int(template.get("spell_slots_level_1") or 0)
+    spell_list, war_art_list = _npc_template_ability_names(char_class, level)
+    if not spell_list:
+        spell_list = list(template.get("spells") or [])
+    first_level_slots = _level_scaled_resource_cap(level) if spell_list else 0
+    martial_points = _level_scaled_resource_cap(level) if war_art_list else 0
     armor_class = 10 + int(armor_bonus) + _ability_mod(dexterity)
 
     profile = PlayerStaticData(
@@ -847,6 +1110,9 @@ def _build_npc_profile(npc_id: str, npc_name: str) -> PlayerStaticData:
             },
             "features_traits": list(template.get("features") or []),
             "spells": spell_list,
+            "war_arts": war_art_list,
+            "spell_origins": {key: value.model_dump(mode="json") for key, value in _template_origin_map(spell_list).items()},
+            "war_art_origins": {key: value.model_dump(mode="json") for key, value in _template_origin_map(war_art_list).items()},
             "spell_slots_max": {
                 "level_1": first_level_slots,
                 "level_2": 0,
@@ -869,6 +1135,9 @@ def _build_npc_profile(npc_id: str, npc_name: str) -> PlayerStaticData:
                 "level_8": 0,
                 "level_9": 0,
             },
+            "martial_points_current": martial_points,
+            "martial_points_maximum": martial_points,
+            "war_art_cooldowns": {},
             "notes": f"常驻NPC模板：{sheet_background}，职业倾向为{char_class}。",
         },
     )
@@ -910,6 +1179,8 @@ def _ensure_npc_role_complete(save: SaveFile, role: NpcRoleCard) -> bool:
     if role.talkative_current < 0:
         role.talkative_current = 0
         changed = True
+    if getattr(role, "talkative_recovery_round_cursor", None) is None:
+        role.talkative_recovery_round_cursor = None
 
     profile = role.profile
     template = profile_template
@@ -976,7 +1247,16 @@ def _ensure_npc_role_complete(save: SaveFile, role: NpcRoleCard) -> bool:
     if not sheet.spells and template_sheet.spells:
         sheet.spells = list(template_sheet.spells)
         changed = True
-    if (_spell_slots_total(sheet.spell_slots_max) == 2 and not sheet.spells and template_sheet.spells) or _spell_slots_total(sheet.spell_slots_max) == 0:
+    if not sheet.war_arts and template_sheet.war_arts:
+        sheet.war_arts = list(template_sheet.war_arts)
+        changed = True
+    if not sheet.spell_origins and template_sheet.spell_origins:
+        sheet.spell_origins = template_sheet.spell_origins.model_copy(deep=True) if hasattr(template_sheet.spell_origins, "model_copy") else dict(template_sheet.spell_origins)
+        changed = True
+    if not sheet.war_art_origins and template_sheet.war_art_origins:
+        sheet.war_art_origins = template_sheet.war_art_origins.model_copy(deep=True) if hasattr(template_sheet.war_art_origins, "model_copy") else dict(template_sheet.war_art_origins)
+        changed = True
+    if (_spell_slots_total(sheet.spell_slots_max) <= 1 and not sheet.spells and template_sheet.spells) or _spell_slots_total(sheet.spell_slots_max) == 0:
         if _spell_slots_total(template_sheet.spell_slots_max) >= 0:
             sheet.spell_slots_max = template_sheet.spell_slots_max.model_copy(deep=True)
             sheet.spell_slots_current = template_sheet.spell_slots_current.model_copy(deep=True)
@@ -984,6 +1264,19 @@ def _ensure_npc_role_complete(save: SaveFile, role: NpcRoleCard) -> bool:
     if not sheet.spells and _spell_slots_total(sheet.spell_slots_max) > 0:
         sheet.spell_slots_max = template_sheet.spell_slots_max.model_copy(deep=True)
         sheet.spell_slots_current = template_sheet.spell_slots_current.model_copy(deep=True)
+        changed = True
+    if not sheet.war_arts and int(sheet.martial_points_maximum or 0) > 0:
+        sheet.war_arts = list(template_sheet.war_arts)
+        changed = True
+    if int(sheet.martial_points_maximum or 0) <= 0 and template_sheet.war_arts:
+        sheet.martial_points_maximum = int(template_sheet.martial_points_maximum or 0)
+        sheet.martial_points_current = min(
+            max(0, int(sheet.martial_points_current or 0)),
+            max(0, int(template_sheet.martial_points_maximum or 0)),
+        ) or int(template_sheet.martial_points_current or 0)
+        changed = True
+    if getattr(sheet, "war_art_cooldowns", None) is None:
+        sheet.war_art_cooldowns = {}
         changed = True
 
     try:
@@ -1082,16 +1375,651 @@ def _ensure_role_pool_from_area(save: SaveFile) -> bool:
     return changed
 
 
-def get_current_save(default_session_id: str = "sess_default") -> SaveFile:
+def spawn_persistent_scene_npc_in_save(
+    save: SaveFile,
+    *,
+    name: str,
+    title: str = "",
+    description: str = "",
+    speaking_style: str = "",
+    agenda: str = "",
+    appearance: str = "",
+    alignment: str = "",
+    likes: list[str] | None = None,
+) -> NpcRoleCard:
+    current_sub_zone_id = save.area_snapshot.current_sub_zone_id
+    sub = next((item for item in save.area_snapshot.sub_zones if item.sub_zone_id == current_sub_zone_id), None)
+    if sub is None:
+        raise ValueError("CURRENT_SUB_ZONE_NOT_FOUND")
+    zone = next((item for item in save.area_snapshot.zones if item.zone_id == sub.zone_id), None)
+    zone_name = zone.name if zone is not None else (sub.zone_id or "当前区域")
+    world_state = ensure_world_state(save)
+
+    clean_name = " ".join(str(name or "").split()).strip()[:24]
+    if not clean_name:
+        _, clean_name = _build_npc_identity(zone_name, sub.name, sub.sub_zone_id, len(sub.npcs))
+    existing_names = {item.name for item in sub.npcs}
+    final_name = clean_name
+    suffix = 2
+    while final_name in existing_names:
+        final_name = f"{clean_name}{suffix}"
+        suffix += 1
+
+    base_role_id = f"npc_scene_{sub.sub_zone_id}_{int(datetime.now(timezone.utc).timestamp() * 1000)}"
+    role_id = base_role_id
+    seen_role_ids = {role.role_id for role in save.role_pool} | {npc.npc_id for npc in sub.npcs}
+    suffix = 2
+    while role_id in seen_role_ids:
+        role_id = f"{base_role_id}_{suffix}"
+        suffix += 1
+
+    flavor = _build_npc_flavor(role_id, zone_name, sub.name, sub.description)
+    clean_title = " ".join(str(title or "").split()).strip()[:40]
+    clean_description = " ".join(str(description or "").split()).strip()[:160]
+    clean_agenda = " ".join(str(agenda or "").split()).strip()[:120]
+    clean_speaking_style = " ".join(str(speaking_style or "").split()).strip()[:80]
+    clean_appearance = " ".join(str(appearance or "").split()).strip()[:80]
+    clean_alignment = " ".join(str(alignment or "").split()).strip()[:40]
+    clean_likes = [
+        " ".join(str(item or "").split()).strip()[:32]
+        for item in list(likes or [])
+        if " ".join(str(item or "").split()).strip()
+    ][:6]
+    background_parts = [part for part in [clean_title, clean_description or flavor["background"]] if part]
+    background_text = "。".join(background_parts)[:180]
+    secret_text = clean_agenda or flavor["secret"]
+    talkative_maximum = _build_npc_talkative_maximum(role_id, flavor["personality"])
+
+    role = NpcRoleCard(
+        role_id=role_id,
+        name=final_name,
+        zone_id=sub.zone_id,
+        sub_zone_id=sub.sub_zone_id,
+        source_world_revision=world_state.world_revision,
+        source_map_revision=world_state.map_revision,
+        state="idle",
+        personality=flavor["personality"],
+        speaking_style=clean_speaking_style or flavor["speaking_style"],
+        appearance=clean_appearance or flavor["appearance"],
+        background=background_text or flavor["background"],
+        cognition=clean_agenda or flavor["cognition"],
+        alignment=clean_alignment or flavor["alignment"],
+        secret=secret_text,
+        likes=clean_likes or _build_npc_likes(role_id),
+        talkative_maximum=talkative_maximum,
+        talkative_current=talkative_maximum,
+        profile=_build_npc_profile(role_id, final_name),
+        relations=[],
+    )
+    if clean_title:
+        role.profile.dnd5e_sheet.notes = f"{clean_title}。{role.profile.dnd5e_sheet.notes}".strip()
+    _ensure_npc_role_complete(save, role)
+    sub.npcs.append(AreaNpc(npc_id=role.role_id, name=role.name, state="idle"))
+    save.role_pool.append(role)
+    return role
+
+
+def _encounter_location_zone_id(zone_name: str, zone_type_hint: str) -> str:
+    seed = f"{zone_name}|{zone_type_hint}".encode("utf-8")
+    return f"zone_enc_{hashlib.sha1(seed).hexdigest()[:10]}"
+
+
+def _encounter_location_sub_zone_id(zone_id: str, sub_zone_name: str) -> str:
+    seed = f"{zone_id}|{sub_zone_name}".encode("utf-8")
+    return f"sub_{zone_id}_{hashlib.sha1(seed).hexdigest()[:8]}"
+
+
+def _match_zone_for_encounter_location(save: SaveFile, zone_name: str, zone_id: str | None) -> Zone | None:
+    normalized_name = " ".join(zone_name.split()).strip()
+    if zone_id:
+        found = next((item for item in save.map_snapshot.zones if item.zone_id == zone_id), None)
+        if found is not None:
+            return found
+    if not normalized_name:
+        return None
+    return next(
+        (
+            item
+            for item in save.map_snapshot.zones
+            if item.zone_id == normalized_name or " ".join(item.name.split()).strip() == normalized_name
+        ),
+        None,
+    )
+
+
+def _match_sub_zone_for_encounter_location(save: SaveFile, zone_id: str, sub_zone_name: str, sub_zone_id: str | None = None) -> AreaSubZone | None:
+    normalized_name = " ".join(sub_zone_name.split()).strip()
+    if sub_zone_id:
+        found = next((item for item in save.area_snapshot.sub_zones if item.sub_zone_id == sub_zone_id), None)
+        if found is not None:
+            return found
+    if not normalized_name:
+        return None
+    return next(
+        (
+            item
+            for item in save.area_snapshot.sub_zones
+            if item.zone_id == zone_id and (item.sub_zone_id == normalized_name or " ".join(item.name.split()).strip() == normalized_name)
+        ),
+        None,
+    )
+
+
+def _normalize_encounter_location_interactions(payload: object) -> list[dict[str, str]]:
+    if not isinstance(payload, list):
+        return []
+    items: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in payload[:3]:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()[:32]
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        items.append(
+            {
+                "name": name,
+                "type": _coerce_interaction_type(str(item.get("type") or "scene")),
+                "status": _coerce_interaction_status(str(item.get("status") or "ready")),
+            }
+        )
+    return items
+
+
+def _build_encounter_location_prompt(
+    *,
+    encounter_title: str,
+    encounter_description: str,
+    current_zone_name: str,
+    current_zone_description: str,
+    target_zone_name: str,
+    target_zone_description: str,
+    target_zone_type_hint: str,
+    target_sub_zone_name: str,
+    target_sub_zone_description: str,
+    reason: str,
+) -> str:
+    default_prompt = (
+        "你是跑团地图地点生成器，只输出 JSON。"
+        "你要围绕一个遭遇线索，立即生成一个可落地到地图的真实地点内容。"
+        "如果目标大区块已经存在，也要返回与该大区块匹配的子区块内容。"
+        "必须返回严格 JSON，结构为："
+        "{\"zone\":{\"name\":\"\",\"description\":\"\",\"zone_type\":\"city|village|forest|mountain|river|desert|coast|cave|ruins|unknown\",\"size\":\"small|medium|large\",\"radius_m\":120,\"tags\":[\"\"]},"
+        "\"sub_zones\":[{\"name\":\"\",\"description\":\"\",\"offset_x\":0,\"offset_y\":0,\"offset_z\":0,"
+        "\"interactions\":[{\"name\":\"\",\"type\":\"item|scene|npc\",\"status\":\"ready|disabled|hidden\"}]}]}。"
+        "要求："
+        "1. sub_zones 必须包含目标子区块，且名称必须与指定目标子区块完全一致。"
+        "2. 如果指定了目标大区块名称，zone.name 必须与指定目标大区块完全一致。"
+        "3. 内容必须贴合当前遭遇、线索原因和地点语义，不要返回空泛描述。"
+        "4. 生成 3-5 个子区块，目标子区块放在其中；offset_* 使用相对区块中心的米制偏移。"
+        "5. interactions 只为目标子区块生成 1-3 个可交互内容，其它子区块 interactions 可为空。"
+        "6. 所有文本都用简体中文。"
+        "当前遭遇标题=$encounter_title。"
+        "当前遭遇描述=$encounter_description。"
+        "当前参考大区块=$current_zone_name。"
+        "当前参考大区块描述=$current_zone_description。"
+        "目标大区块=$target_zone_name。"
+        "目标大区块补充描述=$target_zone_description。"
+        "目标大区块类型提示=$target_zone_type_hint。"
+        "目标子区块=$target_sub_zone_name。"
+        "目标子区块补充描述=$target_sub_zone_description。"
+        "线索或迁移原因=$reason。"
+    )
+    return prompt_table.render(
+        "world.encounter_location.user",
+        default_prompt,
+        encounter_title=encounter_title,
+        encounter_description=encounter_description,
+        current_zone_name=current_zone_name,
+        current_zone_description=current_zone_description,
+        target_zone_name=target_zone_name,
+        target_zone_description=target_zone_description,
+        target_zone_type_hint=target_zone_type_hint,
+        target_sub_zone_name=target_sub_zone_name,
+        target_sub_zone_description=target_sub_zone_description,
+        reason=reason,
+    )
+
+
+def _ai_generate_encounter_location_content(
+    *,
+    session_id: str,
+    encounter,
+    directive: dict[str, object],
+    config: ChatConfig,
+    existing_zone: Zone | None,
+) -> dict[str, object]:
+    api_key = (config.openai_api_key or "").strip()
+    model = (config.model or "").strip()
+    if not api_key or not model:
+        raise AIRegionGenerationError("encounter_location_target: 缺少有效的模型配置或 API Key")
+
+    requested_zone_name = " ".join(str(directive.get("zone_name") or "").split()).strip()
+    requested_sub_zone_name = " ".join(str(directive.get("sub_zone_name") or "").split()).strip()[:48]
+    if not requested_sub_zone_name:
+        raise AIRegionGenerationError("encounter_location_target: 缺少目标子区块名称")
+
+    requested_zone_description = " ".join(str(directive.get("zone_description") or "").split()).strip()[:160]
+    requested_zone_type_hint = " ".join(str(directive.get("zone_type_hint") or "unknown").split()).strip()[:24] or "unknown"
+    requested_sub_zone_description = " ".join(str(directive.get("sub_zone_description") or "").split()).strip()[:180]
+    reason = " ".join(str(directive.get("reason") or "").split()).strip()[:120]
+
+    prompt = _build_encounter_location_prompt(
+        encounter_title=str(getattr(encounter, "title", "") or "").strip(),
+        encounter_description=str(getattr(encounter, "description", "") or "").strip(),
+        current_zone_name=(existing_zone.name if existing_zone is not None else ""),
+        current_zone_description=(existing_zone.description if existing_zone is not None else ""),
+        target_zone_name=requested_zone_name or (existing_zone.name if existing_zone is not None else ""),
+        target_zone_description=requested_zone_description,
+        target_zone_type_hint=requested_zone_type_hint,
+        target_sub_zone_name=requested_sub_zone_name,
+        target_sub_zone_description=requested_sub_zone_description,
+        reason=reason,
+    )
+
+    try:
+        client = create_sync_client(config, client_cls=OpenAI)
+        resp = client.chat.completions.create(
+            model=model,
+            **build_completion_options(config),
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": prompt_table.get_text("world.region.system", "你是地图设计器，只输出 JSON。")},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        usage = resp.usage
+        token_usage_store.add(
+            session_id,
+            "encounter_location_generation",
+            getattr(usage, "prompt_tokens", 0) or 0,
+            getattr(usage, "completion_tokens", 0) or 0,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        if not content:
+            raise AIRegionGenerationError("encounter_location_target: AI 返回为空")
+        parsed = _extract_json_content(content)
+    except AIRegionGenerationError:
+        raise
+    except Exception as exc:
+        raise AIRegionGenerationError(f"encounter_location_target: {exc}") from exc
+
+    raw_zone = parsed.get("zone") if isinstance(parsed, dict) and isinstance(parsed.get("zone"), dict) else {}
+    raw_sub_zones = parsed.get("sub_zones") if isinstance(parsed, dict) else None
+    if not isinstance(raw_sub_zones, list):
+        raise AIRegionGenerationError("encounter_location_target: sub_zones 缺失")
+
+    allowed_zone_types = {"city", "village", "forest", "mountain", "river", "desert", "coast", "cave", "ruins", "unknown"}
+    zone_name = requested_zone_name or (existing_zone.name if existing_zone is not None else "") or str(raw_zone.get("name") or "").strip()
+    if not zone_name:
+        raise AIRegionGenerationError("encounter_location_target: AI 未返回有效大区块名称")
+    zone_type = str(raw_zone.get("zone_type") or requested_zone_type_hint or (existing_zone.zone_type if existing_zone is not None else "unknown")).strip().lower() or "unknown"
+    if zone_type not in allowed_zone_types:
+        zone_type = "unknown"
+    zone_size = str(raw_zone.get("size") or (existing_zone.size if existing_zone is not None else "small")).strip().lower() or "small"
+    if zone_size not in {"small", "medium", "large"}:
+        zone_size = "small"
+    rmin, rmax = _zone_radius_range(zone_size)
+    default_radius = existing_zone.radius_m if existing_zone is not None else int((rmin + rmax) / 2)
+    zone_radius_m = min(rmax, max(rmin, int(raw_zone.get("radius_m") or default_radius)))
+    zone_description = (
+        str(raw_zone.get("description") or "").strip()
+        or requested_zone_description
+        or (existing_zone.description if existing_zone is not None else "")
+        or requested_sub_zone_description
+        or reason
+        or str(getattr(encounter, "description", "") or "").strip()
+        or "遭遇线索指向的新地点"
+    )[:160]
+    raw_tags = raw_zone.get("tags")
+    zone_tags = [str(item).strip()[:24] for item in raw_tags] if isinstance(raw_tags, list) else []
+    zone_tags = [item for item in zone_tags if item]
+    for extra_tag in ["encounter_generated", "clue_site", zone_type]:
+        if extra_tag and extra_tag not in zone_tags:
+            zone_tags.append(extra_tag)
+
+    seed_payloads: list[dict[str, object]] = []
+    seen_names: set[str] = set()
+    for item in raw_sub_zones[:8]:
+        if not isinstance(item, dict):
+            continue
+        name = " ".join(str(item.get("name") or "").split()).strip()[:48]
+        if not name or name in seen_names:
+            continue
+        seen_names.add(name)
+        seed_payloads.append(
+            {
+                "name": name,
+                "description": (" ".join(str(item.get("description") or "").split()).strip() or zone_description)[:180],
+                "offset_x": int(item.get("offset_x") or 0),
+                "offset_y": int(item.get("offset_y") or 0),
+                "offset_z": int(item.get("offset_z") or 0),
+                "interactions": _normalize_encounter_location_interactions(item.get("interactions")),
+            }
+        )
+
+    target_index = next((idx for idx, item in enumerate(seed_payloads) if item["name"] == requested_sub_zone_name), -1)
+    if target_index < 0:
+        fallback_description = requested_sub_zone_description or (str(seed_payloads[0]["description"]) if seed_payloads else zone_description)
+        fallback_interactions = list(seed_payloads[0].get("interactions") or []) if seed_payloads else []
+        seed_payloads.insert(
+            0,
+            {
+                "name": requested_sub_zone_name,
+                "description": fallback_description[:180],
+                "offset_x": 0,
+                "offset_y": 0,
+                "offset_z": 0,
+                "interactions": fallback_interactions[:3],
+            },
+        )
+    else:
+        seed_payloads[target_index]["name"] = requested_sub_zone_name
+        if requested_sub_zone_description:
+            seed_payloads[target_index]["description"] = requested_sub_zone_description[:180]
+
+    min_count, max_count = _sub_zone_count_range(zone_size, config)
+    default_fillers = _default_sub_zone_seeds(zone_size, zone_name, config)
+    used_names = {str(item["name"]) for item in seed_payloads}
+    for filler in default_fillers:
+        if len(seed_payloads) >= min_count:
+            break
+        if filler.name in used_names or filler.name == requested_sub_zone_name:
+            continue
+        used_names.add(filler.name)
+        seed_payloads.append(
+            {
+                "name": filler.name,
+                "description": filler.description or zone_description,
+                "offset_x": filler.offset_x,
+                "offset_y": filler.offset_y,
+                "offset_z": filler.offset_z,
+                "interactions": [],
+            }
+        )
+    if len(seed_payloads) < min_count:
+        for idx in range(len(seed_payloads), min_count):
+            filler_name = f"{zone_name}扩展点{idx + 1}"
+            if filler_name in used_names:
+                continue
+            used_names.add(filler_name)
+            seed_payloads.append(
+                {
+                    "name": filler_name,
+                    "description": zone_description,
+                    "offset_x": 0,
+                    "offset_y": 0,
+                    "offset_z": 0,
+                    "interactions": [],
+                }
+            )
+    if len(seed_payloads) > max_count:
+        target_seed = next((item for item in seed_payloads if item["name"] == requested_sub_zone_name), seed_payloads[0])
+        others = [item for item in seed_payloads if item["name"] != requested_sub_zone_name][: max(0, max_count - 1)]
+        seed_payloads = [target_seed, *others]
+
+    if not seed_payloads:
+        raise AIRegionGenerationError("encounter_location_target: AI 未返回有效子区块内容")
+
+    normalized_seeds: list[dict[str, object]] = []
+    for payload in seed_payloads:
+        ox, oy = _fit_offset_in_radius(int(payload.get("offset_x") or 0), int(payload.get("offset_y") or 0), zone_radius_m)
+        normalized_seeds.append(
+            {
+                "name": str(payload["name"]),
+                "description": str(payload.get("description") or zone_description)[:180],
+                "offset_x": ox,
+                "offset_y": oy,
+                "offset_z": int(payload.get("offset_z") or 0),
+                "interactions": list(payload.get("interactions") or []),
+            }
+        )
+
+    return {
+        "zone_name": zone_name,
+        "zone_description": zone_description,
+        "zone_type": zone_type,
+        "zone_size": zone_size,
+        "zone_radius_m": zone_radius_m,
+        "zone_tags": zone_tags,
+        "sub_zone_seeds": normalized_seeds,
+        "target_sub_zone_name": requested_sub_zone_name,
+        "target_sub_zone_description": requested_sub_zone_description[:180] or next(
+            (str(item.get("description") or "") for item in normalized_seeds if item["name"] == requested_sub_zone_name),
+            zone_description,
+        ),
+        "target_interactions": next(
+            (list(item.get("interactions") or []) for item in normalized_seeds if item["name"] == requested_sub_zone_name),
+            [],
+        ),
+    }
+
+
+def ensure_encounter_location_target_in_save(
+    save: SaveFile,
+    encounter,
+    directive: dict[str, object],
+    *,
+    session_id: str,
+    config: ChatConfig | None = None,
+) -> dict[str, object]:
+    _ensure_area_snapshot(save)
+
+    zone_name = " ".join(str(directive.get("zone_name") or "").split()).strip()
+    zone_description = " ".join(str(directive.get("zone_description") or "").split()).strip()[:160]
+    zone_type_hint = " ".join(str(directive.get("zone_type_hint") or "unknown").split()).strip()[:24] or "unknown"
+    sub_zone_name = " ".join(str(directive.get("sub_zone_name") or "").split()).strip()[:48]
+    sub_zone_description = " ".join(str(directive.get("sub_zone_description") or "").split()).strip()[:180]
+    reason = " ".join(str(directive.get("reason") or "").split()).strip()[:120]
+    if not sub_zone_name:
+        raise ValueError("ENCOUNTER_LOCATION_TARGET_REQUIRES_SUB_ZONE_NAME")
+
+    reference_zone_id = encounter.zone_id or save.area_snapshot.current_zone_id or (save.map_snapshot.player_position.zone_id if save.map_snapshot.player_position else None)
+    zone = _match_zone_for_encounter_location(save, zone_name, reference_zone_id if not zone_name else None)
+    generated_zone = False
+    ai_payload: dict[str, object] | None = None
+    if zone is None:
+        if config is None:
+            raise AIRegionGenerationError("encounter_location_target: 缺少模型配置，无法即时生成新地点")
+        ai_payload = _ai_generate_encounter_location_content(
+            session_id=session_id,
+            encounter=encounter,
+            directive=directive,
+            config=config,
+            existing_zone=None,
+        )
+        zone_id = _encounter_location_zone_id(str(ai_payload.get("zone_name") or zone_name or (encounter.title or "clue_site")), str(ai_payload.get("zone_type") or zone_type_hint))
+        reference_zone = next((item for item in save.map_snapshot.zones if item.zone_id == reference_zone_id), None)
+        base_x = reference_zone.x if reference_zone is not None else (save.map_snapshot.player_position.x if save.map_snapshot.player_position is not None else 0)
+        base_y = reference_zone.y if reference_zone is not None else (save.map_snapshot.player_position.y if save.map_snapshot.player_position is not None else 0)
+        base_z = reference_zone.z if reference_zone is not None else (save.map_snapshot.player_position.z if save.map_snapshot.player_position is not None else 0)
+        offset = 180 + (len(save.map_snapshot.zones) % 5) * 36
+        zone = Zone(
+            zone_id=zone_id,
+            name=str(ai_payload.get("zone_name") or zone_name or (encounter.title or "新地点")),
+            x=base_x + offset,
+            y=base_y - max(60, offset // 2),
+            z=base_z,
+            zone_type=str(ai_payload.get("zone_type") or zone_type_hint or "unknown"),
+            size=str(ai_payload.get("zone_size") or "small"),
+            radius_m=int(ai_payload.get("zone_radius_m") or 120),
+            description=str(ai_payload.get("zone_description") or zone_description or reason or "遭遇线索指向的新地点"),
+            tags=[str(item) for item in list(ai_payload.get("zone_tags") or ["encounter_generated", "clue_site", zone_type_hint])],
+            sub_zones=[
+                ZoneSubZoneSeed(
+                    name=str(item.get("name") or ""),
+                    description=str(item.get("description") or ""),
+                    offset_x=int(item.get("offset_x") or 0),
+                    offset_y=int(item.get("offset_y") or 0),
+                    offset_z=int(item.get("offset_z") or 0),
+                )
+                for item in list(ai_payload.get("sub_zone_seeds") or [])
+                if str(item.get("name") or "").strip()
+            ],
+        )
+        save.map_snapshot.zones.append(zone)
+        _enforce_non_overlap(save.map_snapshot.zones)
+        generated_zone = True
+
+    zone_id = zone.zone_id
+    map_zone = next((item for item in save.map_snapshot.zones if item.zone_id == zone_id), None)
+    if map_zone is None:
+        map_zone = Zone(
+            zone_id=zone.zone_id,
+            name=zone.name,
+            x=zone.x,
+            y=zone.y,
+            z=zone.z,
+            zone_type=zone.zone_type,
+            size=zone.size,
+            radius_m=zone.radius_m,
+            description=zone.description,
+            tags=list(zone.tags),
+            sub_zones=list(zone.sub_zones),
+        )
+        save.map_snapshot.zones.append(map_zone)
+
+    _ensure_zone_subzone_placeholders(save, zone_id)
+    sub_zone = _match_sub_zone_for_encounter_location(save, zone_id, sub_zone_name)
+    generated_sub_zone = False
+    if sub_zone is None:
+        if config is None:
+            raise AIRegionGenerationError("encounter_location_target: 缺少模型配置，无法即时生成新子区块")
+        ai_payload = _ai_generate_encounter_location_content(
+            session_id=session_id,
+            encounter=encounter,
+            directive=directive,
+            config=config,
+            existing_zone=map_zone,
+        )
+        map_zone.description = str(ai_payload.get("zone_description") or map_zone.description)
+        map_zone.zone_type = str(ai_payload.get("zone_type") or map_zone.zone_type)
+        map_zone.size = str(ai_payload.get("zone_size") or map_zone.size)
+        map_zone.radius_m = int(ai_payload.get("zone_radius_m") or map_zone.radius_m)
+        existing_names = {" ".join(item.name.split()).strip() for item in map_zone.sub_zones}
+        for item in list(ai_payload.get("sub_zone_seeds") or []):
+            seed_name = " ".join(str(item.get("name") or "").split()).strip()
+            if not seed_name or seed_name in existing_names:
+                continue
+            existing_names.add(seed_name)
+            map_zone.sub_zones.append(
+                ZoneSubZoneSeed(
+                    name=seed_name,
+                    description=str(item.get("description") or ""),
+                    offset_x=int(item.get("offset_x") or 0),
+                    offset_y=int(item.get("offset_y") or 0),
+                    offset_z=int(item.get("offset_z") or 0),
+                )
+            )
+        _ensure_zone_subzone_placeholders(save, zone_id)
+        sub_zone = _match_sub_zone_for_encounter_location(save, zone_id, sub_zone_name)
+        generated_sub_zone = sub_zone is not None
+
+    if sub_zone is None:
+        raise ValueError("ENCOUNTER_LOCATION_TARGET_SUB_ZONE_NOT_FOUND")
+
+    target_payload = next(
+        (
+            item
+            for item in list((ai_payload or {}).get("sub_zone_seeds") or [])
+            if " ".join(str(item.get("name") or "").split()).strip() == sub_zone_name
+        ),
+        None,
+    )
+    target_description = (
+        str((target_payload or {}).get("description") or "").strip()
+        or str((ai_payload or {}).get("target_sub_zone_description") or "").strip()
+        or sub_zone_description
+        or reason
+        or sub_zone.description
+    )[:180]
+    if target_description:
+        sub_zone.description = target_description
+    sub_zone.generated_mode = "instant" if (generated_zone or generated_sub_zone) else sub_zone.generated_mode
+    target_interactions = list((target_payload or {}).get("interactions") or (ai_payload or {}).get("target_interactions") or [])
+    existing_interaction_names = {item.name for item in sub_zone.key_interactions}
+    for idx, interaction in enumerate(target_interactions):
+        name = str(interaction.get("name") or "").strip()
+        if not name or name in existing_interaction_names:
+            continue
+        existing_interaction_names.add(name)
+        sub_zone.key_interactions.append(
+            AreaInteraction(
+                interaction_id=f"int_{sub_zone.sub_zone_id}_enc_{idx + 1}",
+                name=name,
+                type=_coerce_interaction_type(str(interaction.get("type") or "scene")),
+                status=_coerce_interaction_status(str(interaction.get("status") or "ready")),
+                generated_mode="instant",
+                placeholder=False,
+            )
+        )
+    if not sub_zone.key_interactions:
+        sub_zone.key_interactions.append(
+            AreaInteraction(
+                interaction_id=f"int_{sub_zone.sub_zone_id}_observe",
+                name="观察周边",
+                type="scene",
+                generated_mode="instant",
+                placeholder=True,
+            )
+        )
+
+    area_zone = next((item for item in save.area_snapshot.zones if item.zone_id == zone_id), None)
+    if area_zone is not None:
+        area_zone.description = map_zone.description
+
+    _ensure_role_pool_from_area(save)
+    entity_refs = list(getattr(encounter, "entity_refs", []) or [])
+    for ref in (
+        EntityRef(entity_type="zone", entity_id=zone_id, label=zone.name, source="system"),
+        EntityRef(entity_type="sub_zone", entity_id=sub_zone.sub_zone_id, label=sub_zone.name, source="system"),
+    ):
+        if not any(item.entity_type == ref.entity_type and item.entity_id == ref.entity_id for item in entity_refs):
+            entity_refs.append(ref)
+    encounter.entity_refs = entity_refs
+
+    if bool(directive.get("move_encounter_focus")):
+        encounter.zone_id = zone_id
+        encounter.sub_zone_id = sub_zone.sub_zone_id
+
+    save.game_logs.append(
+        GameLogEntry(
+            id=f"glog_{int(datetime.now(timezone.utc).timestamp() * 1000)}",
+            session_id=session_id,
+            kind="encounter_location_target",
+            message=f"遭遇地点指向 {zone.name}/{sub_zone.name}",
+            payload={
+                "encounter_id": getattr(encounter, "encounter_id", ""),
+                "zone_id": zone_id,
+                "sub_zone_id": sub_zone.sub_zone_id,
+                "generated_zone": generated_zone,
+                "generated_sub_zone": generated_sub_zone,
+            },
+        )
+    )
+    return {
+        "zone_id": zone_id,
+        "sub_zone_id": sub_zone.sub_zone_id,
+        "zone_name": zone.name,
+        "sub_zone_name": sub_zone.name,
+        "target_location_label": f"{zone.name} / {sub_zone.name}",
+        "generated_zone": generated_zone,
+        "generated_sub_zone": generated_sub_zone,
+    }
+
+
+def _load_current_save(default_session_id: str = "sess_default") -> SaveFile:
     payload = read_save_payload(storage_state.save_path)
     if payload is None:
         save = _empty_save(default_session_id)
         ensure_world_state(save)
-        save_current(save)
+        _persist_save(save)
         return save
 
     save = SaveFile.model_validate(payload)
     ensure_world_state(save)
+    ensure_character_build_state(save)
     if not save.player_runtime_data.session_id:
         save.player_runtime_data.session_id = save.session_id
     _recompute_player_derived(save.player_static_data)
@@ -1119,17 +2047,66 @@ def get_current_save(default_session_id: str = "sess_default") -> SaveFile:
         _recompute_player_derived(role.profile)
         if _ensure_npc_role_complete(save, role):
             changed = True
+    if ensure_item_system(save):
+        changed = True
     _, reconciled = reconcile_consistency(save, session_id=save.session_id or default_session_id, reason="load")
     if changed or reconciled:
-        save_current(save)
+        _persist_save(save)
     return save
 
 
-def save_current(save: SaveFile) -> None:
+def _persist_save(save: SaveFile) -> None:
     ensure_world_state(save)
+    ensure_character_build_state(save)
     save.updated_at = _utc_now()
     save.player_runtime_data.updated_at = save.updated_at
     write_save_payload(storage_state.save_path, save.model_dump(mode="json"))
+
+
+def current_save_transaction() -> SaveTransaction | None:
+    return _SAVE_TRANSACTION.get()
+
+
+@contextmanager
+def save_transaction(default_session_id: str = "sess_default") -> Iterator[SaveTransaction]:
+    base_save = _load_current_save(default_session_id)
+    txn = SaveTransaction(save=base_save.model_copy(deep=True))
+    token = _SAVE_TRANSACTION.set(txn)
+    try:
+        yield txn
+    finally:
+        _SAVE_TRANSACTION.reset(token)
+
+
+def get_current_save(default_session_id: str = "sess_default") -> SaveFile:
+    txn = current_save_transaction()
+    if txn is not None:
+        save = txn.save
+        ensure_world_state(save)
+        ensure_character_build_state(save)
+        if not save.player_runtime_data.session_id:
+            save.player_runtime_data.session_id = save.session_id
+        _recompute_player_derived(save.player_static_data)
+        _ensure_area_snapshot(save)
+        for role in save.role_pool:
+            _recompute_player_derived(role.profile)
+            _ensure_npc_role_complete(save, role)
+        ensure_item_system(save)
+        return save
+    return _load_current_save(default_session_id)
+
+
+def save_current(save: SaveFile) -> None:
+    txn = current_save_transaction()
+    ensure_item_system(save)
+    ensure_character_build_state(save)
+    if txn is not None:
+        ensure_world_state(save)
+        save.updated_at = _utc_now()
+        save.player_runtime_data.updated_at = save.updated_at
+        txn.save = save
+        return
+    _persist_save(save)
 
 
 def clear_current_save(session_id: str) -> SaveFile:
@@ -1195,6 +2172,65 @@ def _get_inventory_item_for_owner(profile: PlayerStaticData, item_id: str) -> In
     item = next((entry for entry in profile.dnd5e_sheet.backpack.items if entry.item_id == item_id), None)
     if item is None:
         raise KeyError("ITEM_NOT_FOUND")
+    return item
+
+
+def _merge_inventory_item(existing: InventoryItem, incoming: InventoryItem) -> InventoryItem:
+    existing.quantity += incoming.quantity
+    if existing.description == "" and incoming.description:
+        existing.description = incoming.description
+    if existing.effect == "" and incoming.effect:
+        existing.effect = incoming.effect
+    if existing.uses_max is None and incoming.uses_max is not None:
+        existing.uses_max = incoming.uses_max
+    if existing.uses_left is None and incoming.uses_left is not None:
+        existing.uses_left = incoming.uses_left
+    if existing.cooldown_min == 0 and incoming.cooldown_min:
+        existing.cooldown_min = incoming.cooldown_min
+    existing.bound = existing.bound or incoming.bound
+    existing.attack_bonus = max(existing.attack_bonus, incoming.attack_bonus)
+    existing.armor_bonus = max(existing.armor_bonus, incoming.armor_bonus)
+    return existing
+
+
+def _grant_inventory_item_to_profile(profile: PlayerStaticData, item: InventoryItem) -> InventoryItem:
+    items = profile.dnd5e_sheet.backpack.items
+    existing = next((it for it in items if it.item_id == item.item_id), None)
+    if existing is not None:
+        return _merge_inventory_item(existing, item)
+    cloned = item.model_copy(deep=True)
+    if cloned.uses_max is not None and cloned.uses_left is None:
+        cloned.uses_left = cloned.uses_max
+    items.append(cloned)
+    return cloned
+
+
+def _consume_inventory_item_from_profile(
+    profile: PlayerStaticData,
+    *,
+    item_id: str,
+    amount: int,
+    consume_mode: str,
+) -> InventoryItem:
+    item = _get_inventory_item_for_owner(profile, item_id)
+    mode = consume_mode if consume_mode in {"auto", "quantity", "uses"} else "auto"
+    use_charges = item.uses_left is not None if mode == "auto" else mode == "uses"
+    if use_charges:
+        if item.uses_left is None:
+            raise ValueError("ITEM_HAS_NO_USES")
+        if item.uses_left < amount:
+            raise ValueError("ITEM_USES_INSUFFICIENT")
+        item.uses_left -= amount
+        if item.uses_left == 0 and item.quantity > 1:
+            item.quantity -= 1
+            if item.uses_max is not None:
+                item.uses_left = item.uses_max
+        return item
+    if item.quantity < amount:
+        raise ValueError("ITEM_QUANTITY_INSUFFICIENT")
+    item.quantity -= amount
+    if item.quantity <= 0:
+        profile.dnd5e_sheet.backpack.items = [entry for entry in profile.dnd5e_sheet.backpack.items if entry.item_id != item.item_id]
     return item
 
 
@@ -1293,7 +2329,7 @@ def _generate_inventory_interaction_reply(
                     model=model,
                     **build_completion_options(config),
                     messages=[
-                        {"role": "system", "content": "Return plain Chinese text only."},
+                        {"role": "system", "content": prompt_table.get_text("world.plain_zh.system", "Return plain Chinese text only.")},
                         {
                             "role": "user",
                             "content": _build_item_interaction_prompt(owner_type, owner_name, item, mode, prompt, action_check_result),
@@ -1319,8 +2355,26 @@ def _generate_inventory_interaction_reply(
 def inventory_equip(payload: InventoryEquipRequest) -> InventoryMutationResponse:
     save = get_current_save(default_session_id=payload.session_id)
     save.session_id = payload.session_id
+    ensure_item_system(save)
     owner_id, owner_name, profile, role = _resolve_inventory_owner(save, payload.owner)
-    item = _equip_profile_item(profile, payload.item_id, payload.slot)
+    instance = get_owner_instance_by_ref(
+        save,
+        owner_kind=("player" if payload.owner.owner_type == "player" else "role"),
+        owner_id=owner_id,
+        item_ref=payload.item_id,
+    )
+    item = _get_inventory_item_for_owner(profile, instance.metadata.get("compat_item_id", instance.item_instance_id))
+    if payload.slot == "weapon" and item.slot_type != "weapon":
+        raise ValueError("ITEM_SLOT_MISMATCH")
+    if payload.slot == "armor" and item.slot_type != "armor":
+        raise ValueError("ITEM_SLOT_MISMATCH")
+    if payload.slot == "weapon":
+        profile.dnd5e_sheet.equipment_slots.weapon_item_instance_id = instance.item_instance_id
+        profile.dnd5e_sheet.equipment_slots.weapon_item_id = item.item_id
+    else:
+        profile.dnd5e_sheet.equipment_slots.armor_item_instance_id = instance.item_instance_id
+        profile.dnd5e_sheet.equipment_slots.armor_item_id = item.item_id
+    ensure_item_system(save)
     _recompute_player_derived(profile)
     if role is not None:
         role.profile = profile
@@ -1329,6 +2383,7 @@ def inventory_equip(payload: InventoryEquipRequest) -> InventoryMutationResponse
         session_id=payload.session_id,
         owner=payload.owner,
         message=f"{owner_name} 装备了【{item.name}】。",
+        item_id=item.item_id,
         player=profile if payload.owner.owner_type == "player" else None,
         role=role,
     )
@@ -1337,11 +2392,20 @@ def inventory_equip(payload: InventoryEquipRequest) -> InventoryMutationResponse
 def inventory_unequip(payload: InventoryUnequipRequest) -> InventoryMutationResponse:
     save = get_current_save(default_session_id=payload.session_id)
     save.session_id = payload.session_id
+    ensure_item_system(save)
     owner_id, owner_name, profile, role = _resolve_inventory_owner(save, payload.owner)
-    equipped_id = _unequip_profile_item(profile, payload.slot)
+    if payload.slot == "weapon":
+        equipped_id = profile.dnd5e_sheet.equipment_slots.weapon_item_instance_id
+        profile.dnd5e_sheet.equipment_slots.weapon_item_instance_id = None
+        profile.dnd5e_sheet.equipment_slots.weapon_item_id = None
+    else:
+        equipped_id = profile.dnd5e_sheet.equipment_slots.armor_item_instance_id
+        profile.dnd5e_sheet.equipment_slots.armor_item_instance_id = None
+        profile.dnd5e_sheet.equipment_slots.armor_item_id = None
     equipped_name = None
     if equipped_id:
         equipped_name = next((item.name for item in profile.dnd5e_sheet.backpack.items if item.item_id == equipped_id), None)
+    ensure_item_system(save)
     _recompute_player_derived(profile)
     if role is not None:
         role.profile = profile
@@ -1351,6 +2415,151 @@ def inventory_unequip(payload: InventoryUnequipRequest) -> InventoryMutationResp
         session_id=payload.session_id,
         owner=payload.owner,
         message=f"{owner_name} 卸下了{slot_label}{f'【{equipped_name}】' if equipped_name else ''}。",
+        item_id=equipped_id,
+        player=profile if payload.owner.owner_type == "player" else None,
+        role=role,
+    )
+
+
+def inventory_grant(payload: InventoryGrantRequest) -> InventoryMutationResponse:
+    save = get_current_save(default_session_id=payload.session_id)
+    save.session_id = payload.session_id
+    ensure_item_system(save)
+    owner_id, owner_name, profile, role = _resolve_inventory_owner(save, payload.owner)
+    owner_kind = "player" if payload.owner.owner_type == "player" else "role"
+    definition_id = ensure_definition_for_inventory_item(payload.item)
+    existing = next(
+        (
+            entry
+            for entry in resolve_owner_instances(save, owner_kind=owner_kind, owner_id=owner_id)
+            if entry.definition_id == definition_id
+            and (entry.uses_max == payload.item.uses_max)
+            and (entry.display_name or payload.item.name) == payload.item.name
+            and str(entry.metadata.get("compat_item_id") or payload.item.item_id) == payload.item.item_id
+        ),
+        None,
+    )
+    if existing is not None:
+        existing.quantity += max(1, payload.item.quantity)
+        if existing.uses_left is None and payload.item.uses_left is not None:
+            existing.uses_left = payload.item.uses_left
+        if existing.uses_max is None and payload.item.uses_max is not None:
+            existing.uses_max = payload.item.uses_max
+        existing.updated_at = _utc_now()
+        item_id = existing.item_instance_id
+        quantity_after = existing.quantity
+        uses_left_after = existing.uses_left
+    else:
+        created = create_item_instance(
+            save,
+            definition_id=definition_id,
+            owner_kind=owner_kind,
+            owner_id=owner_id,
+            quantity=max(1, payload.item.quantity),
+            uses_left=payload.item.uses_left,
+            uses_max=payload.item.uses_max,
+            display_name=payload.item.name,
+            description_override=payload.item.description,
+            zone_id=save.area_snapshot.current_zone_id,
+            sub_zone_id=save.area_snapshot.current_sub_zone_id,
+            metadata={"reason": payload.reason.strip()[:120], "legacy_item_id": payload.item.item_id, "compat_item_id": payload.item.item_id},
+        )
+        item_id = created.item_instance_id
+        quantity_after = created.quantity
+        uses_left_after = created.uses_left
+    ensure_item_system(save)
+    item = _get_inventory_item_for_owner(profile, payload.item.item_id)
+    _recompute_player_derived(profile)
+    if role is not None:
+        role.profile = profile
+    save.game_logs.append(
+        _new_game_log(
+            payload.session_id,
+            "inventory_grant",
+            f"{owner_name} 获得了【{item.name}】。",
+            {
+                "owner_type": payload.owner.owner_type,
+                "owner_id": owner_id,
+                "item_id": payload.item.item_id,
+                "quantity": quantity_after,
+                "reason": payload.reason[:120],
+            },
+        )
+    )
+    save_current(save)
+    return InventoryMutationResponse(
+        session_id=payload.session_id,
+        owner=payload.owner,
+        message=(f"{owner_name} 获得了【{item.name}】。" if not payload.reason.strip() else f"{owner_name} 获得了【{item.name}】。原因：{payload.reason.strip()[:120]}"),
+        item_id=payload.item.item_id,
+        amount_changed=max(1, payload.item.quantity),
+        quantity_after=quantity_after,
+        uses_left_after=uses_left_after,
+        player=profile if payload.owner.owner_type == "player" else None,
+        role=role,
+    )
+
+
+def inventory_consume(payload: InventoryConsumeRequest) -> InventoryMutationResponse:
+    save = get_current_save(default_session_id=payload.session_id)
+    save.session_id = payload.session_id
+    ensure_item_system(save)
+    owner_id, owner_name, profile, role = _resolve_inventory_owner(save, payload.owner)
+    before = _get_inventory_item_for_owner(profile, payload.item_id)
+    item_name = before.name
+    owner_kind = "player" if payload.owner.owner_type == "player" else "role"
+    instance = get_owner_instance_by_ref(save, owner_kind=owner_kind, owner_id=owner_id, item_ref=payload.item_id)
+    mode = payload.consume_mode if payload.consume_mode in {"auto", "quantity", "uses"} else "auto"
+    use_charges = instance.uses_left is not None if mode == "auto" else mode == "uses"
+    if use_charges:
+        if instance.uses_left is None:
+            raise ValueError("ITEM_HAS_NO_USES")
+        if instance.uses_left < payload.amount:
+            raise ValueError("ITEM_USES_INSUFFICIENT")
+        instance.uses_left -= payload.amount
+        if instance.uses_left == 0 and instance.quantity > 1:
+            instance.quantity -= 1
+            if instance.uses_max is not None:
+                instance.uses_left = instance.uses_max
+    else:
+        if instance.quantity < payload.amount:
+            raise ValueError("ITEM_QUANTITY_INSUFFICIENT")
+        instance.quantity -= payload.amount
+        if instance.quantity <= 0:
+            remove_item_instance(save, instance.item_instance_id)
+            instance = None  # type: ignore[assignment]
+    refresh_item_system_projection(save)
+    updated_item = next((entry for entry in profile.dnd5e_sheet.backpack.items if entry.item_id == payload.item_id), None)
+    _recompute_player_derived(profile)
+    if role is not None:
+        role.profile = profile
+    save.game_logs.append(
+        _new_game_log(
+            payload.session_id,
+            "inventory_consume",
+            f"{owner_name} 消耗了【{item_name}】。",
+            {
+                "owner_type": payload.owner.owner_type,
+                "owner_id": owner_id,
+                "item_id": payload.item_id,
+                "amount": payload.amount,
+                "consume_mode": payload.consume_mode,
+                "reason": payload.reason[:120],
+            },
+        )
+    )
+    save_current(save)
+    after_quantity = updated_item.quantity if updated_item is not None else 0
+    after_uses = updated_item.uses_left if updated_item is not None else 0
+    reason_suffix = f" 原因：{payload.reason.strip()[:120]}" if payload.reason.strip() else ""
+    return InventoryMutationResponse(
+        session_id=payload.session_id,
+        owner=payload.owner,
+        message=f"{owner_name} 消耗了【{item_name}】。{('剩余数量 ' + str(after_quantity)) if updated_item is not None else '该物品已耗尽。'}{reason_suffix}".strip(),
+        item_id=payload.item_id,
+        amount_changed=-payload.amount,
+        quantity_after=after_quantity,
+        uses_left_after=after_uses,
         player=profile if payload.owner.owner_type == "player" else None,
         role=role,
     )
@@ -1359,6 +2568,7 @@ def inventory_unequip(payload: InventoryUnequipRequest) -> InventoryMutationResp
 def inventory_interact(payload: InventoryInteractRequest) -> InventoryInteractResponse:
     save = get_current_save(default_session_id=payload.session_id)
     save.session_id = payload.session_id
+    ensure_item_system(save)
     owner_id, owner_name, profile, role = _resolve_inventory_owner(save, payload.owner)
     item = _get_inventory_item_for_owner(profile, payload.item_id)
     action_result: ActionCheckResponse | None = None
@@ -1391,10 +2601,28 @@ def inventory_interact(payload: InventoryInteractRequest) -> InventoryInteractRe
         time_spent_min = max(1, action_result.time_spent_min)
         save = get_current_save(default_session_id=payload.session_id)
         save.session_id = payload.session_id
+        ensure_item_system(save)
         owner_id, owner_name, profile, role = _resolve_inventory_owner(save, payload.owner)
         item = _get_inventory_item_for_owner(profile, payload.item_id)
-        if action_result.success and item.uses_left is not None:
-            item.uses_left = max(0, item.uses_left - 1)
+        if action_result.success:
+            owner_kind = "player" if payload.owner.owner_type == "player" else "role"
+            instance = get_owner_instance_by_ref(save, owner_kind=owner_kind, owner_id=owner_id, item_ref=payload.item_id)
+            if instance.uses_left is not None:
+                instance.uses_left = max(0, instance.uses_left - 1)
+                if instance.uses_left == 0 and instance.quantity > 1:
+                    instance.quantity -= 1
+                    if instance.uses_max is not None:
+                        instance.uses_left = instance.uses_max
+                elif instance.uses_left == 0 and instance.quantity <= 1:
+                    instance.uses_left = 0
+                if instance.quantity <= 0:
+                    remove_item_instance(save, instance.item_instance_id)
+            elif instance.quantity > 0:
+                instance.quantity = max(0, instance.quantity - 1)
+                if instance.quantity == 0:
+                    remove_item_instance(save, instance.item_instance_id)
+            refresh_item_system_projection(save)
+            item = next((entry for entry in profile.dnd5e_sheet.backpack.items if entry.item_id == payload.item_id), item)
         if payload.action_check is not None and save.area_snapshot.clock is not None:
             save.area_snapshot.clock = _advance_clock(save.area_snapshot.clock, time_spent_min)
     reply = _generate_inventory_interaction_reply(
@@ -1432,20 +2660,6 @@ def inventory_interact(payload: InventoryInteractRequest) -> InventoryInteractRe
         summary = _scene_events_to_summary(scene_events)
         if summary:
             reply = f"{reply}\n\n{summary}"
-    try:
-        from app.services.encounter_service import advance_active_encounter_in_save
-
-        advanced = advance_active_encounter_in_save(save, session_id=payload.session_id, minutes_elapsed=time_spent_min, config=payload.config)
-        if advanced is not None:
-            scene_events.append(
-                _new_scene_event(
-                    "encounter_background",
-                    advanced.latest_outcome_summary or advanced.scene_summary or advanced.description,
-                    metadata={"encounter_id": advanced.encounter_id},
-                )
-            )
-    except Exception:
-        pass
     _recompute_player_derived(profile)
     if role is not None:
         role.profile = profile
@@ -1562,7 +2776,11 @@ def remove_player_spell(session_id: str, payload: PlayerSpellSetRequest) -> Play
 def add_player_skill(session_id: str, payload: PlayerSkillSetRequest) -> PlayerStaticData:
     save = get_current_save(default_session_id=session_id)
     save.session_id = session_id
-    save.player_static_data.dnd5e_sheet.skills_proficient.append(payload.value)
+    sheet = save.player_static_data.dnd5e_sheet
+    sheet.skills_proficient.append(payload.value)
+    war_art_name = _martial_resource_name(payload.value)
+    if war_art_name:
+        sheet.war_arts.append(war_art_name)
     _recompute_player_derived(save.player_static_data)
     save_current(save)
     return save.player_static_data
@@ -1572,9 +2790,12 @@ def remove_player_skill(session_id: str, payload: PlayerSkillSetRequest) -> Play
     save = get_current_save(default_session_id=session_id)
     save.session_id = session_id
     value = payload.value.strip().lower()
-    save.player_static_data.dnd5e_sheet.skills_proficient = [
-        s for s in save.player_static_data.dnd5e_sheet.skills_proficient if s.strip().lower() != value
-    ]
+    sheet = save.player_static_data.dnd5e_sheet
+    sheet.skills_proficient = [s for s in sheet.skills_proficient if s.strip().lower() != value]
+    war_art_name = _martial_resource_name(payload.value)
+    if war_art_name:
+        target = war_art_name.strip().lower()
+        sheet.war_arts = [s for s in sheet.war_arts if s.strip().lower() != target and s.strip().lower() != value]
     _recompute_player_derived(save.player_static_data)
     save_current(save)
     return save.player_static_data
@@ -1602,6 +2823,28 @@ def recover_spell_slots(session_id: str, payload: PlayerSpellSlotAdjustRequest) 
     cur = int(getattr(sheet.spell_slots_current, key))
     max_val = int(getattr(sheet.spell_slots_max, key))
     setattr(sheet.spell_slots_current, key, min(max_val, cur + payload.amount))
+    _recompute_player_derived(save.player_static_data)
+    save_current(save)
+    return save.player_static_data
+
+
+def consume_martial_points(session_id: str, payload: PlayerMartialPointAdjustRequest) -> PlayerStaticData:
+    save = get_current_save(default_session_id=session_id)
+    save.session_id = session_id
+    sheet = save.player_static_data.dnd5e_sheet
+    if sheet.martial_points_current < payload.amount:
+        raise ValueError("MARTIAL_POINTS_NOT_ENOUGH")
+    sheet.martial_points_current -= payload.amount
+    _recompute_player_derived(save.player_static_data)
+    save_current(save)
+    return save.player_static_data
+
+
+def recover_martial_points(session_id: str, payload: PlayerMartialPointAdjustRequest) -> PlayerStaticData:
+    save = get_current_save(default_session_id=session_id)
+    save.session_id = session_id
+    sheet = save.player_static_data.dnd5e_sheet
+    sheet.martial_points_current = min(sheet.martial_points_maximum, sheet.martial_points_current + payload.amount)
     _recompute_player_derived(save.player_static_data)
     save_current(save)
     return save.player_static_data
@@ -2067,6 +3310,10 @@ def generate_regions(req: RegionGenerateRequest) -> RegionGenerateResponse:
     return RegionGenerateResponse(session_id=req.session_id, generated=True, zones=zones)
 
 
+def generate_regions_in_save(req: RegionGenerateRequest) -> RegionGenerateResponse:
+    return generate_regions(req)
+
+
 def generate_zones_for_chat(session_id: str, config: ChatConfig, world_prompt: str, count: int = 1) -> list[Zone]:
     save = get_current_save(default_session_id=session_id)
     center = (
@@ -2119,12 +3366,28 @@ def generate_zones_for_chat(session_id: str, config: ChatConfig, world_prompt: s
     return appended
 
 
-def render_map(req: RenderMapRequest) -> RenderMapResponse:
-    nodes = [RenderNode(zone_id=z.zone_id, name=z.name, x=z.x, y=z.y) for z in req.zones]
+def render_map_payload(*, zones: list[Zone], player_position: Position, zone_metrics: dict[str, object] | None = None) -> MapRenderPayload:
+    from app.services import zone_metric_service
+
+    nodes = [RenderNode(zone_id=z.zone_id, name=z.name, x=z.x, y=z.y) for z in zones]
     sub_nodes: list[RenderSubNode] = []
     circles: list[RenderCircle] = []
-    for z in req.zones:
-        circles.append(RenderCircle(zone_id=z.zone_id, center_x=z.x, center_y=z.y, radius_m=z.radius_m))
+    for z in zones:
+        metric = zone_metrics.get(z.zone_id) if isinstance(zone_metrics, dict) else None
+        danger_score = getattr(metric, "danger_score", None)
+        danger_band = getattr(metric, "danger_band", None)
+        fill_color = zone_metric_service.danger_fill_color(int(danger_score)) if isinstance(danger_score, int) else None
+        circles.append(
+            RenderCircle(
+                zone_id=z.zone_id,
+                center_x=z.x,
+                center_y=z.y,
+                radius_m=z.radius_m,
+                danger_score=danger_score if isinstance(danger_score, int) else None,
+                danger_band=danger_band if isinstance(danger_band, str) else None,
+                fill_color=fill_color,
+            )
+        )
         for idx, sub in enumerate(z.sub_zones):
             sub_nodes.append(
                 RenderSubNode(
@@ -2143,14 +3406,21 @@ def render_map(req: RenderMapRequest) -> RenderMapResponse:
         "min_y": min(ys) - 10,
         "max_y": max(ys) + 10,
     }
-    return RenderMapResponse(
-        session_id=req.session_id,
+    return MapRenderPayload(
         viewport=viewport,
         nodes=nodes,
         sub_nodes=sub_nodes,
         circles=circles,
-        player_marker={"x": req.player_position.x, "y": req.player_position.y},
+        player_marker={"x": player_position.x, "y": player_position.y},
     )
+
+
+def render_map(req: RenderMapRequest) -> RenderMapResponse:
+    zone_metrics = None
+    if req.zone_metric_state is not None:
+        zone_metrics = {entry.zone_id: entry for entry in req.zone_metric_state.entries}
+    payload = render_map_payload(zones=req.zones, player_position=req.player_position, zone_metrics=zone_metrics)
+    return RenderMapResponse(session_id=req.session_id, **payload.model_dump())
 
 
 def _distance_m(from_zone: Zone, to_zone: Zone) -> float:
@@ -2165,16 +3435,6 @@ def _requires_encounter_escape_before_move(
     target_zone_id: str | None,
     target_sub_zone_id: str | None,
 ) -> str | None:
-    state = save.encounter_state
-    if state is None or not state.active_encounter_id:
-        return None
-    encounter = next((item for item in state.encounters if item.encounter_id == state.active_encounter_id), None)
-    if encounter is None or encounter.status != "active" or encounter.player_presence != "engaged":
-        return None
-    if encounter.zone_id and target_zone_id and encounter.zone_id != target_zone_id:
-        return encounter.encounter_id
-    if encounter.sub_zone_id and encounter.sub_zone_id != target_sub_zone_id:
-        return encounter.encounter_id
     return None
 
 
@@ -2185,29 +3445,8 @@ def _attempt_escape_for_move(
     target_sub_zone_id: str | None,
     config: ChatConfig | None = None,
 ) -> None:
-    save = get_current_save(default_session_id=session_id)
-    if save.session_id != session_id:
-        save.session_id = session_id
-    _ensure_area_snapshot(save)
-    encounter_id = _requires_encounter_escape_before_move(
-        save,
-        target_zone_id=target_zone_id,
-        target_sub_zone_id=target_sub_zone_id,
-    )
-    if not encounter_id:
-        return
-    from app.models.schemas import EncounterEscapeRequest
-    from app.services.encounter_service import escape_encounter
-
-    result = escape_encounter(
-        encounter_id,
-        EncounterEscapeRequest(
-            session_id=session_id,
-            config=config,
-        ),
-    )
-    if not result.escape_success:
-        raise ValueError("ENCOUNTER_ESCAPE_BLOCKED")
+    _ = (session_id, target_zone_id, target_sub_zone_id, config)
+    return
 
 
 def move_to_zone(req: MoveRequest) -> MoveResponse:
@@ -2299,12 +3538,6 @@ def move_to_zone(req: MoveRequest) -> MoveResponse:
         )
     except Exception:
         pass
-    try:
-        from app.services.encounter_service import advance_active_encounter_in_save
-
-        advance_active_encounter_in_save(save, session_id=req.session_id, minutes_elapsed=duration_min)
-    except Exception:
-        pass
     save_current(save)
 
     return MoveResponse(
@@ -2313,6 +3546,10 @@ def move_to_zone(req: MoveRequest) -> MoveResponse:
         duration_min=duration_min,
         movement_log=movement_log,
     )
+
+
+def move_to_zone_in_save(req: MoveRequest) -> MoveResponse:
+    return move_to_zone(req)
 
 
 def _default_world_clock(calendar: str = "fantasy_default") -> WorldClock:
@@ -2711,8 +3948,21 @@ def _build_npc_prompt_context(role: NpcRoleCard, clock: WorldClock | None, recen
         lines.append(f"当前世界时间={world_time_text}")
     lines.append(_npc_conversation_state_summary(role))
     if save is not None:
+        zone_id, sub_zone_id = _effective_npc_area_ids(save, role)
+        zone_name = next((item.name for item in save.area_snapshot.zones if item.zone_id == zone_id), zone_id or "未知区域")
+        sub_zone_name = next((item.name for item in save.area_snapshot.sub_zones if item.sub_zone_id == sub_zone_id), sub_zone_id or "附近")
+        lines.append(f"当前地点={zone_name} / {sub_zone_name}")
+        lines.append(f"玩家关系标签={_npc_player_relation_tag(role, save.player_static_data.player_id)}")
+        team_member = _team_member_for_role(save, role.role_id)
+        if team_member is not None or role.state == "in_team":
+            affinity = team_member.affinity if team_member is not None else 50
+            trust = team_member.trust if team_member is not None else 40
+            join_reason = (team_member.join_reason if team_member is not None else "").strip() or "已随玩家同行"
+            lines.append(f"队伍状态=当前在玩家队伍中, affinity={affinity}, trust={trust}, join_reason={join_reason}")
         active_encounter = _active_encounter_for_current_sub_zone(save)
         if active_encounter is not None:
+            from app.services.encounter_service import encounter_secret_for_actor
+
             lines.append(
                 "当前地区活跃遭遇="
                 + json.dumps(
@@ -2720,8 +3970,9 @@ def _build_npc_prompt_context(role: NpcRoleCard, clock: WorldClock | None, recen
                         "encounter_id": active_encounter.encounter_id,
                         "title": active_encounter.title,
                         "status": active_encounter.status,
+                        "goal": active_encounter.goal,
                         "scene_summary": active_encounter.scene_summary,
-                        "latest_outcome_summary": active_encounter.latest_outcome_summary,
+                        "secret": encounter_secret_for_actor(save, role.role_id),
                     },
                     ensure_ascii=False,
                 )
@@ -2737,6 +3988,7 @@ def _build_npc_prompt_context(role: NpcRoleCard, clock: WorldClock | None, recen
 
 def _build_npc_roleplay_brief(role: NpcRoleCard) -> str:
     traits: list[str] = []
+    sheet = role.profile.dnd5e_sheet
     if role.personality:
         traits.append(f"性格={_trim_npc_text(role.personality, 80)}")
     if role.speaking_style:
@@ -2748,6 +4000,18 @@ def _build_npc_roleplay_brief(role: NpcRoleCard) -> str:
     if role.likes:
         traits.append(f"偏好={' / '.join(role.likes[:5])}")
     traits.append(f"健谈值={role.talkative_current}/{role.talkative_maximum}")
+    spell_text = "、".join(list(sheet.spells or [])[:6]) if sheet.spells else "无"
+    war_art_text = "、".join(list(sheet.war_arts or [])[:6]) if sheet.war_arts else "无"
+    slot_parts = [
+        f"1环:{int(sheet.spell_slots_current.level_1 or 0)}/{int(sheet.spell_slots_max.level_1 or 0)}"
+    ] if int(sheet.spell_slots_max.level_1 or 0) > 0 else []
+    traits.append(
+        f"职业={_trim_npc_text(sheet.char_class or '未知', 24)}；"
+        f"已会法术={spell_text}；"
+        f"已会武技={war_art_text}；"
+        f"法术位={('，'.join(slot_parts) if slot_parts else '无')}；"
+        f"武技点={int(sheet.martial_points_current or 0)}/{int(sheet.martial_points_maximum or 0)}"
+    )
     if role.state == "in_team":
         traits.append("当前是玩家队友，通常会更愿意给出实用反馈，但仍保留个人脾气。")
     if role.secret:
@@ -2911,20 +4175,133 @@ def _world_clock_iso(clock: WorldClock | None) -> str | None:
     return _clock_to_datetime(clock).isoformat()
 
 
-def _restore_npc_talkative(role: NpcRoleCard, clock: WorldClock | None) -> int:
-    if clock is None or not role.last_private_chat_at:
+def _team_member_for_role(save: SaveFile | None, role_id: str):
+    if save is None:
+        return None
+    state = getattr(save, "team_state", None)
+    members = getattr(state, "members", None) or []
+    return next((item for item in members if item.role_id == role_id), None)
+
+
+def _sync_team_role_before_private_chat(save: SaveFile, role: NpcRoleCard) -> None:
+    member = _team_member_for_role(save, role.role_id)
+    if role.state != "in_team" and member is None:
+        return
+    try:
+        from app.services.team_service import sync_team_members_with_player_in_save
+
+        sync_team_members_with_player_in_save(save)
+    except Exception:
+        return
+
+
+def _effective_npc_area_ids(save: SaveFile | None, role: NpcRoleCard) -> tuple[str | None, str | None]:
+    zone_id = role.zone_id
+    sub_zone_id = role.sub_zone_id
+    if save is None:
+        return zone_id, sub_zone_id
+    member = _team_member_for_role(save, role.role_id)
+    if role.state == "in_team" or member is not None:
+        zone_id = save.area_snapshot.current_zone_id or zone_id
+        sub_zone_id = save.area_snapshot.current_sub_zone_id or sub_zone_id
+    return zone_id, sub_zone_id
+
+
+def _npc_player_relation_tag(role: NpcRoleCard, player_id: str) -> str:
+    relation = next((item for item in role.relations if item.target_role_id == player_id), None)
+    return (relation.relation_tag or "neutral") if relation is not None else "neutral"
+
+
+def _world_time_dict_to_datetime(world_time: dict[str, str | int] | None) -> datetime | None:
+    if not world_time:
+        return None
+    try:
+        return datetime(
+            year=max(int(world_time.get("year") or 1), 1),
+            month=min(max(int(world_time.get("month") or 1), 1), 12),
+            day=min(max(int(world_time.get("day") or 1), 1), 28),
+            hour=min(max(int(world_time.get("hour") or 0), 0), 23),
+            minute=min(max(int(world_time.get("minute") or 0), 0), 59),
+            tzinfo=timezone.utc,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _count_public_turns_since_last_private_chat(save: SaveFile, role: NpcRoleCard) -> int:
+    last_private_raw = str(getattr(role, "last_private_chat_at", "") or "").strip()
+    if not last_private_raw:
         return 0
     try:
-        delta = _clock_to_datetime(clock) - datetime.fromisoformat(role.last_private_chat_at)
+        last_private_dt = datetime.fromisoformat(last_private_raw)
     except ValueError:
         return 0
-    delta_min = max(0, int(delta.total_seconds() // 60))
-    recovered = max(0, (delta_min // 20) * 4)
-    if recovered <= 0:
+    _, sub_zone_id = _effective_npc_area_ids(save, role)
+    if not sub_zone_id:
         return 0
+    sub_zone = next((item for item in save.area_snapshot.sub_zones if item.sub_zone_id == sub_zone_id), None)
+    if sub_zone is None:
+        return 0
+    count = 0
+    for turn in sub_zone.chat_context.recent_turns:
+        if turn.source != "main_chat":
+            continue
+        turn_dt = _world_time_dict_to_datetime(turn.world_time) or datetime.fromisoformat(turn.created_at)
+        if turn_dt <= last_private_dt:
+            continue
+        count += 1
+    return count
+
+
+def _eligible_roles_for_public_talkative_recovery(save: SaveFile) -> list[NpcRoleCard]:
+    current_zone_id = save.area_snapshot.current_zone_id
+    current_sub_zone_id = save.area_snapshot.current_sub_zone_id
+    team_ids = {item.role_id for item in getattr(save.team_state, "members", [])}
+    roles: list[NpcRoleCard] = []
+    for role in save.role_pool:
+        sheet = role.profile.dnd5e_sheet
+        if role.state == "dead" or sheet.role_action_status == "dead" or sheet.is_dead:
+            continue
+        if role.role_id in team_ids:
+            roles.append(role)
+            continue
+        if current_sub_zone_id and role.sub_zone_id == current_sub_zone_id:
+            roles.append(role)
+            continue
+        if current_zone_id and role.zone_id == current_zone_id and not role.sub_zone_id:
+            roles.append(role)
+    return roles
+
+
+def restore_npc_talkative_from_public_round(save: SaveFile, *, round_id: str) -> dict[str, int]:
+    recovered: dict[str, int] = {}
+    for role in _eligible_roles_for_public_talkative_recovery(save):
+        if role.talkative_recovery_round_cursor == round_id:
+            continue
+        before = int(role.talkative_current or 0)
+        role.talkative_current = min(int(role.talkative_maximum or 100), before + 4)
+        role.talkative_recovery_round_cursor = round_id
+        role.last_public_turn_at = _utc_now()
+        delta = max(0, int(role.talkative_current or 0) - before)
+        if delta > 0:
+            recovered[role.role_id] = delta
+    return recovered
+
+
+def _restore_npc_talkative(role: NpcRoleCard, clock: WorldClock | None, save: SaveFile | None = None) -> int:
+    del clock
     before = role.talkative_current
-    role.talkative_current = min(role.talkative_maximum, role.talkative_current + recovered)
+    if save is not None and not getattr(role, "talkative_recovery_round_cursor", None):
+        recovered_turns = _count_public_turns_since_last_private_chat(save, role)
+        if recovered_turns > 0:
+            role.talkative_current = min(role.talkative_maximum, role.talkative_current + recovered_turns * 4)
+            role.last_public_turn_at = _utc_now()
+    role.talkative_current = min(role.talkative_maximum, max(0, role.talkative_current))
     return max(0, role.talkative_current - before)
+
+
+def _npc_private_chat_ignore_action(role: NpcRoleCard) -> str:
+    return f"{role.name} 明显不想理会你，只是把视线挪开，没有接话。"
 
 
 def _npc_talkative_delta(role: NpcRoleCard, action_text: str, speech_text: str) -> int:
@@ -3346,10 +4723,7 @@ def _fallback_npc_reply_parts(
 
 
 def _public_behavior_triggered(action_text: str, speech_text: str, raw_text: str) -> bool:
-    if speech_text.strip():
-        return True
-    merged = f"{action_text}\n{raw_text}".strip()
-    return _contains_any_token(merged, ["奔跑", "大喊", "砸", "挥舞", "冲向", "推开", "攻击", "打碎", "翻找"])
+    return bool(str(action_text or "").strip() or str(speech_text or "").strip() or str(raw_text or "").strip())
 
 
 def _new_scene_event(
@@ -3377,7 +4751,20 @@ def _visible_public_roles(save: SaveFile) -> list[NpcRoleCard]:
     if current_sub is None:
         return []
     visible_ids = {npc.npc_id for npc in current_sub.npcs}
-    return [role for role in save.role_pool if role.role_id in visible_ids and role.state != "in_team" and role.sub_zone_id == current_sub.sub_zone_id]
+    dead_ids = {
+        str(getattr(record, "role_id", "") or "")
+        for record in getattr(getattr(current_sub, "state", None), "dead_npc_records", [])
+    }
+    return [
+        role
+        for role in save.role_pool
+        if role.role_id in visible_ids
+        and role.role_id not in dead_ids
+        and role.state not in {"in_team", "dead"}
+        and role.sub_zone_id == current_sub.sub_zone_id
+        and role.profile.dnd5e_sheet.role_action_status != "dead"
+        and not role.profile.dnd5e_sheet.is_dead
+    ]
 
 
 def _public_npc_reaction(role: NpcRoleCard, player_text: str, gm_summary: str) -> tuple[str, str]:
@@ -3426,55 +4813,63 @@ def _generate_targeted_public_npc_reply(
     knowledge = build_npc_knowledge_snapshot(save, role.role_id)
     gm_summary = str((scene_context or {}).get("gm_narration") or "").strip()
     scene_context_json = json.dumps(scene_context or {}, ensure_ascii=False)
-    if config is not None:
-        api_key = (config.openai_api_key or "").strip()
-        model = (config.model or "").strip()
-        if api_key and model:
-            try:
-                client = create_sync_client(config, client_cls=OpenAI)
-                world_time_text, _ = _world_time_payload(save.area_snapshot.clock)
-                prompt = prompt_table.render(
-                    PromptKeys.NPC_PUBLIC_TARGETED_USER,
-                    "你要扮演公开区域里被玩家喊话的NPC，只输出 JSON。",
-                    roleplay_brief=_build_npc_roleplay_brief(role),
-                    scene_summary=gm_summary or "公开区域中的即时互动",
-                    world_time_text=world_time_text,
-                    conversation_state=_npc_conversation_state_summary(role),
-                    knowledge_rules="\n".join(f"- {item}" for item in knowledge.response_rules),
-                    player_text=player_text,
-                    context=_build_npc_prompt_context(role, save.area_snapshot.clock, recent_count=8, save=save),
-                    scene_context_json=scene_context_json,
-                )
-                resp = client.chat.completions.create(
-                    model=model,
-                    **build_completion_options(config),
-                    response_format={"type": "json_object"},
-                    messages=[
-                        {"role": "system", "content": config.gm_prompt},
-                        {"role": "user", "content": prompt},
-                    ],
-                )
-                parsed = _extract_json_content((resp.choices[0].message.content or "").strip())
-                action = str(parsed.get("action_reaction") or "").strip()
-                speech = str(parsed.get("speech_reply") or "").strip()
-                relation_tag = str(parsed.get("relation_tag") or "met").strip().lower()
-                if relation_tag not in {"ally", "friendly", "met", "neutral", "wary", "hostile"}:
-                    relation_tag = "met"
-                action, speech = _normalize_npc_reply_parts(
-                    role,
-                    "",
-                    player_text,
-                    None,
-                    action,
-                    speech,
-                    allow_action_repair=False,
-                    allow_speech_repair=False,
-                )
-                if action or speech:
-                    return action, speech, relation_tag
-            except Exception:
-                pass
-    return _fallback_targeted_public_npc_reply(role, player_text, scene_context)
+    config = require_ai_config(config)
+    try:
+        client = create_sync_client(config, client_cls=OpenAI)
+        world_time_text, _ = _world_time_payload(save.area_snapshot.clock)
+        prompt = prompt_table.render(
+            PromptKeys.NPC_PUBLIC_TARGETED_USER,
+            "你要扮演公开区域里被玩家喊话的NPC，只输出 JSON。",
+            roleplay_brief=_build_npc_roleplay_brief(role),
+            scene_summary=gm_summary or "公开区域中的即时互动",
+            world_time_text=world_time_text,
+            conversation_state=_npc_conversation_state_summary(role),
+            knowledge_rules="\n".join(f"- {item}" for item in knowledge.response_rules),
+            player_text=player_text,
+            context=_build_npc_prompt_context(role, save.area_snapshot.clock, recent_count=8, save=save),
+            scene_context_json=scene_context_json,
+        )
+        prompt = f"{prompt}\nAllowed enum ids:\n{render_enum_pool_text(_RELATION_TAG_CONTRACT_FIELDS)}"
+        resp = client.chat.completions.create(
+            model=config.model,
+            **build_completion_options(config),
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": config.gm_prompt},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        raw_json = (resp.choices[0].message.content or "").strip() or "{}"
+        parsed = _extract_json_content(raw_json)
+        with allow_protocol_repair():
+            parsed = validate_or_repair_json_payload(
+                parsed=parsed,
+                raw_json=raw_json,
+                fields=_RELATION_TAG_CONTRACT_FIELDS,
+                config=config,
+                system_prompt=config.gm_prompt,
+                original_prompt=prompt,
+            )
+        action = str(parsed.get("action_reaction") or "").strip()
+        speech = str(parsed.get("speech_reply") or "").strip()
+        relation_tag = str(parsed.get("relation_tag") or "").strip().lower()
+        action, speech = _normalize_npc_reply_parts(
+            role,
+            "",
+            player_text,
+            None,
+            action,
+            speech,
+            allow_action_repair=False,
+            allow_speech_repair=False,
+        )
+        if action or speech:
+            return action, speech, relation_tag
+        raise ValueError("AI_PROTOCOL_REPAIR_FAILED")
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"{AI_PROVIDER_CALL_FAILED}: {exc}") from exc
 
 
 def _generate_bystander_public_reactions(
@@ -3487,46 +4882,50 @@ def _generate_bystander_public_reactions(
     created: list[tuple[NpcRoleCard, str, str]] = []
     gm_summary = str((scene_context or {}).get("gm_narration") or "").strip()
     scene_context_json = json.dumps(scene_context or {}, ensure_ascii=False)
+    config = require_ai_config(config)
     for role in roles[:2]:
-        action_reaction = ""
-        speech_reply = ""
-        relation_tag = "met"
-        if config is not None:
-            api_key = (config.openai_api_key or "").strip()
-            model = (config.model or "").strip()
-            if api_key and model:
-                try:
-                    client = create_sync_client(config, client_cls=OpenAI)
-                    prompt = prompt_table.render(
-                        PromptKeys.NPC_PUBLIC_BYSTANDER_USER,
-                        "你要扮演公开区域中的旁观NPC，只输出 JSON。",
-                        roleplay_brief=_build_npc_roleplay_brief(role),
-                        scene_summary=gm_summary or "公开区域中的即时互动",
-                        player_text=player_text,
-                        gm_summary=gm_summary,
-                        scene_context_json=scene_context_json,
-                    )
-                    resp = client.chat.completions.create(
-                        model=model,
-                        **build_completion_options(config),
-                        response_format={"type": "json_object"},
-                        messages=[
-                            {"role": "system", "content": config.gm_prompt},
-                            {"role": "user", "content": prompt},
-                        ],
-                    )
-                    parsed = _extract_json_content((resp.choices[0].message.content or "").strip())
-                    action_reaction = _trim_npc_text(str(parsed.get("action_reaction") or "").strip(), 160)
-                    speech_reply = _trim_npc_text(str(parsed.get("speech_reply") or "").strip(), 120)
-                    relation_tag = str(parsed.get("relation_tag") or "met").strip().lower()
-                except Exception:
-                    action_reaction = ""
-                    speech_reply = ""
+        try:
+            client = create_sync_client(config, client_cls=OpenAI)
+            prompt = prompt_table.render(
+                PromptKeys.NPC_PUBLIC_BYSTANDER_USER,
+                "你要扮演公开区域中的旁观NPC，只输出 JSON。",
+                roleplay_brief=_build_npc_roleplay_brief(role),
+                scene_summary=gm_summary or "公开区域中的即时互动",
+                player_text=player_text,
+                gm_summary=gm_summary,
+                scene_context_json=scene_context_json,
+            )
+            prompt = f"{prompt}\nAllowed enum ids:\n{render_enum_pool_text(_RELATION_TAG_CONTRACT_FIELDS)}"
+            resp = client.chat.completions.create(
+                model=config.model,
+                **build_completion_options(config),
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": config.gm_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            raw_json = (resp.choices[0].message.content or "").strip() or "{}"
+            parsed = _extract_json_content(raw_json)
+            with allow_protocol_repair():
+                parsed = validate_or_repair_json_payload(
+                    parsed=parsed,
+                    raw_json=raw_json,
+                    fields=_RELATION_TAG_CONTRACT_FIELDS,
+                    config=config,
+                    system_prompt=config.gm_prompt,
+                    original_prompt=prompt,
+                )
+            action_reaction = _trim_npc_text(str(parsed.get("action_reaction") or "").strip(), 160)
+            speech_reply = _trim_npc_text(str(parsed.get("speech_reply") or "").strip(), 120)
+            relation_tag = str(parsed.get("relation_tag") or "").strip().lower()
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"{AI_PROVIDER_CALL_FAILED}: {exc}") from exc
         line = _compose_npc_reply(action_reaction, speech_reply)
         if not line:
-            line, relation_tag = _public_npc_reaction(role, player_text, gm_summary)
-        if relation_tag not in {"friendly", "met", "wary", "hostile", "neutral"}:
-            relation_tag = "met"
+            raise ValueError("AI_PROTOCOL_REPAIR_FAILED")
         created.append((role, line, relation_tag))
     return created
 
@@ -3689,6 +5088,7 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
     if role is None:
         raise KeyError("ROLE_NOT_FOUND")
     _ensure_npc_role_complete(save, role)
+    _sync_team_role_before_private_chat(save, role)
     player = save.player_static_data
     intent = _parse_player_intent(req.player_message)
     action_text = str(intent["action_text"])
@@ -3705,7 +5105,7 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
         clock=save.area_snapshot.clock,
     )
 
-    recovered_talkative = _restore_npc_talkative(role, save.area_snapshot.clock)
+    recovered_talkative = _restore_npc_talkative(role, save.area_snapshot.clock, save)
     action_reaction = ""
     speech_reply = ""
     relation_tag = "met"
@@ -3714,7 +5114,7 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
     scene_events: list[SceneEvent] = []
     knowledge = build_npc_knowledge_snapshot(save, role.role_id)
     if role.talkative_current <= 0:
-        action_reaction = f"{role.name} 明显不想继续交谈，只是移开了视线。"
+        action_reaction = _npc_private_chat_ignore_action(role)
     elif player_mentions_unknown_npc(save, role.role_id, player_text):
         action_reaction = f"{role.name} 皱起眉，像是在确认你提到的是谁。"
         speech_reply = npc_guard_reply()
@@ -3789,12 +5189,21 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
                     {"role": "user", "content": prompt},
                 ],
             )
-            parsed = _extract_json_content((resp.choices[0].message.content or "").strip())
+            raw_json = (resp.choices[0].message.content or "").strip() or "{}"
+            parsed = _extract_json_content(raw_json)
+            with allow_protocol_repair():
+                parsed = validate_or_repair_json_payload(
+                    parsed=parsed,
+                    raw_json=raw_json,
+                    fields=_RELATION_TAG_CONTRACT_FIELDS,
+                    config=req.config,
+                    system_prompt=req.config.gm_prompt,
+                    original_prompt=prompt,
+                )
             action_reaction = str(parsed.get("action_reaction") or "").strip()
             speech_reply = str(parsed.get("speech_reply") or "").strip()
             tag = str(parsed.get("relation_tag") or "").strip().lower()
-            if tag in {"ally", "friendly", "met", "neutral", "wary", "hostile"}:
-                relation_tag = tag
+            relation_tag = tag
             forbidden_role_names = [
                 item.name
                 for item in save.role_pool
@@ -3876,6 +5285,19 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
         )
     )
     try:
+        from app.services.team_service import apply_private_chat_feedback_in_save
+
+        apply_private_chat_feedback_in_save(
+            save,
+            session_id=req.session_id,
+            role_id=role.role_id,
+            player_text=player_text,
+            reply=reply,
+            relation_tag=relation_tag,
+        )
+    except Exception:
+        pass
+    try:
         from app.services.team_service import apply_team_reactions_in_save
 
         apply_team_reactions_in_save(
@@ -3886,20 +5308,6 @@ def npc_chat(req: NpcChatRequest) -> NpcChatResponse:
             summary=reply,
             exclude_role_ids={role.role_id},
         )
-    except Exception:
-        pass
-    try:
-        from app.services.encounter_service import advance_active_encounter_in_save
-
-        advanced = advance_active_encounter_in_save(save, session_id=req.session_id, minutes_elapsed=time_spent_min, config=req.config)
-        if advanced is not None:
-            scene_events.append(
-                _new_scene_event(
-                    "encounter_background",
-                    advanced.latest_outcome_summary or advanced.scene_summary or advanced.description,
-                    metadata={"encounter_id": advanced.encounter_id},
-                )
-            )
     except Exception:
         pass
     save_current(save)
@@ -4032,24 +5440,49 @@ def _default_check_task(action_type: str, action_prompt: str) -> str:
     return "判断这次行动是否顺利完成"
 
 
+_ABILITY_USED_CONTRACT_FIELDS = (
+    EnumContractField(
+        field_path="ability_used",
+        allowed_ids=("strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"),
+    ),
+)
+_ACTION_TYPE_CONTRACT_FIELDS = (
+    EnumContractField(
+        field_path="action_type",
+        allowed_ids=("attack", "check", "item_use"),
+        required=False,
+    ),
+)
+_RELATION_TAG_CONTRACT_FIELDS = (
+    EnumContractField(
+        field_path="relation_tag",
+        allowed_ids=("ally", "friendly", "met", "neutral", "wary", "hostile"),
+    ),
+)
+
+
 def _normalize_action_plan(
     action_type: str,
     action_prompt: str,
     raw_plan: dict[str, object] | None,
 ) -> dict[str, int | bool | str]:
     raw_plan = raw_plan or {}
+    normalized_action_type = str(raw_plan.get("action_type") or action_type).strip().lower()
+    if normalized_action_type not in {"attack", "check", "item_use"}:
+        normalized_action_type = "check" if action_type == "auto" else action_type
     ability = str(raw_plan.get("ability_used") or "").strip().lower()
     if ability not in {"strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"}:
         ability = "wisdom"
     dc = int(raw_plan.get("dc") or 12)
     dc = max(5, min(30, dc))
-    time_spent_min = int(raw_plan.get("time_spent_min") or (3 if action_type == "item_use" else 5))
+    time_spent_min = int(raw_plan.get("time_spent_min") or (3 if normalized_action_type == "item_use" else 5))
     time_spent_min = max(1, min(180, time_spent_min))
     requires_check = bool(raw_plan.get("requires_check"))
-    if action_type in {"attack", "check"}:
+    if normalized_action_type in {"attack", "check"}:
         requires_check = True
-    check_task = str(raw_plan.get("check_task") or "").strip() or _default_check_task(action_type, action_prompt)
+    check_task = str(raw_plan.get("check_task") or "").strip() or _default_check_task(normalized_action_type, action_prompt)
     return {
+        "action_type": normalized_action_type,
         "ability_used": ability,
         "dc": dc,
         "time_spent_min": time_spent_min,
@@ -4059,6 +5492,7 @@ def _normalize_action_plan(
 
 
 def _fallback_action_plan(action_type: str, action_prompt: str) -> dict[str, int | bool | str]:
+    normalized_action_type = "check" if action_type == "auto" else action_type
     text = action_prompt.lower()
     ability = "wisdom"
     if any(k in text for k in ["attack", "strike", "hit", "砍", "攻击"]):
@@ -4069,22 +5503,375 @@ def _fallback_action_plan(action_type: str, action_prompt: str) -> dict[str, int
         ability = "intelligence"
     elif any(k in text for k in ["persuade", "deceive", "intimidate", "说服", "威吓"]):
         ability = "charisma"
-    requires_check = action_type in {"attack", "check"}
+    requires_check = normalized_action_type in {"attack", "check"}
     if not requires_check:
         if any(token in text for token in ["尝试", "试图", "强行", "撬", "逃离", "说服", "威胁", "潜行", "偷", "骗", "拆", "破解"]):
             requires_check = True
         elif any(token in text for token in ["观察", "看看", "检查标签", "阅读", "打招呼", "问好", "listen", "look"]):
             requires_check = False
     return _normalize_action_plan(
-        action_type,
+        normalized_action_type,
         action_prompt,
         {
+            "action_type": normalized_action_type,
             "ability_used": ability,
             "dc": 12,
-            "time_spent_min": 5 if action_type != "item_use" else 3,
+            "time_spent_min": 5 if normalized_action_type != "item_use" else 3,
             "requires_check": requires_check,
-            "check_task": _default_check_task(action_type, action_prompt),
+            "check_task": _default_check_task(normalized_action_type, action_prompt),
         },
+    )
+
+
+_PUBLIC_TURN_RESOLUTION_RULE_FIELDS = (
+    EnumContractField(
+        field_path="resolution_rule",
+        allowed_ids=("static_dc", "opposed_actor"),
+    ),
+)
+
+
+def _current_team_roles(save: SaveFile) -> list[NpcRoleCard]:
+    role_ids = {item.role_id for item in getattr(save.team_state, "members", [])}
+    return [role for role in save.role_pool if role.role_id in role_ids]
+
+
+def _extract_target_role_id(action_prompt: str) -> str | None:
+    lowered = action_prompt.lower()
+    for marker in ("npc_id=", "target_role_id="):
+        if marker not in lowered:
+            continue
+        start = lowered.index(marker) + len(marker)
+        value = action_prompt[start:].split(";", 1)[0].split("\n", 1)[0].strip()
+        if value:
+            return value
+    return None
+
+
+def _extract_prompt_value(action_prompt: str, marker: str) -> str:
+    lowered = action_prompt.lower()
+    marker_lower = marker.lower()
+    if marker_lower not in lowered:
+        return ""
+    start = lowered.index(marker_lower) + len(marker_lower)
+    return action_prompt[start:].split(";", 1)[0].split("\n", 1)[0].strip()
+
+
+def _opposed_rule_for_prompt(action_prompt: str) -> tuple[str, str] | None:
+    if _extract_target_role_id(action_prompt):
+        return "strength", "max_strength_or_dexterity"
+    if _extract_prompt_value(action_prompt, "target=").strip():
+        return "strength", "max_strength_or_dexterity"
+    return None
+
+
+def _ai_public_turn_resolution_rule(
+    *,
+    action_type: str,
+    action_prompt: str,
+    target_name: str,
+    config: ChatConfig | None,
+) -> str | None:
+    if not has_ai_config(config):
+        return None
+    config = require_ai_config(config)
+    prompt = prompt_table.render(
+        "public.turn.action_resolution.user",
+        (
+            "Decide whether this public-turn action should resolve as static_dc or opposed_actor against the named target. "
+            "Return JSON only with resolution_rule. "
+            f"Allowed enum ids:\n{render_enum_pool_text(_PUBLIC_TURN_RESOLUTION_RULE_FIELDS)}\n"
+            "Use opposed_actor only when the action directly contests, restrains, attacks, blocks, grabs, or forcefully prevents the target. "
+            "Use static_dc for observation, persuasion, performance, indirect manipulation, or actions that do not directly collide with the target's immediate resistance. "
+            "action_type=$action_type; target_name=$target_name; action_prompt=$action_prompt"
+        ),
+        action_type=action_type,
+        target_name=target_name,
+        action_prompt=action_prompt[:240],
+    )
+    try:
+        client = create_sync_client(config, client_cls=OpenAI)
+        resp = client.chat.completions.create(
+            model=config.model,
+            **build_completion_options(config),
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": prompt_table.get_text("public.turn.action_resolution.system", "Return JSON only.")},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        raw_json = (resp.choices[0].message.content or "").strip() or "{}"
+        parsed = _extract_json_content(raw_json)
+        parsed = validate_or_repair_json_payload(
+            parsed=parsed,
+            raw_json=raw_json,
+            fields=_PUBLIC_TURN_RESOLUTION_RULE_FIELDS,
+            config=config,
+            system_prompt=prompt_table.get_text("public.turn.action_resolution.system", "Return JSON only."),
+            original_prompt=prompt,
+        )
+        resolution_rule = str(parsed.get("resolution_rule") or "").strip().lower()
+        if resolution_rule in {"static_dc", "opposed_actor"}:
+            return resolution_rule
+    except Exception:
+        return None
+    return None
+
+
+def _choose_opposed_target_ability(profile: PlayerStaticData, mode: str) -> tuple[str, int]:
+    if mode == "max_strength_or_dexterity":
+        strength_mod = int(profile.dnd5e_sheet.current_ability_modifiers.strength)
+        dexterity_mod = int(profile.dnd5e_sheet.current_ability_modifiers.dexterity)
+        if dexterity_mod > strength_mod:
+            return "dexterity", dexterity_mod
+        return "strength", strength_mod
+    ability = "strength"
+    return ability, int(getattr(profile.dnd5e_sheet.current_ability_modifiers, ability))
+
+
+def _public_turn_target_candidates(save: SaveFile) -> list[NpcRoleCard]:
+    current_sub_zone_id = save.area_snapshot.current_sub_zone_id
+    visible_roles = _visible_public_roles(save)
+    team_roles = [role for role in _current_team_roles(save) if role.sub_zone_id == current_sub_zone_id]
+    seen: set[str] = set()
+    ordered: list[NpcRoleCard] = []
+    for role in [*visible_roles, *team_roles]:
+        if role.role_id in seen:
+            continue
+        seen.add(role.role_id)
+        ordered.append(role)
+    return ordered
+
+
+def _public_turn_actor_candidates(
+    save: SaveFile,
+    *,
+    include_player: bool,
+    exclude_actor_id: str | None = None,
+) -> list[dict[str, object]]:
+    current_sub_zone_id = save.area_snapshot.current_sub_zone_id
+    visible_roles = _visible_public_roles(save)
+    team_roles = [role for role in _current_team_roles(save) if role.sub_zone_id == current_sub_zone_id]
+    seen: set[str] = set()
+    ordered: list[dict[str, object]] = []
+    if include_player and save.player_static_data.player_id != exclude_actor_id:
+        ordered.append(
+            {
+                "actor_id": save.player_static_data.player_id,
+                "name": save.player_static_data.name,
+                "actor_kind": "player",
+            }
+        )
+        seen.add(save.player_static_data.player_id)
+    for role in [*visible_roles, *team_roles]:
+        if role.role_id == exclude_actor_id or role.role_id in seen:
+            continue
+        seen.add(role.role_id)
+        ordered.append(
+            {
+                "actor_id": role.role_id,
+                "name": role.name,
+                "actor_kind": "npc",
+                "role": role,
+            }
+        )
+    return ordered
+
+
+def _resolve_public_turn_opposed_actor_target(
+    save: SaveFile,
+    action_prompt: str,
+    *,
+    actor_role_id: str | None = None,
+    include_player: bool = True,
+    addressed_role_name: str = "",
+) -> dict[str, object] | None:
+    explicit_role_id = _extract_target_role_id(action_prompt)
+    if explicit_role_id:
+        if explicit_role_id == save.player_static_data.player_id:
+            return {
+                "actor_id": save.player_static_data.player_id,
+                "name": save.player_static_data.name,
+                "actor_kind": "player",
+            }
+        role = next((item for item in save.role_pool if item.role_id == explicit_role_id), None)
+        if role is not None:
+            return {"actor_id": role.role_id, "name": role.name, "actor_kind": "npc", "role": role}
+
+    candidates = _public_turn_actor_candidates(
+        save,
+        include_player=include_player,
+        exclude_actor_id=actor_role_id,
+    )
+    if not candidates:
+        return None
+
+    target_value = _extract_prompt_value(action_prompt, "target=")
+    search_text = "\n".join(
+        part
+        for part in (
+            addressed_role_name.strip(),
+            target_value,
+            _humanize_action_prompt(action_prompt),
+            action_prompt,
+        )
+        if part.strip()
+    )
+    normalized_prompt = _humanize_action_prompt(action_prompt) or action_prompt
+    matched: list[dict[str, object]] = []
+    for candidate in sorted(candidates, key=lambda item: len(str(item.get("name") or "")), reverse=True):
+        name = str(candidate.get("name") or "")
+        if name and name in search_text:
+            matched.append(candidate)
+    if len(matched) == 1:
+        return matched[0]
+
+    player_name = save.player_static_data.name
+    if include_player and actor_role_id != save.player_static_data.player_id:
+        player_markers = {player_name, "玩家", "player"}
+        if any(marker and marker.lower() in normalized_prompt.lower() for marker in player_markers):
+            return {
+                "actor_id": save.player_static_data.player_id,
+                "name": player_name,
+                "actor_kind": "player",
+            }
+
+    if len(candidates) == 1 and _extract_prompt_value(action_prompt, "target=").strip():
+        return candidates[0]
+    return None
+
+
+def _resolve_public_turn_opposed_target(
+    save: SaveFile,
+    action_prompt: str,
+    *,
+    actor_role_id: str | None = None,
+) -> NpcRoleCard | None:
+    target = _resolve_public_turn_opposed_actor_target(
+        save,
+        action_prompt,
+        actor_role_id=actor_role_id,
+        include_player=False,
+    )
+    role = target.get("role") if isinstance(target, dict) else None
+    return role if isinstance(role, NpcRoleCard) else None
+
+
+def _build_public_turn_opposed_plan(
+    save: SaveFile,
+    *,
+    actor_role_id: str,
+    action_type: str,
+    action_prompt: str,
+    planned_ability_used: str = "strength",
+    planned_requires_check: bool = True,
+    config: ChatConfig | None = None,
+) -> dict[str, int | bool | str] | None:
+    target = _resolve_public_turn_opposed_actor_target(
+        save,
+        action_prompt,
+        actor_role_id=actor_role_id,
+        include_player=True,
+    )
+    if target is None:
+        return None
+    target_role_id = str(target.get("actor_id") or "")
+    target_name = str(target.get("name") or "")
+    target_actor_kind = "player" if str(target.get("actor_kind") or "") == "player" else "npc"
+    if not target_role_id or not target_name:
+        return None
+    should_be_opposed = str(action_type or "").strip().lower() == "attack"
+    if not should_be_opposed and planned_requires_check:
+        hinted_rule = _ai_public_turn_resolution_rule(
+            action_type=action_type,
+            action_prompt=action_prompt,
+            target_name=target_name,
+            config=config,
+        )
+        if hinted_rule is not None:
+            should_be_opposed = hinted_rule == "opposed_actor"
+        elif not has_ai_config(config):
+            should_be_opposed = True
+    if not should_be_opposed:
+        return None
+    _, target_profile = _get_actor_profile(save, target_role_id)
+    actor_id, actor_profile = _get_actor_profile(save, actor_role_id)
+    if actor_id != actor_role_id:
+        actor_role_id = actor_id
+    actor_ability = str(planned_ability_used or "strength").strip().lower() or "strength"
+    if actor_ability not in {"strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"}:
+        actor_ability = "strength"
+    target_ability, target_modifier = _choose_opposed_target_ability(target_profile, "max_strength_or_dexterity")
+    return {
+        "ability_used": actor_ability,
+        "dc": max(5, min(30, 10 + int(target_modifier))),
+        "time_spent_min": 5 if action_type != "item_use" else 3,
+        "requires_check": True,
+        "check_task": f"与{target_name}对抗，尝试完成：{_humanize_action_prompt(action_prompt) or '当前动作'}",
+        "target_role_id": target_role_id,
+        "target_name": target_name,
+        "target_actor_kind": target_actor_kind,
+        "target_ability_used": target_ability,
+        "target_ability_modifier": target_modifier,
+        "actor_ability_modifier": _ability_modifier(actor_profile, actor_ability),
+    }
+
+
+def plan_public_turn_opposed_exchange(req: PublicTurnOpposedPlanRequest) -> PublicTurnOpposedPlanResponse:
+    save = get_current_save(default_session_id=req.session_id)
+    if save.session_id != req.session_id:
+        save.session_id = req.session_id
+    source_actor_id, source_profile = _get_actor_profile(save, req.source_actor_id)
+    target_actor_id, target_profile = _get_actor_profile(save, req.target_actor_id)
+    source_name = source_profile.name
+    target_name = target_profile.name
+    combined_prompt = "\n".join(
+        part.strip()
+        for part in (
+            req.source_action_summary,
+            req.source_speech_text,
+            req.target_action_summary,
+            req.target_speech_text,
+        )
+        if str(part or "").strip()
+    )
+    if has_ai_config(req.config):
+        source_plan = _ai_action_plan("check", combined_prompt or req.source_action_summary, req.config)
+        source_ability = str(source_plan.get("ability_used") or "strength").strip().lower() or "strength"
+    else:
+        source_ability = "strength"
+    if source_ability not in {"strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"}:
+        source_ability = "strength"
+    target_ability = "strength"
+    if has_ai_config(req.config):
+        try:
+            target_plan = _ai_action_plan("check", req.target_action_summary or req.target_speech_text or combined_prompt or req.source_action_summary, req.config)
+            target_ability = str(target_plan.get("ability_used") or "strength").strip().lower() or "strength"
+        except Exception:
+            target_ability = "strength"
+    if target_ability not in {"strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"}:
+        target_ability = "strength"
+    target_modifier = _ability_modifier(target_profile, target_ability)
+    source_modifier = _ability_modifier(source_profile, source_ability)
+    task_seed = _humanize_action_prompt(req.source_action_summary) or _humanize_action_prompt(combined_prompt) or "当前对抗"
+    return PublicTurnOpposedPlanResponse(
+        session_id=req.session_id,
+        round_id=req.round_id,
+        check_id=req.check_id,
+        source_actor_id=source_actor_id,
+        source_actor_name=source_name,
+        source_action_summary=req.source_action_summary.strip(),
+        source_speech_text=req.source_speech_text.strip(),
+        source_ability_used=source_ability,
+        source_ability_modifier=source_modifier,
+        target_actor_id=target_actor_id,
+        target_actor_name=target_name,
+        target_action_summary=req.target_action_summary.strip(),
+        target_speech_text=req.target_speech_text.strip(),
+        target_ability_used=target_ability,
+        target_ability_modifier=target_modifier,
+        check_task=f"{source_name} 与 {target_name} 对抗：{task_seed}",
+        stakes_summary=req.source_action_summary.strip() or task_seed,
     )
 
 
@@ -4093,22 +5880,20 @@ def _ai_action_plan(
     action_prompt: str,
     config: ChatConfig | None,
 ) -> dict[str, int | bool | str]:
-    if config is None:
-        return _fallback_action_plan(action_type, action_prompt)
-    api_key = (config.openai_api_key or "").strip()
-    model = (config.model or "").strip()
-    if not api_key or not model:
-        return _fallback_action_plan(action_type, action_prompt)
+    config = require_ai_config(config)
 
     try:
         default_prompt = (
             "你是跑团行动判定助手。基于玩家行动，返回JSON。"
+            "字段: action_type(attack|check|item_use),"
             "字段: ability_used(strength|dexterity|constitution|intelligence|wisdom|charisma),"
             "dc(5-30),time_spent_min(>=1),requires_check(boolean),check_task(string)。"
             "规则: 任何结果不明确、存在风险、需要说服/潜行/逃脱/破解/攻击/强行尝试的行为，都应 requires_check=true。"
             "只有结果明显、无需悬念或风险的简单行为，才允许 requires_check=false。"
+            "如果传入的 action_type=auto，你必须先判断这次行为属于 attack/check/item_use 中哪一类，并返回该稳定 id。"
+            "如果行为明显是 DND 风格的武器攻击、伤害法术、范围法术或直接制造伤害/爆炸/击飞，也应判为 attack。"
             "check_task 要写清楚这次到底在判定什么。"
-            "action_type=attack/check/item_use。"
+            "action_type=attack/check/item_use/auto。"
             "action_type=$action_type, action_prompt=$action_prompt"
         )
         prompt = prompt_table.render(
@@ -4117,9 +5902,13 @@ def _ai_action_plan(
             action_type=action_type,
             action_prompt=action_prompt,
         )
+        prompt = (
+            f"{prompt}\nAllowed enum ids:\n{render_enum_pool_text((*_ACTION_TYPE_CONTRACT_FIELDS, *_ABILITY_USED_CONTRACT_FIELDS))}\n"
+            "Use only the allowed stable ids for action_type and ability_used."
+        )
         client = create_sync_client(config, client_cls=OpenAI)
         resp = client.chat.completions.create(
-            model=model,
+            model=config.model,
             **build_completion_options(config),
             response_format={"type": "json_object"},
             messages=[
@@ -4127,11 +5916,22 @@ def _ai_action_plan(
                 {"role": "user", "content": prompt},
             ],
         )
-        content = (resp.choices[0].message.content or "").strip()
+        content = (resp.choices[0].message.content or "").strip() or "{}"
         parsed = _extract_json_content(content)
+        with allow_protocol_repair():
+            parsed = validate_or_repair_json_payload(
+                parsed=parsed,
+                raw_json=content,
+                fields=(*_ACTION_TYPE_CONTRACT_FIELDS, *_ABILITY_USED_CONTRACT_FIELDS),
+                config=config,
+                system_prompt=prompt_table.get_text("action.plan.system", "你只输出JSON。"),
+                original_prompt=prompt,
+            )
         return _normalize_action_plan(action_type, action_prompt, parsed)
-    except Exception:
-        return _fallback_action_plan(action_type, action_prompt)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"{AI_PROVIDER_CALL_FAILED}: {exc}") from exc
 
 
 def _planned_action_plan(req: ActionCheckRequest) -> dict[str, int | bool | str] | None:
@@ -4162,19 +5962,114 @@ def plan_action_check(req: ActionCheckPlanRequest) -> ActionCheckPlanResponse:
     actor_role_id, profile = _get_actor_profile(save, req.actor_role_id)
     actor_kind = _actor_kind(save, actor_role_id)
     plan = _ai_action_plan(req.action_type, req.action_prompt, req.config)
+    resolved_action_type = str(plan.get("action_type") or ("check" if req.action_type == "auto" else req.action_type)).strip().lower()
+    if resolved_action_type not in {"attack", "check", "item_use"}:
+        resolved_action_type = "check"
+    resolution_rule: Literal["static_dc", "opposed_actor"] = "static_dc"
+    target_role_id: str | None = None
+    target_name: str | None = None
+    target_actor_kind: Literal["player", "npc"] | None = None
+    target_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
+    target_ability_modifier: int | None = None
+    public_turn_interaction_kind: Literal["generic", "information_gathering", "social_influence", "intimidation"] | None = None
+    public_turn_notice_state: Literal["hidden", "noticed", "obvious"] | None = None
+    public_turn_resolution_mode: Literal["static_dc", "opposed_actor", "opposed_then_information_dc"] | None = None
+    followup_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
+    followup_dc: int | None = None
+    followup_check_task: str | None = None
+    if req.source_context == "public_turn":
+        normalized_prompt = req.action_prompt.lower()
+        info_wisdom_tokens = ("观察", "觉察", "发现", "洞察", "偷听", "察看", "listen", "look", "notice", "watch")
+        info_intelligence_tokens = ("识别", "辨认", "分析", "推理", "读懂", "investigate", "analyze", "identify")
+        social_tokens = ("说服", "劝说", "安抚", "欺骗", "交涉", "persuade", "convince", "deceive", "comfort")
+        intimidation_tokens = ("威胁", "压迫", "威慑", "强逼", "恫吓", "intimidate", "threaten", "coerce")
+        hidden_tokens = ("暗中", "悄悄", "不被发现", "偷听", "潜行", "hidden", "quietly", "unnoticed")
+        obvious_tokens = ("直接", "公开", "当众", "点名", "高声", "强迫", "obvious", "loudly", "publicly")
+        if any(token in normalized_prompt for token in intimidation_tokens):
+            public_turn_interaction_kind = "intimidation"
+            strength_mod = int(profile.dnd5e_sheet.current_ability_modifiers.strength)
+            charisma_mod = int(profile.dnd5e_sheet.current_ability_modifiers.charisma)
+            chosen_ability = "strength" if strength_mod >= charisma_mod else "charisma"
+            plan["ability_used"] = chosen_ability
+        elif any(token in normalized_prompt for token in social_tokens):
+            public_turn_interaction_kind = "social_influence"
+            plan["ability_used"] = "charisma"
+        elif any(token in normalized_prompt for token in info_intelligence_tokens):
+            public_turn_interaction_kind = "information_gathering"
+            plan["ability_used"] = "intelligence"
+        elif any(token in normalized_prompt for token in info_wisdom_tokens):
+            public_turn_interaction_kind = "information_gathering"
+            plan["ability_used"] = "wisdom"
+        else:
+            public_turn_interaction_kind = "generic"
+        if any(token in normalized_prompt for token in hidden_tokens):
+            public_turn_notice_state = "hidden"
+        elif any(token in normalized_prompt for token in obvious_tokens):
+            public_turn_notice_state = "obvious"
+        else:
+            public_turn_notice_state = "noticed"
+        opposed = _build_public_turn_opposed_plan(
+            save,
+            actor_role_id=actor_role_id,
+            action_type=resolved_action_type,
+            action_prompt=req.action_prompt,
+            planned_ability_used=str(plan.get("ability_used") or "strength"),
+            planned_requires_check=bool(plan.get("requires_check")),
+            config=req.config,
+        )
+        if public_turn_interaction_kind == "information_gathering" and public_turn_notice_state == "hidden":
+            public_turn_resolution_mode = "static_dc"
+        elif opposed is not None:
+            plan = opposed
+            resolution_rule = "opposed_actor"
+            target_role_id = str(opposed.get("target_role_id") or "") or None
+            target_name = str(opposed.get("target_name") or "") or None
+            actor_kind_value = str(opposed.get("target_actor_kind") or "").strip()
+            if actor_kind_value in {"player", "npc"}:
+                target_actor_kind = actor_kind_value  # type: ignore[assignment]
+            target_ability_value = str(opposed.get("target_ability_used") or "").strip()
+            if target_ability_value in {"strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"}:
+                target_ability_used = target_ability_value  # type: ignore[assignment]
+            if opposed.get("target_ability_modifier") is not None:
+                target_ability_modifier = int(opposed["target_ability_modifier"])
+            if public_turn_interaction_kind == "information_gathering":
+                public_turn_resolution_mode = "opposed_then_information_dc"
+                followup_ability_used = str(plan.get("ability_used") or "wisdom")  # type: ignore[assignment]
+                followup_dc = int(req.threatened_consequence or 0) if str(req.threatened_consequence or "").isdigit() else int(plan["dc"])
+                followup_check_task = str(plan.get("check_task") or "获取当前线索")
+            else:
+                public_turn_resolution_mode = "opposed_actor"
+        else:
+            public_turn_resolution_mode = "static_dc"
     ability = str(plan["ability_used"])
     return ActionCheckPlanResponse(
         session_id=req.session_id,
         actor_role_id=actor_role_id,
         actor_name=profile.name,
         actor_kind=actor_kind,  # type: ignore[arg-type]
-        action_type=req.action_type,
+        action_type=resolved_action_type,  # type: ignore[arg-type]
+        check_mode=req.check_mode,
+        source_context=req.source_context,
+        resolution_rule=resolution_rule,
         requires_check=bool(plan["requires_check"]),
         ability_used=ability,  # type: ignore[arg-type]
         ability_modifier=_ability_modifier(profile, ability),
         dc=int(plan["dc"]),
         time_spent_min=int(plan["time_spent_min"]),
         check_task=str(plan["check_task"]),
+        source_label=req.source_label,
+        threatened_consequence=req.threatened_consequence,
+        target_role_id=target_role_id,
+        target_name=target_name,
+        target_actor_kind=target_actor_kind,
+        target_ability_used=target_ability_used,
+        target_ability_modifier=target_ability_modifier,
+        public_turn_interaction_kind=public_turn_interaction_kind,
+        public_turn_notice_state=public_turn_notice_state,
+        public_turn_resolution_mode=public_turn_resolution_mode,
+        followup_ability_used=followup_ability_used,
+        followup_dc=followup_dc,
+        followup_check_task=followup_check_task,
     )
 
 
@@ -4200,10 +6095,21 @@ def _apply_penalty(profile: PlayerStaticData, rule_key: str, fail_gap: int) -> l
 
 def _suggest_relation_tag(req: ActionCheckRequest, success: bool, critical: str) -> str | None:
     text = req.action_prompt.lower()
-    if "npc_id=" not in text:
+    target_role_id = req.target_role_id
+    if target_role_id is None and "npc_id=" in text:
+        target_role_id = _extract_target_role_id(req.action_prompt)
+    if target_role_id is None:
         return None
 
-    if req.config is not None:
+    uses_planned_embedded_resolution = (
+        req.resolution_context == "embedded"
+        and req.planned_ability_used is not None
+        and req.planned_dc is not None
+        and req.planned_time_spent_min is not None
+        and req.planned_requires_check is not None
+    )
+
+    if req.config is not None and not uses_planned_embedded_resolution:
         api_key = (req.config.openai_api_key or "").strip()
         model = (req.config.model or "").strip()
         if api_key and model:
@@ -4266,12 +6172,18 @@ def _build_action_process_text(
     *,
     actor_name: str,
     check_task: str,
+    resolution_rule: str,
     ability_used: str,
     ability_modifier: int,
     dc: int,
     requires_check: bool,
     dice_roll: int | None,
     total_score: int | None,
+    target_name: str | None = None,
+    target_ability_used: str | None = None,
+    target_ability_modifier: int | None = None,
+    target_dice_roll: int | None = None,
+    target_total_score: int | None = None,
     success: bool,
     critical: str,
 ) -> str:
@@ -4283,6 +6195,18 @@ def _build_action_process_text(
         detail = "掷出天然20，结果大成功。"
     elif critical == "critical_failure":
         detail = "掷出天然1，结果大失败。"
+    if resolution_rule == "opposed_actor" and target_name:
+        target_modifier_text = (
+            f"{int(target_ability_modifier):+d}" if isinstance(target_ability_modifier, int) else "+0"
+        )
+        return (
+            f"【对抗】{actor_name}进行“{check_task}”检定，"
+            f"使用 {ability_used} 调整值 {modifier_text}，"
+            f"d20({dice_roll if dice_roll is not None else '-'}) {modifier_text} = {total_score if total_score is not None else '-'}；"
+            f"{target_name} 使用 {target_ability_used or '-'} 调整值 {target_modifier_text}，"
+            f"d20({target_dice_roll if target_dice_roll is not None else '-'}) {target_modifier_text} = {target_total_score if target_total_score is not None else '-'}。"
+            f"{detail}"
+        )
     return (
         f"【检定】{actor_name}进行“{check_task}”检定，"
         f"使用 {ability_used} 调整值 {modifier_text}，"
@@ -4386,17 +6310,65 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
 
     actor_role_id, profile = _get_actor_profile(save, req.actor_role_id)
     actor_kind = _actor_kind(save, actor_role_id)
-    plan = _planned_action_plan(req) or _ai_action_plan(req.action_type, req.action_prompt, req.config)
+    uses_public_turn_embedded_resolution = (
+        req.source_context == "public_turn"
+        and req.resolution_context == "embedded"
+    )
+    planned_plan = _planned_action_plan(req)
+    if planned_plan is not None:
+        plan = planned_plan
+    elif uses_public_turn_embedded_resolution:
+        plan = _fallback_action_plan(req.action_type, req.action_prompt)
+    else:
+        plan = _ai_action_plan(req.action_type, req.action_prompt, req.config)
     ability = str(plan["ability_used"])
     dc = int(plan["dc"])
     time_spent_min = int(plan["time_spent_min"])
     requires_check = bool(plan["requires_check"])
     check_task = str(plan["check_task"])
+    resolution_rule = req.resolution_rule
+    target_role_id = req.target_role_id
+    target_name = req.target_name
+    target_actor_kind = req.target_actor_kind
+    target_ability_used = req.target_ability_used
+    target_ability_modifier = req.target_ability_modifier
+    if req.source_context == "public_turn" and resolution_rule == "static_dc":
+        opposed = _build_public_turn_opposed_plan(
+            save,
+            actor_role_id=actor_role_id,
+            action_type=req.action_type,
+            action_prompt=req.action_prompt,
+            planned_ability_used=ability,
+            planned_requires_check=requires_check,
+            config=req.config,
+        )
+        if opposed is not None:
+            resolution_rule = "opposed_actor"
+            target_role_id = str(opposed.get("target_role_id") or "") or None
+            target_name = str(opposed.get("target_name") or "") or None
+            actor_kind_value = str(opposed.get("target_actor_kind") or "").strip()
+            if actor_kind_value in {"player", "npc"}:
+                target_actor_kind = actor_kind_value  # type: ignore[assignment]
+            target_ability_value = str(opposed.get("target_ability_used") or "").strip()
+            if target_ability_value in {"strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"}:
+                target_ability_used = target_ability_value  # type: ignore[assignment]
+            if opposed.get("target_ability_modifier") is not None:
+                target_ability_modifier = int(opposed["target_ability_modifier"])
+            ability = str(opposed.get("ability_used") or ability)
+            dc = int(opposed.get("dc") or dc)
+            time_spent_min = int(opposed.get("time_spent_min") or time_spent_min)
+            requires_check = bool(opposed.get("requires_check"))
+            check_task = str(opposed.get("check_task") or check_task)
+    if resolution_rule == "opposed_actor" and target_role_id:
+        requires_check = True
 
     dice_roll: int | None = None
     total_score: int | None = None
+    target_dice_roll: int | None = None
+    target_total_score: int | None = None
     critical = "none"
     success = True
+    contested_success: bool | None = None
     applied_effects: list[str] = []
     ability_modifier = _ability_modifier(profile, ability)
 
@@ -4405,60 +6377,117 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
             dice_roll = req.forced_dice_roll
         elif actor_kind == "npc" or req.allow_backend_roll:
             dice_roll = random.randint(1, 20)
+        elif req.source_context == "public_turn":
+            raise ValueError("PUBLIC_TURN_PLAYER_CHECK_REQUIRED")
         else:
             raise ValueError("PLAYER_DICE_ROLL_REQUIRED")
         total_score = dice_roll + ability_modifier
-        if dice_roll == 1:
-            critical = "critical_failure"
-            success = False
-        elif dice_roll == 20:
-            critical = "critical_success"
-            success = True
+        if resolution_rule == "opposed_actor" and target_role_id:
+            _, target_profile = _get_actor_profile(save, target_role_id)
+            resolved_target_ability = target_ability_used or "strength"
+            if target_ability_modifier is None:
+                target_ability_modifier = _ability_modifier(target_profile, resolved_target_ability)
+            if req.forced_target_dice_roll is not None:
+                target_dice_roll = req.forced_target_dice_roll
+            else:
+                target_dice_roll = random.randint(1, 20)
+            target_total_score = target_dice_roll + int(target_ability_modifier)
+            target_name = target_name or target_profile.name
+            target_actor_kind = target_actor_kind or _actor_kind(save, target_role_id)
+            target_ability_used = resolved_target_ability  # type: ignore[assignment]
+            if dice_roll == 1:
+                critical = "critical_failure"
+                success = False
+            elif dice_roll == 20:
+                critical = "critical_success"
+                success = True
+            elif target_dice_roll == 20:
+                success = False
+            elif target_dice_roll == 1:
+                success = True
+            else:
+                success = total_score >= target_total_score
+            contested_success = success
         else:
-            success = total_score >= dc
+            if dice_roll == 1:
+                critical = "critical_failure"
+                success = False
+            elif dice_roll == 20:
+                critical = "critical_success"
+                success = True
+            else:
+                success = total_score >= dc
 
-    if not success:
-        fail_gap = max(1, dc - (total_score if total_score is not None else dc))
+    if not success and not uses_public_turn_embedded_resolution:
+        if resolution_rule == "opposed_actor" and target_total_score is not None:
+            fail_gap = max(1, target_total_score - (total_score if total_score is not None else target_total_score))
+        else:
+            fail_gap = max(1, dc - (total_score if total_score is not None else dc))
         rule_key = _ACTION_PENALTY_RULES.get(req.action_type, "hit_points.current")
         applied_effects.extend(_apply_penalty(profile, rule_key, fail_gap))
 
     process_text = _build_action_process_text(
         actor_name=profile.name,
         check_task=check_task,
+        resolution_rule=resolution_rule,
         ability_used=ability,
         ability_modifier=ability_modifier,
         dc=dc,
         requires_check=requires_check,
         dice_roll=dice_roll,
         total_score=total_score,
+        target_name=target_name,
+        target_ability_used=target_ability_used,
+        target_ability_modifier=target_ability_modifier,
+        target_dice_roll=target_dice_roll,
+        target_total_score=target_total_score,
         success=success,
         critical=critical,
     )
-    resolution_text = _ai_action_resolution_text(
-        req,
-        actor_name=profile.name,
-        actor_kind=actor_kind,
-        action_type=req.action_type,
-        action_prompt=req.action_prompt,
-        check_task=check_task,
-        success=success,
-        critical=critical,
-        requires_check=requires_check,
+    uses_planned_embedded_resolution = (
+        req.resolution_context == "embedded"
+        and req.planned_ability_used is not None
+        and req.planned_dc is not None
+        and req.planned_time_spent_min is not None
+        and req.planned_requires_check is not None
     )
-    narrative = process_text if process_text == resolution_text else f"{process_text}\n{resolution_text}".strip()
+    if uses_public_turn_embedded_resolution:
+        resolution_text = _fallback_action_resolution_text(
+            actor_name=profile.name,
+            action_type=req.action_type,
+            check_task=check_task,
+            success=success,
+            critical=critical,
+            requires_check=requires_check,
+        )
+    else:
+        resolution_text = _ai_action_resolution_text(
+            req,
+            actor_name=profile.name,
+            actor_kind=actor_kind,
+            action_type=req.action_type,
+            action_prompt=req.action_prompt,
+            check_task=check_task,
+            success=success,
+            critical=critical,
+            requires_check=requires_check,
+        )
+    if uses_public_turn_embedded_resolution:
+        narrative = resolution_text.strip() or process_text
+    else:
+        narrative = process_text if process_text == resolution_text else f"{process_text}\n{resolution_text}".strip()
     scene_events: list[SceneEvent] = []
 
     relation_tag = _suggest_relation_tag(req, success, critical)
-    if relation_tag is not None and "npc_id=" in req.action_prompt:
+    applied_relation_target_id = req.target_role_id or _extract_target_role_id(req.action_prompt)
+    if relation_tag is not None and applied_relation_target_id:
         try:
-            npc_id = req.action_prompt.split("npc_id=", 1)[1].split(";", 1)[0].strip()
-            if npc_id:
-                role = next((r for r in save.role_pool if r.role_id == npc_id), None)
-                if role is not None:
-                    _upsert_npc_player_relation(role, save.player_static_data.player_id, relation_tag, "行动检定自动更新关系")
-                    role.attitude_changes.append(f"{_utc_now()} action->{relation_tag}")
-                    if len(role.attitude_changes) > 50:
-                        role.attitude_changes = role.attitude_changes[-50:]
+            role = next((r for r in save.role_pool if r.role_id == applied_relation_target_id), None)
+            if role is not None:
+                _upsert_npc_player_relation(role, save.player_static_data.player_id, relation_tag, "行动检定自动更新关系")
+                role.attitude_changes.append(f"{_utc_now()} action->{relation_tag}")
+                if len(role.attitude_changes) > 50:
+                    role.attitude_changes = role.attitude_changes[-50:]
         except Exception:
             pass
 
@@ -4500,20 +6529,6 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
                 gm_summary=resolution_text,
                 config=req.config,
             )
-        try:
-            from app.services.encounter_service import advance_active_encounter_in_save
-
-            advanced = advance_active_encounter_in_save(save, session_id=req.session_id, minutes_elapsed=time_spent_min, config=req.config)
-            if advanced is not None:
-                scene_events.append(
-                    _new_scene_event(
-                        "encounter_background",
-                        advanced.latest_outcome_summary or advanced.scene_summary or advanced.description,
-                        metadata={"encounter_id": advanced.encounter_id},
-                    )
-                )
-        except Exception:
-            pass
     save_current(save)
 
     return ActionCheckResponse(
@@ -4522,13 +6537,26 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
         actor_name=profile.name,
         actor_kind=actor_kind,  # type: ignore[arg-type]
         action_type=req.action_type,
+        check_mode=req.check_mode,
+        source_context=req.source_context,
+        resolution_rule=resolution_rule,  # type: ignore[arg-type]
         requires_check=requires_check,
         ability_used=ability,  # type: ignore[arg-type]
         ability_modifier=ability_modifier,
         dc=dc,
         check_task=check_task,
+        source_label=req.source_label,
+        threatened_consequence=req.threatened_consequence,
+        target_role_id=target_role_id,
+        target_name=target_name,
+        target_actor_kind=target_actor_kind,
+        target_ability_used=target_ability_used,
+        target_ability_modifier=target_ability_modifier,
         dice_roll=dice_roll,
         total_score=total_score,
+        target_dice_roll=target_dice_roll,
+        target_total_score=target_total_score,
+        contested_success=contested_success,
         success=success,
         critical=critical,  # type: ignore[arg-type]
         time_spent_min=time_spent_min,
@@ -4539,7 +6567,11 @@ def action_check(req: ActionCheckRequest) -> ActionCheckResponse:
     )
 
 
-def move_to_sub_zone(req: AreaMoveSubZoneRequest) -> AreaMoveResult:
+def action_check_in_save(req: ActionCheckRequest) -> ActionCheckResponse:
+    return action_check(req)
+
+
+def move_to_sub_zone_in_save(req: AreaMoveSubZoneRequest) -> AreaMoveResult:
     _attempt_escape_for_move(
         session_id=req.session_id,
         target_zone_id=None,
@@ -4593,6 +6625,7 @@ def move_to_sub_zone(req: AreaMoveSubZoneRequest) -> AreaMoveResult:
             clock_after=snap.clock,
             movement_feedback=f"你已在【{to_sub.name}】。",
         )
+
     distance_m = _distance3d_m(from_point.coord, to_point.coord)
     speed_mph = max(1, save.player_static_data.move_speed_mph)
     duration_min = max(1, ceil((distance_m / speed_mph) * 60.0))
@@ -4621,41 +6654,8 @@ def move_to_sub_zone(req: AreaMoveSubZoneRequest) -> AreaMoveResult:
             },
         )
     )
-    save_current(save)
 
     movement_feedback = f"你移动到【{to_sub.name}】，花费 {duration_min} 分钟。"
-    if req.config is not None:
-        try:
-            api_key = (req.config.openai_api_key or "").strip()
-            model = (req.config.model or "").strip()
-            if api_key and model:
-                client = create_sync_client(req.config, client_cls=OpenAI)
-                default_prompt = (
-                    "你是跑团GM。基于以下移动结果写一段50-120字叙事。"
-                    "不要编号，不要选项。"
-                    "from=$from_id, to=$to_name, distance_m=$distance_m, duration_min=$duration_min"
-                )
-                prompt = prompt_table.render(
-                    "move.subzone.user",
-                    default_prompt,
-                    from_id=(from_point.sub_zone_id or from_point.zone_id),
-                    to_name=to_sub.name,
-                    distance_m=round(distance_m, 2),
-                    duration_min=duration_min,
-                )
-                resp = client.chat.completions.create(
-                    model=model,
-                    **build_completion_options(req.config),
-                    messages=[
-                        {"role": "system", "content": req.config.gm_prompt},
-                        {"role": "user", "content": prompt},
-                    ],
-                )
-                txt = (resp.choices[0].message.content or "").strip()
-                if txt:
-                    movement_feedback = txt
-        except Exception:
-            pass
     try:
         from app.services.team_service import apply_team_reactions_in_save, sync_team_members_with_player_in_save
 
@@ -4666,12 +6666,6 @@ def move_to_sub_zone(req: AreaMoveSubZoneRequest) -> AreaMoveResult:
             trigger_kind="sub_zone_move",
             summary=movement_feedback,
         )
-    except Exception:
-        pass
-    try:
-        from app.services.encounter_service import advance_active_encounter_in_save
-
-        advance_active_encounter_in_save(save, session_id=req.session_id, minutes_elapsed=duration_min, config=req.config)
     except Exception:
         pass
     save_current(save)
@@ -4688,11 +6682,62 @@ def move_to_sub_zone(req: AreaMoveSubZoneRequest) -> AreaMoveResult:
     )
 
 
+def move_to_sub_zone(req: AreaMoveSubZoneRequest) -> AreaMoveResult:
+    result = move_to_sub_zone_in_save(req)
+    movement_feedback = result.movement_feedback
+    if req.config is not None:
+        try:
+            api_key = (req.config.openai_api_key or "").strip()
+            model = (req.config.model or "").strip()
+            if api_key and model:
+                client = create_sync_client(req.config, client_cls=OpenAI)
+                save = get_current_save(default_session_id=req.session_id)
+                from_name = next(
+                    (item.name for item in save.area_snapshot.sub_zones if item.sub_zone_id == result.from_point.sub_zone_id),
+                    result.from_point.sub_zone_id or result.from_point.zone_id,
+                )
+                to_name = next(
+                    (item.name for item in save.area_snapshot.sub_zones if item.sub_zone_id == result.to_point.sub_zone_id),
+                    result.to_point.sub_zone_id or result.to_point.zone_id,
+                )
+                default_prompt = (
+                    "你是跑团GM。基于以下移动结果写一段50-120字叙事。"
+                    "不要编号，不要选项。"
+                    "from_name=$from_name, from_id=$from_id, to_name=$to_name, to_id=$to_id, "
+                    "distance_m=$distance_m, duration_min=$duration_min"
+                )
+                prompt = prompt_table.render(
+                    "move.subzone.user",
+                    default_prompt,
+                    from_name=from_name,
+                    from_id=(result.from_point.sub_zone_id or result.from_point.zone_id),
+                    to_name=to_name,
+                    to_id=(result.to_point.sub_zone_id or result.to_point.zone_id),
+                    distance_m=round(result.distance_m, 2),
+                    duration_min=result.duration_min,
+                )
+                resp = client.chat.completions.create(
+                    model=model,
+                    **build_completion_options(req.config),
+                    messages=[
+                        {"role": "system", "content": req.config.gm_prompt},
+                        {"role": "user", "content": prompt},
+                    ],
+                )
+                txt = (resp.choices[0].message.content or "").strip()
+                if txt and not re.search(r"\$[A-Za-z_][A-Za-z0-9_]*", txt):
+                    movement_feedback = txt
+        except Exception:
+            pass
+    return result.model_copy(update={"movement_feedback": movement_feedback})
+
+
 def discover_interactions(req: AreaDiscoverInteractionsRequest) -> AreaDiscoverInteractionsResponse:
     save = get_current_save(default_session_id=req.session_id)
     if save.session_id != req.session_id:
         raise ValueError("session mismatch with current save")
     _ensure_area_snapshot(save)
+    ensure_item_system(save)
     snap = save.area_snapshot
     target = next((s for s in snap.sub_zones if s.sub_zone_id == req.sub_zone_id), None)
     if target is None:
@@ -4745,7 +6790,26 @@ def discover_interactions(req: AreaDiscoverInteractionsRequest) -> AreaDiscoverI
             )
         ]
 
-    target.key_interactions.extend(deduped)
+    for interaction in deduped:
+        save.scene_interactable_state.items.append(
+            SceneInteractable(
+                interactable_id=interaction.interaction_id,
+                template_id=infer_interactable_template_id(interaction.name, interaction.type),
+                zone_id=target.zone_id,
+                sub_zone_id=target.sub_zone_id,
+                name=interaction.name,
+                interactable_kind=("item_proxy" if interaction.type == "item" else "scene"),  # type: ignore[arg-type]
+                description="",
+                allowed_actions=(["inspect", "pickup"] if interaction.type == "item" else ["inspect"]),
+                state_tags=["visible"],
+                status=interaction.status,
+                generated_mode="instant",
+                placeholder=True,
+                updated_at=_utc_now(),
+            )
+        )
+    save.scene_interactable_state.updated_at = _utc_now()
+    ensure_item_system(save)
     if snap.clock is not None:
         snap.clock = _advance_clock(snap.clock, 1)
 
@@ -4761,7 +6825,12 @@ def discover_interactions(req: AreaDiscoverInteractionsRequest) -> AreaDiscoverI
         )
     )
     save_current(save)
-    return AreaDiscoverInteractionsResponse(ok=True, generated_mode="instant", new_interactions=deduped)
+    refreshed_target = next((s for s in snap.sub_zones if s.sub_zone_id == req.sub_zone_id), target)
+    return AreaDiscoverInteractionsResponse(ok=True, generated_mode="instant", new_interactions=list(deduped))
+
+
+def discover_interactions_in_save(req: AreaDiscoverInteractionsRequest) -> AreaDiscoverInteractionsResponse:
+    return discover_interactions(req)
 
 
 def execute_interaction(req: AreaExecuteInteractionRequest) -> AreaExecuteInteractionResponse:
@@ -4769,27 +6838,27 @@ def execute_interaction(req: AreaExecuteInteractionRequest) -> AreaExecuteIntera
     if save.session_id != req.session_id:
         raise ValueError("session mismatch with current save")
     _ensure_area_snapshot(save)
-
-    found = False
-    for sub in save.area_snapshot.sub_zones:
-        if any(it.interaction_id == req.interaction_id for it in sub.key_interactions):
-            found = True
-            break
-    if not found:
-        raise KeyError("AREA_INVALID_INTERACTION")
-
-    if save.area_snapshot.clock is not None:
-        save.area_snapshot.clock = _advance_clock(save.area_snapshot.clock, 1)
-    save.game_logs.append(
-        _new_game_log(
-            req.session_id,
-            "area_interaction_placeholder",
-            f"触发交互 {req.interaction_id}（占位）",
-            {"interaction_id": req.interaction_id},
-        )
-    )
+    result = execute_scene_interaction_in_save(save, req)
     save_current(save)
-    return AreaExecuteInteractionResponse(ok=True, status="placeholder", message="待开发")
+    return result
+
+
+def execute_interaction_in_save(req: AreaExecuteInteractionRequest) -> AreaExecuteInteractionResponse:
+    return execute_interaction(req)
+
+
+def get_scene_interactables(session_id: str, sub_zone_id: str | None = None) -> list[SceneInteractable]:
+    save = get_current_save(default_session_id=session_id)
+    if save.session_id != session_id:
+        raise ValueError("session mismatch with current save")
+    return list_scene_interactables(save, sub_zone_id=sub_zone_id)
+
+
+def get_template_library_status_payload(session_id: str) -> dict[str, object]:
+    save = get_current_save(default_session_id=session_id)
+    if save.session_id != session_id:
+        raise ValueError("session mismatch with current save")
+    return get_template_library_status()
 
 
 def describe_behavior(session_id: str, movement_log: MovementLog, config: ChatConfig) -> BehaviorDescribeResponse:
@@ -4836,4 +6905,3 @@ def describe_behavior(session_id: str, movement_log: MovementLog, config: ChatCo
         raise
     except Exception as exc:
         raise AIBehaviorError(str(exc)) from exc
-

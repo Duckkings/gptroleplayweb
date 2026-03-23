@@ -67,12 +67,19 @@
 
 ## 快速开始
 
-### 方式一：一键启动
+### 方式一：一键启动（Windows 本机）
 ```bat
 start-dev.bat
 ```
 
-### 方式二：手动启动
+### 方式二：Docker 开发模式（推荐：不想装 Python）
+```bash
+docker compose -f docker-compose.dev.yml up --build
+```
+
+更多说明见：`docs/docker-dev.md`
+
+### 方式三：手动启动
 
 1. 启动后端：
 ```powershell

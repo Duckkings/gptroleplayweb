@@ -1,0 +1,32 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    container_name: gptroleplayweb-backend
+    environment:
+      # Persisted session secret (optional). If unset, backend will generate and store one under data/auth/secret.txt
+      - GRW_AUTH_SECRET=
+    volumes:
+      - ./:/app
+    working_dir: /app/backend
+    command: uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: gptroleplayweb-frontend
+    environment:
+      # Vite proxy target inside Docker network
+      - VITE_BACKEND_URL=http://backend:8000
+      - VITE_HOST=0.0.0.0
+      - VITE_PORT=5173
+    volumes:
+      - ./frontend:/app/frontend
+      - /app/frontend/node_modules
+    working_dir: /app/frontend
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend

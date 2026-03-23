@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -32,10 +33,18 @@ class SubZoneDebugConfig(BaseModel):
         return self
 
 
+class PublicSceneConfig(BaseModel):
+    active_actor_limit: int = Field(default=8, ge=1, le=16)
+    idle_actor_limit: int = Field(default=2, ge=1, le=8)
+    max_world_pushes: int = Field(default=2, ge=0, le=4)
+    uncertain_actions_require_check: bool = True
+
+
 class ChatRuntimeConfig(BaseModel):
     temperature: float | None = Field(default=None, ge=0, le=2)
     max_tokens: int | None = Field(default=None, gt=0)
     max_completion_tokens: int | None = Field(default=None, gt=0)
+    structured_output_mode: Literal["auto", "legacy_tags"] = "auto"
 
 
 AIProvider = Literal["openai", "deepseek", "gemini"]
@@ -50,6 +59,11 @@ def _normalize_runtime_payload(raw: Any) -> dict[str, Any]:
         runtime.pop("max_tokens", None)
     if "max_completion_tokens" in runtime and runtime["max_completion_tokens"] in ("", None):
         runtime.pop("max_completion_tokens", None)
+    mode = str(runtime.get("structured_output_mode") or "").strip().lower()
+    if mode in {"auto", "legacy_tags"}:
+        runtime["structured_output_mode"] = mode
+    elif "structured_output_mode" in runtime:
+        runtime.pop("structured_output_mode", None)
     return runtime
 
 
@@ -103,6 +117,79 @@ class ProviderConfigMap(BaseModel):
         return getattr(self, provider)
 
 
+class ProviderBuildMediaConfig(BaseModel):
+    api_key: str = Field(default="", min_length=0)
+    base_url_override: str | None = None
+    generation_model: str = Field(default="", min_length=0)
+    background_removal_model: str = Field(default="", min_length=0)
+    vision_model: str = Field(default="", min_length=0)
+
+
+class ProviderBuildMediaConfigMap(BaseModel):
+    openai: ProviderBuildMediaConfig = Field(default_factory=ProviderBuildMediaConfig)
+    deepseek: ProviderBuildMediaConfig = Field(default_factory=ProviderBuildMediaConfig)
+    gemini: ProviderBuildMediaConfig = Field(default_factory=ProviderBuildMediaConfig)
+
+    def for_provider(self, provider: AIProvider) -> ProviderBuildMediaConfig:
+        return getattr(self, provider)
+
+
+def _empty_build_media_provider_config() -> dict[str, Any]:
+    return {
+        "api_key": "",
+        "base_url_override": None,
+        "generation_model": "",
+        "background_removal_model": "",
+        "vision_model": "",
+    }
+
+
+def _normalize_build_media_provider_payload(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    data = dict(raw)
+    if "openai_api_key" in data and "api_key" not in data:
+        data["api_key"] = data.pop("openai_api_key")
+    normalized: dict[str, Any] = {}
+    for key in ("api_key", "base_url_override", "generation_model", "background_removal_model", "vision_model"):
+        if key in data:
+            normalized[key] = data.get(key)
+    if "model" in data and "generation_model" not in normalized:
+        normalized["generation_model"] = data.get("model")
+    return normalized
+
+
+class BuildMediaConfig(BaseModel):
+    mode: Literal["follow_chat_provider", "explicit_provider"] = "follow_chat_provider"
+    explicit_provider: Literal["openai", "gemini"] | None = None
+    provider_configs: ProviderBuildMediaConfigMap = Field(default_factory=ProviderBuildMediaConfigMap)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy(cls, raw: Any) -> Any:
+        if not isinstance(raw, dict):
+            return raw
+        data = dict(raw)
+        provider_configs = {
+            name: _empty_build_media_provider_config()
+            for name in AI_PROVIDERS
+        }
+        raw_provider_configs = data.get("provider_configs")
+        if isinstance(raw_provider_configs, dict):
+            for name in AI_PROVIDERS:
+                if name not in raw_provider_configs:
+                    continue
+                provider_configs[name].update(_normalize_build_media_provider_payload(raw_provider_configs[name]))
+        data["provider_configs"] = provider_configs
+        mode = str(data.get("mode") or "follow_chat_provider").strip().lower()
+        if mode not in {"follow_chat_provider", "explicit_provider"}:
+            data["mode"] = "follow_chat_provider"
+        explicit = str(data.get("explicit_provider") or "").strip().lower()
+        if explicit not in {"openai", "gemini"}:
+            data["explicit_provider"] = None
+        return data
+
+
 class ChatConfig(BaseModel):
     version: str = Field(default="2.0.0")
     provider: AIProvider = "openai"
@@ -115,6 +202,8 @@ class ChatConfig(BaseModel):
     gm_prompt: str = Field(..., min_length=1)
     speech_time_per_50_tokens_min: int = Field(default=1, ge=1, le=30)
     sub_zone_debug: SubZoneDebugConfig = Field(default_factory=SubZoneDebugConfig)
+    public_scene: PublicSceneConfig = Field(default_factory=PublicSceneConfig)
+    build_media: BuildMediaConfig = Field(default_factory=BuildMediaConfig)
     ui: UIConfig | None = None
 
     @model_validator(mode="before")
@@ -159,6 +248,8 @@ class ChatConfig(BaseModel):
         data["base_url_override"] = selected.get("base_url_override")
         data["model"] = selected.get("model", "")
         data["runtime"] = selected.get("runtime", {})
+        if "build_media" not in data:
+            data["build_media"] = BuildMediaConfig().model_dump(mode="json")
         return data
 
     @property
@@ -250,12 +341,23 @@ class ToolEvent(BaseModel):
 class SceneEvent(BaseModel):
     event_id: str = Field(..., min_length=1)
     kind: Literal[
+        "damage_resolution",
         "public_targeted_npc_reply",
         "public_bystander_reaction",
         "team_public_reaction",
         "public_actor_action",
         "public_actor_resolution",
         "public_round_resolution",
+        "public_turn_phase",
+        "public_turn_initiative",
+        "public_turn_actor_action",
+        "public_turn_actor_resolution",
+        "public_turn_situation",
+        "public_turn_gm_push",
+        "public_turn_round_end",
+        "public_turn_relation_update",
+        "public_turn_team_update",
+        "public_turn_environment_update",
         "role_desire_surface",
         "companion_story_surface",
         "reputation_update",
@@ -264,6 +366,21 @@ class SceneEvent(BaseModel):
         "encounter_resolution",
         "encounter_background",
         "encounter_situation_update",
+        "encounter_world_push",
+        "player_reaction_triggered",
+        "player_reaction_result",
+        "player_dying",
+        "player_death_save",
+        "player_entered_death_save",
+        "player_death_save_result",
+        "player_stabilized",
+        "player_died",
+        "player_revived",
+        "team_npc_entered_death_save",
+        "team_npc_death_save_result",
+        "team_npc_died",
+        "sub_zone_dead_npc_recorded",
+        "system_notice",
     ]
     actor_role_id: str = Field(default="", min_length=0)
     actor_name: str = Field(default="", min_length=0)
@@ -280,6 +397,8 @@ class ChatResponse(BaseModel):
     scene_events: list[SceneEvent] = Field(default_factory=list)
     time_spent_min: int = 0
     archived_sub_zone_turn_id: str | None = None
+    main_turn_summary: "MainTurnSummary | None" = None
+    current_zone_metric: "ZoneMetricEntry | None" = None
 
 
 class HealthResponse(BaseModel):
@@ -289,6 +408,189 @@ class HealthResponse(BaseModel):
 
 class PathConfig(BaseModel):
     path: str = Field(..., min_length=1)
+
+
+class MainTurnSummary(BaseModel):
+    player_situation_delta: int = 0
+    public_actor_situation_delta_total: int = 0
+    world_push_situation_delta_total: int = 0
+    turn_total_delta: int = 0
+    situation_value_before: int | None = None
+    situation_value_after: int | None = None
+
+
+class PlayerReactionCheck(BaseModel):
+    reaction_id: str = Field(..., min_length=1)
+    source_kind: Literal["npc_action", "environment", "world_push", "encounter_effect", "npc_chat", "map_arrival", "public_turn"]
+    source_actor_id: str | None = None
+    source_actor_name: str | None = None
+    source_label: str = Field(..., min_length=1)
+    trigger_summary: str = Field(..., min_length=1)
+    threatened_consequence: str = Field(..., min_length=1)
+    ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"]
+    dc: int = Field(..., ge=5, le=30)
+    check_task: str = Field(..., min_length=1)
+    resolution_context: Literal["main_chat", "encounter", "npc_chat", "map_move", "public_turn"]
+    success_hint: str = Field(default="", min_length=0)
+    failure_hint: str = Field(default="", min_length=0)
+    critical_success_hint: str = Field(default="", min_length=0)
+    critical_failure_hint: str = Field(default="", min_length=0)
+
+
+class PlayerReactionCheckSeed(BaseModel):
+    source_kind: Literal["npc_action", "environment", "world_push", "encounter_effect", "npc_chat", "map_arrival", "public_turn"]
+    source_actor_id: str | None = None
+    source_actor_name: str | None = None
+    source_label: str = Field(..., min_length=1)
+    trigger_summary: str = Field(..., min_length=1)
+    threatened_consequence: str = Field(..., min_length=1)
+    ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"]
+    dc: int = Field(..., ge=5, le=30)
+    check_task: str = Field(..., min_length=1)
+    success_hint: str = Field(default="", min_length=0)
+    failure_hint: str = Field(default="", min_length=0)
+    critical_success_hint: str = Field(default="", min_length=0)
+    critical_failure_hint: str = Field(default="", min_length=0)
+
+
+class MainTurnSegment(BaseModel):
+    reply_text: str = Field(default="", min_length=0)
+    public_actor_updates: list[dict[str, Any]] = Field(default_factory=list)
+    public_round_resolution: str = Field(default="", min_length=0)
+    encounter_update: dict[str, Any] = Field(default_factory=dict)
+    player_reaction_check: PlayerReactionCheckSeed | None = None
+    segment_status: Literal["completed", "awaiting_reaction"] = "completed"
+
+    @model_validator(mode="after")
+    def _validate_reaction_checkpoint(self) -> "MainTurnSegment":
+        if self.segment_status == "awaiting_reaction" and self.player_reaction_check is None:
+            raise ValueError("awaiting_reaction requires player_reaction_check")
+        if self.segment_status == "completed" and self.player_reaction_check is not None:
+            raise ValueError("completed segment must not include player_reaction_check")
+        return self
+
+
+class NpcChatBundleSegment(BaseModel):
+    action_reaction: str = Field(default="", min_length=0)
+    speech_reply: str = Field(default="", min_length=0)
+    relation_tag: Literal["ally", "friendly", "met", "neutral", "wary", "hostile"] = "neutral"
+
+
+class NpcChatSegment(BaseModel):
+    reply_text: str = Field(default="", min_length=0)
+    npc_bundle: NpcChatBundleSegment = Field(default_factory=NpcChatBundleSegment)
+    player_reaction_check: PlayerReactionCheckSeed | None = None
+    segment_status: Literal["completed", "awaiting_reaction"] = "completed"
+
+    @model_validator(mode="after")
+    def _validate_reaction_checkpoint(self) -> "NpcChatSegment":
+        if self.segment_status == "awaiting_reaction" and self.player_reaction_check is None:
+            raise ValueError("awaiting_reaction requires player_reaction_check")
+        if self.segment_status == "completed" and self.player_reaction_check is not None:
+            raise ValueError("completed segment must not include player_reaction_check")
+        return self
+
+
+class PendingTurnState(BaseModel):
+    pending_turn_id: str = Field(..., min_length=1)
+    session_id: str = Field(..., min_length=1)
+    flow_kind: Literal["main_chat", "encounter", "npc_chat", "map_move", "public_turn"]
+    status: Literal[
+        "awaiting_reaction",
+        "awaiting_opposed",
+        "awaiting_player_information_check",
+        "awaiting_player_attack_response",
+        "awaiting_player_attack_defense",
+        "awaiting_player_death_save",
+        "awaiting_protocol_repair",
+        "cancelled",
+        "completed",
+    ] = "awaiting_reaction"
+    staged_save: dict[str, Any] = Field(default_factory=dict)
+    original_request: dict[str, Any] = Field(default_factory=dict)
+    accumulated_reply_text: str = Field(default="", min_length=0)
+    accumulated_scene_events: list[SceneEvent] = Field(default_factory=list)
+    accumulated_tool_events: list[ToolEvent] = Field(default_factory=list)
+    time_spent_min: int = 0
+    pending_reaction: PlayerReactionCheck | None = None
+    public_attack_prompt: "PublicTurnAttackPrompt | None" = None
+    public_attack_defense_prompt: "PublicTurnAttackDefensePrompt | None" = None
+    public_opposed_prompt: "PublicTurnOpposedPrompt | None" = None
+    public_information_check_prompt: "PublicTurnInformationCheckPrompt | None" = None
+    death_save_prompt: "DeathSavePrompt | None" = None
+    continuation_index: int = 0
+    usage: Usage = Field(default_factory=Usage)
+    npc_role_id: str | None = None
+    public_round_id: str | None = None
+    public_phase_before_pause: "PublicTurnPhase | None" = None
+    public_turn_protocol_repair_request: "PublicTurnProtocolRepairRequest | None" = None
+    public_turn_protocol_repair_notice: "PublicTurnProtocolRepairNotice | None" = None
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class PendingTurnContinueRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    pending_turn_id: str = Field(..., min_length=1)
+    forced_dice_roll: int = Field(..., ge=1, le=20)
+    config: ChatConfig | None = None
+
+
+class PendingTurnContinueResponse(BaseModel):
+    session_id: str
+    pending_turn_id: str | None = None
+    flow_kind: Literal["main_chat", "encounter", "npc_chat", "map_move", "public_turn"]
+    status: Literal[
+        "awaiting_reaction",
+        "awaiting_opposed",
+        "awaiting_player_information_check",
+        "awaiting_player_attack_response",
+        "awaiting_player_attack_defense",
+        "awaiting_player_death_save",
+        "awaiting_protocol_repair",
+        "completed",
+        "cancelled",
+    ]
+    reply_text: str = Field(default="", min_length=0)
+    scene_events: list[SceneEvent] = Field(default_factory=list)
+    tool_events: list[ToolEvent] = Field(default_factory=list)
+    main_turn_summary: "MainTurnSummary | None" = None
+    current_zone_metric: "ZoneMetricEntry | None" = None
+    pending_reaction: PlayerReactionCheck | None = None
+    public_interaction_prompt: "PublicTurnInteractionPrompt | None" = None
+    public_attack_prompt: "PublicTurnAttackPrompt | None" = None
+    public_attack_defense_prompt: "PublicTurnAttackDefensePrompt | None" = None
+    public_opposed_prompt: "PublicTurnOpposedPrompt | None" = None
+    public_information_check_prompt: "PublicTurnInformationCheckPrompt | None" = None
+    death_save_prompt: "DeathSavePrompt | None" = None
+    reaction_result: "ActionCheckResponse | None" = None
+    player_action_check_result: "ActionCheckResponse | None" = None
+    public_turn_state: "PublicTurnState | None" = None
+    public_turn_presentation: "PublicTurnPresentation | None" = None
+    archived_sub_zone_turn_id: str | None = None
+    npc_role_id: str | None = None
+    public_turn_protocol_repair_notice: "PublicTurnProtocolRepairNotice | None" = None
+    public_turn_protocol_repair_request: "PublicTurnProtocolRepairRequest | None" = None
+
+
+class PublicTurnProtocolEnumViolation(BaseModel):
+    field_path: str = Field(..., min_length=1)
+    invalid_value: str | None = None
+    allowed_ids: list[str] = Field(default_factory=list)
+    reason: str = Field(default="", min_length=0)
+
+
+class PublicTurnProtocolRepairNotice(BaseModel):
+    code: str = Field(default="AI_PROTOCOL_ENUM_INVALID", min_length=1)
+    message: str = Field(default="AI 首次输出协议错误，正在自动修复并续跑...", min_length=1)
+    violations: list[PublicTurnProtocolEnumViolation] = Field(default_factory=list)
+
+
+class PublicTurnProtocolRepairRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    pending_turn_id: str = Field(..., min_length=1)
+    continue_kind: Literal["entry", "continue", "reaction", "opposed", "information_check", "attack_defense", "death_save"]
+    config: ChatConfig | None = None
 
 
 class PathStatusResponse(BaseModel):
@@ -351,6 +653,172 @@ class AreaInteraction(BaseModel):
     placeholder: bool = True
 
 
+class ItemDefinition(BaseModel):
+    definition_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    item_kind: str = Field(default="misc", min_length=1)
+    sub_kind: str = Field(default="", min_length=0)
+    description: str = Field(default="", min_length=0)
+    rarity: str = Field(default="common", min_length=1)
+    weight: float = Field(default=0, ge=0)
+    value: int = Field(default=0, ge=0)
+    stackable: bool = True
+    max_stack: int = Field(default=1, ge=1)
+    use_tags: list[str] = Field(default_factory=list)
+    interaction_tags: list[str] = Field(default_factory=list)
+    combat_tags: list[str] = Field(default_factory=list)
+    effect_prompt_hint: str = Field(default="", min_length=0)
+
+
+class EquipmentDefinition(BaseModel):
+    definition_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    equipment_kind: Literal["weapon", "armor", "shield"] = "weapon"
+    slot_type: Literal["weapon", "armor", "shield"] = "weapon"
+    damage_dice: str = Field(default="", min_length=0)
+    damage_type: str = Field(default="bludgeoning", min_length=1)
+    attack_mode: Literal["targeted_attack", "aoe_attack"] = "targeted_attack"
+    attack_ability_mode: Literal[
+        "strength",
+        "dexterity",
+        "finesse_choice",
+        "intelligence",
+        "wisdom",
+        "charisma",
+        "other",
+    ] = "strength"
+    damage_bonus: int = 0
+    attack_bonus: int = 0
+    armor_bonus: int = 0
+    range_normal: int = Field(default=0, ge=0)
+    range_long: int = Field(default=0, ge=0)
+    area_shape: Literal["none", "sphere", "cone", "line", "burst", "emanation"] = "none"
+    area_radius_m: float = Field(default=0, ge=0)
+    area_length_m: float = Field(default=0, ge=0)
+    self_target_policy: Literal["never", "can_include_self", "always_include_self"] = "never"
+    two_handed: bool = False
+    light: bool = False
+    heavy: bool = False
+    thrown: bool = False
+    finesse: bool = False
+    ammunition: bool = False
+    description: str = Field(default="", min_length=0)
+    rarity: str = Field(default="common", min_length=1)
+    weight: float = Field(default=0, ge=0)
+    value: int = Field(default=0, ge=0)
+
+
+class SpellDefinition(BaseModel):
+    definition_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    attack_mode: Literal["targeted_attack", "aoe_attack"] = "targeted_attack"
+    casting_ability: Literal["intelligence", "wisdom", "charisma", "other"] = "intelligence"
+    spell_cost: int = Field(default=1, ge=0, le=9)
+    damage_dice: str = Field(default="", min_length=0)
+    damage_bonus: int = 0
+    damage_type: str = Field(default="force", min_length=1)
+    area_shape: Literal["none", "sphere", "cone", "line", "burst", "emanation"] = "none"
+    area_radius_m: float = Field(default=0, ge=0)
+    area_length_m: float = Field(default=0, ge=0)
+    self_target_policy: Literal["never", "can_include_self", "always_include_self"] = "never"
+    description: str = Field(default="", min_length=0)
+    resolution_notes: str = Field(default="", min_length=0)
+    recommended_classes: list[str] = Field(default_factory=list)
+    min_level: int = Field(default=1, ge=1, le=20)
+    npc_priority: int = Field(default=0, ge=0, le=100)
+
+
+class WarArtDefinition(BaseModel):
+    definition_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    attack_mode: Literal["targeted_attack", "aoe_attack"] = "targeted_attack"
+    scaling_ability: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma", "other"] = "strength"
+    martial_cost: int = Field(default=1, ge=0, le=9)
+    cooldown_rounds: int = Field(default=0, ge=0, le=99)
+    damage_dice: str = Field(default="", min_length=0)
+    damage_bonus: int = 0
+    damage_type: str = Field(default="bludgeoning", min_length=1)
+    area_shape: Literal["none", "sphere", "cone", "line", "burst", "emanation"] = "none"
+    area_radius_m: float = Field(default=0, ge=0)
+    area_length_m: float = Field(default=0, ge=0)
+    self_target_policy: Literal["never", "can_include_self", "always_include_self"] = "never"
+    description: str = Field(default="", min_length=0)
+    resolution_notes: str = Field(default="", min_length=0)
+    recommended_classes: list[str] = Field(default_factory=list)
+    min_level: int = Field(default=1, ge=1, le=20)
+    npc_priority: int = Field(default=0, ge=0, le=100)
+
+
+class InteractableTemplate(BaseModel):
+    template_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    interactable_kind: Literal["item_proxy", "container", "clue", "door", "path", "mechanism", "hazard", "scene"] = "scene"
+    description: str = Field(default="", min_length=0)
+    allowed_actions: list[str] = Field(default_factory=list)
+    initial_state_tags: list[str] = Field(default_factory=list)
+    loot_mode: Literal["none", "fixed", "ai_first_open"] = "none"
+    allowed_item_tags: list[str] = Field(default_factory=list)
+    allowed_definition_ids: list[str] = Field(default_factory=list)
+    can_pick_up: bool = False
+    can_drop_into: bool = False
+    can_lock: bool = False
+    can_break: bool = False
+    can_trigger: bool = False
+
+
+class ItemInstance(BaseModel):
+    item_instance_id: str = Field(..., min_length=1)
+    definition_id: str = Field(..., min_length=1)
+    quantity: int = Field(default=1, ge=0)
+    uses_left: int | None = Field(default=None, ge=0)
+    uses_max: int | None = Field(default=None, ge=0)
+    durability: int | None = Field(default=None, ge=0)
+    owner_kind: Literal["player", "role", "scene", "container"] = "player"
+    owner_id: str = Field(..., min_length=1)
+    zone_id: str | None = None
+    sub_zone_id: str | None = None
+    display_name: str = Field(default="", min_length=0)
+    description_override: str = Field(default="", min_length=0)
+    tags: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class ItemInstanceState(BaseModel):
+    version: str = Field(default="0.1.0")
+    items: list[ItemInstance] = Field(default_factory=list)
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class SceneInteractable(BaseModel):
+    interactable_id: str = Field(..., min_length=1)
+    template_id: str = Field(..., min_length=1)
+    zone_id: str = Field(..., min_length=1)
+    sub_zone_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    interactable_kind: Literal["item_proxy", "container", "clue", "door", "path", "mechanism", "hazard", "scene"] = "scene"
+    description: str = Field(default="", min_length=0)
+    allowed_actions: list[str] = Field(default_factory=list)
+    state_tags: list[str] = Field(default_factory=list)
+    status: Literal["ready", "disabled", "hidden"] = "ready"
+    generated_mode: Literal["pre", "instant", "migrated"] = "pre"
+    placeholder: bool = False
+    item_instance_id: str | None = None
+    contained_item_instance_ids: list[str] = Field(default_factory=list)
+    loot_generation_status: Literal["ungenerated", "generated"] = "ungenerated"
+    first_generated_at: str | None = None
+    clue_payload: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class SceneInteractableState(BaseModel):
+    version: str = Field(default="0.1.0")
+    items: list[SceneInteractable] = Field(default_factory=list)
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
 class AreaNpc(BaseModel):
     npc_id: str = Field(..., min_length=1)
     name: str = Field(..., min_length=1)
@@ -365,10 +833,555 @@ class ZoneState(BaseModel):
 class SubZoneState(BaseModel):
     time_segment: str = Field(default="day")
     flags: list[str] = Field(default_factory=lambda: ["normal"])
+    dead_npc_records: list["DeadNpcRecord"] = Field(default_factory=list)
+
+
+class DeadNpcRecord(BaseModel):
+    role_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    death_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    death_cause: str = Field(default="", min_length=0)
+    was_team_member: bool = False
+
+
+class PublicTurnPhase(str, Enum):
+    IDLE = "idle"
+    INITIATIVE_DECLARATION = "initiative_declaration"
+    INITIATIVE_EXECUTION = "initiative_execution"
+    NORMAL_ADVANCEMENT = "normal_advancement"
+    GM_PUSH = "gm_push"
+    SITUATION_ADVANCEMENT = "situation_advancement"
+    AWAITING_PLAYER_INTERACTION = "awaiting_player_interaction"
+    AWAITING_PLAYER_REACTION = "awaiting_player_reaction"
+    AWAITING_PLAYER_OPPOSED = "awaiting_player_opposed"
+    AWAITING_PLAYER_INFORMATION_CHECK = "awaiting_player_information_check"
+    AWAITING_PLAYER_ATTACK_RESPONSE = "awaiting_player_attack_response"
+    AWAITING_PLAYER_ATTACK_DEFENSE = "awaiting_player_attack_defense"
+    AWAITING_PLAYER_DEATH_SAVE = "awaiting_player_death_save"
+
+
+class EnvironmentRiskLevel(str, Enum):
+    STABLE = "stable"
+    RISKY = "risky"
+    COLLAPSE = "collapse"
+
+
+class PublicTurnEntryType(str, Enum):
+    NEXT_ROUND = "next_round"
+    INITIATIVE = "initiative"
+    GOD_OVERRIDE = "god_override"
+
+
+class PublicTurnActorType(str, Enum):
+    PLAYER = "player"
+    NPC = "npc"
+    TEAM = "team"
+    ENCOUNTER_TEMP_NPC = "encounter_temp_npc"
+    HIDDEN_NPC = "hidden_npc"
+    ENVIRONMENT = "environment"
+
+
+class PublicTurnWorldImpactType(str, Enum):
+    NON_WORLD = "non_world"
+    WORLD = "world"
+
+
+class PublicTurnActionSubmission(BaseModel):
+    actor_id: str = Field(..., min_length=1)
+    action_text: str = Field(default="", min_length=0)
+    speech_text: str = Field(default="", min_length=0)
+    source_phase: PublicTurnPhase
+    forced_first: bool = False
+
+
+class PublicTurnInteractionResponseSubmission(BaseModel):
+    prompt_id: str = Field(..., min_length=1)
+    action_text: str = Field(default="", min_length=0)
+    speech_text: str = Field(default="", min_length=0)
+    response_kind: Literal["explicit_response", "no_action"] = "explicit_response"
+
+
+class InitiativeDeclaration(BaseModel):
+    actor_id: str = Field(..., min_length=1)
+    actor_type: Literal["player", "npc", "team", "encounter_temp_npc", "hidden_npc"] = "npc"
+    actor_name: str = Field(..., min_length=1)
+    declared_action: str = Field(..., min_length=1)
+    dex_modifier: int = 0
+    roll_d20: int | None = Field(default=None, ge=1, le=20)
+    total_initiative: int | None = None
+    is_hidden: bool = False
+    revealed_by_declaration: bool = False
+    forced_first: bool = False
+
+
+class PublicTurnRelationDelta(BaseModel):
+    role_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    before_tag: str = Field(default="neutral", min_length=1)
+    after_tag: str = Field(default="neutral", min_length=1)
+    relation_delta: int = 0
+    reaction_tone: Literal["supportive", "approving", "neutral", "concerned", "warning", "hostile"] = "neutral"
+    reaction_focus_actor_id: str | None = None
+    reaction_focus_actor_name: str | None = None
+    reaction_speech_target_id: str | None = None
+    reaction_speech_target_name: str | None = None
+    reaction_action: str = Field(default="", min_length=0)
+    reaction_speech: str = Field(default="", min_length=0)
+    reaction_text: str = Field(default="", min_length=0)
+
+
+class PublicTurnTeamAffinityDelta(BaseModel):
+    member_role_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    affinity_before: int = 0
+    affinity_after: int = 0
+    affinity_delta: int = 0
+    trust_before: int = 0
+    trust_after: int = 0
+    trust_delta: int = 0
+    reaction_tone: Literal["supportive", "approving", "neutral", "concerned", "warning", "hostile"] = "neutral"
+    reaction_focus_actor_id: str | None = None
+    reaction_focus_actor_name: str | None = None
+    reaction_speech_target_id: str | None = None
+    reaction_speech_target_name: str | None = None
+    reaction_action: str = Field(default="", min_length=0)
+    reaction_speech: str = Field(default="", min_length=0)
+    reaction_text: str = Field(default="", min_length=0)
+
+
+class PublicTurnHpChange(BaseModel):
+    target_id: str = Field(..., min_length=1)
+    target_name: str = Field(..., min_length=1)
+    hp_before: int = 0
+    hp_after: int = 0
+    hp_delta: int = 0
+
+
+class PublicTurnImpact(BaseModel):
+    actor_id: str = Field(..., min_length=1)
+    actor_name: str = Field(..., min_length=1)
+    action_summary: str = Field(default="", min_length=0)
+    check_outcome: Literal["none", "success", "failure", "critical_success", "critical_failure"] = "none"
+    situation_delta: int = 0
+    zone_reputation_delta: int = 0
+    relation_deltas: list[PublicTurnRelationDelta] = Field(default_factory=list)
+    team_affinity_deltas: list[PublicTurnTeamAffinityDelta] = Field(default_factory=list)
+    hp_changes: list[PublicTurnHpChange] = Field(default_factory=list)
+    environment_shift: int = 0
+    scene_event_ids: list[str] = Field(default_factory=list)
+
+
+class PublicTurnInitiativeEntry(BaseModel):
+    actor_id: str = Field(..., min_length=1)
+    actor_name: str = Field(..., min_length=1)
+    actor_type: PublicTurnActorType = PublicTurnActorType.NPC
+    dex_modifier: int = 0
+    roll_d20: int = Field(default=1, ge=1, le=20)
+    total_initiative: int = 0
+    revealed: bool = True
+    order_index: int = Field(default=0, ge=0)
+
+
+class PublicTurnSettlementCheck(BaseModel):
+    resolution_rule: Literal["static_dc", "opposed_actor"] = "static_dc"
+    ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] = "wisdom"
+    ability_modifier: int = 0
+    dice_roll: int | None = Field(default=None, ge=1, le=20)
+    total_score: int | None = None
+    dc: int | None = Field(default=None, ge=1, le=40)
+    target_name: str | None = None
+    target_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
+    target_ability_modifier: int | None = None
+    target_dice_roll: int | None = Field(default=None, ge=1, le=20)
+    target_total_score: int | None = None
+    success: bool = True
+    critical: Literal["none", "critical_success", "critical_failure"] = "none"
+    comparison_text: str = Field(default="", min_length=0)
+    outcome_text: str = Field(default="", min_length=0)
+
+
+class PublicTurnGmPushResult(BaseModel):
+    roll_d6: int = Field(default=1, ge=1, le=6)
+    outcome_kind: Literal["none", "environment_change", "extra_npc_intervention"] = "none"
+    outcome_label: str = Field(default="", min_length=0)
+    gm_environment_text: str = Field(default="", min_length=0)
+    environment_change_text: str = Field(default="", min_length=0)
+    spawned_npc_role_id: str | None = None
+    spawned_npc_name: str | None = None
+
+
+class PublicTurnSettlementEntry(BaseModel):
+    entry_id: str = Field(..., min_length=1)
+    round_id: str = Field(..., min_length=1)
+    entry_kind: Literal["actor", "gm_push"] = "actor"
+    phase: PublicTurnPhase = PublicTurnPhase.IDLE
+    order_index: int = Field(default=0, ge=0)
+    actor_id: str = Field(..., min_length=1)
+    actor_name: str = Field(..., min_length=1)
+    actor_type: PublicTurnActorType = PublicTurnActorType.NPC
+    action_summary: str = Field(default="", min_length=0)
+    speech_text: str = Field(default="", min_length=0)
+    narrative_entry_id: str | None = None
+    action_target_actor_id: str | None = None
+    action_target_name: str | None = None
+    action_target_kind: PublicTurnActorType | None = None
+    speech_target_actor_id: str | None = None
+    speech_target_name: str | None = None
+    speech_target_kind: PublicTurnActorType | None = None
+    source_world_impact_type: PublicTurnWorldImpactType = PublicTurnWorldImpactType.NON_WORLD
+    target_response_world_impact_type: PublicTurnWorldImpactType = PublicTurnWorldImpactType.NON_WORLD
+    interaction_exchange_kind: Literal["non_world_exchange", "world_exchange", "alternated_exchange"] = "world_exchange"
+    alternation_depth: int = Field(default=0, ge=0, le=1)
+    target_response_kind: Literal["explicit_response", "no_action"] = "explicit_response"
+    interaction_target_name: str | None = None
+    interaction_resolution: Literal[
+        "non_interactive",
+        "accepted",
+        "ambiguous_non_opposed",
+        "rejected_opposed",
+        "attack_flow",
+    ] = "non_interactive"
+    attack_kind: Literal["ordinary_action", "targeted_attack", "aoe_attack"] | None = None
+    attack_basis: Literal["weapon", "spell", "war_art", "other"] | None = None
+    attack_definition_id: str | None = None
+    attack_definition_name: str | None = None
+    attack_area_shape: Literal["none", "sphere", "cone", "line", "burst", "emanation"] | None = None
+    threatened_target_names: list[str] = Field(default_factory=list)
+    hit_target_names: list[str] = Field(default_factory=list)
+    avoided_target_names: list[str] = Field(default_factory=list)
+    revealed_target_names: list[str] = Field(default_factory=list)
+    opposed_target_name: str | None = None
+    opposed_target_action: str | None = None
+    opposed_target_speech: str | None = None
+    opposed_target_speech_target_name: str | None = None
+    check: PublicTurnSettlementCheck | None = None
+    followup_check: PublicTurnSettlementCheck | None = None
+    gm_resolution_summary: str = Field(default="", min_length=0)
+    gm_push_result: PublicTurnGmPushResult | None = None
+    situation_delta: int = 0
+    zone_reputation_delta: int = 0
+    relation_deltas: list[PublicTurnRelationDelta] = Field(default_factory=list)
+    team_affinity_deltas: list[PublicTurnTeamAffinityDelta] = Field(default_factory=list)
+    hp_changes: list[PublicTurnHpChange] = Field(default_factory=list)
+    environment_shift: int = 0
+
+
+class PublicTurnRoundNarrationStatus(str, Enum):
+    PENDING = "pending"
+    READY = "ready"
+    EMPTY = "empty"
+    STREAMING = "streaming"
+    PAUSED = "paused"
+    COMPLETE = "complete"
+
+
+class PublicTurnNarrativeEntry(BaseModel):
+    narrative_entry_id: str = Field(..., min_length=1)
+    round_id: str = Field(..., min_length=1)
+    settlement_entry_id: str | None = None
+    phase: PublicTurnPhase = PublicTurnPhase.IDLE
+    order_index: int = Field(default=0, ge=0)
+    actor_id: str = Field(default="", min_length=0)
+    actor_name: str = Field(default="", min_length=0)
+    actor_type: PublicTurnActorType = PublicTurnActorType.NPC
+    text: str = Field(default="", min_length=0)
+    status: Literal["streaming", "ready"] = "ready"
+
+
+class PublicTurnSegmentBoundary(BaseModel):
+    boundary_kind: Literal[
+        "player_turn",
+        "player_interaction",
+        "player_reaction",
+        "player_opposed",
+        "player_attack_response",
+        "player_attack_defense",
+        "round_end",
+    ] = "round_end"
+    phase: PublicTurnPhase = PublicTurnPhase.IDLE
+    pause_source_actor_id: str | None = None
+    pause_source_actor_name: str | None = None
+
+
+class PublicTurnSegmentActorDirective(BaseModel):
+    actor_id: str = Field(..., min_length=1)
+    actor_name: str = Field(..., min_length=1)
+    actor_type: PublicTurnActorType = PublicTurnActorType.NPC
+    phase: PublicTurnPhase = PublicTurnPhase.IDLE
+    action_type: Literal["attack", "check", "item_use"] = "check"
+    action_summary: str = Field(default="", min_length=0)
+    speech_text: str = Field(default="", min_length=0)
+    action_prompt: str = Field(default="", min_length=0)
+    action_target_actor_id: str | None = None
+    action_target_name: str | None = None
+    action_target_kind: PublicTurnActorType | None = None
+    speech_target_actor_id: str | None = None
+    speech_target_name: str | None = None
+    speech_target_kind: PublicTurnActorType | None = None
+    speech_target_label: str = Field(default="", min_length=0)
+    world_impact_type: PublicTurnWorldImpactType = PublicTurnWorldImpactType.NON_WORLD
+    alternation_depth: int = Field(default=0, ge=0, le=1)
+    target_actor_id: str | None = None
+    target_name: str | None = None
+    target_actor_kind: Literal["player", "npc"] | None = None
+    interaction_target_actor_id: str | None = None
+    interaction_target_name: str | None = None
+    interaction_target_kind: PublicTurnActorType | None = None
+    interaction_kind: str = Field(default="", min_length=0)
+    interaction_requires_response: bool = False
+    target_response_action_summary: str = Field(default="", min_length=0)
+    target_response_speech_text: str = Field(default="", min_length=0)
+    target_response_speech_target_name: str | None = None
+    target_response_world_impact_type: PublicTurnWorldImpactType = PublicTurnWorldImpactType.NON_WORLD
+    interaction_exchange_kind: Literal["non_world_exchange", "world_exchange", "alternated_exchange"] = "world_exchange"
+    consent_state: Literal["accepted", "rejected", "ambiguous", "not_applicable"] = "not_applicable"
+    resolution_mode: Literal["static_dc", "opposed_actor", "attack_flow", "none"] = "none"
+    resolution_rule: Literal["static_dc", "opposed_actor"] = "static_dc"
+    planned_requires_check: bool = False
+    planned_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
+    planned_dc: int | None = Field(default=None, ge=5, le=30)
+    planned_check_task: str | None = None
+    target_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
+    target_ability_modifier: int | None = None
+    specific_threat: str = Field(default="", min_length=0)
+    stakes_summary: str = Field(default="", min_length=0)
+    situation_delta_hint: int = 0
+    reputation_delta_hint: int = 0
+    pause_kind: Literal[
+        "none",
+        "player_interaction",
+        "player_reaction",
+        "player_opposed",
+        "player_attack_response",
+        "player_attack_defense",
+    ] = "none"
+
+
+class PublicTurnSegmentPlan(BaseModel):
+    segment_id: str = Field(..., min_length=1)
+    round_id: str = Field(..., min_length=1)
+    phase: PublicTurnPhase = PublicTurnPhase.IDLE
+    actor_directives: list[PublicTurnSegmentActorDirective] = Field(default_factory=list)
+    boundary: PublicTurnSegmentBoundary = Field(default_factory=PublicTurnSegmentBoundary)
+
+
+class PublicTurnNarrationInputItem(BaseModel):
+    anchor_kind: Literal["settlement", "pause_preview"] = "settlement"
+    anchor_id: str = Field(..., min_length=1)
+    order_index: int = Field(default=0, ge=0)
+    actor_name: str = Field(default="", min_length=0)
+    actor_type: PublicTurnActorType = PublicTurnActorType.NPC
+    action_summary: str = Field(default="", min_length=0)
+    speech_text: str = Field(default="", min_length=0)
+    action_target_name: str | None = None
+    speech_target_name: str | None = None
+    gm_resolution_summary: str = Field(default="", min_length=0)
+    opposed_target_name: str | None = None
+    opposed_target_action: str | None = None
+    opposed_target_speech: str | None = None
+    opposed_target_speech_target_name: str | None = None
+
+
+class PublicTurnNarrationFragmentResult(BaseModel):
+    anchor_kind: Literal["settlement", "pause_preview"] = "settlement"
+    anchor_id: str = Field(..., min_length=1)
+    text: str = Field(default="", min_length=0)
+
+
+class PublicTurnNarrationFragmentBatch(BaseModel):
+    segment_id: str = Field(..., min_length=1)
+    fragments: list[PublicTurnNarrationFragmentResult] = Field(default_factory=list)
+
+
+class PublicTurnOpposedPrompt(BaseModel):
+    check_id: str = Field(..., min_length=1)
+    round_id: str = Field(..., min_length=1)
+    phase: PublicTurnPhase = PublicTurnPhase.IDLE
+    source_actor_id: str = Field(..., min_length=1)
+    source_actor_name: str = Field(..., min_length=1)
+    source_action_summary: str = Field(default="", min_length=0)
+    source_speech_text: str = Field(default="", min_length=0)
+    source_interaction_kind: str = Field(default="", min_length=0)
+    source_action_target_name: str | None = None
+    source_speech_target_name: str | None = None
+    source_situation_delta_hint: int = 0
+    source_reputation_delta_hint: int = 0
+    target_actor_id: str = Field(..., min_length=1)
+    target_actor_name: str = Field(..., min_length=1)
+    stakes_summary: str = Field(default="", min_length=0)
+    followup_notice_state: Literal["hidden", "noticed", "obvious"] | None = None
+    followup_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
+    followup_dc: int | None = Field(default=None, ge=1, le=40)
+    followup_check_task: str | None = None
+
+
+class PublicTurnInformationCheckPrompt(BaseModel):
+    prompt_id: str = Field(..., min_length=1)
+    round_id: str = Field(..., min_length=1)
+    phase: PublicTurnPhase = PublicTurnPhase.AWAITING_PLAYER_INFORMATION_CHECK
+    actor_id: str = Field(..., min_length=1)
+    actor_name: str = Field(..., min_length=1)
+    source_actor_id: str | None = None
+    source_actor_name: str | None = None
+    source_interaction_kind: Literal["information_gathering", "social_influence", "intimidation", "generic"] = "information_gathering"
+    notice_state: Literal["hidden", "noticed", "obvious"] = "noticed"
+    ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] = "wisdom"
+    ability_modifier: int = 0
+    dc: int = Field(default=10, ge=1, le=40)
+    check_task: str = Field(default="", min_length=0)
+    stakes_summary: str = Field(default="", min_length=0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DeathSavePrompt(BaseModel):
+    prompt_id: str = Field(..., min_length=1)
+    round_id: str = Field(..., min_length=1)
+    phase: PublicTurnPhase = PublicTurnPhase.AWAITING_PLAYER_DEATH_SAVE
+    actor_id: str = Field(..., min_length=1)
+    actor_name: str = Field(..., min_length=1)
+    successes: int = Field(default=0, ge=0, le=3)
+    failures: int = Field(default=0, ge=0, le=3)
+    dc: int = Field(default=10, ge=1, le=30)
+    severe_wound_threshold: int = Field(default=1, ge=1)
+    speech_only: bool = True
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class PublicTurnAttackPrompt(BaseModel):
+    prompt_id: str = Field(..., min_length=1)
+    round_id: str = Field(..., min_length=1)
+    phase: PublicTurnPhase = PublicTurnPhase.IDLE
+    source_actor_id: str = Field(..., min_length=1)
+    source_actor_name: str = Field(..., min_length=1)
+    source_action_summary: str = Field(default="", min_length=0)
+    source_speech_text: str = Field(default="", min_length=0)
+    attack_kind: Literal["targeted_attack", "aoe_attack"] = "targeted_attack"
+    attack_basis: Literal["weapon", "spell", "war_art", "other"] = "other"
+    attack_definition_id: str | None = None
+    attack_definition_name: str | None = None
+    attack_area_shape: Literal["none", "sphere", "cone", "line", "burst", "emanation"] = "none"
+    attack_area_radius_m: float = Field(default=0, ge=0)
+    attack_area_length_m: float = Field(default=0, ge=0)
+    can_include_self: bool = False
+    current_target_actor_id: str = Field(..., min_length=1)
+    current_target_name: str = Field(..., min_length=1)
+    current_target_kind: PublicTurnActorType = PublicTurnActorType.PLAYER
+    threatened_target_names: list[str] = Field(default_factory=list)
+    revealed_target_names: list[str] = Field(default_factory=list)
+    player_in_danger: bool = False
+    attack_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
+    suggested_response_hint: str = Field(default="", min_length=0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class PublicTurnAttackDefensePrompt(BaseModel):
+    check_id: str = Field(..., min_length=1)
+    round_id: str = Field(..., min_length=1)
+    phase: PublicTurnPhase = PublicTurnPhase.IDLE
+    attack_kind: Literal["targeted_attack", "aoe_attack"] = "targeted_attack"
+    source_actor_id: str = Field(..., min_length=1)
+    source_actor_name: str = Field(..., min_length=1)
+    source_action_summary: str = Field(default="", min_length=0)
+    source_speech_text: str = Field(default="", min_length=0)
+    source_attack_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] = "strength"
+    source_attack_ability_modifier: int = 0
+    target_actor_id: str = Field(..., min_length=1)
+    target_actor_name: str = Field(..., min_length=1)
+    target_action_summary: str = Field(default="", min_length=0)
+    target_speech_text: str = Field(default="", min_length=0)
+    target_defense_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] = "dexterity"
+    target_defense_ability_modifier: int = 0
+    threatened_target_names: list[str] = Field(default_factory=list)
+    hit_target_names: list[str] = Field(default_factory=list)
+    aoe_remaining_target_count: int = Field(default=0, ge=0)
+    stakes_summary: str = Field(default="", min_length=0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class PublicTurnInteractionPrompt(BaseModel):
+    prompt_id: str = Field(..., min_length=1)
+    round_id: str = Field(..., min_length=1)
+    phase: PublicTurnPhase = PublicTurnPhase.IDLE
+    source_actor_id: str = Field(..., min_length=1)
+    source_actor_name: str = Field(..., min_length=1)
+    source_action_type: Literal["attack", "check", "item_use"] = "check"
+    source_action_summary: str = Field(default="", min_length=0)
+    source_speech_text: str = Field(default="", min_length=0)
+    source_action_target_name: str | None = None
+    source_speech_target_name: str | None = None
+    source_action_prompt: str = Field(default="", min_length=0)
+    source_world_impact_type: PublicTurnWorldImpactType = PublicTurnWorldImpactType.NON_WORLD
+    source_situation_delta_hint: int = 0
+    source_reputation_delta_hint: int = 0
+    source_planned_requires_check: bool = False
+    source_planned_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
+    source_planned_dc: int | None = Field(default=None, ge=5, le=30)
+    source_planned_check_task: str | None = None
+    source_interaction_kind: str = Field(default="", min_length=0)
+    target_actor_id: str = Field(..., min_length=1)
+    target_actor_name: str = Field(..., min_length=1)
+    target_actor_kind: PublicTurnActorType = PublicTurnActorType.PLAYER
+    alternation_depth: int = Field(default=0, ge=0, le=1)
+    interaction_mode: Literal["initial", "alternated"] = "initial"
+    suggested_target_label: str = Field(default="", min_length=0)
+
+
+class PublicTurnAttackResponseSubmission(BaseModel):
+    prompt_id: str = Field(..., min_length=1)
+    target_actor_id: str = Field(..., min_length=1)
+    action_text: str = Field(default="", min_length=0)
+    speech_text: str = Field(default="", min_length=0)
+    response_kind: Literal["explicit_response", "no_action"] = "explicit_response"
+
+
+class PublicTurnRound(BaseModel):
+    round_id: str = Field(..., min_length=1)
+    round_number: int = Field(default=1, ge=1)
+    phase: PublicTurnPhase = PublicTurnPhase.IDLE
+    initiative_declarations: list[InitiativeDeclaration] = Field(default_factory=list)
+    initiative_order: list[PublicTurnInitiativeEntry] = Field(default_factory=list)
+    executed_actor_ids: list[str] = Field(default_factory=list)
+    impacts: list[PublicTurnImpact] = Field(default_factory=list)
+    settlement_entries: list[PublicTurnSettlementEntry] = Field(default_factory=list)
+    situation_triggered: bool = False
+    situation_event: str | None = None
+    environment_risk_level: EnvironmentRiskLevel = EnvironmentRiskLevel.STABLE
+    situation_dc: int = 10
+    pending_reaction_check_id: str | None = None
+    pending_interaction_prompt: PublicTurnInteractionPrompt | None = None
+    pending_attack_prompt: PublicTurnAttackPrompt | None = None
+    pending_attack_defense_prompt: PublicTurnAttackDefensePrompt | None = None
+    pending_information_check_prompt: PublicTurnInformationCheckPrompt | None = None
+    pending_death_save_prompt: DeathSavePrompt | None = None
+    current_actor_id: str | None = None
+    awaiting_player_action: bool = False
+    awaiting_player_action_phase: PublicTurnPhase | None = None
+    gm_push_summary: str = Field(default="", min_length=0)
+    gm_push_scene_event_id: str | None = None
+    gm_push_result: PublicTurnGmPushResult | None = None
+    accumulated_narration: str = Field(default="", min_length=0)
+    narrative_entries: list[PublicTurnNarrativeEntry] = Field(default_factory=list)
+    narrative_status: PublicTurnRoundNarrationStatus = PublicTurnRoundNarrationStatus.EMPTY
+    round_narration: str = Field(default="", min_length=0)
+    round_narration_status: PublicTurnRoundNarrationStatus = PublicTurnRoundNarrationStatus.PENDING
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    completed_at: str | None = None
+
+
+class PublicTurnState(BaseModel):
+    version: str = Field(default="0.2.0")
+    current_round: PublicTurnRound | None = None
+    round_history: list[PublicTurnRound] = Field(default_factory=list)
+    max_history: int = Field(default=20, ge=1, le=100)
+    environment_risk_level: EnvironmentRiskLevel = EnvironmentRiskLevel.STABLE
+    situation_dc: int = 10
+    awaiting_player_entry: bool = True
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 class SubZoneChatTurnEvent(BaseModel):
     event_kind: Literal[
+        "damage_resolution",
         "encounter_progress",
         "encounter_resolution",
         "npc_reply",
@@ -377,10 +1390,27 @@ class SubZoneChatTurnEvent(BaseModel):
         "public_actor_action",
         "public_actor_resolution",
         "public_round_resolution",
+        "public_turn_phase",
+        "public_turn_initiative",
+        "public_turn_actor_action",
+        "public_turn_actor_resolution",
+        "public_turn_situation",
+        "public_turn_gm_push",
+        "public_turn_round_end",
+        "public_turn_relation_update",
+        "public_turn_team_update",
+        "public_turn_environment_update",
         "role_desire_surface",
         "companion_story_surface",
         "reputation_update",
         "encounter_situation_update",
+        "encounter_world_push",
+        "player_entered_death_save",
+        "player_death_save_result",
+        "player_died",
+        "team_npc_entered_death_save",
+        "team_npc_death_save_result",
+        "team_npc_died",
     ] = "system_notice"
     actor_type: Literal["npc", "team", "encounter_temp_npc", "system"] = "system"
     actor_id: str = Field(default="", min_length=0)
@@ -393,6 +1423,9 @@ class SubZoneChatTurn(BaseModel):
     turn_id: str = Field(..., min_length=1)
     source: Literal["main_chat", "encounter", "system"] = "main_chat"
     player_mode: Literal["active", "passive"] = "active"
+    public_round_id: str | None = None
+    public_round_number: int | None = None
+    public_phase: PublicTurnPhase | None = None
     world_time_text: str = Field(default="", min_length=0)
     world_time: dict[str, str | int] = Field(default_factory=dict)
     player_action: str = Field(default="", min_length=0)
@@ -402,13 +1435,15 @@ class SubZoneChatTurn(BaseModel):
     active_encounter_id: str | None = None
     active_encounter_title: str = Field(default="", min_length=0)
     active_encounter_status: str = Field(default="", min_length=0)
+    public_turn_presentation: "PublicTurnPresentation | None" = None
     events: list[SubZoneChatTurnEvent] = Field(default_factory=list)
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 class SubZoneChatContext(BaseModel):
-    version: str = Field(default="0.1.0")
+    version: str = Field(default="0.2.0")
     recent_turns: list[SubZoneChatTurn] = Field(default_factory=list)
+    public_turn_state: PublicTurnState = Field(default_factory=PublicTurnState)
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -490,7 +1525,7 @@ class Dnd5eHitPoints(BaseModel):
 
 
 class Dnd5eSpellSlots(BaseModel):
-    level_1: int = Field(default=2, ge=0, le=9)
+    level_1: int = Field(default=1, ge=0, le=9)
     level_2: int = Field(default=0, ge=0, le=9)
     level_3: int = Field(default=0, ge=0, le=9)
     level_4: int = Field(default=0, ge=0, le=9)
@@ -527,6 +1562,11 @@ class RoleBuff(BaseModel):
     effect: RoleBuffEffect = Field(default_factory=RoleBuffEffect)
 
 
+class OriginStamp(BaseModel):
+    origin_kind: Literal["starting_build", "level_up", "loot", "quest_reward", "purchase", "learned", "crafted", "gifted", "debug"] = "debug"
+    origin_ref: str = Field(default="", min_length=0)
+
+
 class InventoryItem(BaseModel):
     item_id: str = Field(..., min_length=1)
     name: str = Field(..., min_length=1)
@@ -544,16 +1584,63 @@ class InventoryItem(BaseModel):
     slot_type: Literal["weapon", "armor", "misc"] = "misc"
     attack_bonus: int = 0
     armor_bonus: int = 0
+    origin: OriginStamp | None = None
 
 
 class InventoryData(BaseModel):
     gold: int = Field(default=0, ge=0)
+    item_instance_ids: list[str] = Field(default_factory=list)
     items: list[InventoryItem] = Field(default_factory=list)
 
 
 class EquipmentSlots(BaseModel):
     weapon_item_id: str | None = None
     armor_item_id: str | None = None
+    shield_item_id: str | None = None
+    weapon_item_instance_id: str | None = None
+    armor_item_instance_id: str | None = None
+    shield_item_instance_id: str | None = None
+
+
+class PlayerDeathState(BaseModel):
+    """轻量级死亡状态追踪，嵌入 Dnd5eCharacterSheet"""
+    version: str = Field(default="0.1.0")
+    
+    # 生命状态
+    life_status: Literal["healthy", "dying", "stable", "dead"] = "healthy"
+    
+    # 濒死追踪 (0-3)
+    death_save_successes: int = Field(default=0, ge=0, le=3)
+    death_save_failures: int = Field(default=0, ge=0, le=3)
+    
+    # 死亡统计
+    death_count: int = Field(default=0, ge=0)
+    death_streak_count: int = Field(default=0, ge=0)  # 24小时内
+    death_streak_reset_at: str | None = None
+    
+    # 上次死亡信息
+    last_death_at: str | None = None
+    last_death_zone_id: str | None = None
+    last_death_sub_zone_id: str | None = None
+    last_death_cause: str = Field(default="")
+    
+    # 复活追踪
+    revived_at: str | None = None
+    revival_method: Literal["shrine", "teammate", "item"] | None = None
+    revival_weakness_until: str | None = None
+    
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+RoleActionStatus = Literal["free_action", "death_saving", "dead", "unable_to_act"]
+
+
+class DeathPenalties(BaseModel):
+    """死亡惩罚计算结果"""
+    gold_lost: int = 0
+    exp_lost: int = 0
+    items_lost: list[str] = Field(default_factory=list)  # item_instance_ids
+    weakness_duration_min: int = 60
 
 
 class Dnd5eCharacterSheet(BaseModel):
@@ -572,6 +1659,7 @@ class Dnd5eCharacterSheet(BaseModel):
     stamina_current: int = Field(default=10, ge=0)
     stamina_maximum: int = Field(default=10, ge=1)
     is_dead: bool = False
+    role_action_status: RoleActionStatus = "free_action"
     status_flags: list[str] = Field(default_factory=list)
     hit_dice: str = Field(default="1d8", min_length=1)
     hit_points: Dnd5eHitPoints = Field(default_factory=Dnd5eHitPoints)
@@ -589,14 +1677,47 @@ class Dnd5eCharacterSheet(BaseModel):
     buffs: list[RoleBuff] = Field(default_factory=list)
     features_traits: list[str] = Field(default_factory=list)
     spells: list[str] = Field(default_factory=list)
+    war_arts: list[str] = Field(default_factory=list)
+    spell_origins: dict[str, OriginStamp] = Field(default_factory=dict)
+    skill_origins: dict[str, OriginStamp] = Field(default_factory=dict)
+    war_art_origins: dict[str, OriginStamp] = Field(default_factory=dict)
     spell_slots_max: Dnd5eSpellSlots = Field(default_factory=Dnd5eSpellSlots)
     spell_slots_current: Dnd5eSpellSlots = Field(default_factory=Dnd5eSpellSlots)
+    martial_points_current: int = Field(default=0, ge=0, le=9)
+    martial_points_maximum: int = Field(default=0, ge=0, le=9)
+    war_art_cooldowns: dict[str, int] = Field(default_factory=dict)
     notes: str = Field(default="", min_length=0)
+    death_state: PlayerDeathState = Field(default_factory=PlayerDeathState)
+
+
+class PortraitAssetRef(BaseModel):
+    asset_id: str = Field(..., min_length=1)
+    relative_path: str = Field(..., min_length=1)
+    mime_type: str = Field(default="image/png", min_length=1)
+    width: int = Field(default=768, ge=1)
+    height: int = Field(default=1344, ge=1)
+    variant_kind: Literal["uploaded_raw", "generated_raw", "bg_removed", "final_portrait"] = "uploaded_raw"
+    derived_from_asset_id: str | None = None
+    provider: AIProvider | None = None
+    model: str | None = None
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class CharacterBuildState(BaseModel):
+    player_status: Literal["uncreated", "completed"] = "uncreated"
+    initial_companion_offer_seen: bool = False
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 class PlayerStaticData(BaseModel):
     player_id: str = Field(default="player_001", min_length=1)
     name: str = Field(default="玩家", min_length=1)
+    age: int = Field(default=18, ge=0, le=999)
+    height_cm: int = Field(default=170, ge=50, le=300)
+    body_type: str = Field(default="", min_length=0)
+    appearance: str = Field(default="", min_length=0)
+    portrait: PortraitAssetRef | None = None
+    build_archive_id: str | None = None
     move_speed_mph: int = Field(default=4500, gt=0)
     role_type: Literal["player", "npc", "monster"] = "player"
     dnd5e_sheet: Dnd5eCharacterSheet = Field(default_factory=Dnd5eCharacterSheet)
@@ -634,6 +1755,15 @@ class NpcConversationState(BaseModel):
     last_referenced_entity: str = Field(default="", min_length=0)
     last_scene_mode: Literal["private_chat", "public_chat", "team_chat", "encounter", "unknown"] = "unknown"
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class NpcPrivateChatMemoryEntry(BaseModel):
+    memory_id: str = Field(..., min_length=1)
+    world_time_text: str = Field(..., min_length=1)
+    world_time: dict[str, str | int] = Field(default_factory=dict)
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    summary: str = Field(..., min_length=1)
+    source_dialogue_ids: list[str] = Field(default_factory=list)
 
 
 class RoleDesire(BaseModel):
@@ -686,12 +1816,16 @@ class NpcRoleCard(BaseModel):
     talkative_maximum: int = Field(default=100, ge=1, le=100)
     last_private_chat_at: str | None = None
     last_public_turn_at: str | None = None
+    talkative_recovery_round_cursor: str | None = None
+    portrait: PortraitAssetRef | None = None
+    retained_id: str | None = None
     profile: PlayerStaticData = Field(default_factory=lambda: PlayerStaticData(role_type="npc"))
     relations: list[RoleRelation] = Field(default_factory=list)
     cognition_changes: list[str] = Field(default_factory=list)
     attitude_changes: list[str] = Field(default_factory=list)
     conversation_state: NpcConversationState = Field(default_factory=NpcConversationState)
     dialogue_logs: list[NpcDialogueEntry] = Field(default_factory=list)
+    private_chat_memories: list[NpcPrivateChatMemoryEntry] = Field(default_factory=list)
     generated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -759,6 +1893,25 @@ class ReputationState(BaseModel):
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
+class ZoneMetricEntry(BaseModel):
+    zone_id: str = Field(..., min_length=1)
+    zone_name: str = Field(..., min_length=1)
+    reputation_score: int = Field(default=50, ge=0, le=100)
+    reputation_band: Literal["hostile", "cold", "neutral", "trusted", "favored"] = "neutral"
+    danger_score: int = Field(default=50, ge=0, le=100)
+    danger_band: Literal["low", "medium", "high"] = "medium"
+    reputation_reasons: list[str] = Field(default_factory=list)
+    danger_reasons: list[str] = Field(default_factory=list)
+    seed_source: Literal["ai_generated", "migration_backfill", "system_default"] = "system_default"
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class ZoneMetricState(BaseModel):
+    version: str = Field(default="0.1.0")
+    entries: list[ZoneMetricEntry] = Field(default_factory=list)
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
 class StoryQuestSummary(BaseModel):
     quest_id: str = Field(..., min_length=1)
     title: str = Field(..., min_length=1)
@@ -815,6 +1968,8 @@ class EncounterOutcomeChange(BaseModel):
 class EncounterOutcomePackage(BaseModel):
     result: Literal["success", "failure"] = "success"
     reputation_delta: int = 0
+    zone_reputation_delta: int = 0
+    zone_danger_delta: int = 0
     npc_relation_deltas: list[EncounterOutcomeChange] = Field(default_factory=list)
     team_deltas: list[EncounterOutcomeChange] = Field(default_factory=list)
     item_rewards: list[InventoryItem] = Field(default_factory=list)
@@ -828,11 +1983,13 @@ class PublicSceneState(BaseModel):
     current_zone_id: str | None = None
     current_sub_zone_id: str | None = None
     current_reputation: SubZoneReputationEntry | None = None
+    current_zone_metric: ZoneMetricEntry | None = None
     visible_npcs: list[StoryNpcSummary] = Field(default_factory=list)
     team_members: list[StoryNpcSummary] = Field(default_factory=list)
     candidate_actors: list[PublicSceneActorCandidate] = Field(default_factory=list)
     surfaced_drives: list[RoleDriveSummary] = Field(default_factory=list)
     active_encounter: "EncounterEntry | None" = None
+    public_turn_state: PublicTurnState = Field(default_factory=PublicTurnState)
 
 
 class NpcKnowledgeSnapshot(BaseModel):
@@ -873,7 +2030,7 @@ class TeamReaction(BaseModel):
     reaction_id: str = Field(..., min_length=1)
     member_role_id: str = Field(..., min_length=1)
     member_name: str = Field(..., min_length=1)
-    trigger_kind: Literal["main_chat", "npc_chat", "zone_move", "sub_zone_move", "action_check", "team_chat", "public_chat", "encounter", "system"] = "system"
+    trigger_kind: Literal["main_chat", "npc_chat", "zone_move", "sub_zone_move", "action_check", "team_chat", "public_chat", "public_turn", "encounter", "system"] = "system"
     content: str = Field(..., min_length=1)
     affinity_delta: int = 0
     trust_delta: int = 0
@@ -885,6 +2042,243 @@ class TeamState(BaseModel):
     members: list[TeamMember] = Field(default_factory=list)
     reactions: list[TeamReaction] = Field(default_factory=list)
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class TravelCompanionEntry(BaseModel):
+    role_id: str = Field(..., min_length=1)
+    role_name: str = Field(..., min_length=1)
+    source_kind: Literal["npc", "team"] = "npc"
+    destination_zone_id: str = Field(..., min_length=1)
+    destination_sub_zone_id: str | None = None
+    follow_until_arrival: bool = True
+    declared_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class TravelCompanionState(BaseModel):
+    version: str = Field(default="0.1.0")
+    companions: list[TravelCompanionEntry] = Field(default_factory=list)
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class BattleDamageProfile(BaseModel):
+    dice: str = Field(default="1d4", min_length=1)
+    damage_type: str = Field(default="bludgeoning", min_length=1)
+    flat_bonus: int = 0
+
+
+class BattleFieldState(BaseModel):
+    zone_id: str | None = None
+    zone_name: str = Field(default="", min_length=0)
+    sub_zone_id: str | None = None
+    sub_zone_name: str = Field(default="", min_length=0)
+    description: str = Field(default="", min_length=0)
+    feature_tags: list[str] = Field(default_factory=list)
+    danger_score: int | None = Field(default=None, ge=0, le=100)
+    reputation_score: int | None = Field(default=None, ge=0, le=100)
+
+
+class BattleStepEntry(BaseModel):
+    step_id: str = Field(..., min_length=1)
+    round: int = Field(default=1, ge=1)
+    kind: Literal[
+        "setup",
+        "initiative",
+        "turn_start",
+        "attack",
+        "damage",
+        "move",
+        "defend",
+        "disengage",
+        "escape",
+        "observe",
+        "item_use",
+        "reaction_prompt",
+        "reaction_result",
+        "defeat",
+        "end",
+        "system",
+    ] = "system"
+    actor_combatant_id: str | None = None
+    actor_name: str = Field(default="", min_length=0)
+    content: str = Field(..., min_length=1)
+    metadata: dict[str, str | int | float | bool] = Field(default_factory=dict)
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class CombatantState(BaseModel):
+    combatant_id: str = Field(..., min_length=1)
+    source_kind: Literal["player", "team", "npc", "test_monster"] = "player"
+    role_id: str | None = None
+    display_name: str = Field(..., min_length=1)
+    side: Literal["player_side", "enemy_side"] = "player_side"
+    template_id: str | None = None
+    role_kind: Literal["brute", "skirmisher", "ranged", "support", "beast", "adventurer"] = "adventurer"
+    ai_style: str = Field(default="hold_line", min_length=1)
+    level_hint: int = Field(default=1, ge=1)
+    max_hp: int = Field(default=10, ge=1)
+    current_hp: int = Field(default=10, ge=0)
+    temp_hp: int = Field(default=0, ge=0)
+    base_armor_class: int = Field(default=10, ge=0)
+    armor_class: int = Field(default=10, ge=0)
+    speed: int = Field(default=6, ge=0)
+    initiative: int = 0
+    initiative_bonus: int = 0
+    attack_bonus: int = 0
+    damage_profile: BattleDamageProfile = Field(default_factory=BattleDamageProfile)
+    ability_modifiers: Dnd5eAbilityModifiers = Field(default_factory=Dnd5eAbilityModifiers)
+    saving_throw_bonuses: Dnd5eAbilityModifiers = Field(default_factory=Dnd5eAbilityModifiers)
+    position_band: Literal["engaged", "near", "far", "remote"] = "near"
+    position_feature_tags: list[str] = Field(default_factory=list)
+    action_available: bool = True
+    bonus_action_available: bool = True
+    reaction_available: bool = True
+    movement_remaining: int = Field(default=6, ge=0)
+    conditions: list[str] = Field(default_factory=list)
+    alive: bool = True
+    downed: bool = False
+    escaped: bool = False
+    temporary_ac_bonus: int = 0
+    next_attack_bonus_against: str | None = None
+    next_attack_bonus_amount: int = 0
+    inventory_item_instance_ids: list[str] = Field(default_factory=list)
+    equipped_weapon_instance_id: str | None = None
+    equipped_armor_instance_id: str | None = None
+    equipped_shield_instance_id: str | None = None
+    inventory_items: list[InventoryItem] = Field(default_factory=list)
+    death_state: PlayerDeathState = Field(default_factory=PlayerDeathState)
+
+
+class CombatState(BaseModel):
+    round: int = Field(default=1, ge=1)
+    phase: Literal["initiative", "turn", "resolution", "ended"] = "initiative"
+    active_combatant_id: str | None = None
+    initiative_order: list[str] = Field(default_factory=list)
+    momentum_value: int = 0
+    combatants: list[CombatantState] = Field(default_factory=list)
+    recent_steps: list[BattleStepEntry] = Field(default_factory=list)
+    winner_side: Literal["player_side", "enemy_side", "escaped", "cancelled"] | None = None
+
+
+class BattleRollPrompt(BaseModel):
+    prompt_id: str = Field(..., min_length=1)
+    roll_kind: Literal["initiative", "attack", "observe", "escape", "reaction", "item_use", "death_save", "stabilize"] = "attack"
+    actor_combatant_id: str = Field(..., min_length=1)
+    actor_name: str = Field(..., min_length=1)
+    ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] = "strength"
+    ability_modifier: int = 0
+    dc: int = Field(default=10, ge=1, le=30)
+    check_task: str = Field(..., min_length=1)
+    source_label: str | None = None
+    threatened_consequence: str | None = None
+    success_hint: str | None = None
+    failure_hint: str | None = None
+    target_combatant_id: str | None = None
+    action_name: str = Field(default="", min_length=0)
+    metadata: dict[str, str | int | float | bool] = Field(default_factory=dict)
+
+
+class BattleRollResolution(BaseModel):
+    prompt_id: str = Field(..., min_length=1)
+    actor_combatant_id: str = Field(..., min_length=1)
+    actor_name: str = Field(..., min_length=1)
+    roll_kind: Literal["initiative", "attack", "observe", "escape", "reaction", "item_use", "death_save", "stabilize"] = "attack"
+    ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] = "strength"
+    ability_modifier: int = 0
+    dc: int = Field(default=10, ge=1, le=30)
+    dice_roll: int = Field(..., ge=1, le=20)
+    total_score: int
+    success: bool
+    critical: Literal["none", "critical_success", "critical_failure"] = "none"
+    summary: str = Field(..., min_length=1)
+
+
+class BattleUiFlags(BaseModel):
+    ai_pacing: Literal["step", "auto"] = "step"
+    can_continue_ai: bool = False
+
+
+class BattleSandboxState(BaseModel):
+    battle_id: str = Field(..., min_length=1)
+    session_id: str = Field(..., min_length=1)
+    status: Literal["setup", "active", "awaiting_player_action", "awaiting_player_roll", "awaiting_ai_continue", "ended", "cancelled"] = "setup"
+    source_kind: Literal["debug_template", "debug_ai_generated"] = "debug_template"
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    battlefield: BattleFieldState = Field(default_factory=BattleFieldState)
+    player_snapshot: CombatantState
+    ally_snapshots: list[CombatantState] = Field(default_factory=list)
+    enemy_snapshots: list[CombatantState] = Field(default_factory=list)
+    combat_state: CombatState = Field(default_factory=CombatState)
+    pending_roll: BattleRollPrompt | None = None
+    last_roll_result: BattleRollResolution | None = None
+    battle_logs: list[BattleStepEntry] = Field(default_factory=list)
+    ui_flags: BattleUiFlags = Field(default_factory=BattleUiFlags)
+
+
+class BattleStartRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    mode: Literal["template", "ai_generated"] = "template"
+    template_group: str | None = None
+    ai_scale: Literal["single", "squad"] = "single"
+    ai_strength: Literal["weak", "standard", "strong"] = "standard"
+    ai_pacing: Literal["step", "auto"] = "step"
+    config: ChatConfig | None = None
+
+
+class BattleStartResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    battle: BattleSandboxState
+
+
+class BattleActionRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    action_kind: Literal["attack", "defend", "move", "disengage", "escape", "use_item", "observe", "end_turn"]
+    target_combatant_id: str | None = None
+    destination_band: Literal["engaged", "near", "far", "remote"] | None = None
+    item_id: str | None = None
+
+
+class BattleActionResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    battle: BattleSandboxState
+
+
+class BattleContinueAiRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    ai_pacing: Literal["step", "auto"] | None = None
+
+
+class BattleContinueAiResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    battle: BattleSandboxState
+
+
+class BattleResolveRollRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    forced_dice_roll: int = Field(..., ge=1, le=20)
+
+
+class BattleResolveRollResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    battle: BattleSandboxState
+    roll_result: BattleRollResolution | None = None
+
+
+class BattleCurrentResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    battle: BattleSandboxState | None = None
+
+
+class BattleEndResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    battle_id: str | None = None
+    ended: bool = True
 
 
 class SaveFile(BaseModel):
@@ -900,9 +2294,14 @@ class SaveFile(BaseModel):
     role_pool: list[NpcRoleCard] = Field(default_factory=list)
     team_state: TeamState = Field(default_factory=TeamState)
     reputation_state: ReputationState = Field(default_factory=ReputationState)
+    zone_metric_state: ZoneMetricState = Field(default_factory=ZoneMetricState)
+    travel_companion_state: TravelCompanionState = Field(default_factory=TravelCompanionState)
+    item_instance_state: ItemInstanceState = Field(default_factory=ItemInstanceState)
+    scene_interactable_state: SceneInteractableState = Field(default_factory=SceneInteractableState)
     quest_state: QuestState = Field(default_factory=lambda: QuestState())
     encounter_state: EncounterState = Field(default_factory=lambda: EncounterState())
     fate_state: FateState = Field(default_factory=lambda: FateState())
+    character_build_state: CharacterBuildState = Field(default_factory=CharacterBuildState)
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -916,6 +2315,289 @@ class SaveSetRequest(BaseModel):
 
 class SaveClearRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
+
+
+class CharacterBuildBasicInfo(BaseModel):
+    name: str = Field(default="", min_length=0)
+    age: int = Field(default=18, ge=0, le=999)
+    race: str = Field(default="", min_length=0)
+    height_cm: int = Field(default=170, ge=50, le=300)
+    body_type: str = Field(default="", min_length=0)
+
+
+class CharacterBuildChoiceOption(BaseModel):
+    option_id: str = Field(..., min_length=1)
+    label: str = Field(..., min_length=1)
+    description: str = Field(default="", min_length=0)
+    source_kind: Literal["spell", "equipment", "skill", "item", "armor"] = "item"
+    definition_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CharacterBuildMediaCapabilities(BaseModel):
+    active_provider: AIProvider | None = None
+    supports_generation: bool = False
+    supports_background_removal: bool = False
+    supports_vision: bool = False
+    requires_explicit_provider: bool = False
+    detail: str = Field(default="", min_length=0)
+
+
+class CharacterBuildStateResponse(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    state: CharacterBuildState = Field(default_factory=CharacterBuildState)
+    forced_entry: bool = False
+    can_build_companion: bool = False
+    companion_offer_pending: bool = False
+    media_capabilities: CharacterBuildMediaCapabilities = Field(default_factory=CharacterBuildMediaCapabilities)
+
+
+class CharacterBuildOptionsResponse(BaseModel):
+    kind: Literal["player", "companion"] = "player"
+    specialization: Literal["warrior", "mage"] = "warrior"
+    point_buy_total: int = 27
+    point_buy_costs: dict[str, int] = Field(default_factory=dict)
+    recommended_races: list[str] = Field(default_factory=list)
+    body_type_suggestions: list[str] = Field(default_factory=list)
+    spell_pick_count: int = 0
+    equipment_pick_count: int = 0
+    skill_pick_count: int = 0
+    spell_options: list[CharacterBuildChoiceOption] = Field(default_factory=list)
+    equipment_options: list[CharacterBuildChoiceOption] = Field(default_factory=list)
+    skill_options: list[CharacterBuildChoiceOption] = Field(default_factory=list)
+    granted_armor: CharacterBuildChoiceOption | None = None
+    granted_items: list[CharacterBuildChoiceOption] = Field(default_factory=list)
+
+
+class CharacterBuildBasicInfoSuggestRequest(BaseModel):
+    config: ChatConfig | None = None
+    prompt: str = Field(default="", min_length=0)
+    current: CharacterBuildBasicInfo | None = None
+    kind: Literal["player", "companion"] = "player"
+
+
+class CharacterBuildBasicInfoSuggestResponse(BaseModel):
+    basic_info: CharacterBuildBasicInfo
+
+
+class CharacterBuildAbilitySuggestRequest(BaseModel):
+    config: ChatConfig | None = None
+    prompt: str = Field(default="", min_length=0)
+    current_scores: Dnd5eAbilityScores | None = None
+    specialization: Literal["warrior", "mage"] | None = None
+
+
+class CharacterBuildAbilitySuggestResponse(BaseModel):
+    ability_scores: Dnd5eAbilityScores = Field(default_factory=Dnd5eAbilityScores)
+    points_spent: int = 0
+
+
+class CharacterBuildPortraitPromptSuggestRequest(BaseModel):
+    config: ChatConfig | None = None
+    prompt: str = Field(default="", min_length=0)
+    current_prompt: str = Field(default="", min_length=0)
+    basic_info: CharacterBuildBasicInfo | None = None
+
+
+class CharacterBuildPortraitPromptSuggestResponse(BaseModel):
+    portrait_prompt: str = Field(default="", min_length=0)
+
+
+class CharacterBuildLoadoutSuggestRequest(BaseModel):
+    config: ChatConfig | None = None
+    prompt: str = Field(default="", min_length=0)
+    kind: Literal["player", "companion"] = "player"
+    specialization: Literal["warrior", "mage"] = "warrior"
+    basic_info: CharacterBuildBasicInfo | None = None
+    appearance: str = Field(default="", min_length=0)
+    available_spell_option_ids: list[str] = Field(default_factory=list)
+    available_equipment_option_ids: list[str] = Field(default_factory=list)
+    available_skill_option_ids: list[str] = Field(default_factory=list)
+
+
+class CharacterBuildLoadoutSuggestResponse(BaseModel):
+    spell_option_ids: list[str] = Field(default_factory=list)
+    equipment_option_ids: list[str] = Field(default_factory=list)
+    skill_option_ids: list[str] = Field(default_factory=list)
+
+
+class CharacterBuildCompanionFlavor(BaseModel):
+    personality: str = Field(default="", min_length=0)
+    speaking_style: str = Field(default="", min_length=0)
+    cognition: str = Field(default="", min_length=0)
+    secret: str = Field(default="", min_length=0)
+    likes: list[str] = Field(default_factory=list)
+
+
+class CharacterBuildCompanionFlavorSuggestRequest(BaseModel):
+    config: ChatConfig | None = None
+    prompt: str = Field(default="", min_length=0)
+    current: CharacterBuildCompanionFlavor | None = None
+    basic_info: CharacterBuildBasicInfo | None = None
+    appearance: str = Field(default="", min_length=0)
+
+
+class CharacterBuildCompanionFlavorSuggestResponse(BaseModel):
+    flavor: CharacterBuildCompanionFlavor = Field(default_factory=CharacterBuildCompanionFlavor)
+
+
+class CharacterBuildMediaUploadRequest(BaseModel):
+    data_base64: str = Field(..., min_length=1)
+    mime_type: str = Field(default="image/png", min_length=1)
+    file_name: str = Field(default="", min_length=0)
+
+
+class CharacterBuildMediaUploadResponse(BaseModel):
+    asset: PortraitAssetRef
+
+
+class CharacterBuildMediaGenerateRequest(BaseModel):
+    config: ChatConfig
+    prompt: str = Field(..., min_length=1)
+    basic_info: CharacterBuildBasicInfo | None = None
+    reference_asset_id: str | None = None
+
+
+class CharacterBuildMediaGenerateResponse(BaseModel):
+    assets: list[PortraitAssetRef] = Field(default_factory=list)
+    provider: AIProvider
+    model: str = Field(..., min_length=1)
+    prompt_used: str = Field(..., min_length=1)
+
+
+class CharacterBuildMediaRemoveBackgroundRequest(BaseModel):
+    config: ChatConfig
+    raw_asset_id: str = Field(..., min_length=1)
+
+
+class CharacterBuildMediaRemoveBackgroundResponse(BaseModel):
+    raw_asset: PortraitAssetRef
+    bg_removed_asset: PortraitAssetRef
+
+
+class CharacterBuildMediaFinalizeRequest(BaseModel):
+    asset_id: str = Field(..., min_length=1)
+
+
+class CharacterBuildMediaFinalizeResponse(BaseModel):
+    asset: PortraitAssetRef
+
+
+class CharacterBuildMediaDescribeRequest(BaseModel):
+    config: ChatConfig
+    asset_id: str = Field(..., min_length=1)
+    basic_info: CharacterBuildBasicInfo | None = None
+
+
+class CharacterBuildMediaDescribeResponse(BaseModel):
+    description: str = Field(default="", min_length=0)
+    asset_id: str = Field(..., min_length=1)
+    provider: AIProvider
+    model: str = Field(..., min_length=1)
+
+
+class CharacterBuildLoadoutSelection(BaseModel):
+    spell_option_ids: list[str] = Field(default_factory=list)
+    equipment_option_ids: list[str] = Field(default_factory=list)
+    skill_option_ids: list[str] = Field(default_factory=list)
+
+
+class PlayerBuildSeedSummary(BaseModel):
+    archive_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    created_at: str = Field(..., min_length=1)
+    portrait: PortraitAssetRef | None = None
+
+
+class PlayerBuildSeed(BaseModel):
+    archive_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    created_at: str = Field(..., min_length=1)
+    basic_info: CharacterBuildBasicInfo = Field(default_factory=CharacterBuildBasicInfo)
+    specialization: Literal["warrior", "mage"] = "warrior"
+    player_static_data: PlayerStaticData
+
+
+class PlayerBuildSeedListResponse(BaseModel):
+    items: list[PlayerBuildSeedSummary] = Field(default_factory=list)
+
+
+class PlayerBuildSeedResponse(BaseModel):
+    seed: PlayerBuildSeed
+
+
+class CompanionBuildSeedSummary(BaseModel):
+    retained_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    retained_at: str = Field(..., min_length=1)
+    portrait: PortraitAssetRef | None = None
+
+
+class CompanionBuildSeedListResponse(BaseModel):
+    items: list[CompanionBuildSeedSummary] = Field(default_factory=list)
+
+
+class CompanionBuildSeedResponse(BaseModel):
+    retained_id: str = Field(..., min_length=1)
+    retained_at: str = Field(..., min_length=1)
+    role: NpcRoleCard
+
+
+class CharacterBuildPlayerCompleteRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    basic_info: CharacterBuildBasicInfo
+    specialization: Literal["warrior", "mage"] = "warrior"
+    ability_scores: Dnd5eAbilityScores = Field(default_factory=Dnd5eAbilityScores)
+    final_portrait_asset_id: str = Field(..., min_length=1)
+    appearance: str = Field(default="", min_length=0)
+    loadout: CharacterBuildLoadoutSelection = Field(default_factory=CharacterBuildLoadoutSelection)
+
+
+class CharacterBuildPlayerCompleteResponse(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    player: PlayerStaticData
+    state: CharacterBuildState = Field(default_factory=CharacterBuildState)
+    archive_id: str = Field(..., min_length=1)
+
+
+class CharacterBuildCompanionCompleteRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    basic_info: CharacterBuildBasicInfo
+    specialization: Literal["warrior", "mage"] = "warrior"
+    ability_scores: Dnd5eAbilityScores = Field(default_factory=Dnd5eAbilityScores)
+    final_portrait_asset_id: str = Field(..., min_length=1)
+    appearance: str = Field(default="", min_length=0)
+    loadout: CharacterBuildLoadoutSelection = Field(default_factory=CharacterBuildLoadoutSelection)
+    flavor: CharacterBuildCompanionFlavor = Field(default_factory=CharacterBuildCompanionFlavor)
+
+
+class CharacterBuildCompanionCompleteResponse(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    role: NpcRoleCard
+    member: TeamMember
+    retained_id: str = Field(..., min_length=1)
+
+
+class CharacterBuildCompanionOfferRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    seen: bool = True
+
+
+class DebugSaveResetRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+
+
+class DebugSaveResetResponse(BaseModel):
+    ok: bool = True
+    session_id: str = Field(..., min_length=1)
+    save: SaveFile
+    cleared_active_encounter_ids: list[str] = Field(default_factory=list)
+    cleared_pending_encounter_ids: list[str] = Field(default_factory=list)
+    cleared_public_round_ids: list[str] = Field(default_factory=list)
+    cleared_recent_turn_count: int = Field(default=0, ge=0)
+    cleared_team_member_role_ids: list[str] = Field(default_factory=list)
+    cleared_pending_turn: bool = False
+    summary: str = Field(default="", min_length=0)
 
 
 class RegionGenerateRequest(BaseModel):
@@ -934,10 +2616,19 @@ class RegionGenerateResponse(BaseModel):
     zones: list[Zone]
 
 
+class MapRenderPayload(BaseModel):
+    viewport: dict[str, int]
+    nodes: list["RenderNode"]
+    sub_nodes: list["RenderSubNode"] = Field(default_factory=list)
+    circles: list["RenderCircle"] = Field(default_factory=list)
+    player_marker: dict[str, int]
+
+
 class RenderMapRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     zones: list[Zone] = Field(default_factory=list)
     player_position: Position
+    zone_metric_state: ZoneMetricState | None = None
 
 
 class RenderNode(BaseModel):
@@ -960,6 +2651,9 @@ class RenderCircle(BaseModel):
     center_x: int
     center_y: int
     radius_m: int
+    danger_score: int | None = None
+    danger_band: Literal["low", "medium", "high"] | None = None
+    fill_color: str | None = None
 
 
 class RenderMapResponse(BaseModel):
@@ -969,6 +2663,11 @@ class RenderMapResponse(BaseModel):
     sub_nodes: list[RenderSubNode] = Field(default_factory=list)
     circles: list[RenderCircle] = Field(default_factory=list)
     player_marker: dict[str, int]
+
+
+class MapNarrativePayload(BaseModel):
+    text: str = Field(default="", min_length=0)
+    source: Literal["ai", "deterministic", "none"] = "none"
 
 
 class MovementLog(BaseModel):
@@ -983,6 +2682,8 @@ class MoveRequest(BaseModel):
     from_zone_id: str = Field(..., min_length=1)
     to_zone_id: str = Field(..., min_length=1)
     player_name: str | None = None
+    config: ChatConfig | None = None
+    config: ChatConfig | None = None
 
 
 class MoveResponse(BaseModel):
@@ -990,6 +2691,16 @@ class MoveResponse(BaseModel):
     new_position: Position
     duration_min: int
     movement_log: MovementLog
+
+
+class MapPostChecksBundle(BaseModel):
+    trigger_kind: Literal["random_move", "random_dialog", "scripted", "quest_rule", "fate_rule", "debug_forced"] | None = None
+    quests_evaluated: bool = False
+    fate_evaluated: bool = False
+    encounter_checked: bool = False
+    encounter_generated: bool = False
+    generated_encounter_id: str | None = None
+    blocked_by_higher_priority_modal: bool = False
 
 
 class BehaviorDescribeRequest(BaseModel):
@@ -1104,6 +2815,8 @@ class EncounterEntry(BaseModel):
     encounter_mode: Literal["standard", "npc_initiated_chat"] = "standard"
     title: str = Field(..., min_length=1)
     description: str = Field(..., min_length=1)
+    goal: str = Field(default="", min_length=0)
+    secret: str = Field(default="", min_length=0)
     zone_id: str | None = None
     sub_zone_id: str | None = None
     npc_role_id: str | None = None
@@ -1136,7 +2849,10 @@ class EncounterTemporaryNpc(BaseModel):
     description: str = Field(default="", min_length=0)
     speaking_style: str = Field(default="", min_length=0)
     agenda: str = Field(default="", min_length=0)
+    knows_secret: bool = False
     state: str = Field(default="active", min_length=1)
+    zone_id: str | None = None
+    sub_zone_id: str | None = None
     introduced_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -1150,11 +2866,12 @@ class EncounterTerminationCondition(BaseModel):
 
 class EncounterStepEntry(BaseModel):
     step_id: str = Field(..., min_length=1)
-    kind: Literal["announcement", "player_action", "gm_update", "npc_reaction", "team_reaction", "temp_npc_action", "escape_attempt", "background_tick", "resolution"] = "gm_update"
+    kind: Literal["announcement", "player_action", "gm_update", "npc_reaction", "team_reaction", "temp_npc_action", "escape_attempt", "background_tick", "world_push", "resolution"] = "gm_update"
     actor_type: Literal["player", "npc", "team", "encounter_temp_npc", "system"] = "system"
     actor_id: str = Field(default="", min_length=0)
     actor_name: str = Field(default="", min_length=0)
     content: str = Field(..., min_length=1)
+    metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -1179,6 +2896,157 @@ class EncounterState(BaseModel):
     history: list[EncounterResolution] = Field(default_factory=list)
     debug_force_trigger: bool = False
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class PublicEncounterTemporaryNpc(BaseModel):
+    encounter_npc_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    title: str = Field(default="", min_length=0)
+    description: str = Field(default="", min_length=0)
+    speaking_style: str = Field(default="", min_length=0)
+    agenda: str = Field(default="", min_length=0)
+    state: str = Field(default="active", min_length=1)
+    zone_id: str | None = None
+    sub_zone_id: str | None = None
+    introduced_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class PublicEncounterTerminationCondition(BaseModel):
+    condition_id: str = Field(..., min_length=1)
+    kind: Literal["npc_leaves", "player_escapes", "target_resolved", "time_elapsed", "manual_custom"] = "manual_custom"
+    description: str = Field(..., min_length=1)
+    satisfied: bool = False
+    satisfied_at: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_internal_condition(cls, value: Any) -> Any:
+        if isinstance(value, EncounterTerminationCondition):
+            return {
+                "condition_id": value.condition_id,
+                "kind": value.kind,
+                "description": value.description,
+                "satisfied": value.satisfied,
+                "satisfied_at": value.satisfied_at,
+            }
+        return value
+
+
+class PublicEncounterEntry(BaseModel):
+    encounter_id: str = Field(..., min_length=1)
+    type: Literal["npc", "event", "anomaly"] = "event"
+    source_world_revision: int = Field(default=1, ge=1)
+    source_map_revision: int = Field(default=1, ge=1)
+    entity_refs: list[EntityRef] = Field(default_factory=list)
+    invalidated_reason: str | None = None
+    status: Literal["queued", "active", "resolved", "expired", "invalidated"] = "queued"
+    trigger_kind: Literal["random_move", "random_dialog", "scripted", "quest_rule", "fate_rule", "debug_forced"] = "random_move"
+    encounter_mode: Literal["standard", "npc_initiated_chat"] = "standard"
+    title: str = Field(..., min_length=1)
+    description: str = Field(..., min_length=1)
+    goal: str = Field(default="", min_length=0)
+    zone_id: str | None = None
+    sub_zone_id: str | None = None
+    npc_role_id: str | None = None
+    related_quest_ids: list[str] = Field(default_factory=list)
+    related_fate_phase_ids: list[str] = Field(default_factory=list)
+    participant_role_ids: list[str] = Field(default_factory=list)
+    temporary_npcs: list["PublicEncounterTemporaryNpc"] = Field(default_factory=list)
+    generated_prompt_tags: list[str] = Field(default_factory=list)
+    allow_player_prompt: bool = True
+    termination_conditions: list["PublicEncounterTerminationCondition"] = Field(default_factory=list)
+    steps: list["EncounterStepEntry"] = Field(default_factory=list)
+    scene_summary: str = Field(default="", min_length=0)
+    situation_start_value: int = Field(default=50, ge=0, le=100)
+    situation_value: int = Field(default=50, ge=0, le=100)
+    situation_trend: Literal["improving", "stable", "worsening"] = "stable"
+    last_outcome_package: "EncounterOutcomePackage | None" = None
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    presented_at: str | None = None
+    resolved_at: str | None = None
+    last_advanced_at: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_internal_encounter(cls, value: Any) -> Any:
+        if isinstance(value, EncounterEntry):
+            return {
+                "encounter_id": value.encounter_id,
+                "type": value.type,
+                "source_world_revision": value.source_world_revision,
+                "source_map_revision": value.source_map_revision,
+                "entity_refs": value.entity_refs,
+                "invalidated_reason": value.invalidated_reason,
+                "status": "active" if value.status == "escaped" else value.status,
+                "trigger_kind": value.trigger_kind,
+                "encounter_mode": value.encounter_mode,
+                "title": value.title,
+                "description": value.description,
+                "goal": value.goal,
+                "zone_id": value.zone_id,
+                "sub_zone_id": value.sub_zone_id,
+                "npc_role_id": value.npc_role_id,
+                "related_quest_ids": value.related_quest_ids,
+                "related_fate_phase_ids": value.related_fate_phase_ids,
+                "participant_role_ids": value.participant_role_ids,
+                "temporary_npcs": [
+                    {
+                        "temp_id": temp.temp_id,
+                        "name": temp.name,
+                        "title": temp.title,
+                        "description": temp.description,
+                        "speaking_style": temp.speaking_style,
+                        "agenda": temp.agenda,
+                        "appearance": temp.appearance,
+                        "alignment": temp.alignment,
+                        "likes": list(temp.likes),
+                        "introduced_at": temp.introduced_at,
+                    }
+                    for temp in value.temporary_npcs
+                ],
+                "generated_prompt_tags": value.generated_prompt_tags,
+                "allow_player_prompt": value.allow_player_prompt,
+                "termination_conditions": value.termination_conditions,
+                "steps": value.steps,
+                "scene_summary": value.scene_summary,
+                "situation_start_value": value.situation_start_value,
+                "situation_value": value.situation_value,
+                "situation_trend": value.situation_trend,
+                "last_outcome_package": value.last_outcome_package,
+                "created_at": value.created_at,
+                "presented_at": value.presented_at,
+                "resolved_at": value.resolved_at,
+                "last_advanced_at": value.last_advanced_at,
+            }
+        if isinstance(value, dict) and value.get("status") == "escaped":
+            value = dict(value)
+            value["status"] = "active"
+        return value
+
+
+class PublicEncounterState(BaseModel):
+    version: str = Field(default="0.1.0")
+    pending_ids: list[str] = Field(default_factory=list)
+    active_encounter_id: str | None = None
+    encounters: list[PublicEncounterEntry] = Field(default_factory=list)
+    history: list["EncounterResolution"] = Field(default_factory=list)
+    debug_force_trigger: bool = False
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_internal_state(cls, value: Any) -> Any:
+        if isinstance(value, EncounterState):
+            return {
+                "version": value.version,
+                "pending_ids": list(value.pending_ids),
+                "active_encounter_id": value.active_encounter_id,
+                "encounters": [PublicEncounterEntry.model_validate(item) for item in value.encounters],
+                "history": value.history,
+                "debug_force_trigger": value.debug_force_trigger,
+                "updated_at": value.updated_at,
+            }
+        return value
 
 
 class FateTriggerCondition(BaseModel):
@@ -1238,6 +3106,7 @@ class TokenUsageSources(BaseModel):
     chat: TokenUsageBucket = Field(default_factory=TokenUsageBucket)
     map_generation: TokenUsageBucket = Field(default_factory=TokenUsageBucket)
     movement_narration: TokenUsageBucket = Field(default_factory=TokenUsageBucket)
+    encounter_location_generation: TokenUsageBucket = Field(default_factory=TokenUsageBucket)
 
 
 class TokenUsageResponse(BaseModel):
@@ -1289,6 +3158,52 @@ class AreaMoveResult(BaseModel):
     movement_feedback: str = Field(..., min_length=1)
 
 
+class MapStateSyncBundle(BaseModel):
+    map_snapshot: MapSnapshot
+    area_snapshot: AreaSnapshot
+    render: MapRenderPayload
+    world_state: WorldState
+    player_static_data: PlayerStaticData
+    player_runtime_data: PlayerRuntimeData
+    role_pool: list[NpcRoleCard] = Field(default_factory=list)
+    current_reputation: SubZoneReputationEntry | None = None
+    current_zone_metric: ZoneMetricEntry | None = None
+    zone_metric_state: ZoneMetricState = Field(default_factory=ZoneMetricState)
+    quest_state: QuestState
+    pending_offers: list[QuestEntry] = Field(default_factory=list)
+    tracked_quest: QuestEntry | None = None
+    encounter_state: EncounterState
+    pending_encounters: list[EncounterEntry] = Field(default_factory=list)
+    active_encounter: EncounterEntry | None = None
+    fate_state: FateState
+    team_state: TeamState
+    team_members: list[TeamMember] = Field(default_factory=list)
+    game_logs: list[GameLogEntry] = Field(default_factory=list)
+
+
+class MapBootstrapResponse(BaseModel):
+    ok: bool = True
+    operation: Literal["bootstrap"] = "bootstrap"
+    generated: bool = False
+    narration: MapNarrativePayload = Field(default_factory=MapNarrativePayload)
+    state_sync: MapStateSyncBundle
+
+
+class MoveResolvedResponse(MoveResponse):
+    narration: MapNarrativePayload = Field(default_factory=MapNarrativePayload)
+    post_checks: MapPostChecksBundle = Field(default_factory=MapPostChecksBundle)
+    state_sync: MapStateSyncBundle
+    scene_events: list[SceneEvent] = Field(default_factory=list)
+    main_turn_summary: MainTurnSummary | None = None
+    current_zone_metric: ZoneMetricEntry | None = None
+
+
+class AreaMoveResolvedResponse(AreaMoveResult):
+    narration: MapNarrativePayload = Field(default_factory=MapNarrativePayload)
+    post_checks: MapPostChecksBundle = Field(default_factory=MapPostChecksBundle)
+    state_sync: MapStateSyncBundle
+
+
 class AreaDiscoverInteractionsRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     sub_zone_id: str = Field(..., min_length=1)
@@ -1305,12 +3220,122 @@ class AreaDiscoverInteractionsResponse(BaseModel):
 class AreaExecuteInteractionRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     interaction_id: str = Field(..., min_length=1)
+    action_kind: str = Field(default="inspect", min_length=1)
+    actor_kind: Literal["player", "role"] = "player"
+    actor_role_id: str | None = None
+    item_instance_id: str | None = None
+    prompt: str = Field(default="", min_length=0)
+    action_check: "ActionCheckResponse | None" = None
+    config: ChatConfig | None = None
 
 
 class AreaExecuteInteractionResponse(BaseModel):
     ok: bool = True
-    status: Literal["placeholder"] = "placeholder"
+    status: Literal["placeholder", "ok", "fallback"] = "placeholder"
     message: str = Field(default="待开发", min_length=1)
+    reply: str = Field(default="", min_length=0)
+    scene_events: list[SceneEvent] = Field(default_factory=list)
+    inventory_changes: list[dict[str, Any]] = Field(default_factory=list)
+    interactable_updates: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class AreaDiscoverInteractionsResolvedResponse(AreaDiscoverInteractionsResponse):
+    narration: MapNarrativePayload = Field(default_factory=MapNarrativePayload)
+    state_sync: MapStateSyncBundle
+
+
+class AreaExecuteInteractionResolvedResponse(AreaExecuteInteractionResponse):
+    state_sync: MapStateSyncBundle
+
+
+class TemplateLibraryStatusResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    template_dir: str
+    item_definition_count: int = Field(default=0, ge=0)
+    equipment_definition_count: int = Field(default=0, ge=0)
+    spell_definition_count: int = Field(default=0, ge=0)
+    war_art_definition_count: int = Field(default=0, ge=0)
+    interactable_template_count: int = Field(default=0, ge=0)
+    last_filled_at: str | None = None
+
+
+class TemplateLibraryDefinitionsRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    kind: Literal["spell", "war_art", "all"] = "all"
+    definition_ids: list[str] = Field(default_factory=list)
+    recommended_class: str | None = None
+    min_level: int | None = Field(default=None, ge=1, le=20)
+    for_role_id: str | None = None
+    limit: int = Field(default=20, ge=1, le=200)
+
+
+class TemplateLibraryDefinitionsResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    kind: Literal["spell", "war_art", "all"] = "all"
+    spell_definitions: list[SpellDefinition] = Field(default_factory=list)
+    war_art_definitions: list[WarArtDefinition] = Field(default_factory=list)
+
+
+class TemplateLibraryFillRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    fill_scope: Literal["all", "spells"] = "all"
+    spell_fill_count: int = Field(default=20, ge=1, le=100)
+    config: ChatConfig | None = None
+
+
+class TemplateLibraryFillResponse(TemplateLibraryStatusResponse):
+    appended_item_definition_ids: list[str] = Field(default_factory=list)
+    appended_equipment_definition_ids: list[str] = Field(default_factory=list)
+    appended_spell_definition_ids: list[str] = Field(default_factory=list)
+    appended_war_art_definition_ids: list[str] = Field(default_factory=list)
+    appended_interactable_template_ids: list[str] = Field(default_factory=list)
+    updated_item_definition_ids: list[str] = Field(default_factory=list)
+    updated_equipment_definition_ids: list[str] = Field(default_factory=list)
+    updated_spell_definition_ids: list[str] = Field(default_factory=list)
+    updated_war_art_definition_ids: list[str] = Field(default_factory=list)
+    updated_interactable_template_ids: list[str] = Field(default_factory=list)
+
+
+class RoleCapabilityAbilityEntry(BaseModel):
+    definition_id: str = Field(default="", min_length=0)
+    name: str = Field(default="", min_length=0)
+    kind: Literal["spell", "war_art"] = "spell"
+    resource_cost: int = Field(default=0, ge=0)
+    cooldown_rounds: int = Field(default=0, ge=0)
+    cooldown_remaining: int = Field(default=0, ge=0)
+    available_now: bool = True
+    summary: str = Field(default="", min_length=0)
+
+
+class RoleCapabilitySnapshot(BaseModel):
+    role_id: str = Field(..., min_length=1)
+    role_name: str = Field(..., min_length=1)
+    actor_kind: Literal["player", "npc"] = "npc"
+    char_class: str = Field(default="", min_length=0)
+    level: int = Field(default=1, ge=1, le=20)
+    spells_known: list[str] = Field(default_factory=list)
+    war_arts_known: list[str] = Field(default_factory=list)
+    spell_slots_current: dict[str, int] = Field(default_factory=dict)
+    spell_slots_max: dict[str, int] = Field(default_factory=dict)
+    martial_points_current: int = Field(default=0, ge=0)
+    martial_points_maximum: int = Field(default=0, ge=0)
+    war_art_cooldowns: dict[str, int] = Field(default_factory=dict)
+    equipped_weapon_name: str | None = None
+    equipped_armor_name: str | None = None
+    available_abilities: list[RoleCapabilityAbilityEntry] = Field(default_factory=list)
+
+
+class RoleCapabilityResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    role_id: str = Field(..., min_length=1)
+    snapshot: RoleCapabilitySnapshot
+
+
+class DebugPlayerZeroHpRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
 
 
 class RolePoolListResponse(BaseModel):
@@ -1364,12 +3389,96 @@ class NpcChatResponse(BaseModel):
     scene_events: list[SceneEvent] = Field(default_factory=list)
 
 
+class PlayerInputValidationRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    entry_point: Literal[
+        "main_chat",
+        "npc_chat",
+        "teammate_chat",
+        "public_turn_action",
+        "public_turn_interaction_response",
+        "public_turn_attack_response",
+        "debug_panel",
+    ]
+    action_text: str = Field(default="", min_length=0)
+    speech_text: str = Field(default="", min_length=0)
+    actor_role_id: str | None = None
+    config: ChatConfig | None = None
+
+
+class PlayerInputValidationIssue(BaseModel):
+    code: Literal[
+        "multiple_world_actions",
+        "claimed_outcome",
+        "controls_other_actor",
+        "spell_not_known",
+        "spell_slot_insufficient",
+        "war_art_not_known",
+        "war_art_points_insufficient",
+        "war_art_requires_weapon",
+        "item_not_owned",
+        "speech_only_required",
+        "actor_dead",
+    ]
+    message: str = Field(..., min_length=1)
+    field: Literal["action_text", "speech_text", "both"] = "action_text"
+
+
+class PlayerInputResourceStatus(BaseModel):
+    check_status: Literal["not_applicable", "passed", "failed"] = "not_applicable"
+    resource_kind: Literal["none", "spell", "war_art", "item"] = "none"
+    mentioned_name: str = Field(default="", min_length=0)
+    resolved_name: str = Field(default="", min_length=0)
+    resolved_definition_id: str | None = None
+    required_amount: int | None = Field(default=None, ge=0)
+    current_amount: int | None = Field(default=None, ge=0)
+    requirement_summary: str = Field(default="", min_length=0)
+    current_summary: str = Field(default="", min_length=0)
+
+
+class PlayerInputValidationResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    entry_point: Literal[
+        "main_chat",
+        "npc_chat",
+        "teammate_chat",
+        "public_turn_action",
+        "public_turn_interaction_response",
+        "public_turn_attack_response",
+        "debug_panel",
+    ]
+    actor_role_id: str
+    actor_name: str
+    actor_kind: Literal["player", "npc"] = "player"
+    status: Literal["accepted", "needs_player_confirmation"] = "accepted"
+    normalized_action_text: str = Field(default="", min_length=0)
+    normalized_speech_text: str = Field(default="", min_length=0)
+    fallback_action_text: str = Field(default="", min_length=0)
+    display_text: str = Field(default="", min_length=0)
+    summary: str = Field(default="", min_length=0)
+    issues: list[PlayerInputValidationIssue] = Field(default_factory=list)
+    resource_status: PlayerInputResourceStatus = Field(default_factory=PlayerInputResourceStatus)
+
+
 class ActionCheckRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     action_type: Literal["attack", "check", "item_use"] = "check"
+    check_mode: Literal["action", "reaction_save"] = "action"
     action_prompt: str = Field(..., min_length=1)
     actor_role_id: str | None = None
+    pending_turn_id: str | None = None
+    source_label: str | None = None
+    threatened_consequence: str | None = None
+    source_context: Literal["generic", "public_turn"] = "generic"
+    resolution_rule: Literal["static_dc", "opposed_actor"] = "static_dc"
+    target_role_id: str | None = None
+    target_name: str | None = None
+    target_actor_kind: Literal["player", "npc"] | None = None
+    target_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
+    target_ability_modifier: int | None = None
     forced_dice_roll: int | None = Field(default=None, ge=1, le=20)
+    forced_target_dice_roll: int | None = Field(default=None, ge=1, le=20)
     allow_backend_roll: bool = False
     resolution_context: Literal["standalone", "embedded"] = "standalone"
     planned_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
@@ -1377,14 +3486,20 @@ class ActionCheckRequest(BaseModel):
     planned_time_spent_min: int | None = Field(default=None, ge=1, le=180)
     planned_requires_check: bool | None = None
     planned_check_task: str | None = None
+    return_state_sync: bool = False
+    post_trigger_kind: Literal["random_move", "random_dialog", "scripted", "quest_rule", "fate_rule", "debug_forced"] | None = None
     config: ChatConfig | None = None
 
 
 class ActionCheckPlanRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
-    action_type: Literal["attack", "check", "item_use"] = "check"
+    action_type: Literal["attack", "check", "item_use", "auto"] = "check"
+    check_mode: Literal["action", "reaction_save"] = "action"
     action_prompt: str = Field(..., min_length=1)
     actor_role_id: str | None = None
+    source_label: str | None = None
+    threatened_consequence: str | None = None
+    source_context: Literal["generic", "public_turn"] = "generic"
     config: ChatConfig | None = None
 
 
@@ -1395,12 +3510,28 @@ class ActionCheckPlanResponse(BaseModel):
     actor_name: str
     actor_kind: Literal["player", "npc"] = "player"
     action_type: Literal["attack", "check", "item_use"]
+    check_mode: Literal["action", "reaction_save"] = "action"
+    source_context: Literal["generic", "public_turn"] = "generic"
+    resolution_rule: Literal["static_dc", "opposed_actor"] = "static_dc"
     requires_check: bool
     ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"]
     ability_modifier: int
     dc: int
     time_spent_min: int = Field(ge=1)
     check_task: str = Field(default="", min_length=0)
+    source_label: str | None = None
+    threatened_consequence: str | None = None
+    target_role_id: str | None = None
+    target_name: str | None = None
+    target_actor_kind: Literal["player", "npc"] | None = None
+    target_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
+    target_ability_modifier: int | None = None
+    public_turn_interaction_kind: Literal["generic", "information_gathering", "social_influence", "intimidation"] | None = None
+    public_turn_notice_state: Literal["hidden", "noticed", "obvious"] | None = None
+    public_turn_resolution_mode: Literal["static_dc", "opposed_actor", "opposed_then_information_dc"] | None = None
+    followup_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
+    followup_dc: int | None = Field(default=None, ge=1, le=40)
+    followup_check_task: str | None = None
 
 
 class ActionCheckResponse(BaseModel):
@@ -1410,13 +3541,26 @@ class ActionCheckResponse(BaseModel):
     actor_name: str
     actor_kind: Literal["player", "npc"] = "player"
     action_type: Literal["attack", "check", "item_use"]
+    check_mode: Literal["action", "reaction_save"] = "action"
+    source_context: Literal["generic", "public_turn"] = "generic"
+    resolution_rule: Literal["static_dc", "opposed_actor"] = "static_dc"
     requires_check: bool
     ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"]
     ability_modifier: int
     dc: int
     check_task: str = Field(default="", min_length=0)
+    source_label: str | None = None
+    threatened_consequence: str | None = None
+    target_role_id: str | None = None
+    target_name: str | None = None
+    target_actor_kind: Literal["player", "npc"] | None = None
+    target_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
+    target_ability_modifier: int | None = None
     dice_roll: int | None = None
     total_score: int | None = None
+    target_dice_roll: int | None = None
+    target_total_score: int | None = None
+    contested_success: bool | None = None
     success: bool
     critical: Literal["none", "critical_success", "critical_failure"] = "none"
     time_spent_min: int = Field(ge=1)
@@ -1424,6 +3568,8 @@ class ActionCheckResponse(BaseModel):
     applied_effects: list[str] = Field(default_factory=list)
     relation_tag_suggestion: str | None = None
     scene_events: list[SceneEvent] = Field(default_factory=list)
+    state_sync: MapStateSyncBundle | None = None
+    post_checks: MapPostChecksBundle | None = None
 
 
 class QuestDraft(BaseModel):
@@ -1495,15 +3641,15 @@ class EncounterCheckResponse(BaseModel):
     generated: bool = False
     encounter_id: str | None = None
     blocked_by_higher_priority_modal: bool = False
-    encounter: EncounterEntry | None = None
+    encounter: PublicEncounterEntry | None = None
 
 
 class EncounterPendingResponse(BaseModel):
     ok: bool = True
     session_id: str
-    encounter_state: EncounterState
-    pending: list[EncounterEntry] = Field(default_factory=list)
-    active_encounter: EncounterEntry | None = None
+    encounter_state: PublicEncounterState
+    pending: list[PublicEncounterEntry] = Field(default_factory=list)
+    active_encounter: PublicEncounterEntry | None = None
 
 
 class EncounterHistoryResponse(BaseModel):
@@ -1520,8 +3666,8 @@ class EncounterPresentResponse(BaseModel):
     ok: bool = True
     session_id: str
     encounter_id: str
-    status: Literal["queued", "active", "resolved", "escaped", "expired", "invalidated"]
-    encounter: EncounterEntry
+    status: Literal["queued", "active", "resolved", "expired", "invalidated"]
+    encounter: PublicEncounterEntry
 
 
 class EncounterActRequest(BaseModel):
@@ -1534,12 +3680,12 @@ class EncounterActResponse(BaseModel):
     ok: bool = True
     session_id: str
     encounter_id: str
-    status: Literal["queued", "active", "resolved", "escaped", "expired", "invalidated"]
+    status: Literal["queued", "active", "resolved", "expired", "invalidated"]
     reply: str = Field(..., min_length=1)
     time_spent_min: int = Field(default=1, ge=1)
-    encounter: EncounterEntry
+    encounter: PublicEncounterEntry
     resolution: EncounterResolution
-    encounter_state: EncounterState
+    encounter_state: PublicEncounterState
 
 
 class EncounterForceToggleRequest(BaseModel):
@@ -1563,13 +3709,21 @@ class EncounterEscapeResponse(BaseModel):
     ok: bool = True
     session_id: str
     encounter_id: str
-    status: Literal["active", "escaped", "resolved", "expired", "invalidated"]
+    status: Literal["active", "resolved", "expired", "invalidated"]
     reply: str = Field(..., min_length=1)
     time_spent_min: int = Field(default=1, ge=1)
     escape_success: bool = False
-    encounter: EncounterEntry
-    encounter_state: EncounterState
+    encounter: PublicEncounterEntry
+    encounter_state: PublicEncounterState
     action_check: ActionCheckResponse | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_status(cls, value: Any) -> Any:
+        if isinstance(value, dict) and value.get("status") == "escaped":
+            value = dict(value)
+            value["status"] = "active"
+        return value
 
 
 class EncounterRejoinRequest(BaseModel):
@@ -1581,17 +3735,17 @@ class EncounterRejoinResponse(BaseModel):
     ok: bool = True
     session_id: str
     encounter_id: str
-    status: Literal["active", "escaped", "resolved", "expired", "invalidated"]
+    status: Literal["active", "resolved", "expired", "invalidated"]
     reply: str = Field(..., min_length=1)
-    encounter: EncounterEntry
-    encounter_state: EncounterState
+    encounter: PublicEncounterEntry
+    encounter_state: PublicEncounterState
 
 
 class EncounterDebugOverviewResponse(BaseModel):
     ok: bool = True
     session_id: str
-    active_encounter: EncounterEntry | None = None
-    queued_encounters: list[EncounterEntry] = Field(default_factory=list)
+    active_encounter: PublicEncounterEntry | None = None
+    queued_encounters: list[PublicEncounterEntry] = Field(default_factory=list)
     summary: str = Field(default="", min_length=0)
 
 
@@ -1651,6 +3805,160 @@ class PublicSceneStateResponse(BaseModel):
     ok: bool = True
     session_id: str
     public_scene_state: PublicSceneState
+
+
+class PublicTurnStateResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    public_turn_state: PublicTurnState
+
+
+class PublicTurnEntryRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    entry_type: PublicTurnEntryType
+    player_action: str | None = None
+    config: ChatConfig | None = None
+
+
+class PublicTurnPlayerActionCheck(BaseModel):
+    action_type: Literal["attack", "check", "item_use"] = "check"
+    source_context: Literal["generic", "public_turn"] = "public_turn"
+    resolution_rule: Literal["static_dc", "opposed_actor"] = "static_dc"
+    planned_requires_check: bool = False
+    planned_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
+    planned_dc: int | None = Field(default=None, ge=5, le=30)
+    planned_time_spent_min: int | None = Field(default=None, ge=1, le=180)
+    planned_check_task: str | None = None
+    forced_dice_roll: int | None = Field(default=None, ge=1, le=20)
+    target_role_id: str | None = None
+    target_name: str | None = None
+    target_actor_kind: Literal["player", "npc"] | None = None
+    target_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
+    target_ability_modifier: int | None = None
+    public_turn_interaction_kind: Literal["generic", "information_gathering", "social_influence", "intimidation"] | None = None
+    public_turn_notice_state: Literal["hidden", "noticed", "obvious"] | None = None
+    public_turn_resolution_mode: Literal["static_dc", "opposed_actor", "opposed_then_information_dc"] | None = None
+    followup_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] | None = None
+    followup_dc: int | None = Field(default=None, ge=1, le=40)
+    followup_check_task: str | None = None
+
+
+class PublicTurnContinueRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    action_submission: PublicTurnActionSubmission | None = None
+    player_interaction_response: PublicTurnInteractionResponseSubmission | None = None
+    player_attack_response: PublicTurnAttackResponseSubmission | None = None
+    player_action_check: PublicTurnPlayerActionCheck | None = None
+    config: ChatConfig | None = None
+
+
+class PublicTurnReactionCheckRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    check_id: str = Field(..., min_length=1)
+    forced_dice_roll: int = Field(..., ge=1, le=20)
+    config: ChatConfig | None = None
+
+
+class PublicTurnDeathSaveResolveRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    prompt_id: str = Field(..., min_length=1)
+    forced_dice_roll: int = Field(..., ge=1, le=20)
+    config: ChatConfig | None = None
+
+
+class PublicTurnOpposedPlanRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    round_id: str = Field(..., min_length=1)
+    check_id: str = Field(..., min_length=1)
+    source_actor_id: str = Field(..., min_length=1)
+    target_actor_id: str = Field(..., min_length=1)
+    source_action_summary: str = Field(default="", min_length=0)
+    source_speech_text: str = Field(default="", min_length=0)
+    target_action_summary: str = Field(default="", min_length=0)
+    target_speech_text: str = Field(default="", min_length=0)
+    config: ChatConfig | None = None
+
+
+class PublicTurnOpposedPlanResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    round_id: str = Field(..., min_length=1)
+    check_id: str = Field(..., min_length=1)
+    resolution_rule: Literal["opposed_actor"] = "opposed_actor"
+    source_actor_id: str = Field(..., min_length=1)
+    source_actor_name: str = Field(..., min_length=1)
+    source_action_summary: str = Field(default="", min_length=0)
+    source_speech_text: str = Field(default="", min_length=0)
+    source_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] = "strength"
+    source_ability_modifier: int = 0
+    target_actor_id: str = Field(..., min_length=1)
+    target_actor_name: str = Field(..., min_length=1)
+    target_action_summary: str = Field(default="", min_length=0)
+    target_speech_text: str = Field(default="", min_length=0)
+    target_ability_used: Literal["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"] = "strength"
+    target_ability_modifier: int = 0
+    check_task: str = Field(default="", min_length=0)
+    stakes_summary: str = Field(default="", min_length=0)
+
+
+class PublicTurnOpposedResolveRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    check_id: str = Field(..., min_length=1)
+    forced_dice_roll: int = Field(..., ge=1, le=20)
+    target_action_summary: str = Field(default="", min_length=0)
+    target_speech_text: str = Field(default="", min_length=0)
+    config: ChatConfig | None = None
+
+
+class PublicTurnInformationCheckResolveRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    prompt_id: str = Field(..., min_length=1)
+    forced_dice_roll: int = Field(..., ge=1, le=20)
+    config: ChatConfig | None = None
+
+
+class PublicTurnAttackDefenseResolveRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    check_id: str = Field(..., min_length=1)
+    forced_dice_roll: int = Field(..., ge=1, le=20)
+    config: ChatConfig | None = None
+
+
+class PublicTurnPresentation(BaseModel):
+    round_id: str = Field(default="", min_length=0)
+    round_number: int = Field(default=0, ge=0)
+    phase: PublicTurnPhase = PublicTurnPhase.IDLE
+    initiative_order: list[PublicTurnInitiativeEntry] = Field(default_factory=list)
+    settlement_entries: list[PublicTurnSettlementEntry] = Field(default_factory=list)
+    gm_push_result: PublicTurnGmPushResult | None = None
+    narrative_entries: list[PublicTurnNarrativeEntry] = Field(default_factory=list)
+    accumulated_narration: str = Field(default="", min_length=0)
+    narrative_status: PublicTurnRoundNarrationStatus = PublicTurnRoundNarrationStatus.EMPTY
+    round_narration: str = Field(default="", min_length=0)
+    round_narration_status: PublicTurnRoundNarrationStatus = PublicTurnRoundNarrationStatus.PENDING
+
+
+class PublicTurnResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    phase: PublicTurnPhase = PublicTurnPhase.IDLE
+    narration: str = Field(default="", min_length=0)
+    scene_events: list[SceneEvent] = Field(default_factory=list)
+    reaction_check: PlayerReactionCheck | None = None
+    public_interaction_prompt: PublicTurnInteractionPrompt | None = None
+    public_attack_prompt: PublicTurnAttackPrompt | None = None
+    public_attack_defense_prompt: PublicTurnAttackDefensePrompt | None = None
+    public_opposed_prompt: PublicTurnOpposedPrompt | None = None
+    public_information_check_prompt: PublicTurnInformationCheckPrompt | None = None
+    death_save_prompt: DeathSavePrompt | None = None
+    round_completed: bool = False
+    awaiting_entry: bool = False
+    public_turn_state: PublicTurnState = Field(default_factory=PublicTurnState)
+    archived_sub_zone_turn_id: str | None = None
+    impacts: list[PublicTurnImpact] = Field(default_factory=list)
+    pending_turn_id: str | None = None
+    player_action_check_result: ActionCheckResponse | None = None
+    presentation: PublicTurnPresentation = Field(default_factory=PublicTurnPresentation)
 
 
 class NpcKnowledgeResponse(BaseModel):
@@ -1722,6 +4030,22 @@ class TeamChatResponse(BaseModel):
     time_spent_min: int = Field(default=1, ge=1)
 
 
+class TeamPrivateChatMemoryGenerateRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    npc_role_id: str = Field(..., min_length=1)
+    source_dialogue_ids: list[str] = Field(default_factory=list)
+    config: ChatConfig | None = None
+
+
+class TeamPrivateChatMemoryGenerateResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    npc_role_id: str
+    memory: NpcPrivateChatMemoryEntry
+    role: NpcRoleCard
+    deduped_existing: bool = False
+
+
 class EntityIndexResponse(BaseModel):
     ok: bool = True
     session_id: str
@@ -1791,8 +4115,28 @@ class InventoryMutationResponse(BaseModel):
     session_id: str
     owner: InventoryOwnerRef
     message: str = Field(default="", min_length=0)
+    item_id: str | None = None
+    amount_changed: int = 0
+    quantity_after: int | None = None
+    uses_left_after: int | None = None
     player: PlayerStaticData | None = None
     role: NpcRoleCard | None = None
+
+
+class InventoryGrantRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    owner: InventoryOwnerRef
+    item: InventoryItem
+    reason: str = Field(default="", min_length=0)
+
+
+class InventoryConsumeRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    owner: InventoryOwnerRef
+    item_id: str = Field(..., min_length=1)
+    amount: int = Field(default=1, ge=1)
+    reason: str = Field(default="", min_length=0)
+    consume_mode: Literal["auto", "quantity", "uses"] = "auto"
 
 
 class InventoryInteractRequest(BaseModel):
@@ -1858,10 +4202,84 @@ class PlayerSpellSlotAdjustRequest(BaseModel):
     amount: int = Field(default=1, ge=1, le=9)
 
 
+class PlayerMartialPointAdjustRequest(BaseModel):
+    amount: int = Field(default=1, ge=1, le=9)
+
+
 class PlayerStaminaAdjustRequest(BaseModel):
     amount: int = Field(default=1, ge=1)
+
+
+class DeathStatusResponse(BaseModel):
+    """获取当前死亡状态响应"""
+    ok: bool = True
+    session_id: str
+    life_status: Literal["healthy", "dying", "stable", "dead"] = "healthy"
+    death_state: PlayerDeathState = Field(default_factory=PlayerDeathState)
+    can_be_stabilized: bool = False
+    nearby_medical_items: list[str] = Field(default_factory=list)
+    nearby_allies: list[str] = Field(default_factory=list)
+
+
+class StabilizeRequest(BaseModel):
+    """尝试稳定濒死玩家请求"""
+    session_id: str = Field(..., min_length=1)
+    target_player_id: str = Field(..., min_length=1)
+    method: Literal["medicine_check", "healing_kit", "spell"] = "medicine_check"
+    item_instance_id: str | None = None
+    medic_role_id: str | None = None
+
+
+class StabilizeResponse(BaseModel):
+    """尝试稳定濒死玩家响应"""
+    ok: bool = True
+    session_id: str
+    success: bool
+    stabilized: bool
+    roll_result: BattleRollResolution | None = None
+    narrative: str = Field(default="", min_length=0)
+    scene_events: list[SceneEvent] = Field(default_factory=list)
+
+
+class ReviveRequest(BaseModel):
+    """执行复活请求"""
+    session_id: str = Field(..., min_length=1)
+    method: Literal["shrine", "item", "teammate"] = "shrine"
+    shrine_zone_id: str | None = None
+    item_instance_id: str | None = None
+    teammate_role_id: str | None = None
+
+
+class ReviveResponse(BaseModel):
+    """执行复活响应"""
+    ok: bool = True
+    session_id: str
+    success: bool
+    method: str = "shrine"
+    penalties_applied: DeathPenalties = Field(default_factory=DeathPenalties)
+    narrative: str = Field(default="", min_length=0)
+    scene_events: list[SceneEvent] = Field(default_factory=list)
+    state_sync: MapStateSyncBundle | None = None
+
+
+class DeathDeclareRequest(BaseModel):
+    """宣告玩家死亡请求（调试/剧情用）"""
+    session_id: str = Field(..., min_length=1)
+    cause: str = Field(default="", min_length=0)
+    is_instant: bool = False
+
+
+class DeathDeclareResponse(BaseModel):
+    """宣告玩家死亡响应"""
+    ok: bool = True
+    session_id: str
+    declared: bool
+    death_state: PlayerDeathState = Field(default_factory=PlayerDeathState)
+    scene_events: list[SceneEvent] = Field(default_factory=list)
 
 
 RoleDesire.model_rebuild()
 PublicSceneState.model_rebuild()
 EncounterEntry.model_rebuild()
+ChatResponse.model_rebuild()
+PendingTurnContinueResponse.model_rebuild()

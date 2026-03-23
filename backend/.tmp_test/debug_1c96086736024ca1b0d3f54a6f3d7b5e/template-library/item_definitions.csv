@@ -1,0 +1,9 @@
+﻿definition_id,name,item_kind,sub_kind,description,rarity,weight,value,stackable,max_stack,use_tags,interaction_tags,combat_tags,effect_prompt_hint
+healing_potion,治疗药水,consumable,healing,一瓶常见的治疗药水，喝下后能恢复少量体力。,common,0.5,50,True,10,heal|drink,pickup|use|give|drop,healing,恢复少量生命值。
+torch,火把,tool,light,普通火把，可用于照明和点燃易燃物。,common,1.0,2,True,5,ignite|light,pickup|use|drop|give,fire,照明、点火、制造轻微火焰威胁。
+legacy_misc_绷带卷,绷带卷,misc,,川洛 随身携带的物品。,common,0.0,5,False,1,,pickup|use|drop|give,,
+legacy_misc_木珠手串,木珠手串,misc,,川洛 随身携带的物品。,common,0.0,7,False,1,,pickup|use|drop|give,,
+legacy_misc_法术书,法术书,misc,,缇儿 随身携带的物品。,common,0.0,5,False,1,,pickup|use|drop|give,,
+legacy_misc_墨水套装,墨水套装,misc,,缇儿 随身携带的物品。,common,0.0,7,False,1,,pickup|use|drop|give,,
+legacy_misc_磨刀石,磨刀石,misc,,zone_a向导岚岑 随身携带的物品。,common,0.0,5,False,1,,pickup|use|drop|give,,
+legacy_misc_水袋,水袋,misc,,zone_a向导岚岑 随身携带的物品。,common,0.0,7,False,1,,pickup|use|drop|give,,

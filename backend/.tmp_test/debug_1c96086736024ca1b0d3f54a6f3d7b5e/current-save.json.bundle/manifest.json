@@ -1,0 +1,43 @@
+{
+  "format": "save_bundle_v1",
+  "version": 1,
+  "updated_at": "2026-03-22T07:35:11.688258+00:00",
+  "parts": {
+    "meta": "meta.json",
+    "world_state": "world_state.json",
+    "map_snapshot": "map_snapshot.json",
+    "area_snapshot": "area_snapshot.json",
+    "player_data": "player_data.json",
+    "game_logs": "game_logs.json",
+    "role_pool": "role_pool.json",
+    "team_state": "team_state.json",
+    "reputation_state": "reputation_state.json",
+    "zone_metric_state": "zone_metric_state.json",
+    "travel_companion_state": "travel_companion_state.json",
+    "item_instance_state": "item_instance_state.json",
+    "scene_interactable_state": "scene_interactable_state.json",
+    "quest_state": "quest_state.json",
+    "encounter_state": "encounter_state.json",
+    "fate_state": "fate_state.json",
+    "character_build_state": "character_build_state.json"
+  },
+  "hashes": {
+    "meta": "15b8037f315e08286ef5d4a962198e944801e4653f686d875dd7bb03311ba46a",
+    "world_state": "a94f97968420d174083a06ae365a9d21b3b191a50f0da62f3de2f878f918bb6d",
+    "map_snapshot": "81232a22ce03c674aaa6fda1dc82969532bea601c87f28279a2b61a8abd661c3",
+    "area_snapshot": "899c703c67739c29823d016f48a9a5bbe3366c46140f4644a50f69f9d135e774",
+    "player_data": "24d504f6e4634054f88226d4ade6fb11f955322c1a76fba555e8b771de43072a",
+    "game_logs": "eef46741adfc3a9f76294d3b78f37a45f113092ac9d44ee77c7a038a88ff09a1",
+    "role_pool": "318e5a3f254da7276b5ca21c758b74d54b2756293af7934707a56d36102e5d61",
+    "team_state": "e84768055e3d8edf49afd89652f7ff4690998d22b39aa3cb6cec552834cd1a6a",
+    "reputation_state": "1d4bd3be3547fd5383c55f653d3ce1eac5b0104c620c0219ae025b7deca02e33",
+    "zone_metric_state": "9e4250aedfa84279971e08ce2353844065f0e59af29600d0d08f4c692ac93557",
+    "travel_companion_state": "386837a7517bdac95f681f645d7ae61e1aff800abf4460dbd96c79a2e7314a3e",
+    "item_instance_state": "b83a6d8c3a91869e2ce4165db216b15f2708c69b7fcfc5f1a02fda524fba2eb3",
+    "scene_interactable_state": "000bee2e66628c8083815211b8d2be786d248fef796bf0061a64f4db65d0f13a",
+    "quest_state": "d6ff637ce05d0f73f4befa7a6ef72e72119e89468ed061b365826df61ef30fe1",
+    "encounter_state": "97e7bd74f32618ad6eeeae5dd1bf77dce428e1a2633f39aa51432adda91fcdbf",
+    "fate_state": "7a4e2ad35b54a89012df67e95d0c4c58b615fb2d520ea4a7e2e3c2bb2b1ffeba",
+    "character_build_state": "65f7b8a4c78ba51493dac93eeafbd13e9217910c9615771d34cc813f7ec77946"
+  }
+}

@@ -5,15 +5,40 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+import time
 from typing import Any
+from uuid import uuid4
 
 from app.models.schemas import PathStatusResponse
+from app.core.user_context import get_current_user
 
 
 @dataclass
 class StoragePaths:
     config_path: Path
     save_path: Path
+
+
+_ATOMIC_WRITE_RETRY_DELAYS = (0.0, 0.02, 0.05, 0.1, 0.2, 0.35)
+
+
+def _path_is_within(root: Path, candidate: Path) -> bool:
+    return candidate == root or root in candidate.parents
+
+
+def _should_reset_path_to_default(
+    path: Path,
+    *,
+    temp_root: Path,
+    backend_tmp_root: Path,
+) -> bool:
+    try:
+        resolved = path.expanduser().resolve()
+    except OSError:
+        return False
+    if _path_is_within(backend_tmp_root, resolved):
+        return True
+    return not resolved.exists() and _path_is_within(temp_root, resolved)
 
 
 class StorageState:
@@ -53,14 +78,12 @@ class StorageState:
             self._persist(paths)
         return paths
 
-    @staticmethod
-    def _should_reset_to_default(path: Path) -> bool:
-        try:
-            temp_root = Path(tempfile.gettempdir()).resolve()
-            resolved = path.expanduser().resolve()
-        except OSError:
-            return False
-        return not resolved.exists() and temp_root in resolved.parents
+    def _should_reset_to_default(self, path: Path) -> bool:
+        return _should_reset_path_to_default(
+            path,
+            temp_root=Path(tempfile.gettempdir()).resolve(),
+            backend_tmp_root=(self._backend_root / ".tmp_test").resolve(),
+        )
 
     def _persist(self, paths: StoragePaths) -> None:
         self._state_path.write_text(
@@ -75,12 +98,24 @@ class StorageState:
             encoding="utf-8",
         )
 
+    def _user_root(self, username: str) -> Path:
+        # per-user data is always stored under repo/data/users/<username>
+        root = self._data_dir / "users" / username
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
     @property
     def config_path(self) -> Path:
+        user = get_current_user()
+        if user:
+            return self._user_root(user) / "config.json"
         return self._paths.config_path
 
     @property
     def save_path(self) -> Path:
+        user = get_current_user()
+        if user:
+            return self._user_root(user) / "current-save.json"
         return self._paths.save_path
 
     def set_config_path(self, raw_path: str) -> Path:
@@ -114,9 +149,25 @@ class StorageState:
 
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp.replace(path)
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+    last_error: PermissionError | None = None
+    for delay in _ATOMIC_WRITE_RETRY_DELAYS:
+        if delay > 0:
+            time.sleep(delay)
+        temp = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
+        try:
+            temp.write_text(serialized, encoding="utf-8")
+            temp.replace(path)
+            return
+        except PermissionError as exc:
+            last_error = exc
+        finally:
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
+    if last_error is not None:
+        raise last_error
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -168,10 +219,15 @@ def _assemble_bundle(bundle_dir: Path, manifest: dict[str, Any]) -> dict[str, An
     role_pool = _read_part("role_pool", {"items": []})
     team_state = _read_part("team_state", {})
     reputation_state = _read_part("reputation_state", {})
+    zone_metric_state = _read_part("zone_metric_state", {})
+    travel_companion_state = _read_part("travel_companion_state", {})
+    item_instance_state = _read_part("item_instance_state", {})
+    scene_interactable_state = _read_part("scene_interactable_state", {})
     world_state = _read_part("world_state", {})
     quest_state = _read_part("quest_state", {})
     encounter_state = _read_part("encounter_state", {})
     fate_state = _read_part("fate_state", {})
+    character_build_state = _read_part("character_build_state", {})
 
     return {
         "version": meta.get("version", "1.2.0"),
@@ -187,9 +243,14 @@ def _assemble_bundle(bundle_dir: Path, manifest: dict[str, Any]) -> dict[str, An
         "role_pool": role_pool.get("items", []),
         "team_state": team_state,
         "reputation_state": reputation_state,
+        "zone_metric_state": zone_metric_state,
+        "travel_companion_state": travel_companion_state,
+        "item_instance_state": item_instance_state,
+        "scene_interactable_state": scene_interactable_state,
         "quest_state": quest_state,
         "encounter_state": encounter_state,
         "fate_state": fate_state,
+        "character_build_state": character_build_state,
     }
 
 
@@ -243,9 +304,14 @@ def write_save_payload(save_path: Path, payload: dict[str, Any]) -> None:
         "role_pool": ("role_pool.json", {"items": payload.get("role_pool", [])}),
         "team_state": ("team_state.json", payload.get("team_state", {})),
         "reputation_state": ("reputation_state.json", payload.get("reputation_state", {})),
+        "zone_metric_state": ("zone_metric_state.json", payload.get("zone_metric_state", {})),
+        "travel_companion_state": ("travel_companion_state.json", payload.get("travel_companion_state", {})),
+        "item_instance_state": ("item_instance_state.json", payload.get("item_instance_state", {})),
+        "scene_interactable_state": ("scene_interactable_state.json", payload.get("scene_interactable_state", {})),
         "quest_state": ("quest_state.json", payload.get("quest_state", {})),
         "encounter_state": ("encounter_state.json", payload.get("encounter_state", {})),
         "fate_state": ("fate_state.json", payload.get("fate_state", {})),
+        "character_build_state": ("character_build_state.json", payload.get("character_build_state", {})),
     }
 
     old_manifest = _load_bundle_manifest(bundle_dir) or {}

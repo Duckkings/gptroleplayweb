@@ -1,0 +1,10 @@
+﻿definition_id,name,equipment_kind,slot_type,damage_dice,damage_type,attack_mode,attack_ability_mode,damage_bonus,attack_bonus,armor_bonus,range_normal,range_long,area_shape,area_radius_m,area_length_m,self_target_policy,two_handed,light,heavy,thrown,finesse,ammunition,description,rarity,weight,value
+rusty_sword,锈剑,weapon,weapon,1d8,slashing,targeted_attack,strength,0,0,0,1,1,none,0,0,never,False,False,False,False,False,False,一把缺乏保养的旧剑，杀伤力尚可。,common,3.0,8
+leather_armor,皮甲,armor,armor,,none,targeted_attack,strength,0,0,2,0,0,none,0,0,never,False,False,False,False,False,False,轻便的皮革护甲，适合普通冒险者。,common,5.0,10
+wooden_shield,木盾,shield,shield,,none,targeted_attack,strength,0,0,1,0,0,none,0,0,never,False,False,False,False,False,False,一面结实但普通的木盾。,common,4.0,6
+legacy_weapon_短棍,短棍,weapon,weapon,1d8,weapon,targeted_attack,strength,0,1,0,1,1,none,0,0,never,False,False,False,False,False,False,便于训练的武器,common,0.0,25
+legacy_armor_练功服,练功服,armor,armor,,none,targeted_attack,strength,0,0,0,1,1,none,0,0,never,False,False,False,False,False,False,并非真正护甲,common,0.0,27
+legacy_weapon_法杖,法杖,weapon,weapon,1d8,weapon,targeted_attack,strength,0,1,0,1,1,none,0,0,never,False,False,False,False,False,False,施法与自卫兼用,common,0.0,19
+legacy_armor_法袍,法袍,armor,armor,,none,targeted_attack,strength,0,0,0,1,1,none,0,0,never,False,False,False,False,False,False,轻便衣袍,common,0.0,21
+legacy_weapon_长剑,长剑,weapon,weapon,1d8,weapon,targeted_attack,strength,0,2,0,1,1,none,0,0,never,False,False,False,False,False,False,近战常用制式武器,common,0.0,13
+legacy_armor_锁子甲,锁子甲,armor,armor,,none,targeted_attack,strength,0,0,4,1,1,none,0,0,never,False,False,False,False,False,False,常备护甲,common,0.0,15

@@ -10,7 +10,8 @@ class PromptKeys:
     NPC_PUBLIC_TARGETED_USER = "npc.public.targeted.user.v2"
     NPC_PUBLIC_BYSTANDER_USER = "npc.public.bystander.user.v2"
     TEAM_CHAT_USER = "team.chat.user.v1"
-    TEAM_PUBLIC_REACTION_USER = "team.public.reaction.user.v2"
+    TEAM_PRIVATE_CHAT_MEMORY_USER = "team.private_chat.memory.user.v1"
+    TEAM_PUBLIC_REACTION_USER = "team.public.reaction.user.v3"
     SCENE_ACTOR_INTENT_USER = "scene.actor.intent.user.v1"
     SCENE_ACTOR_ACTION_USER = "scene.actor.action.user.v2"
     SCENE_ROUND_RESOLVE_USER = "scene.round.resolve.user.v2"
@@ -19,13 +20,21 @@ class PromptKeys:
     COMPANION_STORY_SEED_USER = "companion.story.seed.user.v1"
     COMPANION_STORY_SURFACE_USER = "companion.story.surface.user.v1"
     REPUTATION_BEHAVIOR_USER = "reputation.behavior.user.v1"
-    ENCOUNTER_GENERATE_USER = "encounter.generate.user.v2"
-    ENCOUNTER_STEP_USER = "encounter.step.user.v3"
+    ENCOUNTER_GENERATE_USER = "encounter.generate.user.v3"
+    ENCOUNTER_STEP_USER = "encounter.step.user.v4"
+    ENCOUNTER_PUBLIC_TURN_SUMMARY_USER = "encounter.public_turn.summary.user.v1"
     ENCOUNTER_BACKGROUND_TICK_USER = "encounter.background.tick.user.v2"
     ENCOUNTER_ESCAPE_USER = "encounter.escape.user.v1"
     ENCOUNTER_REJOIN_USER = "encounter.rejoin.user.v1"
     ENCOUNTER_DEBUG_SUMMARY_USER = "encounter.debug.summary.user.v1"
     ENCOUNTER_OUTCOME_PACKAGE_USER = "encounter.outcome.package.user.v1"
+    PUBLIC_TURN_NON_WORLD_ROUTE_USER = "public.turn.non_world_route.user.v1"
+    
+    # Death system prompts
+    DEATH_DYING_NARRATIVE = "death.dying.narrative.v1"
+    DEATH_SAVE_NARRATIVE = "death.save.narrative.v1"
+    DEATH_DECLARATION_NARRATIVE = "death.declaration.narrative.v1"
+    DEATH_REVIVAL_NARRATIVE = "death.revival.narrative.v1"
 
 
 REQUIRED_PROMPT_KEYS: tuple[str, ...] = (
@@ -48,9 +57,8 @@ REQUIRED_PROMPT_KEYS: tuple[str, ...] = (
     PromptKeys.REPUTATION_BEHAVIOR_USER,
     PromptKeys.ENCOUNTER_GENERATE_USER,
     PromptKeys.ENCOUNTER_STEP_USER,
-    PromptKeys.ENCOUNTER_BACKGROUND_TICK_USER,
-    PromptKeys.ENCOUNTER_ESCAPE_USER,
-    PromptKeys.ENCOUNTER_REJOIN_USER,
+    PromptKeys.ENCOUNTER_PUBLIC_TURN_SUMMARY_USER,
     PromptKeys.ENCOUNTER_DEBUG_SUMMARY_USER,
     PromptKeys.ENCOUNTER_OUTCOME_PACKAGE_USER,
+    PromptKeys.PUBLIC_TURN_NON_WORLD_ROUTE_USER,
 )
