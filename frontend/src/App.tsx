@@ -9269,24 +9269,14 @@ function App() {
   const restoredPublicTurnPresentation = publicTurnPresentationFromRound(publicTurnRound);
   const structuredPublicTurnOutput =
     currentMainOutput?.public_turn_presentation ?? livePublicTurnPresentation ?? restoredPublicTurnPresentation ?? null;
-  const publicTurnSummary = useMemo(
-    () => ({
-      phase: publicTurnPhase,
-      roundNumber: publicTurnRound?.round_number ?? null,
-      currentActorName: currentPublicTurnActorName,
-      riskLevel: publicTurnRound?.environment_risk_level ?? publicTurnState.environment_risk_level,
-      situationValue: currentPublicTurnSituationValue,
-    }),
-    [
-      currentPublicTurnActorName,
-      currentPublicTurnSituationValue,
-      publicTurnPhase,
-      publicTurnRound?.environment_risk_level,
-      publicTurnRound?.round_number,
-      publicTurnState.environment_risk_level,
-    ],
-  );
-  const activeInlinePublicTurnPrompt = useMemo<PublicTurnInlinePromptState | null>(() => {
+  const publicTurnSummary = {
+    phase: publicTurnPhase,
+    roundNumber: publicTurnRound?.round_number ?? null,
+    currentActorName: currentPublicTurnActorName,
+    riskLevel: publicTurnRound?.environment_risk_level ?? publicTurnState.environment_risk_level,
+    situationValue: currentPublicTurnSituationValue,
+  };
+  const activeInlinePublicTurnPrompt: PublicTurnInlinePromptState | null = (() => {
     if (chatMode !== 'main') {
       return null;
     }
@@ -9376,47 +9366,7 @@ function App() {
     }
 
     return null;
-  }, [
-    actionInput,
-    chatMode,
-    chatState,
-    currentPublicTurnActorName,
-    currentPublicTurnSituationValue,
-    onPlanPublicTurnOpposed,
-    onSend,
-    onStartNextPublicTurnRound,
-    onStartPublicTurnInitiative,
-    onSubmitPublicTurnAttackNoAction,
-    onSubmitPublicTurnAttackResponse,
-    onSubmitPublicTurnInteraction,
-    onSubmitPublicTurnInteractionNoAction,
-    onTriggerPublicTurnOpposedRoll,
-    pendingAttackState,
-    pendingInformationCheckState,
-    pendingInteractionState,
-    pendingOpposedState,
-    playerPublicTurnActionStatus,
-    playerSpeechOnlyInPublicTurn,
-    publicTurnSummary,
-    publicTurnActionRollState.open,
-    publicTurnAttackActionInput,
-    publicTurnAttackBusy,
-    publicTurnAttackError,
-    publicTurnAttackSpeechInput,
-    publicTurnAwaitingEntry,
-    publicTurnAwaitingPlayerAction,
-    publicTurnInteractionActionInput,
-    publicTurnInteractionBusy,
-    publicTurnInteractionError,
-    publicTurnInteractionSpeechInput,
-    publicTurnOpposedActionInput,
-    publicTurnOpposedPlan,
-    publicTurnOpposedRollModalOpen,
-    publicTurnOpposedRollState.errorMessage,
-    publicTurnOpposedRollState.phase,
-    publicTurnOpposedSpeechInput,
-    speechInput,
-  ]);
+  })();
   const visiblePublicTurnImpacts = structuredPublicTurnOutput ? (publicTurnImpacts.length > 0 ? publicTurnImpacts : publicTurnRound?.impacts ?? []) : publicTurnImpacts;
   const publicTurnInlinePanel = activeInlinePublicTurnPrompt ? <PublicTurnInlinePromptPanel state={activeInlinePublicTurnPrompt} /> : null;
   const shouldRenderNarrativePane = Boolean(structuredPublicTurnOutput || publicTurnInlinePanel);
