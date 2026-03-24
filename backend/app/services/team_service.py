@@ -1064,9 +1064,90 @@ def _private_chat_deltas(player_text: str, relation_tag: str) -> tuple[int, int]
         "hostile": (-2, -2),
     }.get((relation_tag or "").strip().lower(), (0, 0))
     return (
-        max(-3, min(3, affinity_delta + relation_affinity)),
-        max(-3, min(3, trust_delta + relation_trust)),
+        max(-5, min(5, affinity_delta + relation_affinity)),
+        max(-5, min(5, trust_delta + relation_trust)),
     )
+
+
+_TEAM_RELATION_BREAK_TOKENS = (
+    "决裂",
+    "断绝",
+    "离队",
+    "离开你",
+    "不再同行",
+    "不再合作",
+    "别再找我",
+    "滚开",
+    "我不信你",
+    "我不想再",
+    "到此为止",
+    "结束了",
+)
+
+_TEAM_RELATION_TIGHTEN_TOKENS = (
+    "谢谢",
+    "合作",
+    "帮忙",
+    "照顾",
+    "信任",
+    "理解",
+    "支持",
+    "一起",
+)
+
+
+def _team_relation_signals(*texts: str) -> tuple[bool, bool]:
+    merged = " ".join(str(text or "") for text in texts).lower()
+    return (
+        any(token in merged for token in _TEAM_RELATION_BREAK_TOKENS),
+        any(token in merged for token in _TEAM_RELATION_TIGHTEN_TOKENS),
+    )
+
+
+def _scale_trust_delta_by_affinity(before_affinity: int, trust_delta: int) -> int:
+    if trust_delta == 0:
+        return 0
+    affinity_anchor = max(0, min(100, before_affinity))
+    if trust_delta > 0:
+        multiplier = 0.65 + (affinity_anchor / 100.0) * 0.85
+    else:
+        multiplier = 1.55 - (affinity_anchor / 100.0) * 0.9
+    scaled = int(round(trust_delta * multiplier))
+    if scaled == 0:
+        return 1 if trust_delta > 0 and affinity_anchor >= 70 else (-1 if trust_delta < 0 else 0)
+    return max(-15, min(15, scaled))
+
+
+def _apply_team_relationship_change(
+    member: TeamMember,
+    *,
+    player_text: str,
+    reply_text: str,
+    affinity_delta: int,
+    trust_delta: int,
+) -> tuple[int, int]:
+    before_affinity = _clamp_score(member.affinity)
+    before_trust = _clamp_score(member.trust)
+    break_relation, tighten_relation = _team_relation_signals(player_text, reply_text)
+
+    if break_relation:
+        return -before_affinity, -before_trust
+
+    affinity_delta = max(-15, min(15, affinity_delta))
+    trust_delta = max(-15, min(15, trust_delta))
+
+    if tighten_relation and affinity_delta <= 0:
+        affinity_delta = 1
+    if tighten_relation and trust_delta <= 0:
+        trust_delta = 1
+
+    if affinity_delta > 0 and before_affinity < 35:
+        affinity_delta = max(0, affinity_delta - 1)
+    elif affinity_delta < 0 and before_affinity < 35:
+        affinity_delta -= 1
+
+    trust_delta = _scale_trust_delta_by_affinity(before_affinity, trust_delta)
+    return affinity_delta, trust_delta
 
 
 def apply_private_chat_feedback_in_save(
@@ -1086,6 +1167,13 @@ def apply_private_chat_feedback_in_save(
     if role is None:
         return None
     affinity_delta, trust_delta = _private_chat_deltas(player_text, relation_tag)
+    affinity_delta, trust_delta = _apply_team_relationship_change(
+        member,
+        player_text=player_text,
+        reply_text=(reply or role.name),
+        affinity_delta=affinity_delta,
+        trust_delta=trust_delta,
+    )
     preview = (reply or f"{role.name} 对你的单聊做出了回应。").strip()[:120]
     member.affinity = _clamp_score(member.affinity + affinity_delta)
     member.trust = _clamp_score(member.trust + trust_delta)
@@ -1139,7 +1227,7 @@ def _fallback_team_chat_reply(role: NpcRoleCard, player_text: str) -> tuple[str,
     return (f"{role.name} 简短回应：'明白，我会跟着你的节奏。'", "speech")
 
 
-def _ai_team_chat_reply(save, role: NpcRoleCard, player_text: str, config) -> tuple[str, str] | None:
+def _ai_team_chat_reply(save, role: NpcRoleCard, player_text: str, config) -> tuple[str, str, int, int] | None:
     config = require_ai_config(config)
     try:
         client = create_sync_client(config, client_cls=OpenAI)
@@ -1148,18 +1236,25 @@ def _ai_team_chat_reply(save, role: NpcRoleCard, player_text: str, config) -> tu
         context = _build_npc_context(role, recent_count=10)
         zone_name, sub_name = _current_player_area_names(save)
         active_encounter = next((item for item in save.encounter_state.encounters if item.encounter_id == save.encounter_state.active_encounter_id), None)
+        team_state = ensure_team_state(save)
+        member = _find_member(team_state, role.role_id)
+        current_affinity = _clamp_score(member.affinity if member is not None else 50)
+        current_trust = _clamp_score(member.trust if member is not None else 40)
         default_prompt = (
             "你要扮演跑团中的队友 NPC，在队伍聊天里回应玩家。"
             "只返回 JSON，不要输出额外解释。"
-            "JSON schema: {\"content\":\"...\",\"response_mode\":\"speech|action\"}。"
+            "JSON schema: {\"content\":\"...\",\"response_mode\":\"speech|action\",\"affinity_delta\":0,\"trust_delta\":0}。"
             "要求："
             "1. content 只写 1 句短回应，最多 35 字；"
             "2. response_mode=speech 表示直接说话，action 表示只做动作反应；"
             "3. 必须保持人设一致，不能编造当前世界中不存在或该 NPC 不该知道的人物/地点；"
             "4. 若玩家话题不值得多说，可以选择 action。"
+            "5. affinity_delta / trust_delta 由你根据角色人设、当前关系和玩家内容自行判断，幅度可以明显大于 0，"
+            "通常在 -15 到 15 之间；强烈亲近、背叛、保护、决裂、长期信任崩塌等情况可以给出更大的变化。"
             "\nNPC信息: name=$name, personality=$personality, speaking_style=$speaking_style, appearance=$appearance, background=$background, cognition=$cognition, alignment=$alignment"
             "\n当前位置: $zone_name / $sub_name"
             "\n当前世界时间: $world_time_text"
+            "\n当前关系基线: affinity=$current_affinity, trust=$current_trust"
             "\n知识边界规则:\n$knowledge_rules"
             "\n最近对话:\n$context"
             "\n玩家刚刚在队伍里说: $player_text"
@@ -1178,6 +1273,8 @@ def _ai_team_chat_reply(save, role: NpcRoleCard, player_text: str, config) -> tu
             zone_name=zone_name,
             sub_name=sub_name,
             world_time_text=world_time_text,
+            current_affinity=current_affinity,
+            current_trust=current_trust,
             knowledge_rules="\n".join(f"- {item}" for item in knowledge.response_rules),
             context=context,
             player_text=player_text,
@@ -1214,7 +1311,9 @@ def _ai_team_chat_reply(save, role: NpcRoleCard, player_text: str, config) -> tu
         if not content:
             raise ValueError("AI_PROTOCOL_REPAIR_FAILED")
         response_mode = str(parsed.get("response_mode") or "").strip().lower()
-        return content[:120], response_mode
+        affinity_delta = max(-15, min(15, int(parsed.get("affinity_delta") or 0)))
+        trust_delta = max(-15, min(15, int(parsed.get("trust_delta") or 0)))
+        return content[:120], response_mode, affinity_delta, trust_delta
     except ValueError:
         raise
     except Exception as exc:
@@ -1255,8 +1354,26 @@ def team_chat(req: TeamChatRequest) -> TeamChatResponse:
             clock=save.area_snapshot.clock,
             context_kind="team_chat",
         )
-        content, response_mode = _ai_team_chat_reply(save, role, player_text, req.config)
-        affinity_delta, trust_delta = _team_chat_deltas(player_text)
+        generated = _ai_team_chat_reply(save, role, player_text, req.config)
+        if generated is None:
+            content = f"{role.name} 先沉默了一会儿，随后点了点头。"
+            response_mode = "action"
+            ai_affinity_delta, ai_trust_delta = _team_chat_deltas(player_text)
+        else:
+            if len(generated) >= 4:
+                content, response_mode, ai_affinity_delta, ai_trust_delta = generated[:4]
+            else:
+                content, response_mode = generated[:2]
+                ai_affinity_delta, ai_trust_delta = _team_chat_deltas(player_text)
+        affinity_delta = ai_affinity_delta
+        trust_delta = ai_trust_delta
+        affinity_delta, trust_delta = _apply_team_relationship_change(
+            member,
+            player_text=player_text,
+            reply_text=content,
+            affinity_delta=affinity_delta,
+            trust_delta=trust_delta,
+        )
         _append_npc_dialogue(
             role=role,
             speaker="npc",
@@ -1340,17 +1457,9 @@ def _build_reaction(role: NpcRoleCard, trigger_kind: str, player_text: str, summ
     if trigger_kind in {"zone_move", "sub_zone_move"}:
         return (f"{role.name} 调整步伐跟上你，顺手确认周围动静。", 0, 0)
     if trigger_kind == "npc_chat":
-        if _contains_any([player_text], ["谢谢", "help", "cooperate", "合作", "帮"]):
-            return (f"{role.name} 在一旁听着，神色明显放松了些。", 1, 1)
         return (f"{role.name} 安静旁听，没有贸然插话。", 0, 0)
     if trigger_kind == "action_check":
-        if _contains_any([summary], ["失败", "critical_failure", "大失败"]):
-            return (f"{role.name} 皱了皱眉，显然对这次冒险结果有些担心。", -1, -1)
-        return (f"{role.name} 看起来对你的执行力多了几分认可。", 1, 1)
-    if _contains_any([player_text, summary], ["威胁", "attack", "抢", "杀", "threat", "rob"]):
-        return (f"{role.name} 对你的做法显得不太认同。", -2, -1)
-    if _contains_any([player_text, summary], ["谢谢", "protect", "help", "合作", "照顾", "一起"]):
-        return (f"{role.name} 点了点头，似乎更愿意继续跟着你。", 1, 1)
+        return (f"{role.name} 记下了这件事，暂时没有额外评价。", 0, 0)
     return (f"{role.name} 记下了这件事，但暂时没有多说什么。", 0, 0)
 
 def _ai_team_public_reply(
@@ -1382,6 +1491,11 @@ def _ai_team_public_reply(
             context=_build_npc_prompt_context(role, save.area_snapshot.clock, recent_count=8, save=save),
             scene_context_json=json.dumps(scene_context or {}, ensure_ascii=False),
         )
+        prompt = (
+            f"{prompt}\n"
+            "affinity_delta / trust_delta 由你根据队友人设、当前关系、场面强度和玩家内容自行判断，"
+            "通常在 -10 到 10 之间；明显的背叛、强烈支持、重大冲突或信任转折可以更大。"
+        )
         resp = client.chat.completions.create(
             model=model,
             **build_completion_options(config),
@@ -1405,8 +1519,8 @@ def _ai_team_public_reply(
         if not content:
             return None
         response_mode = "speech" if speech_reply else "action"
-        affinity_delta = max(-3, min(3, int(parsed.get("affinity_delta") or 0)))
-        trust_delta = max(-3, min(3, int(parsed.get("trust_delta") or 0)))
+        affinity_delta = max(-10, min(10, int(parsed.get("affinity_delta") or 0)))
+        trust_delta = max(-10, min(10, int(parsed.get("trust_delta") or 0)))
         return action_reaction, speech_reply, content[:120], response_mode, affinity_delta, trust_delta
     except Exception:
         return None

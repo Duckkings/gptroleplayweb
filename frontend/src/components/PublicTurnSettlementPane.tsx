@@ -50,16 +50,11 @@ function worldImpactLabel(value: PublicTurnWorldImpactType | string | null | und
   return '未标注';
 }
 
-function renderImpactSummary(entry: PublicTurnSettlementEntry) {
+function renderSingleImpactSummary(label: string, value: PublicTurnWorldImpactType | string | null | undefined) {
   return (
     <div className="public-turn-impact-summary">
-      <span className={`public-turn-impact-pill ${entry.source_world_impact_type === 'world' ? 'world' : 'non-world'}`}>
-        源动作：{worldImpactLabel(entry.source_world_impact_type)}
-      </span>
-      <span
-        className={`public-turn-impact-pill ${entry.target_response_world_impact_type === 'world' ? 'world' : 'non-world'}`}
-      >
-        回应：{worldImpactLabel(entry.target_response_world_impact_type)}
+      <span className={`public-turn-impact-pill ${value === 'world' ? 'world' : 'non-world'}`}>
+        {label}：{worldImpactLabel(value)}
       </span>
     </div>
   );
@@ -104,6 +99,92 @@ function renderCheck(check: PublicTurnSettlementCheck | null | undefined) {
         <p>{check.outcome_text}</p>
       </div>
     </details>
+  );
+}
+
+function hasCounterResponse(entry: PublicTurnSettlementEntry): boolean {
+  return Boolean(
+    cleanText(entry.opposed_target_action) ||
+      cleanText(entry.opposed_target_speech) ||
+      entry.followup_check ||
+      entry.target_response_kind !== 'no_action' ||
+      entry.interaction_resolution === 'rejected_opposed' ||
+      entry.interaction_resolution === 'attack_flow',
+  );
+}
+
+function renderSourceActionCard(entry: PublicTurnSettlementEntry) {
+  const actorAction = cleanText(entry.action_summary);
+  const actorSpeech = cleanText(entry.speech_text);
+  const targetName = targetNameOf(entry);
+
+  return (
+    <section className="public-turn-resolution-card source">
+      <header className="public-turn-resolution-card-header">
+        <strong>源动作结果</strong>
+        <span>{entry.actor_name}</span>
+      </header>
+      {targetName ? <p className="public-turn-resolution-target">目标: {targetName}</p> : null}
+      {renderSingleImpactSummary('源动作', entry.source_world_impact_type)}
+      <div className="public-turn-dialogue-lines">
+        {actorAction ? (
+          <p>
+            <strong>动作:</strong>
+            {actorAction}
+          </p>
+        ) : null}
+        {actorSpeech ? (
+          <p>
+            <strong>语言:</strong>
+            {actorSpeech}
+          </p>
+        ) : null}
+      </div>
+      {renderCheck(entry.check)}
+    </section>
+  );
+}
+
+function renderCounterResponseCard(entry: PublicTurnSettlementEntry) {
+  const targetAction = cleanText(entry.opposed_target_action);
+  const targetSpeech = cleanText(entry.opposed_target_speech);
+  const outcome = outcomeTextOf(entry);
+  const targetName = targetNameOf(entry);
+
+  return (
+    <section className="public-turn-resolution-card counter">
+      <header className="public-turn-resolution-card-header">
+        <strong>反制结果</strong>
+        <span>{targetName || '回应方'}</span>
+      </header>
+      {renderSingleImpactSummary('反制', entry.target_response_world_impact_type)}
+      <div className="public-turn-dialogue-lines">
+        {targetAction ? (
+          <p>
+            <strong>反制动作:</strong>
+            {targetAction}
+          </p>
+        ) : null}
+        {targetSpeech ? (
+          <p>
+            <strong>反制语言:</strong>
+            {targetSpeech}
+          </p>
+        ) : null}
+      </div>
+      {entry.followup_check ? (
+        <div className="public-turn-followup-check">
+          <p><strong>后续检定</strong></p>
+          {renderCheck(entry.followup_check)}
+        </div>
+      ) : null}
+      {outcome ? (
+        <section className="public-turn-dialogue-box outcome public-turn-resolution-outcome">
+          <header>结算结论</header>
+          <p>{outcome}</p>
+        </section>
+      ) : null}
+    </section>
   );
 }
 
@@ -202,79 +283,13 @@ function renderConsequences(entry: PublicTurnSettlementEntry, roundActive: boole
   );
 }
 
-function renderDialogueBubbles(entry: PublicTurnSettlementEntry) {
-  const actorAction = cleanText(entry.action_summary);
-  const actorSpeech = cleanText(entry.speech_text);
-  const targetAction = cleanText(entry.opposed_target_action);
-  const targetSpeech = cleanText(entry.opposed_target_speech);
-  const outcome = outcomeTextOf(entry);
-
-  return (
-    <div className="public-turn-dialogue-list">
-      {actorAction || actorSpeech ? (
-        <section className="public-turn-dialogue-box actor">
-          <header>{entry.actor_name}</header>
-          <div className="public-turn-dialogue-lines">
-            {actorAction ? (
-              <p>
-                <strong>行为:</strong>
-                {actorAction}
-              </p>
-            ) : null}
-            {actorSpeech ? (
-              <p>
-                <strong>语言:</strong>
-                {actorSpeech}
-              </p>
-            ) : null}
-          </div>
-        </section>
-      ) : null}
-      {targetAction || targetSpeech ? (
-        <section className="public-turn-dialogue-box target">
-          <header>{targetNameOf(entry) || '回应方'}</header>
-          <div className="public-turn-dialogue-lines">
-            {targetAction ? (
-              <p>
-                <strong>回应行为:</strong>
-                {targetAction}
-              </p>
-            ) : null}
-            {targetSpeech ? (
-              <p>
-                <strong>回应语言:</strong>
-                {targetSpeech}
-              </p>
-            ) : null}
-          </div>
-        </section>
-      ) : null}
-      {outcome ? (
-        <section className="public-turn-dialogue-box outcome">
-          <header>结算结果</header>
-          <p>{outcome}</p>
-        </section>
-      ) : null}
-    </div>
-  );
-}
-
 function renderActorEntry(entry: PublicTurnSettlementEntry, roundActive: boolean) {
   return (
     <>
-      {renderImpactSummary(entry)}
-      {renderDialogueBubbles(entry)}
-      {entry.check || entry.followup_check ? (
-        <div className="scene-event-block">
-          {entry.check ? renderCheck(entry.check) : null}
-          {entry.followup_check ? (
-            <div className="public-turn-check-followup">
-              <p><strong>后续信息检定</strong></p>
-              {renderCheck(entry.followup_check)}
-            </div>
-          ) : null}
-        </div>
-      ) : null}
+      <div className="public-turn-resolution-grid">
+        {renderSourceActionCard(entry)}
+        {hasCounterResponse(entry) ? renderCounterResponseCard(entry) : null}
+      </div>
       <div className="scene-event-block">
         <span>{roundActive ? '待写入后果' : '结构化后果'}</span>
         {renderConsequences(entry, roundActive)}

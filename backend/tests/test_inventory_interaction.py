@@ -147,6 +147,54 @@ class InventoryInteractionTests(unittest.TestCase):
         item = next(entry for entry in updated.player_static_data.dnd5e_sheet.backpack.items if entry.item_id == "player_potion")
         self.assertEqual(item.uses_left, 2)
 
+    def test_inventory_use_with_display_prompt_routes_to_show_mode_without_consumption(self) -> None:
+        sid = "sess_inventory_show_to_npc"
+        self._seed_save(sid)
+        save = get_current_save(sid)
+        save.player_static_data.dnd5e_sheet.backpack.items.append(
+            InventoryItem(item_id="player_cube_lock", name="魔方锁", slot_type="misc", quantity=1)
+        )
+        save_current(save)
+
+        with patch("app.services.world_service.action_check") as mocked_check:
+            mocked_check.return_value = ActionCheckResponse(
+                session_id=sid,
+                actor_role_id="player_001",
+                actor_name="Player",
+                actor_kind="player",
+                action_type="check",
+                requires_check=True,
+                ability_used="charisma",
+                ability_modifier=1,
+                dc=12,
+                check_task="展示这件物品并借机吸引对方注意",
+                dice_roll=16,
+                total_score=17,
+                success=True,
+                critical="none",
+                time_spent_min=2,
+                narrative="展示动作顺利完成。",
+                applied_effects=[],
+                relation_tag_suggestion=None,
+            )
+            response = inventory_interact(
+                InventoryInteractRequest(
+                    session_id=sid,
+                    owner=InventoryOwnerRef(owner_type="player"),
+                    item_id="player_cube_lock",
+                    mode="use",
+                    prompt="从背包取出一个魔方锁并展示出来，顺便诱惑对方注意。",
+                )
+            )
+
+        mocked_check.assert_called_once()
+        self.assertEqual(response.mode, "show_to_npc")
+        self.assertIsNotNone(response.action_check)
+        self.assertEqual(response.action_check.ability_used, "charisma")
+        updated = get_current_save(sid)
+        item = next(entry for entry in updated.player_static_data.dnd5e_sheet.backpack.items if entry.item_id == "player_cube_lock")
+        self.assertEqual(item.quantity, 1)
+
     def test_role_inventory_use_routes_actor_and_persists_uses(self) -> None:
         sid = "sess_inventory_role_use"
         self._seed_save(sid)

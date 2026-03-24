@@ -2177,7 +2177,34 @@ def _build_attack_resolution_bundle(
         hp_changes=hp_changes,
         config=config,
     )
-    scene_events = [*base_events, *damage_events]
+    dead_target_names = [
+        str(change.get("target_name") or "").strip()
+        for change in hp_changes
+        if int(change.get("hp_after") or 0) <= 0 and str(change.get("target_name") or "").strip()
+    ]
+    if dead_target_names:
+        death_summary = f"{'、'.join(dead_target_names)}当场倒下并死亡。"
+        if death_summary not in gm_resolution_summary:
+            gm_resolution_summary = f"{gm_resolution_summary} {death_summary}".strip()
+    death_reaction_rows = []
+    death_reaction_events: list[SceneEvent] = []
+    if dead_target_names and has_ai_config(config):
+        death_reaction_rows, death_reaction_events = apply_player_npc_reactions(
+            save,
+            session_id=session_id,
+            player_text=f"{action_summary.strip()} {speech_text.strip()}".strip(),
+            summary=gm_resolution_summary,
+            relation_delta=0,
+            target_role_id=None,
+            max_extra_roles=0,
+            player_action_target_name=(hit_target_names[0] if hit_target_names else ""),
+            current_primary_aggressor_name=actor_name,
+            current_primary_target_name=dead_target_names[0],
+            prior_settlement_excerpt=gm_resolution_summary,
+            scene_conflict_summary=gm_resolution_summary,
+            config=config,
+        )
+    scene_events = [*base_events, *damage_events, *death_reaction_events]
     if gm_resolution_summary:
         scene_events.append(
             world._new_scene_event(
@@ -2202,7 +2229,7 @@ def _build_attack_resolution_bundle(
         action_result=action_result,
         situation_delta=situation_delta,
         zone_reputation_delta=reputation_delta,
-        relation_deltas=[],
+        relation_deltas=death_reaction_rows,
         team_affinity_deltas=[],
         hp_changes=hp_changes,
         environment_shift=0,

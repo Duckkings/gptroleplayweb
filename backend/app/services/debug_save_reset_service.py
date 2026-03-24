@@ -126,6 +126,65 @@ def _clear_team_memory_logs(save: SaveFile) -> list[str]:
     return cleared_role_ids
 
 
+def _restore_team_relationship_state(save: SaveFile) -> list[str]:
+    restored_role_ids: list[str] = []
+    role_lookup = {role.role_id: role for role in save.role_pool}
+    for member in save.team_state.members:
+        if str(getattr(member, "status", "") or "active") != "active":
+            continue
+        member.affinity = 50
+        member.trust = 50
+        role_id = str(member.role_id or "")
+        if not role_id:
+            continue
+        role = role_lookup.get(role_id)
+        if role is None:
+            continue
+        role.talkative_current = min(80, int(role.talkative_maximum or 0) or 80)
+        restored_role_ids.append(role_id)
+    return restored_role_ids
+
+
+def _restore_team_combat_state(save: SaveFile) -> list[str]:
+    now = _utc_now()
+    restored_role_ids: list[str] = []
+    role_lookup = {role.role_id: role for role in save.role_pool}
+    for member in save.team_state.members:
+        if str(getattr(member, "status", "") or "active") != "active":
+            continue
+        role_id = str(member.role_id or "")
+        if not role_id:
+            continue
+        role = role_lookup.get(role_id)
+        if role is None:
+            continue
+        sheet = role.profile.dnd5e_sheet
+        sheet.hit_points.current = int(sheet.hit_points.maximum or 0)
+        sheet.hit_points.temporary = 0
+        sheet.is_dead = False
+        sheet.role_action_status = "free_action"
+        death_state = sheet.death_state
+        death_state.life_status = "healthy"
+        death_state.death_save_successes = 0
+        death_state.death_save_failures = 0
+        death_state.death_count = 0
+        death_state.death_streak_count = 0
+        death_state.death_streak_reset_at = None
+        death_state.last_death_at = None
+        death_state.last_death_zone_id = None
+        death_state.last_death_sub_zone_id = None
+        death_state.last_death_cause = ""
+        death_state.revived_at = None
+        death_state.revival_method = None
+        death_state.revival_weakness_until = None
+        death_state.updated_at = now
+        for level in range(1, 10):
+            key = f"level_{level}"
+            setattr(sheet.spell_slots_current, key, int(getattr(sheet.spell_slots_max, key) or 0))
+        restored_role_ids.append(role_id)
+    return restored_role_ids
+
+
 def reset_debug_test_state(session_id: str) -> DebugSaveResetResponse:
     save = get_current_save(default_session_id=session_id)
     pending_before = load_pending_turn(session_id)
@@ -138,14 +197,19 @@ def reset_debug_test_state(session_id: str) -> DebugSaveResetResponse:
         save,
         cleared_encounter_ids=set(cleared_active_encounter_ids) | set(cleared_pending_encounter_ids),
     )
+    restored_team_relationship_role_ids = _restore_team_relationship_state(save)
+    restored_team_combat_role_ids = _restore_team_combat_state(save)
     cleared_team_member_role_ids = _clear_team_memory_logs(save)
 
     summary = (
-        f"测试重置完成：关闭遭遇 {len(cleared_active_encounter_ids) + len(cleared_pending_encounter_ids)} 个，"
-        f"清除公开回合 {len(cleared_public_round_ids)} 轮，"
-        f"移除最近记录 {cleared_recent_turn_count} 条，"
-        f"清空队友记忆 {len(cleared_team_member_role_ids)} 人，"
-        f"{'已清理 pending turn。' if pending_cleared else '未发现 pending turn。'}"
+        f"Test reset complete: closed {len(cleared_active_encounter_ids) + len(cleared_pending_encounter_ids)} encounters, "
+        f"cleared {len(cleared_public_round_ids)} public rounds, "
+        f"removed {cleared_recent_turn_count} recent turns, "
+        f"restored affinity/trust for {len(restored_team_relationship_role_ids)} team members, "
+        f"restored talkative for {len(restored_team_relationship_role_ids)} team roles, "
+        f"restored HP/death/spell slots for {len(restored_team_combat_role_ids)} team members, "
+        f"cleared memory for {len(cleared_team_member_role_ids)} team members, "
+        f"{'cleared pending turn' if pending_cleared else 'no pending turn found'}."
     )
     save.game_logs.append(
         _new_game_log(
@@ -157,6 +221,8 @@ def reset_debug_test_state(session_id: str) -> DebugSaveResetResponse:
                 "queued_encounters_cleared": len(cleared_pending_encounter_ids),
                 "public_rounds_cleared": len(cleared_public_round_ids),
                 "recent_turns_cleared": cleared_recent_turn_count,
+                "team_relationships_restored": len(restored_team_relationship_role_ids),
+                "team_combat_restored": len(restored_team_combat_role_ids),
                 "team_members_cleared": len(cleared_team_member_role_ids),
                 "pending_turn_cleared": pending_cleared,
             },

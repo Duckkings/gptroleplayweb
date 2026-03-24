@@ -742,6 +742,10 @@ def plan_public_turn_segment(
     default_boundary_kind: str,
     config: ChatConfig | None,
 ) -> PublicTurnSegmentPlan:
+    # Keep the segment atomic: plan only the next actor in order.
+    # Later actors are re-planned on the next public-turn advance so they can
+    # see the effects from earlier settlements, impacts, and player responses.
+    actor_rows = actor_rows[:1]
     segment_id = f"{round_state.round_id}_{phase.value}_{len(round_state.settlement_entries) + 1}"
     fallback_directives = [
         _fallback_directive(

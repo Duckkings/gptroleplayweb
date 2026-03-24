@@ -2301,6 +2301,11 @@ def _fallback_inventory_interaction_reply(
         effect = f" 你能感觉到它与“{item.effect}”有关。" if item.effect else ""
         desc = item.description or "这件物品没有更多外观说明，但保存状况还算稳定。"
         return f"{owner_name}仔细观察【{item.name}】。{desc}{effect}{focus}"
+    if mode == "show_to_npc":
+        focus = f" 你展示时刻意传达的是：{clean_prompt}。" if clean_prompt else ""
+        effect = f" 你借它暗示出的意味是“{item.effect}”。" if item.effect else ""
+        desc = item.description or "这件物品在灯光下显得很醒目。"
+        return f"{owner_name}将【{item.name}】展示给对方看。{desc}{effect}{focus}"
     if action_check_result is None:
         return f"{owner_name}尝试使用【{item.name}】。"
     outcome = "顺利发挥了作用" if action_check_result.success else "没能稳定发挥作用"
@@ -2574,8 +2579,9 @@ def inventory_interact(payload: InventoryInteractRequest) -> InventoryInteractRe
     action_result: ActionCheckResponse | None = None
     time_spent_min = 1
     scene_events: list[SceneEvent] = []
+    effective_mode = "show_to_npc" if payload.mode == "use" and _is_social_item_display_prompt(payload.prompt) else payload.mode
 
-    if payload.mode == "use":
+    if effective_mode == "use":
         if item.slot_type != "misc":
             raise ValueError("ITEM_USE_UNSUPPORTED_SLOT")
         if item.uses_left is not None and item.uses_left <= 0:
@@ -2623,7 +2629,29 @@ def inventory_interact(payload: InventoryInteractRequest) -> InventoryInteractRe
                     remove_item_instance(save, instance.item_instance_id)
             refresh_item_system_projection(save)
             item = next((entry for entry in profile.dnd5e_sheet.backpack.items if entry.item_id == payload.item_id), item)
-        if payload.action_check is not None and save.area_snapshot.clock is not None:
+        if action_result is not None and save.area_snapshot.clock is not None:
+            save.area_snapshot.clock = _advance_clock(save.area_snapshot.clock, time_spent_min)
+    elif effective_mode == "show_to_npc":
+        if payload.action_check is not None:
+            action_result = payload.action_check
+            if action_result.actor_role_id != owner_id:
+                raise ValueError("ACTION_CHECK_ACTOR_MISMATCH")
+        else:
+            action_result = action_check(
+                ActionCheckRequest(
+                    session_id=payload.session_id,
+                    action_type="check",
+                    action_prompt=(
+                        f"owner_type={payload.owner.owner_type}; role_id={owner_id}; "
+                        f"item_id={item.item_id}; item_name={item.name}; intent=show_to_npc; prompt={payload.prompt.strip() or '-'}"
+                    ),
+                    actor_role_id=owner_id,
+                    allow_backend_roll=(payload.owner.owner_type == "role"),
+                    config=payload.config,
+                )
+            )
+        time_spent_min = max(1, action_result.time_spent_min if action_result is not None else 1)
+        if action_result is not None and save.area_snapshot.clock is not None:
             save.area_snapshot.clock = _advance_clock(save.area_snapshot.clock, time_spent_min)
     reply = _generate_inventory_interaction_reply(
         payload.session_id,
@@ -2631,7 +2659,7 @@ def inventory_interact(payload: InventoryInteractRequest) -> InventoryInteractRe
         payload.owner.owner_type,
         owner_name,
         item,
-        payload.mode,
+        effective_mode,
         payload.prompt,
         action_result,
     )
@@ -2639,12 +2667,12 @@ def inventory_interact(payload: InventoryInteractRequest) -> InventoryInteractRe
         _new_game_log(
             payload.session_id,
             "inventory_interact",
-            f"{owner_name} 对【{item.name}】执行了{payload.mode}。",
+            f"{owner_name} 对【{item.name}】执行了{effective_mode}。",
             {
                 "owner_type": payload.owner.owner_type,
                 "owner_id": owner_id,
                 "item_id": item.item_id,
-                "mode": payload.mode,
+                "mode": effective_mode,
                 "time_spent_min": time_spent_min,
             },
         )
@@ -2653,7 +2681,7 @@ def inventory_interact(payload: InventoryInteractRequest) -> InventoryInteractRe
         scene_events = advance_public_scene_in_save(
             save,
             session_id=payload.session_id,
-            player_text=f"{payload.mode}:{item.name}; {payload.prompt.strip()}".strip(),
+            player_text=f"{effective_mode}:{item.name}; {payload.prompt.strip()}".strip(),
             gm_summary=reply,
             config=payload.config,
         )
@@ -2668,7 +2696,7 @@ def inventory_interact(payload: InventoryInteractRequest) -> InventoryInteractRe
         session_id=payload.session_id,
         owner=payload.owner,
         item_id=item.item_id,
-        mode=payload.mode,
+        mode=effective_mode,
         reply=reply,
         time_spent_min=time_spent_min,
         action_check=action_result,
@@ -4751,20 +4779,31 @@ def _visible_public_roles(save: SaveFile) -> list[NpcRoleCard]:
     if current_sub is None:
         return []
     visible_ids = {npc.npc_id for npc in current_sub.npcs}
-    dead_ids = {
-        str(getattr(record, "role_id", "") or "")
-        for record in getattr(getattr(current_sub, "state", None), "dead_npc_records", [])
-    }
     return [
         role
         for role in save.role_pool
         if role.role_id in visible_ids
-        and role.role_id not in dead_ids
+        and not _role_is_dead_for_public_scene(save, role)
         and role.state not in {"in_team", "dead"}
         and role.sub_zone_id == current_sub.sub_zone_id
         and role.profile.dnd5e_sheet.role_action_status != "dead"
         and not role.profile.dnd5e_sheet.is_dead
     ]
+
+
+def _role_is_dead_for_public_scene(save: SaveFile, role: NpcRoleCard) -> bool:
+    current_sub = _current_sub_zone(save)
+    dead_ids = {
+        str(getattr(record, "role_id", "") or "")
+        for record in getattr(getattr(current_sub, "state", None), "dead_npc_records", [])
+    } if current_sub is not None else set()
+    sheet = role.profile.dnd5e_sheet
+    return (
+        role.role_id in dead_ids
+        or role.state == "dead"
+        or sheet.role_action_status == "dead"
+        or bool(sheet.is_dead)
+    )
 
 
 def _public_npc_reaction(role: NpcRoleCard, player_text: str, gm_summary: str) -> tuple[str, str]:
@@ -5436,8 +5475,175 @@ def _default_check_task(action_type: str, action_prompt: str) -> str:
     if action_type == "attack":
         return "判断这次攻击是否顺利命中并压制目标"
     if action_type == "item_use":
+        if _is_social_item_display_prompt(action_prompt):
+            return "展示这件物品并借机吸引对方注意"
         return "判断这次物品使用是否稳定生效"
     return "判断这次行动是否顺利完成"
+
+
+def _is_social_item_display_prompt(action_prompt: str) -> bool:
+    text = str(action_prompt or "").lower()
+    return any(
+        token in text
+        for token in (
+            "展示",
+            "给npc看",
+            "给他看",
+            "给她看",
+            "show",
+            "display",
+            "亮出",
+            "亮给",
+            "诱惑",
+            "勾引",
+            "吸引",
+            "撩",
+            "调情",
+            "勾搭",
+        )
+    )
+
+
+def _is_npc_chat_social_prompt(action_prompt: str) -> bool:
+    text = str(action_prompt or "")
+    lowered = text.lower()
+    if "npc姓名:" not in text and "当前关系:" not in text and "当前健谈值:" not in text:
+        return False
+    return any(
+        token in lowered
+        for token in (
+            "试探",
+            "拉近",
+            "关系",
+            "交谈",
+            "聊天",
+            "套话",
+            "打探",
+            "刺探",
+            "诱惑",
+            "勾引",
+            "调情",
+            "暧昧",
+            "说服",
+            "劝说",
+            "欺骗",
+            "安抚",
+            "威胁",
+            "威吓",
+            "persuade",
+            "convince",
+            "deceive",
+            "comfort",
+            "intimidate",
+        )
+    )
+
+
+def _is_npc_chat_trust_prompt(action_prompt: str) -> bool:
+    text = str(action_prompt or "")
+    lowered = text.lower()
+    if "npc姓名:" not in text and "当前关系:" not in text and "当前健谈值:" not in text:
+        return False
+    return any(
+        token in lowered
+        for token in (
+            "请求",
+            "拜托",
+            "麻烦",
+            "帮忙",
+            "帮我",
+            "请你",
+            "能不能",
+            "希望你",
+            "配合",
+            "协助",
+            "告诉我",
+            "带我",
+            "照做",
+            "听我",
+            "命令",
+            "执行",
+            "立刻",
+            "现在就",
+            "follow",
+            "assist",
+            "help",
+        )
+    )
+
+
+def _is_npc_chat_coercive_prompt(action_prompt: str) -> bool:
+    text = str(action_prompt or "")
+    lowered = text.lower()
+    if "npc姓名:" not in text and "当前关系:" not in text and "当前健谈值:" not in text:
+        return False
+    return any(
+        token in lowered
+        for token in (
+            "威胁",
+            "威吓",
+            "强迫",
+            "逼迫",
+            "要挟",
+            "压迫",
+            "强制",
+            "逼你",
+            "逼我",
+            "不然",
+            "否则",
+            "threaten",
+            "intimidate",
+            "coerce",
+            "force",
+        )
+    )
+
+
+def _extract_npc_chat_relation_context(action_prompt: str) -> tuple[int | None, int | None, int | None, int | None]:
+    text = str(action_prompt or "")
+    relation_match = re.search(r"当前关系\s*[：:]\s*好感度\s*=\s*(-?\d+)\s*[，,]\s*信任度\s*=\s*(-?\d+)", text)
+    talkative_match = re.search(r"当前健谈值\s*[：:]\s*(\d+)\s*/\s*(\d+)", text)
+    affinity = int(relation_match.group(1)) if relation_match else None
+    trust = int(relation_match.group(2)) if relation_match else None
+    talkative_current = int(talkative_match.group(1)) if talkative_match else None
+    talkative_maximum = int(talkative_match.group(2)) if talkative_match else None
+    return affinity, trust, talkative_current, talkative_maximum
+
+
+def _npc_chat_relation_dc(action_prompt: str, *, mode: Literal["affinity", "trust", "coercive"]) -> int:
+    affinity, trust, talkative_current, talkative_maximum = _extract_npc_chat_relation_context(action_prompt)
+    if mode == "coercive":
+        return 13
+    relation_value = affinity if mode == "affinity" else trust
+    if relation_value is None:
+        relation_value = trust if mode == "affinity" else affinity
+    if relation_value is None:
+        relation_value = 50
+    relation_value = max(0, min(100, int(relation_value)))
+    dc = 20 - round(relation_value * 19 / 100)
+    if talkative_current is not None and talkative_maximum:
+        talkative_ratio = talkative_current / max(1, talkative_maximum)
+        if mode == "affinity":
+            if talkative_ratio >= 0.8:
+                dc -= 2
+            elif talkative_ratio >= 0.6:
+                dc -= 1
+        elif mode == "trust":
+            if talkative_ratio >= 0.8:
+                dc -= 1
+            elif talkative_ratio <= 0.2:
+                dc += 1
+    return max(1, min(20, dc))
+
+
+def _npc_chat_relation_mode(action_prompt: str) -> Literal["affinity", "trust", "coercive"] | None:
+    if _is_npc_chat_coercive_prompt(action_prompt):
+        return "coercive"
+    if _is_npc_chat_trust_prompt(action_prompt):
+        return "trust"
+    if _is_npc_chat_social_prompt(action_prompt):
+        return "affinity"
+    return None
 
 
 _ABILITY_USED_CONTRACT_FIELDS = (
@@ -5525,6 +5731,33 @@ def _fallback_action_plan(action_type: str, action_prompt: str) -> dict[str, int
 
 def _apply_action_prompt_hints(plan: dict[str, int | bool | str], action_prompt: str) -> dict[str, int | bool | str]:
     text = str(action_prompt or "").lower()
+    if _is_social_item_display_prompt(text):
+        plan["ability_used"] = "charisma"
+        current_task = str(plan.get("check_task") or "").strip().lower()
+        if not current_task or any(
+            token in current_task
+            for token in ("观察", "分析", "理解", "构造", "原理", "inspect", "analyze", "investigate", "observe")
+        ):
+            plan["check_task"] = "展示这件物品并借机吸引对方注意"
+        plan["requires_check"] = True
+        return plan
+    npc_chat_mode = _npc_chat_relation_mode(action_prompt)
+    if npc_chat_mode is not None:
+        plan["ability_used"] = "charisma"
+        current_task = str(plan.get("check_task") or "").strip().lower()
+        if not current_task or any(
+            token in current_task
+            for token in ("观察", "分析", "理解", "构造", "原理", "inspect", "analyze", "investigate", "observe")
+        ):
+            if npc_chat_mode == "trust":
+                plan["check_task"] = "争取对方信任并促使其配合"
+            elif npc_chat_mode == "coercive":
+                plan["check_task"] = "施压迫使对方做出回应"
+            else:
+                plan["check_task"] = "试探对方态度并推进关系"
+        plan["dc"] = _npc_chat_relation_dc(action_prompt, mode=npc_chat_mode)
+        plan["requires_check"] = True
+        return plan
     if any(token in text for token in ("attack", "strike", "hit", "砍", "攻击")):
         plan["ability_used"] = "strength"
     elif any(token in text for token in ("sneak", "dodge", "stealth", "潜行", "闪避")):

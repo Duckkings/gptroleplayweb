@@ -48,6 +48,14 @@ def build_player_reaction_check(
         return None
     if not isinstance(dc_raw, int):
         return None
+    if resolution_context == "npc_chat":
+        success_hint = ""
+        failure_hint = ""
+        critical_success_hint = ""
+        critical_failure_hint = ""
+        dc_upper_bound = 20
+    else:
+        dc_upper_bound = 30
     return PlayerReactionCheck(
         reaction_id=str(payload.get("reaction_id") or f"react_{uuid4().hex}"),
         source_kind=source_kind,  # type: ignore[arg-type]
@@ -57,13 +65,17 @@ def build_player_reaction_check(
         trigger_summary=trigger_summary[:240],
         threatened_consequence=threatened_consequence[:240],
         ability_used=ability_used,  # type: ignore[arg-type]
-        dc=max(5, min(30, dc_raw)),
+        dc=max(5, min(dc_upper_bound, dc_raw)),
         check_task=check_task[:180],
         resolution_context=resolution_context,  # type: ignore[arg-type]
-        success_hint=str(payload.get("success_hint") or "").strip()[:180],
-        failure_hint=str(payload.get("failure_hint") or "").strip()[:180],
-        critical_success_hint=str(payload.get("critical_success_hint") or "").strip()[:180],
-        critical_failure_hint=str(payload.get("critical_failure_hint") or "").strip()[:180],
+        success_hint=(success_hint if resolution_context == "npc_chat" else str(payload.get("success_hint") or "").strip())[:180],
+        failure_hint=(failure_hint if resolution_context == "npc_chat" else str(payload.get("failure_hint") or "").strip())[:180],
+        critical_success_hint=(
+            critical_success_hint if resolution_context == "npc_chat" else str(payload.get("critical_success_hint") or "").strip()
+        )[:180],
+        critical_failure_hint=(
+            critical_failure_hint if resolution_context == "npc_chat" else str(payload.get("critical_failure_hint") or "").strip()
+        )[:180],
     )
 
 

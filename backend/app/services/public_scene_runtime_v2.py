@@ -52,7 +52,7 @@ def _local_public_roles(save) -> list:
     roles = list(legacy._visible_public_roles(save))
     seen_ids = {role.role_id for role in roles}
     for role in save.role_pool:
-        if role.role_id in seen_ids or role.state == "in_team":
+        if role.role_id in seen_ids or role.state == "in_team" or legacy._role_is_dead_for_public_scene(save, role):
             continue
         if current_sub_zone_id and role.sub_zone_id == current_sub_zone_id:
             roles.append(role)
@@ -543,11 +543,13 @@ def _ai_actor_action(
         "Recognizable direct-damage spells, explosive spells, and area spells such as Fireball must use action_type=attack even if they affect multiple visible targets.\n"
         "Do not collapse an obvious AOE spell into a harmless single-target check.\n"
         "If private_chat_memory_context is not empty for a team actor, use those memory summaries as the primary reference for the teammate's tone, attitude, and player-facing preference in public turn.\n"
+        "If actor_type is team, write the character as the player's teammate or companion rather than a generic NPC.\n"
         "Newer memory summaries should usually weigh more, but they must not override urgent live threats, legal targets, or formal check/resource rules.\n"
         "situation_delta_hint must be an integer between -8 and 8.\n"
         "reputation_delta_hint must be an integer between -3 and 3 and represents direct public reputation impact in the current zone.\n"
         "If there is no clear public reputation impact, return reputation_delta_hint as 0.\n"
-        "When incoming_interaction_json is not empty, also classify whether this response accepts, rejects, or ambiguously answers the incoming interaction via consent_state, and whether it creates a direct opposed exchange via contest_state."
+        "When incoming_interaction_json is not empty, also classify whether this response accepts, rejects, or ambiguously answers the incoming interaction via consent_state, and whether it creates a direct opposed exchange via contest_state.\n"
+        "When incoming_interaction_json is not empty, keep external_action_narration provisional and avoid final outcome language such as already escaped, fully restrained, or completely blocked until the response exchange is resolved."
     )
     try:
         client = legacy.create_sync_client(config, client_cls=legacy.OpenAI)

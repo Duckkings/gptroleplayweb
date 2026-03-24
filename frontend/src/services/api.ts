@@ -421,7 +421,14 @@ export async function streamChat(
 }
 
 export async function continuePendingTurn(
-  payload: { session_id: string; pending_turn_id: string; forced_dice_roll: number; config?: AppConfig },
+  payload: {
+    session_id: string;
+    pending_turn_id: string;
+    forced_dice_roll: number;
+    reaction_action_text?: string;
+    reaction_speech_text?: string;
+    config?: AppConfig;
+  },
   report?: DebugReporter,
 ): Promise<PendingTurnContinueResponse> {
   return requestJson(
@@ -436,7 +443,14 @@ export async function continuePendingTurn(
 }
 
 export async function continuePendingTurnStream(
-  payload: { session_id: string; pending_turn_id: string; forced_dice_roll: number; config?: AppConfig },
+  payload: {
+    session_id: string;
+    pending_turn_id: string;
+    forced_dice_roll: number;
+    reaction_action_text?: string;
+    reaction_speech_text?: string;
+    config?: AppConfig;
+  },
   handlers: {
     onDelta: (delta: string) => void;
     onError: (message: string) => void;
@@ -2183,7 +2197,7 @@ export async function interactInventoryItem(
     session_id: string;
     owner: { owner_type: 'player' | 'role'; role_id: string | null };
     item_id: string;
-    mode: 'inspect' | 'use';
+    mode: 'inspect' | 'use' | 'show_to_npc';
     prompt: string;
     action_check?: ActionCheckResult | null;
     config?: AppConfig;

@@ -1025,7 +1025,7 @@ function App() {
     if (chatState === 'awaiting_attack_defense') return '等待攻击对抗掷骰...';
     if (chatState === 'awaiting_information_check') return '等待信息检定...';
     if (chatState === 'awaiting_death_save') return '等待死亡豁免...';
-    if (chatState === 'awaiting_reaction') return '等待反应检定...';
+    if (chatState === 'awaiting_reaction') return '等待回应处理中...';
     if (chatState === 'awaiting_opposed') return '等待对抗回应...';
     if (chatState === 'awaiting_protocol_repair') return '正在修复 AI 协议输出...';
     if (chatState === 'error') return `错误: ${error}`;
@@ -1357,7 +1357,11 @@ function App() {
   const visiblePublicTurnOpposed = Boolean(
     pendingOpposedState && publicTurnOpposedRollModalOpen && minimizedBlockingModal !== 'public_turn_opposed',
   );
-  const visibleReactionRoll = Boolean(reactionCheckRollState.open && minimizedBlockingModal !== 'reaction_roll');
+  const visibleReactionRoll = Boolean(
+    reactionCheckRollState.open &&
+      minimizedBlockingModal !== 'reaction_roll' &&
+      pendingReactionState?.flow_kind !== 'npc_chat',
+  );
   const visibleBattleModal = Boolean(activeBattle && minimizedBlockingModal !== 'battle');
   const visibleBattleRoll = Boolean(battleRollState.open && minimizedBlockingModal !== 'battle_roll');
   const playerBuildCompleted = characterBuildState?.state.player_status === 'completed';
@@ -1450,23 +1454,36 @@ function App() {
         : [],
     [activeTeammateChat, activeTeammateDialogueLogs],
   );
+  const teammateReactionPending =
+    pendingReactionState?.flow_kind === 'npc_chat' && Boolean(pendingReactionState.pending_reaction);
+  const npcChatReactionPending = Boolean(
+    chatMode === 'npc' && activeNpcChat && pendingReactionState?.flow_kind === 'npc_chat' && pendingReactionState.pending_reaction,
+  );
   const teammateChatHasInput = teammateChatActionInput.trim().length > 0 || teammateChatSpeechInput.trim().length > 0;
   const teammateChatInputDisabled =
     !activeTeammateRole ||
-    blockingWorkflowActive ||
+    (blockingWorkflowActive && !teammateReactionPending) ||
     encounterEngaged ||
     chatState === 'sending' ||
     chatState === 'streaming';
-  const teammateChatSendDisabled = teammateChatInputDisabled || !teammateChatHasInput;
+  const teammateChatSendDisabled =
+    !teammateChatHasInput ||
+    (chatState === 'sending' || chatState === 'streaming') ||
+    (!teammateReactionPending && teammateChatInputDisabled);
   const teammateChatDisabledHint = !activeTeammateRole
     ? '正在载入队友数据，暂时无法发送。'
+    : teammateReactionPending
+      ? '当前正在处理中断检定，请在下方输入动作和语言后提交。'
     : encounterEngaged
       ? '遭遇进行中，请直接在主聊天描述动作或发言。'
       : blockingWorkflowActive
         ? '当前存在未完成流程，需先处理后才能继续与队友单聊。'
         : '';
   const teammateMemorySummaryAvailable =
-    !teammateChatInputDisabled && activeTeammatePendingMemoryDialogueIds.length > 0 && !teammateMemorySummaryBusy;
+    !teammateChatInputDisabled &&
+    !teammateReactionPending &&
+    activeTeammatePendingMemoryDialogueIds.length > 0 &&
+    !teammateMemorySummaryBusy;
   const setNpcDisplayedMessages = (next: ChatMessage[] | ((prev: ChatMessage[]) => ChatMessage[])) => {
     const npcId = activeNpcChat?.npcId;
     if (!npcId) return;
@@ -1714,7 +1731,10 @@ function App() {
       conversationState?.last_npc_claim ? `上一轮 NPC 表态: ${conversationState.last_npc_claim}` : '',
       `动作描述: ${actionDescription || '-'}`,
       `语言描述: ${speechDescription || '-'}`,
-      '判定要求: 若动作与语言呈现调情、戏谑、试探、暧昧、双关或隐喻，请优先按社交互动、魅力试探、关系推进来理解。',
+      '判定参考: 私聊检定按语义分三类。社交试探类看好感度，DC 在 1-20 之间且好感度影响很大；请求/命令类看信任度，DC 在 1-20 之间且信任度影响很大；强迫/威胁/逼迫类默认 DC 13+。',
+      '判定要求: 若动作与语言呈现调情、戏谑、试探、暧昧、双关或隐喻，请优先按社交互动、好感度相关的关系推进来理解。',
+      '判定要求: 若动作与语言呈现请求、拜托、帮忙、配合、命令、让对方做事，请优先按信任度相关的请求/命令类来理解。',
+      '判定要求: 若动作与语言呈现威胁、逼迫、强迫、要挟、压迫、威吓，请优先按强迫类来理解，DC 不得低于 13。',
       '只有在文本明确提到门锁、箱锁、锁芯、钥匙、撬锁工具、镣铐、手铐或其他实体锁具时，才按物理开锁处理。',
       '如果描述中的“锁”“心门”“防备”“束缚”等更像人物关系或情绪隐喻，也按社交语义理解。',
     ];
@@ -2237,11 +2257,16 @@ function App() {
       npc_role_id: response.npc_role_id ?? null,
       pending_reaction: response.pending_reaction,
     });
-    setReactionCheckRollState({
+    const nextRollState = {
       ...DEFAULT_ACTION_CHECK_ROLL_STATE,
-      open: true,
+      open: response.flow_kind !== 'npc_chat',
       plan: buildReactionPlan(response.pending_reaction),
-    });
+    };
+    setReactionCheckRollState(nextRollState);
+    if (response.flow_kind === 'npc_chat') {
+      setChatState('idle');
+      return;
+    }
     setChatState('awaiting_reaction');
   };
 
@@ -3212,7 +3237,7 @@ function App() {
     pending.reject(new Error(errorMessage));
   };
 
-  const onTriggerReactionCheckRoll = () => {
+  const onTriggerReactionCheckRoll = (reactionInput?: { actionText: string; speechText: string }) => {
     if (reactionCheckRollState.phase !== 'ready' || !pendingReactionState || !reactionCheckRollState.plan) return;
     const rollValue = Math.floor(Math.random() * 20) + 1;
     const rotation = {
@@ -3236,6 +3261,8 @@ function App() {
           if (!pending) {
             throw new Error('待续回合不存在');
           }
+          const reactionActionText = reactionInput?.actionText ?? '';
+          const reactionSpeechText = reactionInput?.speechText ?? '';
           if (pending.flow_kind === 'public_turn') {
             const synthesizedResult = buildReactionCheckResult(pending.pending_reaction, rollValue);
             if (config.stream) {
@@ -3509,6 +3536,13 @@ function App() {
             }
             return;
           }
+          const npcReactionContinuation =
+            pending.flow_kind === 'npc_chat'
+              ? {
+                  reaction_action_text: reactionActionText.trim(),
+                  reaction_speech_text: reactionSpeechText.trim(),
+                }
+              : {};
           if (config.stream && (pending.flow_kind === 'main_chat' || pending.flow_kind === 'npc_chat')) {
             const controller = new AbortController();
             abortRef.current = controller;
@@ -3527,6 +3561,7 @@ function App() {
                 session_id: sessionId,
                 pending_turn_id: pending.pending_turn_id,
                 forced_dice_roll: rollValue,
+                ...npcReactionContinuation,
                 config,
               },
               {
@@ -3624,6 +3659,7 @@ function App() {
                 session_id: sessionId,
                 pending_turn_id: pending.pending_turn_id,
                 forced_dice_roll: rollValue,
+                ...npcReactionContinuation,
                 config,
               },
               report,
@@ -3654,6 +3690,11 @@ function App() {
                 return { ...prev, [pending.npc_role_id!]: current };
               });
             }
+          }
+          if (pending.flow_kind === 'npc_chat') {
+            window.setTimeout(() => {
+              onCloseReactionCheckRoll();
+            }, 0);
           }
         } catch (e) {
           const message = e instanceof Error ? e.message : '反应检定续行失败';
@@ -7779,6 +7820,38 @@ function App() {
       setError(chatMode === 'npc' ? 'NPC 单聊至少需要输入动作或语言其中一项。' : '主聊天至少需要输入动作或语言其中一项。');
       return;
     }
+    if (chatMode === 'npc' && npcChatReactionPending && activeNpcChat) {
+      let validatedActionDescription = actionDescription;
+      let validatedSpeechDescription = speechDescription;
+      try {
+        const validated = await performPlayerInputValidation({
+          entryPoint: 'npc_chat',
+          actorRoleId: playerStatic.player_id,
+          actionText: actionDescription,
+          speechText: speechDescription,
+        });
+        if (!validated) {
+          return;
+        }
+        validatedActionDescription = validated.actionText;
+        validatedSpeechDescription = validated.speechText;
+      } catch (e) {
+        setError(e instanceof Error ? e.message : '玩家输入校验失败');
+        return;
+      }
+      if (!validatedActionDescription && !validatedSpeechDescription) {
+        setError('校验建议后没有可提交内容，请直接修改输入。');
+        return;
+      }
+      setLastActionInput(validatedActionDescription);
+      setLastSpeechInput(validatedSpeechDescription);
+      setError('');
+      onTriggerReactionCheckRoll({
+        actionText: validatedActionDescription,
+        speechText: validatedSpeechDescription,
+      });
+      return;
+    }
     if (chatMode === 'npc' && activeNpcChat) {
       await submitNpcChatTurn({
         npcId: activeNpcChat.npcId,
@@ -7924,6 +7997,37 @@ function App() {
   const onSendTeammateChat = async () => {
     clearDamageHighlights();
     if (!activeTeammateChat || teammateChatSendDisabled) return;
+    if (teammateReactionPending) {
+      let validatedActionDescription = teammateChatActionInput.trim();
+      let validatedSpeechDescription = teammateChatSpeechInput.trim();
+      try {
+        const validated = await performPlayerInputValidation({
+          entryPoint: 'npc_chat',
+          actorRoleId: playerStatic.player_id,
+          actionText: teammateChatActionInput,
+          speechText: teammateChatSpeechInput,
+        });
+        if (!validated) {
+          return;
+        }
+        validatedActionDescription = validated.actionText;
+        validatedSpeechDescription = validated.speechText;
+      } catch (e) {
+        setError(e instanceof Error ? e.message : '玩家输入校验失败');
+        return;
+      }
+      if (!validatedActionDescription && !validatedSpeechDescription) {
+        setError('校验建议后没有可提交内容，请直接修改输入。');
+        return;
+      }
+      setLastActionInput(validatedActionDescription);
+      setLastSpeechInput(validatedSpeechDescription);
+      onTriggerReactionCheckRoll({
+        actionText: validatedActionDescription,
+        speechText: validatedSpeechDescription,
+      });
+      return;
+    }
     await submitNpcChatTurn({
       npcId: activeTeammateChat.npcId,
       npcName: activeTeammateChat.npcName,
@@ -8533,10 +8637,23 @@ function App() {
       setItemInteractionBusy(true);
       forceReturnToMainChat('narrative_switch');
       let actionCheckResult: ActionCheckResult | null = null;
+      const itemPrompt = itemInteractionPrompt.trim();
+      const socialDisplayPrompt = /(展示|给.*看|show|display|诱惑|勾引|吸引|撩|调情|勾搭|亮出|亮给)/i.test(itemPrompt);
       if (itemInteractionMode === 'use') {
+        const actionPrompt = [
+          `owner_type=${itemInteractionOwner.owner_type}`,
+          `role_id=${itemInteractionOwner.role_id ?? playerStatic.player_id}`,
+          `item_id=${itemInteractionItem.itemId}`,
+          `item_name=${itemInteractionItem.itemName}`,
+          `intent_hint=${socialDisplayPrompt ? 'social_display' : 'item_use'}`,
+          socialDisplayPrompt ? 'semantic_note=这是展示给NPC看或借物诱导，不是观察物品结构。' : '',
+          `prompt=${itemPrompt || '-'}`,
+        ]
+          .filter(Boolean)
+          .join('; ');
         actionCheckResult = await performActionCheckWithRoll({
-          action_type: 'item_use',
-          action_prompt: `owner_type=${itemInteractionOwner.owner_type}; role_id=${itemInteractionOwner.role_id ?? playerStatic.player_id}; item_id=${itemInteractionItem.itemId}; item_name=${itemInteractionItem.itemName}; prompt=${itemInteractionPrompt.trim() || '-'}`,
+          action_type: socialDisplayPrompt ? 'auto' : 'item_use',
+          action_prompt: actionPrompt,
           actor_role_id: itemInteractionOwner.owner_type === 'role' ? (itemInteractionOwner.role_id ?? undefined) : playerStatic.player_id,
           source_context: 'inventory_item',
           post_close_output: 'suppress',
@@ -8568,7 +8685,7 @@ function App() {
       setMainOutput('system_output', response.reply, response.scene_events ?? []);
       pushTimeNotice(
         response.time_spent_min,
-        `${itemInteractionMode === 'inspect' ? '观察物品' : '使用物品'}:${itemInteractionItem.itemName}`,
+        `${response.mode === 'show_to_npc' ? '展示物品' : response.mode === 'inspect' ? '观察物品' : '使用物品'}:${itemInteractionItem.itemName}`,
       );
       setItemInteractionOpen(false);
       if (response.mode === 'use') {
@@ -9103,7 +9220,12 @@ function App() {
   };
 
   const onDebugSaveReset = async () => {
-    if (!window.confirm('确认执行测试重置吗？这会保留地图、玩家和队伍，只清遭遇、公开回合、pending turn 和队友记忆。')) return;
+    if (
+      !window.confirm(
+        '确认执行测试重置吗？这会保留地图、玩家和队伍，只清遭遇、公开回合、pending turn 和队友记忆，并把队友好感/信任回调到50、健谈值回调到80。',
+      )
+    )
+      return;
     try {
       const response = await debugSaveReset(sessionId, report);
       setCurrentMainOutput(null);
@@ -10082,10 +10204,24 @@ function App() {
                       />
                     </div>
                   </div>
-                  <p className="hint">NPC 单聊支持只输入动作或只输入语言；若包含动作或向 NPC 提要求，会先进入检定，再把结果一并发给 NPC。</p>
+                  {npcChatReactionPending && pendingReactionState?.pending_reaction ? (
+                    <section className="teammate-chat-reaction-banner npc-chat-reaction-banner">
+                      <h4>NPC 单聊应对待处理</h4>
+                      <p>发起者: {pendingReactionState.pending_reaction.source_actor_name ?? pendingReactionState.pending_reaction.source_label}</p>
+                      <p>触发: {pendingReactionState.pending_reaction.trigger_summary}</p>
+                      <p>当前局势: {pendingReactionState.pending_reaction.threatened_consequence}</p>
+                      <p>
+                        需要检定: {pendingReactionState.pending_reaction.ability_used} / DC {pendingReactionState.pending_reaction.dc} /{' '}
+                        {pendingReactionState.pending_reaction.check_task}
+                      </p>
+                      <p>先在下方输入你的动作和语言，再提交；不会替你自动决定应对方式。</p>
+                    </section>
+                  ) : (
+                    <p className="hint">NPC 单聊支持只输入动作或只输入语言；若包含动作或向 NPC 提要求，会先进入检定，再把结果一并发给 NPC。</p>
+                  )}
                   <div className="actions">
                     <button disabled={!canSend} onClick={() => void onSend()}>
-                      发送
+                      {npcChatReactionPending ? '提交回应并掷骰' : '发送'}
                     </button>
                   </div>
                 </>
@@ -10214,11 +10350,13 @@ function App() {
         trust={activeTeammateMember?.trust ?? null}
         messages={activeTeammateMessages}
         liveProgress={activeTeammateLiveProgress}
+        pendingReaction={teammateReactionPending ? pendingReactionState?.pending_reaction ?? null : null}
         actionValue={teammateChatActionInput}
         speechValue={teammateChatSpeechInput}
         busy={chatState === 'sending' || chatState === 'streaming'}
         inputDisabled={teammateChatInputDisabled}
         sendDisabled={teammateChatSendDisabled}
+        sendLabel={teammateReactionPending ? '提交回应' : '发送'}
         disabledHint={teammateChatDisabledHint}
         errorMessage={error}
         onActionChange={setTeammateChatActionInput}

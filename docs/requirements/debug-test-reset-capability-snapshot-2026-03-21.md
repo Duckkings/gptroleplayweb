@@ -12,7 +12,9 @@ This snapshot records the currently implemented local debug reset and encounter 
 - Added frontend Debug panel button `测试重置`.
 - `测试重置` preserves map, player data, team members, quests, fate, reputation, world state, and ordinary game logs.
 - `测试重置` invalidates active and queued encounters, clears current sub-zone public turn state, clears matching recent turn records, clears pending turn state, and clears teammate memory logs.
-- Teammate `affinity`, `trust`, and `NpcRoleCard.relations` remain intact after reset.
+- Teammate `affinity` and `trust` now reset to `50` on debug reset.
+- The linked active `NpcRoleCard.talkative_current` now resets to `80` on debug reset.
+- `NpcRoleCard.relations` remain intact after reset.
 - Encounter generation now enforces unique display names for `new_npc` and `temporary_npcs`.
 - Duplicate encounter actor names are automatically rewritten to `原名（遭遇NPC）` or `原名（新NPC）`, with numeric suffixes when needed.
 - Legacy bad saves with encounter temp NPC name collisions now receive runtime aliases in public scene and public turn candidate assembly.

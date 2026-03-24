@@ -1,6 +1,6 @@
 import { LiveProgressPanel } from './LiveProgressPanel';
 import { getCharacterBuildAssetUrl } from '../services/api';
-import type { ChatMessage, LiveProgressEntry, NpcRoleCard, RoleActionStatus } from '../types/app';
+import type { ChatMessage, LiveProgressEntry, NpcRoleCard, PlayerReactionCheck, RoleActionStatus } from '../types/app';
 
 type Props = {
   open: boolean;
@@ -9,11 +9,13 @@ type Props = {
   trust: number | null;
   messages: ChatMessage[];
   liveProgress: LiveProgressEntry[];
+  pendingReaction?: PlayerReactionCheck | null;
   actionValue: string;
   speechValue: string;
   busy: boolean;
   inputDisabled: boolean;
   sendDisabled: boolean;
+  sendLabel?: string;
   disabledHint?: string;
   errorMessage?: string;
   onActionChange: (value: string) => void;
@@ -52,11 +54,13 @@ export function TeammateChatModal({
   trust,
   messages,
   liveProgress,
+  pendingReaction,
   actionValue,
   speechValue,
   busy,
   inputDisabled,
   sendDisabled,
+  sendLabel,
   disabledHint,
   errorMessage,
   onActionChange,
@@ -143,6 +147,18 @@ export function TeammateChatModal({
             </header>
 
             <section className="messages teammate-chat-messages">
+              {pendingReaction ? (
+                <section className="teammate-chat-reaction-banner">
+                  <h4>单聊交互待处理</h4>
+                  <p>发起者: {pendingReaction.source_actor_name ?? pendingReaction.source_label}</p>
+                  <p>触发: {pendingReaction.trigger_summary}</p>
+                  <p>当前局势: {pendingReaction.threatened_consequence}</p>
+                  <p>
+                    参考: {pendingReaction.ability_used} / DC {pendingReaction.dc} / {pendingReaction.check_task}
+                  </p>
+                  <p>先在下方输入你的动作和台词，再提交继续交互。</p>
+                </section>
+              ) : null}
               {messages.length === 0 && <p className="hint">你已接近该队友，可以只输入动作或只输入语言开始交互。</p>}
               {messages.map((message, index) => (
                 <article key={`${message.role}_${index}`} className={`msg ${message.role}`}>
@@ -188,7 +204,7 @@ export function TeammateChatModal({
 
               <div className="actions">
                 <button type="button" onClick={onSend} disabled={busy || sendDisabled}>
-                  {busy ? '发送中...' : '发送'}
+                  {busy ? '发送中...' : sendLabel ?? '发送'}
                 </button>
               </div>
             </footer>

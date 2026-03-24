@@ -533,6 +533,8 @@ class PendingTurnContinueRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     pending_turn_id: str = Field(..., min_length=1)
     forced_dice_roll: int = Field(..., ge=1, le=20)
+    reaction_action_text: str = Field(default="", min_length=0)
+    reaction_speech_text: str = Field(default="", min_length=0)
     config: ChatConfig | None = None
 
 
@@ -4143,7 +4145,7 @@ class InventoryInteractRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     owner: InventoryOwnerRef
     item_id: str = Field(..., min_length=1)
-    mode: Literal["inspect", "use"] = "inspect"
+    mode: Literal["inspect", "use", "show_to_npc"] = "inspect"
     prompt: str = Field(default="", min_length=0)
     action_check: ActionCheckResponse | None = None
     config: ChatConfig | None = None
@@ -4154,7 +4156,7 @@ class InventoryInteractResponse(BaseModel):
     session_id: str
     owner: InventoryOwnerRef
     item_id: str = Field(..., min_length=1)
-    mode: Literal["inspect", "use"]
+    mode: Literal["inspect", "use", "show_to_npc"]
     reply: str = Field(..., min_length=1)
     time_spent_min: int = Field(default=1, ge=1)
     action_check: ActionCheckResponse | None = None

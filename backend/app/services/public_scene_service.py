@@ -36,6 +36,7 @@ from app.services.world_service import (
     _new_scene_event,
     _parse_player_intent,
     _public_behavior_triggered,
+    _role_is_dead_for_public_scene,
     _upsert_npc_player_relation,
     _visible_public_roles,
     _world_time_payload,

@@ -697,6 +697,90 @@ class RoleSystemTests(unittest.TestCase):
         self.assertIs(updated, plan)
         self.assertEqual(updated["ability_used"], "wisdom")
 
+    def test_apply_action_prompt_hints_scales_npc_chat_social_dc_by_affinity(self) -> None:
+        plan = {
+            "action_type": "check",
+            "ability_used": "wisdom",
+            "dc": 18,
+            "time_spent_min": 5,
+            "requires_check": False,
+            "check_task": "分析对方态度",
+        }
+
+        updated = _apply_action_prompt_hints(
+            plan,
+            "这是一次与 NPC 的私聊互动判定，请结合动作和语言整体理解真实意图。\n"
+            "npc_id=npc_01\n"
+            "NPC姓名: 罗儿\n"
+            "对象身份: 当前队友。\n"
+            "当前关系: 好感度=68，信任度=54。\n"
+            "当前健谈值: 72/84\n"
+            "动作描述: 我试图通过语言试探她的态度，顺便拉近关系。\n"
+            "语言描述: 你对我到底是什么看法？",
+        )
+
+        self.assertIs(updated, plan)
+        self.assertEqual(updated["ability_used"], "charisma")
+        self.assertEqual(int(updated["dc"]), 5)
+        self.assertEqual(updated["check_task"], "试探对方态度并推进关系")
+        self.assertTrue(updated["requires_check"])
+
+    def test_apply_action_prompt_hints_scales_npc_chat_request_dc_by_trust(self) -> None:
+        plan = {
+            "action_type": "check",
+            "ability_used": "wisdom",
+            "dc": 18,
+            "time_spent_min": 5,
+            "requires_check": False,
+            "check_task": "分析对方态度",
+        }
+
+        updated = _apply_action_prompt_hints(
+            plan,
+            "这是一次与 NPC 的私聊互动判定，请结合动作和语言整体理解真实意图。\n"
+            "npc_id=npc_02\n"
+            "NPC姓名: 罗儿\n"
+            "对象身份: 当前队友。\n"
+            "当前关系: 好感度=40，信任度=86。\n"
+            "当前健谈值: 72/84\n"
+            "动作描述: 我请求她帮我把门打开。\n"
+            "语言描述: 拜托，帮我开一下门。",
+        )
+
+        self.assertIs(updated, plan)
+        self.assertEqual(updated["ability_used"], "charisma")
+        self.assertEqual(int(updated["dc"]), 3)
+        self.assertEqual(updated["check_task"], "争取对方信任并促使其配合")
+        self.assertTrue(updated["requires_check"])
+
+    def test_apply_action_prompt_hints_keeps_coercive_dc_at_least_thirteen(self) -> None:
+        plan = {
+            "action_type": "check",
+            "ability_used": "wisdom",
+            "dc": 9,
+            "time_spent_min": 5,
+            "requires_check": False,
+            "check_task": "分析对方态度",
+        }
+
+        updated = _apply_action_prompt_hints(
+            plan,
+            "这是一次与 NPC 的私聊互动判定，请结合动作和语言整体理解真实意图。\n"
+            "npc_id=npc_03\n"
+            "NPC姓名: 罗儿\n"
+            "对象身份: 当前队友。\n"
+            "当前关系: 好感度=40，信任度=22。\n"
+            "当前健谈值: 72/84\n"
+            "动作描述: 我威胁她如果不配合就别想离开。\n"
+            "语言描述: 你最好现在就按我说的做。",
+        )
+
+        self.assertIs(updated, plan)
+        self.assertEqual(updated["ability_used"], "charisma")
+        self.assertEqual(int(updated["dc"]), 13)
+        self.assertEqual(updated["check_task"], "施压迫使对方做出回应")
+        self.assertTrue(updated["requires_check"])
+
     def test_action_check_player_requires_roll_when_check_needed(self) -> None:
         sid = "sess_action_check_player_roll_required"
         clear_current_save(sid)

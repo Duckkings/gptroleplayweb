@@ -2935,7 +2935,7 @@ export type InventoryInteractRequest = {
   session_id: string;
   owner: InventoryOwnerRef;
   item_id: string;
-  mode: 'inspect' | 'use';
+  mode: 'inspect' | 'use' | 'show_to_npc';
   prompt: string;
   action_check?: ActionCheckResult | null;
   config?: AppConfig;
@@ -2946,7 +2946,7 @@ export type InventoryInteractResponse = {
   session_id: string;
   owner: InventoryOwnerRef;
   item_id: string;
-  mode: 'inspect' | 'use';
+  mode: 'inspect' | 'use' | 'show_to_npc';
   reply: string;
   time_spent_min: number;
   action_check: ActionCheckResult | null;

@@ -68,10 +68,10 @@ def relation_delta_from_result(action_result: ActionCheckResponse | None, situat
             return -1
         return 0
     if action_result.critical == "critical_success":
-        return 2
+        return 4
     if action_result.critical == "critical_failure":
-        return -2
-    return 1 if action_result.success else -1
+        return -4
+    return 2 if action_result.success else -2
 
 
 def reputation_delta_from_situation(situation_delta: int) -> int:
@@ -151,15 +151,15 @@ def sanitize_reaction_tone_deltas(*, tone: str, relation_delta: int = 0, affinit
     if normalized_tone in {"warning", "hostile"}:
         relation_delta = min(relation_delta, 0)
         affinity_delta = min(affinity_delta, 0)
-        trust_delta = max(-1, min(1, trust_delta))
+        trust_delta = max(-10, min(0, trust_delta))
     elif normalized_tone in {"neutral", "concerned"}:
-        relation_delta = max(-1, min(1, relation_delta))
-        affinity_delta = max(-1, min(1, affinity_delta))
-        trust_delta = max(-1, min(1, trust_delta))
-    elif normalized_tone in {"supportive", "approving"}:
         relation_delta = max(-3, min(3, relation_delta))
-        affinity_delta = max(-3, min(3, affinity_delta))
-        trust_delta = max(-3, min(3, trust_delta))
+        affinity_delta = max(-4, min(4, affinity_delta))
+        trust_delta = max(-4, min(4, trust_delta))
+    elif normalized_tone in {"supportive", "approving"}:
+        relation_delta = max(0, min(10, relation_delta))
+        affinity_delta = max(0, min(10, affinity_delta))
+        trust_delta = max(0, min(10, trust_delta))
     return relation_delta, affinity_delta, trust_delta
 
 
@@ -300,7 +300,9 @@ def _ai_public_turn_team_reaction(
         "You are generating one teammate reaction after the player's public-turn action. "
         "Return JSON only with keys reaction_action, reaction_speech, affinity_delta, trust_delta. "
         "reaction_action must be expressive only and cannot move, attack, block, grab, cast, or change any state. "
-        "reaction_speech may be empty. affinity_delta and trust_delta must be integers between -3 and 3. "
+        "reaction_speech may be empty. affinity_delta and trust_delta must be integers between -10 and 10. "
+        "Use larger changes for decisive approval, betrayal, confessions, threats, or clear trust-building moments, "
+        "and keep mild reactions close to zero. "
         "reaction_tone must use one of the allowed stable ids below. "
         f"Allowed enum ids:\n{render_enum_pool_text(_REACTION_TONE_CONTRACT_FIELDS)}\n"
         f"teammate_name={role.name}; personality={getattr(role, 'personality', '')}; speaking_style={getattr(role, 'speaking_style', '')}; "
@@ -357,8 +359,8 @@ def _ai_public_turn_team_reaction(
         return (
             sanitize_reaction_action(str(parsed.get("reaction_action") or "")),
             _clean(str(parsed.get("reaction_speech") or ""), limit=120),
-            clamp(int(parsed.get("affinity_delta") or 0), -3, 3),
-            clamp(int(parsed.get("trust_delta") or 0), -3, 3),
+            clamp(int(parsed.get("affinity_delta") or 0), -10, 10),
+            clamp(int(parsed.get("trust_delta") or 0), -10, 10),
             str(parsed.get("reaction_tone") or "").strip().lower(),
             _clean(str(parsed.get("reaction_focus_target_name") or ""), limit=80) or None,
             _clean(str(parsed.get("reaction_speech_target_name") or ""), limit=80) or None,

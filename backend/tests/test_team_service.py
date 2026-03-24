@@ -218,21 +218,26 @@ class TeamServiceTests(unittest.TestCase):
         weapon = next(item for item in role.profile.dnd5e_sheet.backpack.items if item.item_id == weapon_id)
         self.assertEqual(weapon.name, "短弓")
 
-    def test_negative_team_reaction_can_force_leave(self) -> None:
+    def test_team_reaction_fallback_does_not_change_relationships_by_keywords(self) -> None:
         sid = "sess_team_reaction_leave"
         self._seed_context(sid)
         invite_npc_to_team(TeamInviteRequest(session_id=sid, npc_role_id="npc_local", player_prompt="一起行动吧。"))
 
         save = get_current_save(sid)
         save.team_state.members[0].affinity = 1
+        save.team_state.members[0].trust = 40
         save_current(save)
 
         response = apply_team_reactions(sid, trigger_kind="main_chat", player_text="我要威胁并抢劫路人。", summary="玩家做出了危险选择。")
-        self.assertEqual(response.team_state.members, [])
+        self.assertEqual(len(response.team_state.members), 1)
+        self.assertEqual(response.team_state.members[0].affinity, 1)
+        self.assertEqual(response.team_state.members[0].trust, 40)
 
         updated = get_current_save(sid)
-        self.assertEqual(updated.team_state.members, [])
-        self.assertEqual(updated.role_pool[0].state, "idle")
+        self.assertEqual(len(updated.team_state.members), 1)
+        self.assertEqual(updated.team_state.members[0].affinity, 1)
+        self.assertEqual(updated.team_state.members[0].trust, 40)
+        self.assertEqual(updated.role_pool[0].state, "in_team")
 
     def test_team_chat_records_member_responses_and_reactions(self) -> None:
         sid = "sess_team_chat"
@@ -247,6 +252,29 @@ class TeamServiceTests(unittest.TestCase):
         updated = get_current_save(sid)
         self.assertTrue(any(item.trigger_kind == "team_chat" for item in updated.team_state.reactions))
         self.assertGreaterEqual(len(updated.role_pool[0].dialogue_logs), 2)
+
+    def test_team_chat_keeps_ai_relationship_delta_magnitude(self) -> None:
+        sid = "sess_team_chat_delta_magnitude"
+        self._seed_context(sid)
+        invite_npc_to_team(TeamInviteRequest(session_id=sid, npc_role_id="npc_local", player_prompt="一起行动吧。"))
+
+        save = get_current_save(sid)
+        save.team_state.members[0].affinity = 50
+        save.team_state.members[0].trust = 40
+        save_current(save)
+
+        with patch("app.services.team_service._ai_team_chat_reply", return_value=("我明白你的意思。", "speech", 5, 5)):
+            with patch("app.services.team_service._team_chat_deltas", return_value=(1, 1)):
+                response = team_chat(TeamChatRequest(session_id=sid, player_message="我只是想和你确认一下。"))
+
+        self.assertEqual(len(response.replies), 1)
+        self.assertEqual(response.replies[0].affinity_delta, 5)
+        self.assertEqual(response.replies[0].trust_delta, 5)
+
+        updated = get_current_save(sid)
+        member = updated.team_state.members[0]
+        self.assertEqual(member.affinity, 55)
+        self.assertEqual(member.trust, 45)
 
     def test_debug_teammate_background_preserves_long_ai_output(self) -> None:
         sid = "sess_debug_teammate_long_background"

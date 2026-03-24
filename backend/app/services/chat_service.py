@@ -2966,9 +2966,19 @@ async def _handle_tool_call(payload: ChatRequest, tool_call: Any) -> tuple[dict[
             result["temp_hp_absorbed"] = min(temp_hp, damage) if temp_hp > 0 else 0
 
             if hp_after <= 0:
+                death_state = role_sheet.death_state
+                death_state.life_status = "dead"
+                death_state.death_count += 1
+                death_state.death_streak_count += 1
+                death_state.last_death_at = datetime.now(timezone.utc).isoformat()
+                death_state.last_death_cause = reason or f"伤害 ({damage_type or '未知'})"
+                death_state.updated_at = datetime.now(timezone.utc).isoformat()
                 role_sheet.is_dead = True
-                role_sheet.status_flags = ["dead", "downed"]
+                role_sheet.role_action_status = "dead"
+                role_sheet.status_flags = ["dead"]
+                role.state = "dead"
                 result["life_status"] = "dead"
+                result["declared_death"] = True
                 summary = f"deal_damage: role died, damage={damage}"
             else:
                 result["life_status"] = "healthy"

@@ -697,6 +697,34 @@ button:disabled {
   color: var(--text-dim);
 }
 
+.current-output-panel,
+.current-output-panel * {
+  color: var(--text-dim) !important;
+}
+
+.current-output-panel .current-output-header h3,
+.current-output-panel .current-output-header p,
+.current-output-panel .public-turn-settlement-pane,
+.current-output-panel .public-turn-narrative-pane,
+.current-output-panel .public-turn-inline-panel,
+.current-output-panel .public-turn-summary-strip,
+.current-output-panel .public-turn-summary-strip-title,
+.current-output-panel .public-turn-summary-pill strong,
+.current-output-panel .public-turn-summary-pill-label,
+.current-output-panel .public-turn-impact-pill,
+.current-output-panel .public-turn-consequence-pill,
+.current-output-panel .public-turn-dialogue-box header,
+.current-output-panel .public-turn-dialogue-box p strong,
+.current-output-panel .public-turn-pane-header p,
+.current-output-panel .public-turn-inline-header h4,
+.current-output-panel .public-turn-inline-header p,
+.current-output-panel .public-turn-inline-editor h4,
+.current-output-panel .public-turn-inline-plan p,
+.current-output-panel .public-turn-inline-context p,
+.current-output-panel .public-turn-inline-panel textarea {
+  color: var(--text-dim) !important;
+}
+
 .public-turn-summary-strip {
   border: 1px solid rgba(120, 170, 255, 0.2);
   border-radius: 12px;
@@ -839,6 +867,73 @@ button:disabled {
 
 .public-turn-settlement-card {
   background: #0a101a;
+}
+
+.public-turn-resolution-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  align-items: start;
+}
+
+.public-turn-resolution-card {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(173, 194, 224, 0.12);
+  background: linear-gradient(180deg, rgba(10, 16, 26, 0.95), rgba(7, 12, 20, 0.92));
+}
+
+.public-turn-resolution-card.source {
+  border-color: rgba(94, 150, 217, 0.24);
+  background:
+    radial-gradient(circle at top right, rgba(58, 105, 164, 0.18), transparent 34%),
+    linear-gradient(180deg, rgba(10, 16, 26, 0.97), rgba(7, 12, 20, 0.94));
+}
+
+.public-turn-resolution-card.counter {
+  border-color: rgba(110, 191, 151, 0.24);
+  background:
+    radial-gradient(circle at top right, rgba(40, 116, 77, 0.16), transparent 34%),
+    linear-gradient(180deg, rgba(10, 16, 26, 0.97), rgba(7, 12, 20, 0.94));
+}
+
+.public-turn-resolution-card-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+}
+
+.public-turn-resolution-card-header strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.public-turn-resolution-card-header span,
+.public-turn-resolution-target {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.public-turn-resolution-target {
+  margin: 0;
+}
+
+.public-turn-followup-check {
+  display: grid;
+  gap: 8px;
+}
+
+.public-turn-followup-check > p {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.public-turn-resolution-outcome {
+  margin-top: 2px;
 }
 
 .public-turn-settlement-card .scene-event-card-header strong,

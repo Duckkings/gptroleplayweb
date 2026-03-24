@@ -1,4 +1,4 @@
-import tempfile
+﻿import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -132,7 +132,7 @@ class DebugRouteTests(unittest.TestCase):
             return_value=_FakeSyncClient(
                 (
                     '{"item_definitions":[],"equipment_definitions":[],'
-                    '"spell_definitions":["{\\"definition_id\\":\\"lightning_bolt\\",\\"name\\":\\"闪电束\\",\\"attack_mode\\":\\"aoe_attack\\"}"],'
+                    '"spell_definitions":["{\\"definition_id\\":\\"lightning_bolt\\",\\"name\\":\\"闂數鏉焅\",\\"attack_mode\\":\\"aoe_attack\\"}"],'
                     '"interactable_templates":[]}'
                 )
             ),
@@ -153,7 +153,7 @@ class DebugRouteTests(unittest.TestCase):
             return_value=_FakeSyncClient(
                 (
                     '{"item_definitions":["bad-row"],'
-                    '"spell_definitions":[{"definition_id":"spell_fireball","name":"火焰爆裂","attack_mode":"aoe_attack"}]}'
+                    '"spell_definitions":[{"definition_id":"spell_fireball","name":"鐏劙鐖嗚","attack_mode":"aoe_attack"}]}'
                 )
             ),
         ):
@@ -177,11 +177,11 @@ class DebugRouteTests(unittest.TestCase):
             return_value=_FakeSyncClient(
                 (
                     '{"spell_definitions":['
-                    '{"id":"fire_bolt","name":"火焰箭","damage_type":"fire"},'
-                    '{"id":"fireball","name":"火球术","damage_type":"fire"},'
-                    '{"id":"cure_wounds","name":"治疗伤口","damage_type":"healing"},'
-                    '{"id":"mage_hand","name":"法师之手"},'
-                    '{"id":"shield","name":"护盾术"}'
+                    '{"id":"fire_bolt","name":"鐏劙绠?,"damage_type":"fire"},'
+                    '{"id":"fireball","name":"鐏悆鏈?,"damage_type":"fire"},'
+                    '{"id":"cure_wounds","name":"娌荤枟浼ゅ彛","damage_type":"healing"},'
+                    '{"id":"mage_hand","name":"娉曞笀涔嬫墜"},'
+                    '{"id":"shield","name":"鎶ょ浘鏈?}'
                     ']}'
                 )
             ),
@@ -203,8 +203,8 @@ class DebugRouteTests(unittest.TestCase):
             return_value=_FakeSyncClient(
                 (
                     '{"spell_definitions":['
-                    '"{\\"definition_id\\":\\"thunder_step\\",\\"name\\":\\"雷霆步\\",\\"attack_mode\\":\\"aoe_attack\\"}",'
-                    '"{\\"spell_id\\":\\"counterspell\\",\\"name\\":\\"法术反制\\"}"'
+                    '"{\\"definition_id\\":\\"thunder_step\\",\\"name\\":\\"闆烽渾姝\",\\"attack_mode\\":\\"aoe_attack\\"}",'
+                    '"{\\"spell_id\\":\\"counterspell\\",\\"name\\":\\"娉曟湳鍙嶅埗\\"}"'
                     ']}'
                 )
             ),
@@ -225,8 +225,8 @@ class DebugRouteTests(unittest.TestCase):
             return_value=_FakeSyncClient(
                 (
                     '{"spell_definitions":"['
-                    '{\\"definition_id\\":\\"misty_step\\",\\"name\\":\\"雾步\\",\\"attack_mode\\":\\"targeted_attack\\"},'
-                    '{\\"id\\":\\"guiding_bolt\\",\\"name\\":\\"引导箭\\",\\"attack_mode\\":\\"targeted_attack\\"}'
+                    '{\\"definition_id\\":\\"misty_step\\",\\"name\\":\\"闆炬\\",\\"attack_mode\\":\\"targeted_attack\\"},'
+                    '{\\"id\\":\\"guiding_bolt\\",\\"name\\":\\"寮曞绠璡\",\\"attack_mode\\":\\"targeted_attack\\"}'
                     ']"}'
                 )
             ),
@@ -243,9 +243,9 @@ class DebugRouteTests(unittest.TestCase):
             zones=[
                 AreaZone(
                     zone_id="zone_square",
-                    name="广场",
+                    name="骞垮満",
                     center=Coord3D(x=0, y=0, z=0),
-                    description="测试区域",
+                    description="娴嬭瘯鍖哄煙",
                     sub_zone_ids=["sub_square_1"],
                 )
             ],
@@ -253,9 +253,9 @@ class DebugRouteTests(unittest.TestCase):
                 AreaSubZone(
                     sub_zone_id="sub_square_1",
                     zone_id="zone_square",
-                    name="老榕树广场",
+                    name="鑰佹鏍戝箍鍦?",
                     coord=Coord3D(x=0, y=0, z=0),
-                    description="测试子区块",
+                    description="娴嬭瘯瀛愬尯鍧?",
                 )
             ],
             current_zone_id="zone_square",
@@ -265,20 +265,20 @@ class DebugRouteTests(unittest.TestCase):
         save.team_state.members = [
             TeamMember(
                 role_id="role_teammate",
-                name="缪儿",
+                name="缂効",
                 affinity=77,
                 trust=66,
                 last_reaction_at="2026-03-21T09:00:00+00:00",
-                last_reaction_preview="上次反应",
+                last_reaction_preview="涓婃鍙嶅簲",
             )
         ]
         save.team_state.reactions = [
             TeamReaction(
                 reaction_id="team_reaction_1",
                 member_role_id="role_teammate",
-                member_name="缪儿",
+                member_name="缂効",
                 trigger_kind="public_turn",
-                content="我记得刚才那轮的事。",
+                content="鎴戣寰楀垰鎵嶉偅杞殑浜嬨€?",
                 affinity_delta=1,
                 trust_delta=1,
             )
@@ -286,35 +286,60 @@ class DebugRouteTests(unittest.TestCase):
         save.role_pool = [
             NpcRoleCard(
                 role_id="role_teammate",
-                name="缪儿",
+                name="缂効",
                 zone_id="zone_square",
                 sub_zone_id="sub_square_1",
+                talkative_current=33,
+                talkative_maximum=91,
                 profile=PlayerStaticData(role_type="npc"),
-                relations=[RoleRelation(target_role_id="player_001", relation_tag="ally", note="保留关系")],
-                cognition_changes=["记忆 A"],
-                attitude_changes=["态度 B"],
+                relations=[RoleRelation(target_role_id="player_001", relation_tag="ally", note="淇濈暀鍏崇郴")],
+                cognition_changes=["璁板繂 A"],
+                attitude_changes=["鎬佸害 B"],
                 dialogue_logs=[
                     NpcDialogueEntry(
                         id="dlg_1",
                         speaker="npc",
                         speaker_role_id="role_teammate",
-                        speaker_name="缪儿",
+                        speaker_name="缂効",
                         context_kind="team_chat",
-                        content="我们刚讨论过现场。",
-                        world_time_text="第 1 天 上午",
+                        content="鎴戜滑鍒氳璁鸿繃鐜板満銆?",
+                        world_time_text="绗?1 澶?涓婂崍",
                     )
                 ],
                 last_private_chat_at="2026-03-21T08:00:00+00:00",
                 last_public_turn_at="2026-03-21T08:30:00+00:00",
             )
         ]
+        teammate_sheet = save.role_pool[0].profile.dnd5e_sheet
+        teammate_sheet.hit_points.maximum = 28
+        teammate_sheet.hit_points.current = 7
+        teammate_sheet.hit_points.temporary = 4
+        teammate_sheet.role_action_status = "dead"
+        teammate_sheet.is_dead = True
+        teammate_sheet.death_state.life_status = "dead"
+        teammate_sheet.death_state.death_save_successes = 2
+        teammate_sheet.death_state.death_save_failures = 1
+        teammate_sheet.death_state.death_count = 3
+        teammate_sheet.death_state.death_streak_count = 2
+        teammate_sheet.death_state.death_streak_reset_at = "2026-03-22T09:00:00+00:00"
+        teammate_sheet.death_state.last_death_at = "2026-03-22T08:30:00+00:00"
+        teammate_sheet.death_state.last_death_zone_id = "zone_square"
+        teammate_sheet.death_state.last_death_sub_zone_id = "sub_square_1"
+        teammate_sheet.death_state.last_death_cause = "test damage"
+        teammate_sheet.death_state.revived_at = "2026-03-22T09:05:00+00:00"
+        teammate_sheet.death_state.revival_method = "item"
+        teammate_sheet.death_state.revival_weakness_until = "2026-03-22T10:00:00+00:00"
+        teammate_sheet.spell_slots_max.level_1 = 2
+        teammate_sheet.spell_slots_max.level_2 = 1
+        teammate_sheet.spell_slots_current.level_1 = 0
+        teammate_sheet.spell_slots_current.level_2 = 0
         save.encounter_state.encounters = [
             EncounterEntry(
                 encounter_id="enc_active",
                 type="event",
                 status="active",
-                title="进行中的遭遇",
-                description="现场正在混乱。",
+                title="杩涜涓殑閬亣",
+                description="鐜板満姝ｅ湪娣蜂贡銆?",
                 zone_id="zone_square",
                 sub_zone_id="sub_square_1",
             ),
@@ -322,8 +347,8 @@ class DebugRouteTests(unittest.TestCase):
                 encounter_id="enc_queued",
                 type="event",
                 status="queued",
-                title="排队遭遇",
-                description="下一场遭遇。",
+                title="鎺掗槦閬亣",
+                description="涓嬩竴鍦洪伃閬囥€?",
                 zone_id="zone_square",
                 sub_zone_id="sub_square_1",
             ),
@@ -337,8 +362,8 @@ class DebugRouteTests(unittest.TestCase):
         sub_zone.chat_context.public_turn_state.situation_dc = 17
         sub_zone.chat_context.recent_turns = [
             SubZoneChatTurn(turn_id="turn_public", public_round_id="round_current", public_round_number=2),
-            SubZoneChatTurn(turn_id="turn_encounter", active_encounter_id="enc_active", active_encounter_title="进行中的遭遇"),
-            SubZoneChatTurn(turn_id="turn_keep", player_action="保留的主聊天记录"),
+            SubZoneChatTurn(turn_id="turn_encounter", active_encounter_id="enc_active", active_encounter_title="杩涜涓殑閬亣"),
+            SubZoneChatTurn(turn_id="turn_keep", player_action="淇濈暀鐨勪富鑱婂ぉ璁板綍"),
         ]
         save_current(save)
         save_pending_turn(
@@ -362,16 +387,44 @@ class DebugRouteTests(unittest.TestCase):
         self.assertEqual(payload["cleared_recent_turn_count"], 2)
         self.assertEqual(payload["cleared_team_member_role_ids"], ["role_teammate"])
         self.assertTrue(payload["cleared_pending_turn"])
-        self.assertIn("测试重置完成", payload["summary"])
+        self.assertIn("Test reset complete", payload["summary"])
 
         save_payload = payload["save"]
         self.assertEqual(save_payload["map_snapshot"]["player_position"]["zone_id"], "zone_square")
         self.assertEqual(save_payload["player_runtime_data"]["current_position"]["zone_id"], "zone_square")
-        self.assertEqual(save_payload["team_state"]["members"][0]["affinity"], 77)
-        self.assertEqual(save_payload["team_state"]["members"][0]["trust"], 66)
+        self.assertEqual(save_payload["team_state"]["members"][0]["affinity"], 50)
+        self.assertEqual(save_payload["team_state"]["members"][0]["trust"], 50)
         self.assertIsNone(save_payload["team_state"]["members"][0]["last_reaction_at"])
         self.assertEqual(save_payload["team_state"]["members"][0]["last_reaction_preview"], "")
         self.assertEqual(save_payload["team_state"]["reactions"], [])
+        teammate_sheet_payload = save_payload["role_pool"][0]["profile"]["dnd5e_sheet"]
+        self.assertEqual(save_payload["role_pool"][0]["talkative_current"], 80)
+        self.assertEqual(save_payload["role_pool"][0]["talkative_maximum"], 91)
+        self.assertEqual(teammate_sheet_payload["hit_points"]["current"], 28)
+        self.assertEqual(teammate_sheet_payload["hit_points"]["temporary"], 0)
+        self.assertFalse(teammate_sheet_payload["is_dead"])
+        self.assertEqual(teammate_sheet_payload["role_action_status"], "free_action")
+        self.assertEqual(teammate_sheet_payload["death_state"]["life_status"], "healthy")
+        self.assertEqual(teammate_sheet_payload["death_state"]["death_save_successes"], 0)
+        self.assertEqual(teammate_sheet_payload["death_state"]["death_save_failures"], 0)
+        self.assertEqual(teammate_sheet_payload["death_state"]["death_count"], 0)
+        self.assertEqual(teammate_sheet_payload["death_state"]["death_streak_count"], 0)
+        self.assertIsNone(teammate_sheet_payload["death_state"]["death_streak_reset_at"])
+        self.assertIsNone(teammate_sheet_payload["death_state"]["last_death_at"])
+        self.assertIsNone(teammate_sheet_payload["death_state"]["last_death_zone_id"])
+        self.assertIsNone(teammate_sheet_payload["death_state"]["last_death_sub_zone_id"])
+        self.assertEqual(teammate_sheet_payload["death_state"]["last_death_cause"], "")
+        self.assertIsNone(teammate_sheet_payload["death_state"]["revived_at"])
+        self.assertIsNone(teammate_sheet_payload["death_state"]["revival_method"])
+        self.assertIsNone(teammate_sheet_payload["death_state"]["revival_weakness_until"])
+        self.assertEqual(
+            teammate_sheet_payload["spell_slots_current"]["level_1"],
+            teammate_sheet_payload["spell_slots_max"]["level_1"],
+        )
+        self.assertEqual(
+            teammate_sheet_payload["spell_slots_current"]["level_2"],
+            teammate_sheet_payload["spell_slots_max"]["level_2"],
+        )
         self.assertIsNone(save_payload["area_snapshot"]["sub_zones"][0]["chat_context"]["public_turn_state"]["current_round"])
         self.assertEqual(save_payload["area_snapshot"]["sub_zones"][0]["chat_context"]["public_turn_state"]["round_history"], [])
         self.assertEqual(

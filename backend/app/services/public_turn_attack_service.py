@@ -172,6 +172,8 @@ def resolve_attack_candidates(save: SaveFile, *, include_hidden: bool) -> list[P
     team_ids = {item.role_id for item in getattr(save.team_state, "members", [])}
     visible_ids = {role.role_id for role in world._visible_public_roles(save)}
     for role in save.role_pool:
+        if world._role_is_dead_for_public_scene(save, role):
+            continue
         if role.role_id in visible_ids:
             candidates.append(
                 PublicTurnResolvedAttackTarget(

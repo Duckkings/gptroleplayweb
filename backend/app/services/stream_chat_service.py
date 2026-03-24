@@ -21,6 +21,7 @@ from app.models.schemas import (
     Message,
     NpcChatRequest,
     NpcChatResponse,
+    PendingTurnContinueRequest,
     PendingTurnContinueResponse,
     PendingTurnState,
     PlayerReactionCheck,
@@ -1082,10 +1083,18 @@ def _npc_continue_prompt(
     scene_events: list[SceneEvent],
     reaction_check: PlayerReactionCheck,
     reaction_result_text: str,
+    player_reaction_action_text: str = "",
+    player_reaction_speech_text: str = "",
 ) -> str:
     intent = world._parse_player_intent(req.player_message)
     context = world._build_npc_prompt_context(role, save.area_snapshot.clock, save=save)
     prior_scene_events = [item.model_dump(mode="json") for item in scene_events[-8:]]
+    reaction_input_lines: list[str] = []
+    if player_reaction_action_text.strip():
+        reaction_input_lines.append(f"Player reaction action: {player_reaction_action_text.strip()}")
+    if player_reaction_speech_text.strip():
+        reaction_input_lines.append(f"Player reaction speech: {player_reaction_speech_text.strip()}")
+    reaction_input = "\n".join(reaction_input_lines).strip()
     return (
         "Continue the same one-on-one roleplay conversation after the player's reaction save has already been resolved.\n"
         "Output exactly this tagged format and nothing else:\n"
@@ -1101,6 +1110,7 @@ def _npc_continue_prompt(
         f"Already visible reply:\n{accumulated_reply_text}\n"
         f"Already visible scene events:\n{_json_text(prior_scene_events)}\n"
         f"Resolved player reaction:\n{_json_text({'reaction': reaction_check.model_dump(mode='json'), 'result_text': reaction_result_text})}\n"
+        f"{reaction_input + '\n' if reaction_input else ''}"
         f"Player full input: {intent['display_text'] or req.player_message}"
     )
 
@@ -1114,10 +1124,18 @@ def _npc_continue_segment_prompt(
     scene_events: list[SceneEvent],
     reaction_check: PlayerReactionCheck,
     reaction_result_text: str,
+    player_reaction_action_text: str = "",
+    player_reaction_speech_text: str = "",
 ) -> str:
     intent = world._parse_player_intent(req.player_message)
     context = world._build_npc_prompt_context(role, save.area_snapshot.clock, save=save)
     prior_scene_events = [item.model_dump(mode="json") for item in scene_events[-8:]]
+    reaction_input_lines: list[str] = []
+    if player_reaction_action_text.strip():
+        reaction_input_lines.append(f"Player reaction action: {player_reaction_action_text.strip()}")
+    if player_reaction_speech_text.strip():
+        reaction_input_lines.append(f"Player reaction speech: {player_reaction_speech_text.strip()}")
+    reaction_input = "\n".join(reaction_input_lines).strip()
     return (
         "Continue the same one-on-one roleplay conversation after the player's reaction save has already been resolved.\n"
         "Return one JSON object that matches the NpcChatSegment schema.\n"
@@ -1131,6 +1149,7 @@ def _npc_continue_segment_prompt(
         f"Already visible reply:\n{accumulated_reply_text}\n"
         f"Already visible scene events:\n{_json_text(prior_scene_events)}\n"
         f"Resolved player reaction:\n{_json_text({'reaction': reaction_check.model_dump(mode='json'), 'result_text': reaction_result_text})}\n"
+        f"{reaction_input + '\n' if reaction_input else ''}"
         f"Player full input: {intent['display_text'] or req.player_message}"
     )
 
@@ -1330,7 +1349,14 @@ def _normalize_encounter_update(bundle: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def _normalize_player_reaction_check(bundle: dict[str, Any], *, resolution_context: str) -> PlayerReactionCheck | None:
+def _normalize_player_reaction_check(
+    bundle: dict[str, Any],
+    *,
+    resolution_context: str,
+    allow_reaction_check: bool = True,
+) -> PlayerReactionCheck | None:
+    if not allow_reaction_check:
+        return None
     raw = bundle.get("player_reaction_check")
     if not isinstance(raw, dict):
         return None
@@ -1424,7 +1450,7 @@ def _fallback_public_actor_rows(save) -> list[dict[str, Any]]:
     for role in public_scene_legacy._visible_public_roles(save):
         add_row({"actor_id": role.role_id, "name": role.name, "actor_type": "npc", "priority_reason": "visible_public_role", "role": role})
     for role in save.role_pool:
-        if role.state == "in_team" or role.role_id in seen_ids:
+        if role.state == "in_team" or role.role_id in seen_ids or world._role_is_dead_for_public_scene(save, role):
             continue
         if current_sub_zone_id and role.sub_zone_id == current_sub_zone_id:
             add_row({"actor_id": role.role_id, "name": role.name, "actor_type": "npc", "priority_reason": "local_sub_zone_role", "role": role})
@@ -1821,10 +1847,15 @@ def _apply_structured_main_turn_bundle_result(
     time_spent_min: int,
     bundle: dict[str, Any],
     config,
+    allow_player_reaction_check: bool = True,
 ) -> BundleApplyResult:
     intent = world._parse_player_intent(player_text)
     display_text = str(intent.get("display_text") or player_text).strip()
-    pending_reaction = _normalize_player_reaction_check(bundle, resolution_context="main_chat")
+    pending_reaction = _normalize_player_reaction_check(
+        bundle,
+        resolution_context="main_chat",
+        allow_reaction_check=allow_player_reaction_check,
+    )
     audience_context = public_scene_runtime.build_public_audience_context(save, intent)
     addressed_role_name = str(intent.get("addressed_role_name") or "").strip()
     incoming_target_candidates = [str(item) for item in list(intent.get("incoming_target_candidates") or [])]
@@ -2192,6 +2223,7 @@ def _apply_structured_npc_bundle_result(
     *,
     is_continuation: bool = False,
     restore_talkative: bool = True,
+    allow_player_reaction_check: bool = True,
 ) -> NpcBundleApplyResult:
     role = next((item for item in save.role_pool if item.role_id == req.npc_role_id), None)
     if role is None:
@@ -2218,7 +2250,11 @@ def _apply_structured_npc_bundle_result(
             clock=save.area_snapshot.clock,
         )
     recovered_talkative = world._restore_npc_talkative(role, save.area_snapshot.clock, save) if restore_talkative else 0
-    pending_reaction = _normalize_player_reaction_check(bundle, resolution_context="npc_chat")
+    pending_reaction = _normalize_player_reaction_check(
+        bundle,
+        resolution_context="npc_chat",
+        allow_reaction_check=allow_player_reaction_check,
+    )
     action_reaction, speech_reply = world._normalize_npc_reply_parts(
         role,
         action_text,
@@ -3042,6 +3078,7 @@ async def _continue_main_turn_state(
             time_spent_min=0,
             bundle=bundle,
             config=payload.config,
+            allow_player_reaction_check=False,
         )
         state.accumulated_scene_events = [*state.accumulated_scene_events, *applied.scene_events]
         state.staged_save = txn.save.model_dump(mode="json")
@@ -3097,6 +3134,8 @@ async def _continue_npc_chat_state(
     payload: NpcChatRequest,
     *,
     forced_dice_roll: int,
+    player_reaction_action_text: str = "",
+    player_reaction_speech_text: str = "",
     emit: EmitCallback | None = None,
     is_cancelled: Callable[[], Awaitable[bool]] | None = None,
 ) -> PendingTurnContinueResponse:
@@ -3141,6 +3180,8 @@ async def _continue_npc_chat_state(
                     scene_events=state.accumulated_scene_events,
                     reaction_check=state.pending_reaction,
                     reaction_result_text=reaction_text,
+                    player_reaction_action_text=player_reaction_action_text,
+                    player_reaction_speech_text=player_reaction_speech_text,
                 ),
             },
         ]
@@ -3170,6 +3211,8 @@ async def _continue_npc_chat_state(
                             scene_events=state.accumulated_scene_events,
                             reaction_check=state.pending_reaction,
                             reaction_result_text=reaction_text,
+                            player_reaction_action_text=player_reaction_action_text,
+                            player_reaction_speech_text=player_reaction_speech_text,
                         ),
                     },
                 ],
@@ -3203,10 +3246,12 @@ async def _continue_npc_chat_state(
                                 role,
                                 save,
                                 accumulated_reply_text=state.accumulated_reply_text,
-                                scene_events=state.accumulated_scene_events,
-                                reaction_check=state.pending_reaction,
-                                reaction_result_text=reaction_text,
-                            ),
+                            scene_events=state.accumulated_scene_events,
+                            reaction_check=state.pending_reaction,
+                            reaction_result_text=reaction_text,
+                            player_reaction_action_text=player_reaction_action_text,
+                            player_reaction_speech_text=player_reaction_speech_text,
+                        ),
                         },
                     ],
                     bundle_tag="npc_bundle",
@@ -3223,6 +3268,7 @@ async def _continue_npc_chat_state(
             reply_text,
             0,
             is_continuation=True,
+            allow_player_reaction_check=False,
         )
         state.accumulated_scene_events = [*state.accumulated_scene_events, *applied.response.scene_events]
         state.staged_save = txn.save.model_dump(mode="json")
@@ -3256,7 +3302,7 @@ async def _continue_npc_chat_state(
 
 
 async def run_pending_turn_stream(
-    req,
+    req: PendingTurnContinueRequest,
     *,
     emit: EmitCallback | None = None,
     is_cancelled: Callable[[], Awaitable[bool]] | None = None,
@@ -3285,6 +3331,8 @@ async def run_pending_turn_stream(
                 state,
                 payload,
                 forced_dice_roll=req.forced_dice_roll,
+                player_reaction_action_text=req.reaction_action_text,
+                player_reaction_speech_text=req.reaction_speech_text,
                 emit=emit,
                 is_cancelled=is_cancelled,
             )
